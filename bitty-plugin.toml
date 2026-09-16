@@ -1,0 +1,35 @@
+# Bitty plugin manifest.
+#
+# File name, keys, and limits are the accepted v1 contract in bitty-docs
+# `docs/specifications/plugin-platform-rfc.md` (OQ-012). The plugin manager and
+# the host parse this file independently before any plugin code runs.
+#
+# `just manifest` validates this file with the authoritative `bitty-plugin-lint`
+# from bitty-plugin-sdk (R-SDK-2), pinned by commit in `package.json` and
+# `bun.lock`. Run `just install` once to materialize it.
+
+[plugin]
+id = "bitty-terminal.wheel"
+name = "Wheel"
+version = "0.0.1"
+description = "Wheel — the official Agent Harness plugin for the Bitty terminal (mascot: Bittie the hamster). Pre-implementation scaffold."
+# Optional SPDX expression. Add a LICENSE file and set this before publishing.
+# license = "MIT"
+
+[compat]
+# Application and Plugin API ranges. Adjust to the host release you target;
+# both are syntax-validated here and resolved by the host at install time.
+bitty = ">=0.5,<1.0"
+plugin-api = "^1.0"
+
+[capabilities]
+# Deny by default: omit this table entirely when the plugin needs no authority.
+# Request capabilities one by one; unknown identifiers fail validation and
+# there is no allow-all identifier. `platform.notify` backs the example command
+# in `lua/wheel/init.lua`.
+platform.notify = true
+
+[lazy]
+# Static triggers let the host register the plugin without creating a VM.
+# Commands are plugin-qualified: `<plugin-id>:<resource>`.
+commands = ["bitty-terminal.wheel:hello"]

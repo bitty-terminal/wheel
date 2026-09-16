@@ -1,0 +1,18 @@
+{
+  "name": "wheel",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Wheel — the official Agent Harness plugin for the Bitty terminal (mascot: Bittie the hamster).",
+  "license": "MIT",
+  "packageManager": "bun@1.4.2",
+  "devDependencies": {
+    "@commitlint/cli": "21.2.2",
+    "@commitlint/config-conventional": "21.2.2",
+    "bitty-plugin-sdk": "github:bitty-terminal/bitty-plugin-sdk#c3fa9b0574c684eebb38b01dddfdf504d183cc20",
+    "lefthook": "2.1.12",
+    "luaparse": "0.3.1",
+    "markdownlint-cli2": "0.23.2",
+    "prettier": "3.9.6"
+  }
+}

@@ -1,0 +1,5 @@
+# Ignored scratch and local state for a generated plugin repository.
+node_modules/
+recording/
+.worktrees/
+.carryctx/config.local.toml
