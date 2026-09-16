@@ -69,18 +69,17 @@ manifest: deps
     @test -x node_modules/.bin/bitty-plugin-lint || { echo "bitty-plugin-lint is not installed; run 'just install'" >&2; exit 1; }
     bun run bitty-plugin-lint bitty-plugin.toml
 
-# Parse the Lua entry point with the pinned Lua 5.1 grammar parser.
-# NOTE: `bunx --bun luaparse@...` (NOT `bun run luaparse`) — the latter wraps
-# the binary so any nonzero parser exit is masked by the wrapper.
+# Parse the Lua entry point with the pinned Lua 5.1 grammar parser (luaparse,
+# version pinned in package.json + bun.lock).
 lua: deps
-    bunx --bun luaparse@{{luaparse_pin}} --quiet --file lua/wheel/init.lua
+    bun run luaparse --quiet --file lua/wheel/init.lua
 
 # Fail-closed control for the `lua` gate: the same pinned parser must reject an
 # invalid snippet. `luaparse` exits 0 on empty input, so without this control a
 # recipe that lost its `--file` argument would silently pass rather than parse
 # the generated entry point.
 lua-control: deps
-    @! bunx --bun luaparse@{{luaparse_pin}} --quiet --code 'local ='
+    @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
 check: lint fmt-check manifest lua lua-control
