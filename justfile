@@ -84,6 +84,9 @@ lua-control: deps
 # Aggregate gate run locally and in CI (after `just install`).
 check: lint fmt-check manifest lua lua-control
 
+actionlint:
+    actionlint .github/workflows/*.yml
+
 # Publish a redacted CarryCtx snapshot inside this repo (commander merge
 # closeout only; never a git hook). `carryctx export --publication` redacts the
 # bundle, stamps manifest.redacted, and commits one snapshot to the fixed ref
