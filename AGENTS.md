@@ -32,6 +32,11 @@
   clipboard, terminal input, or persistent-state authority; no install-time
   code execution. A wider request needs an explicitly scoped task and a
   reviewed security note; never widen silently.
+- Coding-only domain: Wheel fixes its task domain to software engineering;
+  roles (Primary, Commander, Coding, Review, Debug, Research) vary by
+  configuration inside that domain, never by class explosion (owner-approved
+  scope, research record 046). Personal, Office, and always-on agents are
+  separate future repositories, never this one.
 - Origin: scaffolded from
   [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template)
   via its deterministic generator.

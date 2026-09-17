@@ -16,6 +16,31 @@ and a CI quality gate.
 > The `lua/<module>/` layout follows the candidate plugin-repository structure
 > in bitty-docs; confirm it against the host loader contract before publishing.
 
+## Scope
+
+Wheel is the official Agent Harness plugin for the Bitty terminal, scoped to
+software engineering only: its task domain is always software development. It
+may support multi-agent, multi-role, multi-model, and multi-workspace/panel
+operation within that domain. Roles (Primary, Commander, Coding, Review,
+Debug, Research) vary by configuration, never by class explosion. The staged
+MVP direction is a single Primary Coding Agent, then Primary plus Subagents,
+then a Commander (research record 046).
+
+### Non-goals
+
+Wheel is not intended to be:
+
+- a personal AI assistant
+- a general-purpose autonomous agent
+- a messaging gateway
+- an email/calendar assistant
+- a home automation agent
+- a lifelong user-memory system
+- a cron/automation daemon
+- a general cloud-management agent
+
+Wheel is focused on software engineering workflows.
+
 ## Layout
 
 | Path                       | Purpose                                                                                                |
