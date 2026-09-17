@@ -16,3 +16,5 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repository governance: `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`,
   CarryCtx baseline (`.carryctx/config.toml`), and the Wheel/Bittie naming
   record (bitty-ai-docs `DEC-0003`).
+- Wheel Coding-Agent scope and Non-goals recorded in `README.md` and
+  `AGENTS.md` (owner-approved scope, research record 046).
