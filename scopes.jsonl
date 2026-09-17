@@ -1,0 +1,4 @@
+{"created_at":"2026-09-17T12:58:42.798328428+00:00","id":"01M2QQ5AQEBGYZAGPC4NEK1CEG","kind":"include","pattern":".github/workflows/ci.yml","project_id":"01M2NPDJWP5VYAT72SPW3J8F6S","task_id":"01M2QQ4WFS8PYWNE471MWVFMP2"}
+{"created_at":"2026-09-17T13:39:27.756305829+00:00","id":"01M2QSFYCCB3B1RK0V2HZ44FR8","kind":"include","pattern":".github/workflows/actionlint.yml","project_id":"01M2NPDJWP5VYAT72SPW3J8F6S","task_id":"01M2QSF6SVWB2XYEN0EKDTNHDH"}
+{"created_at":"2026-09-17T13:39:27.781814620+00:00","id":"01M2QSFYD59E6EC2W7ST6HF5TC","kind":"include","pattern":".github/workflows/codeql.yml","project_id":"01M2NPDJWP5VYAT72SPW3J8F6S","task_id":"01M2QSF6SVWB2XYEN0EKDTNHDH"}
+{"created_at":"2026-09-17T13:39:27.806961565+00:00","id":"01M2QSFYDYTMTXNEED6HY4ESK1","kind":"include","pattern":"justfile","project_id":"01M2NPDJWP5VYAT72SPW3J8F6S","task_id":"01M2QSF6SVWB2XYEN0EKDTNHDH"}
