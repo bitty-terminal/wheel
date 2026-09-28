@@ -32,4 +32,10 @@ platform.notify = true
 [lazy]
 # Static triggers let the host register the plugin without creating a VM.
 # Commands are plugin-qualified: `<plugin-id>:<resource>`.
-commands = ["bitty-terminal.wheel:hello"]
+commands = [
+  "bitty-terminal.wheel:hello",
+  "bitty-terminal.wheel:status",
+  "bitty-terminal.wheel:graph",
+  "bitty-terminal.wheel:plan",
+  "bitty-terminal.wheel:run",
+]

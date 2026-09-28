@@ -69,10 +69,25 @@ manifest: deps
     @test -x node_modules/.bin/bitty-plugin-lint || { echo "bitty-plugin-lint is not installed; run 'just install'" >&2; exit 1; }
     bun run bitty-plugin-lint bitty-plugin.toml
 
-# Parse the Lua entry point with the pinned Lua 5.1 grammar parser (luaparse,
+# Parse all Lua sources with the pinned Lua 5.1 grammar parser (luaparse,
 # version pinned in package.json + bun.lock).
 lua: deps
     bun run luaparse --quiet --file lua/wheel/init.lua
+    bun run luaparse --quiet --file lua/wheel/kernel.lua
+    bun run luaparse --quiet --file lua/wheel/agent.lua
+    bun run luaparse --quiet --file lua/wheel/ui.lua
+
+# Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
+test: deps
+    @if command -v lua5.1 >/dev/null 2>&1; then \
+        lua5.1 tests/test_wheel.lua; \
+    elif command -v luajit >/dev/null 2>&1; then \
+        luajit tests/test_wheel.lua; \
+    elif command -v lua >/dev/null 2>&1; then \
+        lua tests/test_wheel.lua; \
+    else \
+        echo "No lua interpreter found; skipping runtime test execution" >&2; \
+    fi
 
 # Fail-closed control for the `lua` gate: the same pinned parser must reject an
 # invalid snippet. `luaparse` exits 0 on empty input, so without this control a
@@ -82,7 +97,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest lua lua-control
+check: lint fmt-check manifest lua test lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

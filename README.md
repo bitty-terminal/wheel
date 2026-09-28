@@ -43,14 +43,28 @@ Wheel is focused on software engineering workflows.
 
 ## Layout
 
-| Path                       | Purpose                                                                                                |
-| -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `bitty-plugin.toml`        | Static manifest: identity, compatibility, capability requests, and lazy triggers.                      |
-| `lua/wheel/init.lua`       | Entry point evaluated once per activation; every resource it creates belongs to the plugin generation. |
-| `package.json`             | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.             |
-| `bun.lock`                 | Locked dependency graph installed by `just install`.                                                   |
-| `justfile`                 | Quality gates with pinned tool versions.                                                               |
-| `.github/workflows/ci.yml` | CI gate with a read-only token and SHA-pinned actions.                                                 |
+| Path                       | Purpose                                                                                                    |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `bitty-plugin.toml`        | Static manifest: identity, compatibility, capability requests, and lazy triggers.                          |
+| `lua/wheel/init.lua`       | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`). |
+| `lua/wheel/kernel.lua`     | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.         |
+| `lua/wheel/agent.lua`      | WheelAgent runtime: Commander, Worker (Coding, Debug, Research), and Reviewer roles.                       |
+| `lua/wheel/ui.lua`         | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                |
+| `tests/test_wheel.lua`     | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, and registrations.      |
+| `package.json`             | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                 |
+| `bun.lock`                 | Locked dependency graph installed by `just install`.                                                       |
+| `justfile`                 | Quality gates with pinned tool versions.                                                                   |
+| `.github/workflows/ci.yml` | CI gate with a read-only token and SHA-pinned actions.                                                     |
+
+## Commands
+
+Wheel provides the following commands via Bitty's command registry:
+
+- `bitty-terminal.wheel:hello`: Print a greeting from Wheel (Bittie the hamster 🐹).
+- `bitty-terminal.wheel:status`: Display kernel status, active task, checkpoint count, and telemetry.
+- `bitty-terminal.wheel:graph`: Render an ASCII visualization of the Task DAG grouped into topological execution waves.
+- `bitty-terminal.wheel:plan`: Initialize or decompose software engineering tasks into the Task DAG (Commander role).
+- `bitty-terminal.wheel:run`: Execute ready tasks in the DAG using WheelAgent (Worker role).
 
 ## Development
 

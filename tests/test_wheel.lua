@@ -1,0 +1,378 @@
+-- Comprehensive test suite for Bitty Wheel (bitty-terminal.wheel).
+-- Tests WheelKernel, WheelAgent, WheelUI, and plugin command registration.
+
+package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
+
+local WheelKernel = require("wheel.kernel")
+local WheelAgent = require("wheel.agent")
+local WheelUI = require("wheel.ui")
+
+local function run_test(name, fn)
+  local ok, err = pcall(fn)
+  if ok then
+    print("[PASS] " .. name)
+  else
+    print("[FAIL] " .. name .. ": " .. tostring(err))
+    os.exit(1)
+  end
+end
+
+-- ===========================================================================
+-- 1. WheelKernel Tests
+-- ===========================================================================
+
+run_test("WheelKernel: status and empty DAG", function()
+  local kernel = WheelKernel.new_mock()
+  local st = kernel:status()
+  assert(st.task_count == 0, "expected 0 tasks")
+  assert(st.slot_count == 0, "expected 0 slots")
+  assert(st.active_task == nil, "expected no active task")
+end)
+
+run_test("WheelKernel: task creation and cascade readiness", function()
+  local kernel = WheelKernel.new_mock()
+  local t1 = kernel:create_task({ id = "CTX-100", title = "Task 1", dependencies = {} })
+  assert(t1.status == "Ready", "task with 0 deps should be Ready")
+
+  local t2 = kernel:create_task({ id = "CTX-101", title = "Task 2", dependencies = { "CTX-100" } })
+  assert(t2.status == "Pending", "task with unmet dep should be Pending")
+
+  -- Start T1
+  local started = kernel:start_task("CTX-100", "worker-01")
+  assert(started.status == "Running")
+  assert(started.generation == 1)
+
+  -- Generation fencing test: wrong generation fails
+  local ok_stale = pcall(function()
+    kernel:complete_task("CTX-100", 999, nil)
+  end)
+  assert(not ok_stale, "stale generation should fail")
+
+  -- Complete T1
+  local comp = kernel:complete_task("CTX-100", 1, "hash123")
+  assert(comp.status == "Succeeded")
+
+  -- T2 should automatically become Ready
+  local t2_after = kernel:get_task("CTX-101")
+  assert(t2_after.status == "Ready", "T2 should be promoted to Ready")
+end)
+
+run_test("WheelKernel: failure cascades Blocked", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "T-A", title = "A" })
+  kernel:create_task({ id = "T-B", title = "B", dependencies = { "T-A" } })
+  kernel:create_task({ id = "T-C", title = "C", dependencies = { "T-B" } })
+
+  kernel:start_task("T-A", "worker")
+  kernel:fail_task("T-A", 1, "build error")
+
+  local tb = kernel:get_task("T-B")
+  assert(tb.status == "Blocked", "T-B should be Blocked")
+  local tc = kernel:get_task("T-C")
+  assert(tc.status == "Blocked", "T-C should be Blocked transitively")
+end)
+
+run_test("WheelKernel: topological sort", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "C", title = "C", dependencies = { "B" } })
+  kernel:create_task({ id = "A", title = "A", dependencies = {} })
+  kernel:create_task({ id = "B", title = "B", dependencies = { "A" } })
+
+  local order = kernel:topological_sort()
+  assert(#order == 3)
+  assert(order[1] == "A")
+  assert(order[2] == "B")
+  assert(order[3] == "C")
+end)
+
+run_test("WheelKernel: slots and Merkle hashing", function()
+  local kernel = WheelKernel.new_mock()
+  local s1 = kernel:put_slot("file1.lua", "print('hello')")
+  assert(s1.size_bytes == 14)
+  assert(s1.hash ~= nil)
+
+  local fetched = kernel:get_slot("file1.lua")
+  assert(fetched.found == true)
+  assert(fetched.content == "print('hello')")
+
+  local list = kernel:list_slots()
+  assert(#list == 1)
+
+  local rm = kernel:remove_slot("file1.lua")
+  assert(rm.removed == true)
+  local fetched2 = kernel:get_slot("file1.lua")
+  assert(fetched2.found == false)
+end)
+
+run_test("WheelKernel: cognitive checkpoints and history log", function()
+  local kernel = WheelKernel.new_mock()
+  local cp1 = kernel:commit_checkpoint({
+    why = "initial commit",
+    what = "created scaffold",
+    where_focus = "root",
+  })
+  assert(cp1.hash ~= nil)
+
+  local cp2 = kernel:commit_checkpoint({
+    why = "add feature",
+    what = "implemented bridge",
+    where_focus = "bridge",
+  })
+  assert(cp2.hash ~= nil)
+  assert(cp2.parents[1] == cp1.hash)
+
+  local log = kernel:log(10)
+  assert(#log == 2)
+  assert(log[1].hash == cp2.hash)
+  assert(log[2].hash == cp1.hash)
+end)
+
+run_test("WheelKernel: action auto-spillover", function()
+  local kernel = WheelKernel.new_mock()
+  -- Small output
+  local a1 = kernel:record_action({
+    action_id = "act-1",
+    raw_stdout = "small output",
+  })
+  assert(a1.spilled == false)
+
+  -- Large output (> 4096 bytes)
+  local big_str = string.rep("x", 5000)
+  local a2 = kernel:record_action({
+    action_id = "act-2",
+    raw_stdout = big_str,
+  })
+  assert(a2.spilled == true)
+
+  local recent = kernel:recent_actions()
+  assert(#recent == 2)
+
+  kernel:clear_recent_actions()
+  assert(#kernel:recent_actions() == 0)
+end)
+
+run_test("WheelKernel: context compilation", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "T-CTX", title = "Active task" })
+  kernel:set_active_task("T-CTX")
+
+  local compiled = kernel:compile_context({
+    system_instruction = "You are a coding assistant.",
+    project_rules = { "Rule 1", "Rule 2" },
+    tool_schemas = { "schema_read", "schema_write" },
+    turn_prompt = "Perform step 1",
+  })
+
+  assert(compiled.prefix_hash ~= nil)
+  assert(#compiled.zone1_prefix > 0)
+  assert(compiled.zone2_state:find("T-CTX") ~= nil)
+  assert(compiled.zone3_tail:find("Perform step 1") ~= nil)
+  assert(compiled.total_bytes > 0)
+end)
+
+-- ===========================================================================
+-- 2. WheelAgent Tests
+-- ===========================================================================
+
+run_test("WheelAgent: Commander plan decomposition", function()
+  local kernel = WheelKernel.new_mock()
+  local commander = WheelAgent.new({
+    name = "commander-main",
+    role = WheelAgent.Role.COMMANDER,
+    kernel = kernel,
+  })
+
+  local plan = commander:decompose_plan({
+    { id = "P-1", title = "Design", dependencies = {} },
+    { id = "P-2", title = "Build", dependencies = { "P-1" } },
+  })
+  assert(#plan == 2)
+  assert(kernel:get_task("P-1").status == "Ready")
+  assert(kernel:get_task("P-2").status == "Pending")
+end)
+
+run_test("WheelAgent: Worker execution loop and checkpointing", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "W-1", title = "Coding Task", dependencies = {} })
+
+  local worker = WheelAgent.new({
+    name = "worker-code",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    tools = { "run_command" },
+  })
+
+  local outcome = worker:execute_task("W-1", function(agent, ctx, iter)
+    return {
+      action = { tool = "run_command", stdout = "test ok", exit_code = 0 },
+      rationale = { why = "execute coding task", what = "ran test suite" },
+      done = true,
+    }
+  end)
+
+  assert(outcome.success == true)
+  assert(outcome.task.status == "Succeeded")
+  assert(#outcome.checkpoints == 1)
+  assert(kernel:status().active_task == nil, "active task should be cleared after execution")
+end)
+
+run_test("WheelAgent: Read-only authority enforcement", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "R-1", title = "Research Task", dependencies = {} })
+
+  local researcher = WheelAgent.new({
+    name = "researcher-01",
+    role = WheelAgent.Role.RESEARCH,
+    kernel = kernel,
+    tools = { "read_file", "write_file" }, -- write_file declared but disallowed by role
+  })
+
+  -- Read file is allowed
+  local allowed, _ = researcher:is_tool_allowed("read_file")
+  assert(allowed == true)
+
+  -- Write file is denied due to role
+  local denied, err = researcher:is_tool_allowed("write_file")
+  assert(denied == false)
+  assert(err:find("read-only authority", 1, true) ~= nil)
+
+  -- Attempting mutating action during task execution fails task
+  local outcome = researcher:execute_task("R-1", function(agent, ctx, iter)
+    return {
+      action = { tool = "write_file", stdout = "wrote something" },
+    }
+  end)
+  assert(outcome.success == false)
+  assert(outcome.task.status == "Failed")
+  assert(outcome.error:find("read-only authority", 1, true) ~= nil)
+end)
+
+run_test("WheelAgent: Reviewer verification and approval", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "REV-1", title = "Feature Task", dependencies = {} })
+  kernel:start_task("REV-1", "worker")
+  kernel:complete_task("REV-1", 1, "cp_hash_123")
+
+  local reviewer = WheelAgent.new({
+    name = "reviewer-01",
+    role = WheelAgent.Role.REVIEWER,
+    kernel = kernel,
+    tools = { "read_file" },
+  })
+
+  local rev = reviewer:review_task("REV-1", function(agent, task, history)
+    assert(task.id == "REV-1")
+    return true, "all acceptance criteria verified"
+  end)
+
+  assert(rev.approved == true)
+  assert(rev.checkpoint ~= nil)
+end)
+
+-- ===========================================================================
+-- 3. WheelUI Tests
+-- ===========================================================================
+
+run_test("WheelUI: status, graph waves, and telemetry", function()
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "T-1", title = "Task 1", priority = 0 })
+  kernel:create_task({ id = "T-2", title = "Task 2", priority = 1, dependencies = { "T-1" } })
+  kernel:create_task({ id = "T-3", title = "Task 3", priority = 2, dependencies = { "T-1" } })
+  kernel:create_task({ id = "T-4", title = "Task 4", priority = 0, dependencies = { "T-2", "T-3" } })
+
+  kernel:start_task("T-1", "w1")
+  kernel:complete_task("T-1", 1, "cp1")
+  kernel:start_task("T-2", "w2")
+  kernel:set_active_task("T-2")
+
+  local status_str = WheelUI.format_status(kernel)
+  assert(status_str:find("Active Task:%s+T%-2") ~= nil)
+  assert(status_str:find("Tasks: 4 total") ~= nil)
+
+  local graph_str = WheelUI.format_graph(kernel)
+  assert(graph_str:find("%-%- Wave 1") ~= nil)
+  assert(graph_str:find("%-%- Wave 2") ~= nil)
+  assert(graph_str:find("%-%- Wave 3") ~= nil)
+  assert(graph_str:find("%[▶%] T%-2 %(P1%): Task 2 <%-%- ACTIVE") ~= nil)
+  assert(graph_str:find("%[•%] T%-3 %(P2%): Task 3") ~= nil)
+
+  local ctx = kernel:compile_context({ turn_prompt = "hello" })
+  local telem_str = WheelUI.format_telemetry(ctx)
+  assert(telem_str:find("Prefix Hash:") ~= nil)
+  assert(telem_str:find("Total Bytes:") ~= nil)
+
+  local scene = WheelUI.render_scene_node(kernel)
+  assert(scene.type == "Text")
+  assert(type(scene.content) == "string")
+end)
+
+-- ===========================================================================
+-- 4. Plugin Init and Command Registration Tests
+-- ===========================================================================
+
+run_test("Wheel Init: command registration and dispatch", function()
+  -- Mock bitty host API
+  local registered_commands = {}
+  local notifications = {}
+
+  bitty = {
+    commands = {
+      register = function(def)
+        registered_commands[def.id] = def
+        return 1
+      end,
+    },
+    notify = {
+      show = function(payload)
+        table.insert(notifications, payload)
+        return true
+      end,
+    },
+  }
+
+  -- Load init.lua
+  local wheel = require("wheel.init")
+  assert(wheel.kernel ~= nil)
+  assert(wheel.agent ~= nil)
+  assert(wheel.ui ~= nil)
+
+  -- Verify all 5 commands were registered
+  assert(registered_commands["hello"] ~= nil, "hello command registered")
+  assert(registered_commands["status"] ~= nil, "status command registered")
+  assert(registered_commands["graph"] ~= nil, "graph command registered")
+  assert(registered_commands["plan"] ~= nil, "plan command registered")
+  assert(registered_commands["run"] ~= nil, "run command registered")
+
+  -- Test running hello
+  registered_commands["hello"].run()
+  assert(#notifications == 1)
+  assert(notifications[1].title == "Wheel")
+
+  -- Test running plan
+  registered_commands["plan"].run()
+  assert(#notifications == 2)
+  assert(notifications[2].title == "Wheel Plan")
+  assert(#wheel.kernel:list_tasks() == 3)
+
+  -- Test running status
+  registered_commands["status"].run()
+  assert(#notifications == 3)
+  assert(notifications[3].title == "Wheel Status")
+
+  -- Test running graph
+  registered_commands["graph"].run()
+  assert(#notifications == 4)
+  assert(notifications[4].title == "Wheel Task DAG")
+
+  -- Test running run (executes CTX-0001)
+  registered_commands["run"].run()
+  assert(#notifications == 5)
+  assert(notifications[5].title == "Wheel Run")
+  assert(wheel.kernel:get_task("CTX-0001").status == "Succeeded")
+  -- CTX-0002 should now be Ready
+  assert(wheel.kernel:get_task("CTX-0002").status == "Ready")
+end)
+
+print("\n==========================================")
+print("  All Wheel tests PASSED successfully! 🚀 ")
+print("==========================================")
