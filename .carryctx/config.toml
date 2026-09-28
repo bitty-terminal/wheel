@@ -46,4 +46,8 @@ verbose = false
 [agent]
 
 [verification]
-commands = ["just check"]
+commands = [
+  "just check",
+  "just test",
+  "just e2e",
+]
