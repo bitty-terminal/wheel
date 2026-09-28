@@ -68,12 +68,15 @@ local SSEParser = {}
 SSEParser.__index = SSEParser
 
 --- Create a new line-buffered SSE Parser.
+-- @param opts table? Optional configuration { max_buffer_size = number }
 -- @return table SSEParser instance
-function SSEParser.new()
+function SSEParser.new(opts)
+  opts = opts or {}
   local self = setmetatable({}, SSEParser)
   self.buffer = ""
   self.current_event = nil
   self.current_data = {}
+  self.max_buffer_size = opts.max_buffer_size or 1048576 -- 1 MiB limit
   return self
 end
 
@@ -91,14 +94,23 @@ function SSEParser:feed(chunk, on_event)
   if type(chunk) ~= "string" or #chunk == 0 then return end
   self.buffer = self.buffer .. chunk
 
+  -- Enforce maximum unterminated buffer length to prevent memory exhaustion
+  if #self.buffer > (self.max_buffer_size or 1048576) and not self.buffer:find("\n", 1, true) then
+    self:reset()
+    return nil, "SSE line exceeds maximum buffer length (1 MiB)"
+  end
+
+  local pos = 1
+  local stopped = false
+
   while true do
-    local newline_pos = self.buffer:find("\n", 1, true)
+    local newline_pos = self.buffer:find("\n", pos, true)
     if not newline_pos then
       break
     end
 
-    local line = self.buffer:sub(1, newline_pos - 1)
-    self.buffer = self.buffer:sub(newline_pos + 1)
+    local line = self.buffer:sub(pos, newline_pos - 1)
+    pos = newline_pos + 1
 
     -- Trim trailing carriage return
     if #line > 0 and line:sub(-1) == "\r" then
@@ -118,7 +130,10 @@ function SSEParser:feed(chunk, on_event)
 
         if on_event then
           local should_stop = on_event(evt)
-          if should_stop then return true end
+          if should_stop then
+            stopped = true
+            break
+          end
         end
       end
     elseif line:sub(1, 1) == ":" then
@@ -134,7 +149,12 @@ function SSEParser:feed(chunk, on_event)
     end
   end
 
-  return false
+  -- Single compaction at end of feed loop
+  if pos > 1 then
+    self.buffer = self.buffer:sub(pos)
+  end
+
+  return stopped
 end
 
 WheelProvider.SSEParser = SSEParser
@@ -327,7 +347,7 @@ function OpenAIAdapter.new(opts)
   opts = opts or {}
   local self = setmetatable({}, OpenAIAdapter)
   self.name = "openai"
-  self.api_key = opts.api_key or os.getenv("OPENAI_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or ""
+  self.api_key = opts.api_key or ""
   self.base_url = opts.base_url or "https://api.openai.com/v1"
   self.model = opts.model or "gpt-4o"
   self.temperature = opts.temperature or 0.0
@@ -356,8 +376,25 @@ function OpenAIAdapter:_format_payload(request, stream)
     if m.tool_call_id then
       msg.tool_call_id = m.tool_call_id
     end
-    if m.tool_calls then
-      msg.tool_calls = m.tool_calls
+    if m.tool_calls and type(m.tool_calls) == "table" then
+      local out_tcs = {}
+      for _, tc in ipairs(m.tool_calls) do
+        local args_str = "{}"
+        if type(tc.arguments) == "string" then
+          args_str = tc.arguments
+        elseif type(tc.arguments) == "table" then
+          args_str = json.encode(tc.arguments)
+        end
+        table.insert(out_tcs, {
+          id = tc.id or ("call_" .. tostring(math.random(100000, 999999))),
+          type = "function",
+          ["function"] = {
+            name = tc.name or "",
+            arguments = args_str,
+          },
+        })
+      end
+      msg.tool_calls = out_tcs
     end
     table.insert(messages, msg)
   end
@@ -411,7 +448,8 @@ function OpenAIAdapter:complete(request, opts)
     return nil, "HTTP request failed: " .. tostring(err)
   end
   if res.status ~= 200 then
-    return nil, string.format("HTTP %d error: %s", res.status, res.body or "")
+    local preview = (res.body or ""):sub(1, 512)
+    return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
   local data = json.decode(res.body)
@@ -553,6 +591,10 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   if not res then
     return nil, "Streaming HTTP request failed: " .. tostring(err)
   end
+  if res.status and (res.status < 200 or res.status >= 300) then
+    local preview = (res.body or ""):sub(1, 512)
+    return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
+  end
 
   -- Assemble tool calls
   local finalized_tool_calls = {}
@@ -636,17 +678,47 @@ function AnthropicAdapter:_format_payload(request, stream)
     if r == "system" then
       table.insert(system_parts, m.content or "")
     elseif r == "tool" then
-      -- Anthropic tool results are user messages containing tool_result content blocks
-      table.insert(messages, {
-        role = "user",
-        content = {
-          {
-            type = "tool_result",
-            tool_use_id = m.tool_call_id or "tool_0",
-            content = m.content or "",
-          },
-        },
-      })
+      local block = {
+        type = "tool_result",
+        tool_use_id = m.tool_call_id or "tool_0",
+        content = m.content or "",
+      }
+      local last_msg = messages[#messages]
+      if last_msg and last_msg.role == "user" and type(last_msg.content) == "table" then
+        table.insert(last_msg.content, block)
+      else
+        table.insert(messages, {
+          role = "user",
+          content = { block },
+        })
+      end
+    elseif r == "assistant" then
+      if m.tool_calls and #m.tool_calls > 0 then
+        local blocks = {}
+        if m.content and #m.content > 0 then
+          table.insert(blocks, {
+            type = "text",
+            text = m.content,
+          })
+        end
+        for _, tc in ipairs(m.tool_calls) do
+          table.insert(blocks, {
+            type = "tool_use",
+            id = tc.id or ("tool_" .. tostring(#blocks + 1)),
+            name = tc.name or "",
+            input = type(tc.arguments) == "table" and tc.arguments or {},
+          })
+        end
+        table.insert(messages, {
+          role = "assistant",
+          content = blocks,
+        })
+      else
+        table.insert(messages, {
+          role = "assistant",
+          content = m.content or "",
+        })
+      end
     else
       table.insert(messages, {
         role = r,
@@ -717,7 +789,8 @@ function AnthropicAdapter:complete(request, opts)
     return nil, "HTTP request failed: " .. tostring(err)
   end
   if res.status ~= 200 then
-    return nil, string.format("HTTP %d error: %s", res.status, res.body or "")
+    local preview = (res.body or ""):sub(1, 512)
+    return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
   local data = json.decode(res.body)
@@ -780,6 +853,7 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
   local active_block_index = nil
   local stop_reason = "end_turn"
   local usage = {}
+  local stream_err = nil
 
   local res, err = client({
     url = endpoint,
@@ -788,7 +862,18 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
     body = body_str,
     stream = true,
     on_stream_chunk = function(chunk)
+      if stream_err then return true end
       parser:feed(chunk, function(evt)
+        if evt.event == "error" then
+          local err_msg = evt.data or "unknown error"
+          local ok, data = pcall(json.decode, evt.data or "")
+          if ok and type(data) == "table" and data.error and data.error.message then
+            err_msg = data.error.message
+          end
+          stream_err = "Anthropic stream error: " .. tostring(err_msg)
+          return true
+        end
+
         local raw = evt.data
         if not raw then return false end
 
@@ -840,6 +925,13 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
 
   if not res then
     return nil, "Streaming HTTP request failed: " .. tostring(err)
+  end
+  if res.status and (res.status < 200 or res.status >= 300) then
+    local preview = (res.body or ""):sub(1, 512)
+    return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
+  end
+  if stream_err then
+    return nil, stream_err
   end
 
   local tool_calls = {}
@@ -917,15 +1009,30 @@ function StdioAdapter:complete(request, opts)
     }, nil
   end
 
-  -- Secure command execution via pipe
-  local safe_cmd = string.format("%s 2>&1", self.command)
+  -- Secure command execution via redirected temporary file
+  local tmp_file = os.tmpname()
+  local f = io.open(tmp_file, "w")
+  if not f then
+    return nil, "Failed to open temporary file for stdio prompt: " .. tostring(tmp_file)
+  end
+  f:write(prompt)
+  f:close()
+
+  local safe_cmd = string.format("%s < %q 2>&1", self.command, tmp_file)
   local p = io.popen(safe_cmd, "r")
   if not p then
+    os.remove(tmp_file)
     return nil, "Failed to spawn stdio model process: " .. tostring(self.command)
   end
 
   local out = p:read("*a") or ""
-  p:close()
+  local close_ok, close_reason, exit_code = p:close()
+  os.remove(tmp_file)
+
+  if close_ok ~= true then
+    local code = exit_code or 1
+    return nil, string.format("Command '%s' failed (exit code %s): %s", self.command, tostring(code), out:sub(1, 512))
+  end
 
   return {
     content = out,
@@ -959,7 +1066,8 @@ WheelProvider.StdioAdapter = StdioAdapter
 --- Create a model provider adapter based on model profile or role specification.
 -- @param profile table ModelProfile { provider = string, model = string, temperature = number, thinking = table, ... }
 -- @param opts table? Additional options (e.g. http_client, api_key, base_url)
--- @return table WheelProvider adapter instance
+-- @return table? WheelProvider adapter instance, or nil on failure
+-- @return string? Error message on failure
 function WheelProvider.create(profile, opts)
   profile = profile or {}
   opts = opts or {}
@@ -972,38 +1080,53 @@ function WheelProvider.create(profile, opts)
       completion_fn = opts.completion_fn,
       stream_chunk_size = opts.stream_chunk_size,
     })
-  elseif p_type == "openai" or p_type == "deepseek" then
-    local base_url = opts.base_url
-    if not base_url and p_type == "deepseek" then
-      base_url = "https://api.deepseek.com/v1"
-    end
+  elseif p_type == "openai" then
+    local api_key = opts.api_key or os.getenv("OPENAI_API_KEY") or ""
     return OpenAIAdapter.new({
-      api_key = opts.api_key,
-      base_url = base_url,
-      model = profile.model or opts.model or (p_type == "deepseek" and "deepseek-reasoner" or "gpt-4o"),
+      api_key = api_key,
+      base_url = opts.base_url or "https://api.openai.com/v1",
+      model = profile.model or opts.model or "gpt-4o",
+      temperature = profile.temperature or opts.temperature or 0.0,
+      thinking = profile.thinking or opts.thinking,
+      http_client = opts.http_client,
+    })
+  elseif p_type == "deepseek" then
+    local api_key = opts.api_key or os.getenv("DEEPSEEK_API_KEY") or ""
+    return OpenAIAdapter.new({
+      api_key = api_key,
+      base_url = opts.base_url or "https://api.deepseek.com/v1",
+      model = profile.model or opts.model or "deepseek-reasoner",
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
       http_client = opts.http_client,
     })
   elseif p_type == "anthropic" then
+    local api_key = opts.api_key or os.getenv("ANTHROPIC_API_KEY") or ""
     return AnthropicAdapter.new({
-      api_key = opts.api_key,
-      base_url = opts.base_url,
+      api_key = api_key,
+      base_url = opts.base_url or "https://api.anthropic.com/v1",
       model = profile.model or opts.model or "claude-3-5-sonnet-20241022",
       thinking = profile.thinking or opts.thinking,
       http_client = opts.http_client,
     })
-  elseif p_type == "stdio" or p_type == "local" then
+  elseif p_type == "stdio" or p_type == "local" or p_type == "ollama" then
+    local cmd = opts.command
+    if cmd ~= nil and type(cmd) ~= "string" then
+      return nil, "opts.command must be a string"
+    end
+    if not cmd then
+      local m = profile.model or opts.model or "qwen2.5-coder"
+      if type(m) ~= "string" or not m:match("^[%w%._%-:]+$") then
+        return nil, "Invalid model name for local/ollama provider: " .. tostring(m)
+      end
+      cmd = "ollama run " .. m
+    end
     return StdioAdapter.new({
-      command = opts.command or (profile.model and ("ollama run " .. profile.model)) or "ollama run qwen2.5-coder",
+      command = cmd,
       runner = opts.runner,
     })
   else
-    -- Fallback to MockProvider
-    return MockProvider.new({
-      model = profile.model or "mock-model",
-      responses = opts.responses,
-    })
+    return nil, "Unknown or unsupported provider type: " .. tostring(p_type)
   end
 end
 

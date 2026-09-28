@@ -350,9 +350,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         WheelAgent.Role.REVIEWER,
         WheelAgent.Role.RESEARCH,
       }
+      local cfg = M.config and type(M.config.get) == "function" and M.config.get()
       local lines = { "=== Wheel Heterogeneous Model Profiles ===" }
       for _, r in ipairs(roles) do
         local prof = WheelAgent.get_default_model_profile(r)
+        if cfg and cfg.roles and cfg.roles[r] and cfg.roles[r].model_profile then
+          local override = cfg.roles[r].model_profile
+          local merged = {}
+          for k, v in pairs(prof) do merged[k] = v end
+          for k, v in pairs(override) do merged[k] = v end
+          prof = merged
+        end
         local thinking_str = ""
         if prof.thinking and prof.thinking.enabled then
           thinking_str = string.format(" [thinking: %d tokens, %s]", prof.thinking.budget_tokens or 0, prof.thinking.gear or "default")

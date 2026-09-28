@@ -81,7 +81,15 @@ function WheelRunner.run_task(agent, task, opts)
   local provider = opts.provider or (agent.get_provider and agent:get_provider())
   if not provider then
     if WheelProvider and agent.model_profile then
-      provider = WheelProvider.create(agent.model_profile, opts)
+      local p_inst, p_err = WheelProvider.create(agent.model_profile, opts)
+      if not p_inst then
+        return {
+          success = false,
+          error = "Failed to initialize provider: " .. tostring(p_err or "unknown"),
+          iterations = 0,
+        }
+      end
+      provider = p_inst
       if agent.set_provider then
         agent:set_provider(provider)
       end
@@ -89,12 +97,11 @@ function WheelRunner.run_task(agent, task, opts)
   end
 
   if not provider then
-    -- Fallback to MockProvider if no provider configured
-    if WheelProvider then
-      provider = WheelProvider.MockProvider.new({ model = "default-mock" })
-    else
-      return { success = false, error = "No provider adapter available", iterations = 0 }
-    end
+    return {
+      success = false,
+      error = "No provider adapter available",
+      iterations = 0,
+    }
   end
 
   -- 2. Bind active task in kernel and set attribution
@@ -225,7 +232,27 @@ function WheelRunner.run_task(agent, task, opts)
           on_tool_call(tc)
         end
 
-        local outcome = agent:execute_tool(tc.name, tc.arguments)
+        local dispatch_ok, outcome = pcall(agent.execute_tool, agent, tc.name, tc.arguments)
+        if not dispatch_ok or type(outcome) ~= "table" or type(outcome.format_observation) ~= "function" then
+          local dispatch_error = dispatch_ok and "Tool returned an invalid outcome" or tostring(outcome)
+          outcome = {
+            tool = tc.name or "tool",
+            success = false,
+            exit_code = 1,
+            duration_ms = 0,
+            stdout = "",
+            stderr = "Tool execution failed: " .. dispatch_error,
+            format_observation = function(self)
+              return string.format(
+                "[Tool: %s (exit=%d, %dms)]\nSTDERR: %s",
+                tostring(self.tool or "tool"),
+                self.exit_code or 1,
+                self.duration_ms or 0,
+                self.stderr or ""
+              )
+            end,
+          }
+        end
         if on_tool_result then
           on_tool_result(tc, outcome)
         end

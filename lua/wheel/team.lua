@@ -544,7 +544,12 @@ function WheelTeam:run_orchestration_loop(opts)
         -- Resolve worker step function or runner options
         local step_fn = opts.step_fn
         if opts.use_runner then
-          step_fn = opts.runner_opts or {}
+          local r_opts = {}
+          if type(opts.runner_opts) == "table" then
+            for k, v in pairs(opts.runner_opts) do r_opts[k] = v end
+          end
+          r_opts.defer_release = true
+          step_fn = r_opts
         elseif not step_fn then
           step_fn = function(agent, ctx, iter)
             if agent.context and type(agent.context.put_slot) == "function" then

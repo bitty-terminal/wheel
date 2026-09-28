@@ -2518,9 +2518,252 @@ run_test("WheelTeam: run_orchestration_loop with autonomous provider runner and 
   _G.bitty = nil
 end)
 
+-- ---------------------------------------------------------------------------
+-- Section 18: Provider Protocol Compliance & Error Boundaries
+-- ---------------------------------------------------------------------------
+
+run_test("WheelProvider.SSEParser: buffer limits and StdioAdapter prompt stdin pipe", function()
+  -- 1. SSEParser buffer limit (>1 MiB unterminated chunk)
+  local parser = WheelProvider.SSEParser.new({ max_buffer_size = 100 })
+  local big_chunk = string.rep("x", 120) -- no newline
+  local ok, err = parser:feed(big_chunk)
+  assert(ok == nil, "must fail when unterminated chunk exceeds limit")
+  assert(string.find(err, "exceeds maximum buffer length", 1, true) ~= nil, "error message must report buffer limit")
+  assert(parser.buffer == "", "parser buffer must be reset on overflow")
+
+  -- 2. StdioAdapter with mock runner receiving formatted prompt
+  local captured_cmd, captured_prompt
+  local stdio = WheelProvider.StdioAdapter.new({
+    command = "mock_model_cli",
+    runner = function(cmd, prompt)
+      captured_cmd = cmd
+      captured_prompt = prompt
+      return "mock CLI output"
+    end,
+  })
+
+  local res, err = stdio:complete({
+    messages = {
+      { role = "user", content = "hello stdio" },
+    },
+  })
+  assert(res ~= nil, "stdio complete must succeed with runner")
+  assert(res.content == "mock CLI output")
+  assert(captured_cmd == "mock_model_cli")
+  assert(string.find(captured_prompt, "hello stdio", 1, true) ~= nil, "runner must receive prompt")
+end)
+
+run_test("WheelProvider: OpenAI & Anthropic wire format, status check, and error stream rejection", function()
+  -- 1. OpenAI format: assistant tool_calls converted to OpenAI wire schema
+  local oai = WheelProvider.OpenAIAdapter.new({
+    api_key = "test-key",
+  })
+
+  local req = {
+    messages = {
+      {
+        role = "assistant",
+        content = "calling tool",
+        tool_calls = {
+          { id = "call_123", name = "read_file", arguments = { path = "foo.txt" } },
+        },
+      },
+    },
+  }
+  local payload = oai:_format_payload(req, false)
+  assert(payload.messages[1].tool_calls ~= nil)
+  local tc = payload.messages[1].tool_calls[1]
+  assert(tc.id == "call_123")
+  assert(tc.type == "function")
+  assert(tc["function"].name == "read_file")
+  assert(string.find(tc["function"].arguments, "foo.txt", 1, true) ~= nil, "arguments must be JSON string")
+
+  -- 2. OpenAI HTTP non-2xx rejection with truncated preview
+  local bad_http_oai = WheelProvider.OpenAIAdapter.new({
+    http_client = function(req)
+      return { status = 401, body = string.rep("unauthorized_error_", 50) }
+    end,
+  })
+  local res, err = bad_http_oai:complete(req)
+  assert(res == nil, "complete must fail on HTTP 401")
+  assert(string.find(err, "HTTP 401 error:", 1, true) ~= nil)
+  assert(#err <= 600, "error string preview must be bounded")
+
+  local s_res, s_err = bad_http_oai:stream(req, function() end)
+  assert(s_res == nil, "stream must fail on HTTP 401")
+  assert(string.find(s_err, "HTTP 401 streaming error:", 1, true) ~= nil)
+
+  -- 3. Anthropic format: tool_use in assistant message, grouped tool_results in user message
+  local ant = WheelProvider.AnthropicAdapter.new({
+    api_key = "ant-key",
+  })
+  local ant_req = {
+    messages = {
+      {
+        role = "assistant",
+        content = "I will read two files",
+        tool_calls = {
+          { id = "tool_1", name = "read_file", arguments = { path = "a.txt" } },
+          { id = "tool_2", name = "read_file", arguments = { path = "b.txt" } },
+        },
+      },
+      { role = "tool", tool_call_id = "tool_1", content = "content a" },
+      { role = "tool", tool_call_id = "tool_2", content = "content b" },
+    },
+  }
+  local ant_payload = ant:_format_payload(ant_req, false)
+  -- Assistant message has text block + 2 tool_use blocks
+  local asst_msg = ant_payload.messages[1]
+  assert(asst_msg.role == "assistant")
+  assert(#asst_msg.content == 3)
+  assert(asst_msg.content[1].type == "text")
+  assert(asst_msg.content[2].type == "tool_use")
+  assert(asst_msg.content[2].id == "tool_1")
+  assert(asst_msg.content[3].type == "tool_use")
+  assert(asst_msg.content[3].id == "tool_2")
+
+  -- Tool messages grouped into a single user message
+  local user_msg = ant_payload.messages[2]
+  assert(user_msg.role == "user")
+  assert(#user_msg.content == 2, "consecutive tool results must be grouped into single user message")
+  assert(user_msg.content[1].type == "tool_result")
+  assert(user_msg.content[1].tool_use_id == "tool_1")
+  assert(user_msg.content[2].type == "tool_result")
+  assert(user_msg.content[2].tool_use_id == "tool_2")
+
+  -- 4. Anthropic SSE error event handling
+  local error_stream_ant = WheelProvider.AnthropicAdapter.new({
+    http_client = function(req)
+      if req.stream and req.on_stream_chunk then
+        req.on_stream_chunk("event: error\ndata: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"Server overloaded\"}}\n\n")
+      end
+      return { status = 200, body = "" }
+    end,
+  })
+  local ant_s_res, ant_s_err = error_stream_ant:stream(ant_req, function() end)
+  assert(ant_s_res == nil, "stream must fail when Anthropic emits error event")
+  assert(string.find(ant_s_err, "Server overloaded", 1, true) ~= nil, "error message must capture Anthropic error")
+end)
+
+run_test("WheelProvider.create: strict validation, injection rejection, and no mock fallback", function()
+  -- 1. Unknown provider type fails closed
+  local p, err = WheelProvider.create({ provider = "nonexistent_provider" })
+  assert(p == nil, "create must return nil for unknown provider")
+  assert(string.find(err, "Unknown or unsupported provider type", 1, true) ~= nil)
+
+  -- 2. Local provider rejects shell injection in model name
+  local p_inj, err_inj = WheelProvider.create({ provider = "local", model = "qwen; rm -rf /" })
+  assert(p_inj == nil, "create must reject shell injection in model name")
+  assert(string.find(err_inj, "Invalid model name", 1, true) ~= nil)
+
+  -- 3. opts.command non-string validation
+  local p_cmd, err_cmd = WheelProvider.create({ provider = "local" }, { command = 12345 })
+  assert(p_cmd == nil, "create must reject non-string command")
+  assert(string.find(err_cmd, "must be a string", 1, true) ~= nil)
+end)
+
+run_test("WheelRunner & WheelAgent: protected dispatch, task finalization, and config override", function()
+  -- 1. WheelRunner protected tool dispatch converts error to failed observation
+  local kernel = WheelKernel.new()
+  local task = kernel:create_task({ id = "task-faulty", title = "Runner Tool Error Test" })
+
+  local agent = WheelAgent.new({
+    name = "faulty-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+  })
+
+  -- Override execute_tool to throw an exception
+  agent.execute_tool = function()
+    error("Simulated tool crash inside runner")
+  end
+
+  local turn_count = 0
+  local mock = WheelProvider.MockProvider.new({
+    completion_fn = function(req)
+      turn_count = turn_count + 1
+      if turn_count == 1 then
+        return {
+          content = "Trying to run tool",
+          tool_calls = { { id = "call_crash", name = "broken_tool", arguments = {} } },
+        }
+      else
+        return {
+          content = "Observed tool failure and finished",
+        }
+      end
+    end,
+  })
+
+  local runner_res = WheelRunner.run_task(agent, task, {
+    provider = mock,
+    max_turns = 3,
+  })
+  assert(runner_res.success == true, "runner should recover from tool crash observation and finish")
+  assert(runner_res.iterations == 2)
+
+  -- 2. WheelAgent.execute_task finalizes kernel state when run via runner
+  local task2 = kernel:create_task({ id = "task-lifecycle", title = "Runner Lifecycle Finalization" })
+  local normal_agent = WheelAgent.new({
+    name = "lifecycle-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    provider = WheelProvider.MockProvider.new({
+      responses = { "Task 2 deliverables complete" },
+    }),
+  })
+
+  local exec_res = normal_agent:execute_task(task2.id)
+  assert(exec_res.success == true)
+  local final_task = kernel:get_task(task2.id)
+  assert(final_task.status == "succeeded", "task must be finalized as succeeded")
+  assert(kernel.active_task_id == nil, "active_task_id must be cleared")
+
+  -- 3. Models command merges configured profile overrides
+  package.loaded["wheel.init"] = nil
+  package.loaded["lua.wheel.init"] = nil
+
+  local notifications = {}
+  _G.bitty = {
+    commands = {
+      register = function(def) if def.id == "models" then _G._models_cmd = def end; return 1 end,
+    },
+    notify = {
+      show = function(n) table.insert(notifications, n); return true end,
+    },
+  }
+
+  local wheel = require("wheel.init")
+  -- Inject mock config
+  wheel.config = {
+    get = function()
+      return {
+        roles = {
+          coding = {
+            model_profile = {
+              provider = "openai",
+              model = "o3-mini",
+              temperature = 0.2,
+            },
+          },
+        },
+      }
+    end,
+  }
+
+  _G._models_cmd.run()
+  assert(#notifications > 0)
+  local body = notifications[#notifications].body
+  assert(string.find(body, "o3-mini", 1, true) ~= nil, "must display configured model o3-mini")
+
+  _G.bitty = nil
+  _G._models_cmd = nil
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
+
 
 
 

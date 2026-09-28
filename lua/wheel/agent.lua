@@ -434,9 +434,21 @@ function WheelAgent:execute_task(task_id, step_fn)
     if WheelRunner and type(WheelRunner.run_task) == "function" then
       local runner_opts = (type(step_fn) == "table") and step_fn or {}
       local runner_res = WheelRunner.run_task(self, task, runner_opts)
+      local cur = self.kernel:get_task(task_id) or task
+      local generation = cur.generation or task.generation or 0
+      local last_cp = runner_res.checkpoints and runner_res.checkpoints[#runner_res.checkpoints]
+      local finished
+      if not runner_opts.defer_release then
+        if runner_res.success then
+          finished = self.kernel:complete_task(task_id, generation, last_cp)
+        else
+          finished = self.kernel:fail_task(task_id, generation, runner_res.error or "unknown failure")
+        end
+      end
+      self.kernel:set_active_task(nil)
       return {
         success = runner_res.success,
-        task = self.kernel:get_task(task_id) or task,
+        task = finished or self.kernel:get_task(task_id) or task,
         artifacts = runner_res.artifacts,
         checkpoints = runner_res.checkpoints,
         iterations = runner_res.iterations,
