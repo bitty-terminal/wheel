@@ -46,16 +46,39 @@ Wheel is focused on software engineering workflows.
 | Path                          | Purpose                                                                                                                               |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
 | `bitty-plugin.toml`           | Static manifest: identity, compatibility, capability requests, and lazy triggers.                                                     |
-| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`).                            |
+| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`, `trust`).                   |
+| `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.              |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                    |
-| `lua/wheel/agent.lua`         | WheelAgent runtime: Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                  |
+| `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.               |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
-| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, and registrations.                                 |
+| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.           |
 | `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
 | `package.json`                | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                                            |
 | `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                  |
 | `justfile`                    | Quality gates with pinned tool versions.                                                                                              |
 | `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                |
+
+## Configuration and Architecture
+
+### Headless Panel Working Container Invariant
+
+Under Bitty Core Rule R1, `ExecutionContext` is primary: panels describe presentation and view projections, not execution authority (`PanelId != ViewId != TerminalId`). Every Wheel agent defaults to running in an isolated **Headless Panel working container** (`panel_id = "headless:panel:<agent_name>"`, `headless = true`), binding its execution environment without requiring desktop screen rendering. Presentation UI panels are optional observation projections.
+
+### Hierarchical Configuration Layering
+
+Wheel configuration is resolved across three hierarchical layers with fail-closed security:
+
+1. **Defaults (Layer 0)**: Built-in baseline defining roles, directives, context budgets, and headless container policies.
+2. **Global (Layer 1)**: User-wide defaults located at `~/.config/wheel/init.lua` (`$XDG_CONFIG_HOME/wheel/init.lua`).
+3. **Project (Layer 2)**: Project-specific overrides located at `.wheel/init.lua` in the repository root (highest precedence).
+
+### Security Trust Gate (Direnv-Style)
+
+To prevent arbitrary code execution when cloning untrusted repositories, project configurations (`.wheel/init.lua`) are gated by a security trust store (`$XDG_STATE_HOME/wheel/trusted_projects.json`):
+
+- An untrusted `.wheel/init.lua` fails closed (`ok = false, error = "untrusted_project_config"`) and falls back to safe Global and Default configurations.
+- Users explicitly inspect and approve configurations using `bitty-terminal.wheel:trust` or `WheelConfig.trust(path)`.
+- Content tampering invalidates the pinned 64-hex SHA-256 cryptographic content hash immediately, requiring re-approval.
 
 ## Commands
 
@@ -66,6 +89,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:graph`: Render an ASCII visualization of the Task DAG grouped into topological execution waves.
 - `bitty-terminal.wheel:plan`: Initialize or decompose software engineering tasks into the Task DAG (Commander role).
 - `bitty-terminal.wheel:run`: Execute ready tasks in the DAG using WheelAgent (Worker role).
+- `bitty-terminal.wheel:trust`: Inspect and approve project configuration (`.wheel/init.lua`) with hash pinning.
 
 ## Development
 

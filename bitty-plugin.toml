@@ -38,4 +38,5 @@ commands = [
   "bitty-terminal.wheel:graph",
   "bitty-terminal.wheel:plan",
   "bitty-terminal.wheel:run",
+  "bitty-terminal.wheel:trust",
 ]
