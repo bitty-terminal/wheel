@@ -111,8 +111,16 @@ function WheelAgent:execute_task(task_id, step_fn)
   if not task then
     error("Task not found: " .. tostring(task_id))
   end
-  if task.status ~= "Ready" then
+  local st_lower = (task.status or ""):lower()
+  if st_lower ~= "ready" then
     error("Task " .. task_id .. " is not Ready (current status: " .. tostring(task.status) .. ")")
+  end
+  local assigned = task.assigned_agent
+  if not assigned or assigned == "" then
+    assigned = task.worker_id
+  end
+  if assigned and assigned ~= "" and assigned ~= self.name then
+    error("Task " .. task_id .. " is already assigned to " .. assigned)
   end
 
   -- 1. Set active task in kernel
@@ -231,7 +239,8 @@ function WheelAgent:review_task(task_id, review_fn)
   if not task then
     error("Task not found: " .. tostring(task_id))
   end
-  if task.status ~= "Succeeded" then
+  local st_lower = (task.status or ""):lower()
+  if st_lower ~= "succeeded" then
     error("Cannot review uncompleted task " .. task_id .. " (status: " .. tostring(task.status) .. ")")
   end
 

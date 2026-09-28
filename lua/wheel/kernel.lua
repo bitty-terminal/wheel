@@ -289,7 +289,7 @@ local function create_mock_dispatcher()
         return json_codec.encode({ success = false, error = "task already exists" })
       end
       local deps = payload.dependencies or {}
-      local status = (#deps == 0) and "Ready" or "Pending"
+      local status = (#deps == 0) and "ready" or "pending"
       local task = {
         id = id,
         title = payload.title or id,
@@ -298,8 +298,12 @@ local function create_mock_dispatcher()
         status = status,
         dependencies = deps,
         generation = 0,
-        worker_id = nil,
+        assigned_agent = payload.assigned_agent or payload.worker_id,
+        worker_id = payload.assigned_agent or payload.worker_id,
         checkpoint = nil,
+        failure_reason = nil,
+        created_at_ms = payload.now_ms or 0,
+        updated_at_ms = payload.now_ms or 0,
       }
       state.tasks[id] = task
       return json_codec.encode({ success = true, data = task })
@@ -307,9 +311,6 @@ local function create_mock_dispatcher()
     elseif command == "task.get" then
       local id = payload.id
       local task = state.tasks[id]
-      if not task then
-        return json_codec.encode({ success = false, error = "task not found: " .. tostring(id) })
-      end
       return json_codec.encode({ success = true, data = task })
 
     elseif command == "task.list" then
@@ -338,12 +339,15 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found: " .. tostring(id) })
       end
-      if task.status ~= "Ready" then
-        return json_codec.encode({ success = false, error = "task is not ready: " .. task.status })
+      if (task.status or ""):lower() ~= "ready" then
+        return json_codec.encode({ success = false, error = "task is not ready: " .. tostring(task.status) })
       end
-      task.status = "Running"
+      local worker = payload.assigned_agent or payload.worker_id or "worker"
+      task.status = "running"
       task.generation = task.generation + 1
-      task.worker_id = payload.worker_id or "worker"
+      task.assigned_agent = worker
+      task.worker_id = worker
+      task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
     elseif command == "task.complete" then
@@ -352,28 +356,30 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
-      if task.status ~= "Running" then
+      if (task.status or ""):lower() ~= "running" then
         return json_codec.encode({ success = false, error = "task is not running" })
       end
       if payload.expected_generation ~= task.generation then
         return json_codec.encode({ success = false, error = "stale generation" })
       end
-      task.status = "Succeeded"
+      task.status = "succeeded"
       task.checkpoint = payload.checkpoint
+      task.updated_at_ms = payload.now_ms or 0
 
-      -- Promote pending dependents whose dependencies are now all Succeeded
+      -- Promote pending dependents whose dependencies are now all succeeded
       for _, other in pairs(state.tasks) do
-        if other.status == "Pending" then
+        if (other.status or ""):lower() == "pending" then
           local all_succeeded = true
           for _, dep_id in ipairs(other.dependencies) do
             local dep = state.tasks[dep_id]
-            if not dep or dep.status ~= "Succeeded" then
+            if not dep or (dep.status or ""):lower() ~= "succeeded" then
               all_succeeded = false
               break
             end
           end
           if all_succeeded then
-            other.status = "Ready"
+            other.status = "ready"
+            other.updated_at_ms = payload.now_ms or 0
           end
         end
       end
@@ -388,13 +394,20 @@ local function create_mock_dispatcher()
       if payload.expected_generation ~= task.generation then
         return json_codec.encode({ success = false, error = "stale generation" })
       end
-      task.status = "Failed"
-      -- Cascade Blocked to downstream dependents
+      local err_msg = payload.failure_reason or payload.error or "unknown failure"
+      task.status = "failed"
+      task.failure_reason = err_msg
+      task.error = err_msg
+      task.updated_at_ms = payload.now_ms or 0
+
+      -- Cascade blocked to downstream dependents
       local function block_dependents(failed_id)
         for _, other in pairs(state.tasks) do
           for _, dep_id in ipairs(other.dependencies) do
-            if dep_id == failed_id and other.status ~= "Succeeded" and other.status ~= "Failed" then
-              other.status = "Blocked"
+            local other_st = (other.status or ""):lower()
+            if dep_id == failed_id and other_st ~= "succeeded" and other_st ~= "failed" then
+              other.status = "blocked"
+              other.updated_at_ms = payload.now_ms or 0
               block_dependents(other.id)
             end
           end
@@ -409,7 +422,8 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
-      task.status = "Cancelled"
+      task.status = "cancelled"
+      task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
     elseif command == "task.retry" then
@@ -421,12 +435,15 @@ local function create_mock_dispatcher()
       local all_succeeded = true
       for _, dep_id in ipairs(task.dependencies) do
         local dep = state.tasks[dep_id]
-        if not dep or dep.status ~= "Succeeded" then
+        if not dep or (dep.status or ""):lower() ~= "succeeded" then
           all_succeeded = false
           break
         end
       end
-      task.status = all_succeeded and "Ready" or "Pending"
+      task.status = all_succeeded and "ready" or "pending"
+      task.failure_reason = nil
+      task.error = nil
+      task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
     elseif command == "task.topological_sort" then
@@ -687,9 +704,11 @@ end
 --- @param now_ms number?
 --- @return table
 function WheelKernel:start_task(id, worker_id, now_ms)
+  local worker = worker_id or "worker"
   return self:call("task.start", {
     id = id,
-    worker_id = worker_id or "worker",
+    worker_id = worker,
+    assigned_agent = worker,
     now_ms = now_ms or 0,
   })
 end
@@ -720,6 +739,7 @@ function WheelKernel:fail_task(id, expected_generation, error_message, now_ms)
     id = id,
     expected_generation = expected_generation,
     error = error_message,
+    failure_reason = error_message,
     now_ms = now_ms or 0,
   })
 end

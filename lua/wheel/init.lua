@@ -102,7 +102,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       local tasks = M.kernel:list_tasks()
       local ready_task = nil
       for _, t in ipairs(tasks) do
-        if t.status == "Ready" then
+        if (t.status or ""):lower() == "ready" then
           ready_task = t
           break
         end
