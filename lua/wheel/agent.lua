@@ -36,12 +36,106 @@ local READ_ONLY_TOOLS = {
 
 WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
 
+--- Default heterogeneous model profiles per role.
+local DEFAULT_MODEL_PROFILES = {
+  [WheelAgent.Role.COMMANDER] = {
+    provider = "anthropic",
+    model = "claude-3-5-sonnet",
+    temperature = 0.2,
+    thinking = { enabled = true, gear = "medium", budget_tokens = 4096 },
+    context_budget = { max_tokens = 65536 },
+    retry = { max_retries = 3, backoff_ms = 1000 },
+  },
+  [WheelAgent.Role.CODING] = {
+    provider = "anthropic",
+    model = "claude-3-5-sonnet",
+    temperature = 0.0,
+    thinking = { enabled = false, gear = "off", budget_tokens = 0 },
+    context_budget = { max_tokens = 65536 },
+    retry = { max_retries = 3, backoff_ms = 1000 },
+  },
+  [WheelAgent.Role.DEBUG] = {
+    provider = "deepseek",
+    model = "deepseek-reasoner",
+    temperature = 0.0,
+    thinking = { enabled = true, gear = "high", budget_tokens = 8192 },
+    context_budget = { max_tokens = 65536 },
+    retry = { max_retries = 3, backoff_ms = 1000 },
+  },
+  [WheelAgent.Role.REVIEWER] = {
+    provider = "openai",
+    model = "gpt-4o",
+    temperature = 0.0,
+    thinking = { enabled = false, gear = "off", budget_tokens = 0 },
+    context_budget = { max_tokens = 65536 },
+    retry = { max_retries = 3, backoff_ms = 1000 },
+  },
+  [WheelAgent.Role.RESEARCH] = {
+    provider = "local",
+    model = "qwen2.5-coder",
+    temperature = 0.4,
+    thinking = { enabled = false, gear = "off", budget_tokens = 0 },
+    context_budget = { max_tokens = 32768 },
+    retry = { max_retries = 2, backoff_ms = 500 },
+  },
+}
+
+--- Deep copy a table.
+local function deep_copy(orig)
+  if type(orig) ~= "table" then return orig end
+  local copy = {}
+  for k, v in pairs(orig) do
+    copy[k] = deep_copy(v)
+  end
+  return copy
+end
+
+--- Get a copy of the default model profile for a given role.
+--- @param role string: One of WheelAgent.Role
+--- @return table: Model profile table
+function WheelAgent.get_default_model_profile(role)
+  local def = DEFAULT_MODEL_PROFILES[role] or DEFAULT_MODEL_PROFILES[WheelAgent.Role.CODING]
+  return deep_copy(def)
+end
+
+--- Validate a model profile definition.
+--- @param profile table
+--- @return boolean is_valid, string? error_reason
+function WheelAgent.validate_model_profile(profile)
+  if type(profile) ~= "table" then
+    return false, "model_profile must be a table"
+  end
+  if type(profile.provider) ~= "string" or profile.provider == "" then
+    return false, "model_profile.provider must be a non-empty string"
+  end
+  if type(profile.model) ~= "string" or profile.model == "" then
+    return false, "model_profile.model must be a non-empty string"
+  end
+  if profile.temperature ~= nil then
+    if type(profile.temperature) ~= "number" or profile.temperature < 0.0 or profile.temperature > 2.0 then
+      return false, "model_profile.temperature must be a number between 0.0 and 2.0"
+    end
+  end
+  if profile.thinking ~= nil then
+    if type(profile.thinking) ~= "table" then
+      return false, "model_profile.thinking must be a table"
+    end
+    if profile.thinking.budget_tokens ~= nil then
+      if type(profile.thinking.budget_tokens) ~= "number" or profile.thinking.budget_tokens < 0 then
+        return false, "model_profile.thinking.budget_tokens must be a non-negative number"
+      end
+    end
+  end
+  return true, nil
+end
+
 --- Create a new Agent instance.
 --- @param opts table
 ---   opts.name string: Agent identity (e.g. "commander-01", "worker-coding-01")
 ---   opts.role string: One of WheelAgent.Role
 ---   opts.kernel table: WheelKernel instance
 ---   opts.model table?: Model config { name = string, temperature = number }
+---   opts.model_profile table?: Heterogeneous model profile table
 ---   opts.tools table?: List of allowed tool names
 ---   opts.budget table?: Budget limits { max_iterations = number, max_tokens = number }
 ---   opts.workspace table?: Workspace config { root = string }
@@ -73,7 +167,41 @@ function WheelAgent.new(opts)
 
   -- Role config resolution from opts.config if present
   local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role]) or {}
-  self.model = opts.model or role_cfg.model or { name = "claude-3-5-sonnet", temperature = 0.2 }
+
+  -- Model profile resolution (heterogeneous model profile support)
+  local default_profile = WheelAgent.get_default_model_profile(role)
+  local user_profile = opts.model_profile or (role_cfg and role_cfg.model_profile)
+  if user_profile then
+    local ok_val, val_err = WheelAgent.validate_model_profile(user_profile)
+    if not ok_val then
+      error("Invalid model_profile for agent '" .. self.name .. "': " .. tostring(val_err))
+    end
+    for k, v in pairs(user_profile) do
+      default_profile[k] = v
+    end
+  elseif opts.model or (role_cfg and role_cfg.model) then
+    local m = opts.model or role_cfg.model
+    if type(m) == "table" then
+      default_profile.model = m.name or m.model or default_profile.model
+      if m.temperature ~= nil then
+        default_profile.temperature = m.temperature
+      end
+      if m.provider ~= nil then
+        default_profile.provider = m.provider
+      end
+    end
+  end
+  self.model_profile = default_profile
+
+  -- Backward-compatibility: maintain self.model table with name and temperature
+  self.model = {
+    name = self.model_profile.model,
+    model = self.model_profile.model,
+    provider = self.model_profile.provider,
+    temperature = self.model_profile.temperature,
+    thinking = self.model_profile.thinking,
+  }
+
   self.tools = opts.tools or role_cfg.tools or { "read_file", "write_file", "run_command" }
   self.budget = opts.budget or role_cfg.budget or { max_iterations = 10, max_tokens = 65536 }
   self.workspace = opts.workspace or { root = "." }
@@ -238,7 +366,14 @@ function WheelAgent:execute_task(task_id, step_fn)
     error = final_error,
     panel_id = self.panel_id,
     headless = self.headless,
+    model_profile = self.model_profile,
   }
+end
+
+--- Get the resolved heterogeneous model profile for this agent.
+--- @return table: Model profile definition
+function WheelAgent:get_model_profile()
+  return self.model_profile
 end
 
 --- Decompose and submit a software engineering plan into the Task DAG (Commander role).
@@ -296,7 +431,7 @@ function WheelAgent:review_task(task_id, review_fn)
   }
 end
 
---- Get current agent status summary including headless panel container telemetry.
+--- Get current agent status summary including headless panel container telemetry and model profile.
 --- @return table
 function WheelAgent:status()
   return {
@@ -304,6 +439,8 @@ function WheelAgent:status()
     role = self.role,
     panel_id = self.panel_id,
     headless = self.headless,
+    model_profile = self.model_profile,
+    model = self.model,
     tools = self.tools,
     budget = self.budget,
     workspace = self.workspace,

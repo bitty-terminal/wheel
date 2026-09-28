@@ -641,10 +641,13 @@ end
 -- WheelKernel Client Implementation
 -- ---------------------------------------------------------------------------
 
---- Create a new WheelKernel Lua client instance wrapping a JSON-RPC dispatcher.
---- @param dispatcher fun(command: string, payload_json: string): string
---- @return table
-function WheelKernel.new(dispatcher)
+function WheelKernel.new(dispatcher_or_opts)
+  local dispatcher = nil
+  if type(dispatcher_or_opts) == "function" then
+    dispatcher = dispatcher_or_opts
+  elseif type(dispatcher_or_opts) == "table" and type(dispatcher_or_opts.dispatcher) == "function" then
+    dispatcher = dispatcher_or_opts.dispatcher
+  end
   local self = setmetatable({}, WheelKernel)
   self.dispatcher = dispatcher or create_mock_dispatcher()
   return self
