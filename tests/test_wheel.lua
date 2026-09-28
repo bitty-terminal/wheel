@@ -313,6 +313,66 @@ run_test("WheelUI: status, graph waves, and telemetry", function()
   assert(type(scene.content) == "string")
 end)
 
+run_test("WheelUI: diamond and multi-path DAG topological wave calculation", function()
+  -- 1. Symmetric Diamond DAG: A -> B -> D, A -> C -> D
+  local diamond_tasks = {
+    { id = "D", dependencies = { "B", "C" } },
+    { id = "C", dependencies = { "A" } },
+    { id = "B", dependencies = { "A" } },
+    { id = "A", dependencies = {} },
+  }
+  local depths, max_wave = WheelUI.calculate_waves(diamond_tasks)
+  assert(depths["A"] == 1, "A should be Wave 1")
+  assert(depths["B"] == 2, "B should be Wave 2")
+  assert(depths["C"] == 2, "C should be Wave 2")
+  assert(depths["D"] == 3, "D should be Wave 3")
+  assert(max_wave == 3, "max_wave should be 3")
+
+  -- 2. Asymmetric Diamond / Multi-path DAG: A -> B -> C -> D, and A -> D
+  local asymmetric_tasks = {
+    { id = "D", dependencies = { "A", "C" } },
+    { id = "A", dependencies = {} },
+    { id = "B", dependencies = { "A" } },
+    { id = "C", dependencies = { "B" } },
+  }
+  local asym_depths, asym_max = WheelUI.calculate_waves(asymmetric_tasks)
+  assert(asym_depths["A"] == 1, "A should be Wave 1")
+  assert(asym_depths["B"] == 2, "B should be Wave 2")
+  assert(asym_depths["C"] == 3, "C should be Wave 3")
+  assert(asym_depths["D"] == 4, "D should be Wave 4 via longest path A->B->C->D")
+  assert(asym_max == 4, "max_wave should be 4")
+
+  -- 3. Missing dependencies field resilience
+  local raw_tasks = {
+    { id = "RAW-1", title = "Task without dependencies field" },
+    { id = "RAW-2", title = "Second task without field" },
+    { id = "RAW-3", dependencies = { "RAW-1" } },
+  }
+  local raw_depths, raw_max = WheelUI.calculate_waves(raw_tasks)
+  assert(raw_depths["RAW-1"] == 1, "RAW-1 should be Wave 1")
+  assert(raw_depths["RAW-2"] == 1, "RAW-2 should be Wave 1")
+  assert(raw_depths["RAW-3"] == 2, "RAW-3 should be Wave 2")
+  assert(raw_max == 2, "raw_max should be 2")
+
+  -- 4. External missing prerequisite resilience
+  local ext_tasks = {
+    { id = "EXT-DEP", dependencies = { "NON_EXISTENT_UPSTREAM" } },
+  }
+  local ext_depths, ext_max = WheelUI.calculate_waves(ext_tasks)
+  assert(ext_depths["EXT-DEP"] == 2, "task with missing external dependency resolves to depth 2")
+  assert(ext_max == 2)
+
+  -- 5. Cycle guard: cycle does not crash or loop infinitely
+  local cycle_tasks = {
+    { id = "CYC-1", dependencies = { "CYC-2" } },
+    { id = "CYC-2", dependencies = { "CYC-1" } },
+  }
+  local cyc_depths, cyc_max = WheelUI.calculate_waves(cycle_tasks)
+  assert(type(cyc_depths["CYC-1"]) == "number")
+  assert(type(cyc_depths["CYC-2"]) == "number")
+  assert(cyc_max >= 1)
+end)
+
 -- ===========================================================================
 -- 4. Plugin Init and Command Registration Tests
 -- ===========================================================================

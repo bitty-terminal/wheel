@@ -68,7 +68,8 @@ end
 
 --- Calculate topological wave depths for each task.
 --- Wave 1 contains tasks with zero dependencies; Wave N contains tasks whose
---- dependencies are all resolved in earlier waves.
+--- dependencies are all resolved in earlier waves: wave(u) = 1 + max(wave(v) for v in deps(u)).
+--- Cycle detection is guarded via recursion stack tracking.
 --- @param tasks table[]
 --- @return table<string, number>, number
 local function calculate_waves(tasks)
@@ -78,23 +79,34 @@ local function calculate_waves(tasks)
   end
 
   local depths = {}
-  local function get_depth(id, visited)
-    if depths[id] then return depths[id] end
-    visited = visited or {}
-    if visited[id] then return 1 end -- cycle guard
-    visited[id] = true
+  local in_stack = {}
+
+  local function get_depth(id)
+    if depths[id] then
+      return depths[id]
+    end
+    if in_stack[id] then
+      -- Cycle guard: break recursive loop and fallback to wave 1
+      return 1
+    end
 
     local t = task_map[id]
-    if not t or not t.dependencies or #t.dependencies == 0 then
+    local deps = (t and t.dependencies) or {}
+    if #deps == 0 then
       depths[id] = 1
       return 1
     end
 
+    in_stack[id] = true
     local max_dep = 0
-    for _, dep_id in ipairs(t.dependencies) do
-      local d = get_depth(dep_id, visited)
-      if d > max_dep then max_dep = d end
+    for _, dep_id in ipairs(deps) do
+      local d = get_depth(dep_id)
+      if d > max_dep then
+        max_dep = d
+      end
     end
+    in_stack[id] = nil
+
     depths[id] = max_dep + 1
     return depths[id]
   end
@@ -102,11 +114,15 @@ local function calculate_waves(tasks)
   local max_wave = 1
   for _, t in ipairs(tasks) do
     local d = get_depth(t.id)
-    if d > max_wave then max_wave = d end
+    if d > max_wave then
+      max_wave = d
+    end
   end
 
   return depths, max_wave
 end
+
+WheelUI.calculate_waves = calculate_waves
 
 --- Render the Task DAG into an ASCII graph grouped by topological execution waves.
 --- @param kernel table: WheelKernel instance
