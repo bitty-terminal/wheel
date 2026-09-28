@@ -70,10 +70,28 @@ function WheelAgent.new(opts)
   self.name = opts.name
   self.role = role
   self.kernel = opts.kernel
-  self.model = opts.model or { name = "claude-3-5-sonnet", temperature = 0.2 }
-  self.tools = opts.tools or { "read_file", "write_file", "run_command" }
-  self.budget = opts.budget or { max_iterations = 10, max_tokens = 65536 }
+
+  -- Role config resolution from opts.config if present
+  local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role]) or {}
+  self.model = opts.model or role_cfg.model or { name = "claude-3-5-sonnet", temperature = 0.2 }
+  self.tools = opts.tools or role_cfg.tools or { "read_file", "write_file", "run_command" }
+  self.budget = opts.budget or role_cfg.budget or { max_iterations = 10, max_tokens = 65536 }
   self.workspace = opts.workspace or { root = "." }
+
+  -- Headless Panel working container invariant:
+  -- Bitty Core Rule R1: ExecutionContext is primary; panels describe presentation, not execution authority.
+  -- Every agent defaults to running inside a Headless Panel working container.
+  -- Presentation UI panels are optional observation projections.
+  local cfg_panel = (opts.config and opts.config.panel) or {}
+  self.panel_id = opts.panel_id or cfg_panel.panel_id or ("headless:panel:" .. self.name)
+  if opts.headless ~= nil then
+    self.headless = opts.headless
+  elseif cfg_panel.headless ~= nil then
+    self.headless = cfg_panel.headless
+  else
+    self.headless = true
+  end
+  self.config = opts.config
 
   return self
 end
@@ -218,6 +236,8 @@ function WheelAgent:execute_task(task_id, step_fn)
     checkpoints = checkpoints,
     iterations = iterations,
     error = final_error,
+    panel_id = self.panel_id,
+    headless = self.headless,
   }
 end
 
@@ -273,6 +293,21 @@ function WheelAgent:review_task(task_id, review_fn)
     approved = approved,
     reason = reason,
     checkpoint = cp_hash,
+  }
+end
+
+--- Get current agent status summary including headless panel container telemetry.
+--- @return table
+function WheelAgent:status()
+  return {
+    name = self.name,
+    role = self.role,
+    panel_id = self.panel_id,
+    headless = self.headless,
+    tools = self.tools,
+    budget = self.budget,
+    workspace = self.workspace,
+    active_task = self.kernel and self.kernel.active_task_id,
   }
 end
 
