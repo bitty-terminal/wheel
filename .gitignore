@@ -1,4 +1,5 @@
 # Ignored scratch and local state for a generated plugin repository.
+node_modules
 node_modules/
 recording/
 .worktrees/
