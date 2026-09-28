@@ -4,7 +4,7 @@ name = "wheel"
 kind = "plugin"
 lang = "lua/ts"
 role = "independent plugin: official Agent Harness (Bittie the hamster)"
-owner = "TBD"
+owner = "bitty-ai"
 docs = "bitty-plugins-docs"
 
 [contracts.consumes]
