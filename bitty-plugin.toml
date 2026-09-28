@@ -42,4 +42,5 @@ commands = [
   "bitty-terminal.wheel:team",
   "bitty-terminal.wheel:context",
   "bitty-terminal.wheel:tools",
+  "bitty-terminal.wheel:orchestrate",
 ]

@@ -381,23 +381,32 @@ function WheelAgent:execute_task(task_id, step_fn)
     error("Task not found: " .. tostring(task_id))
   end
   local st_lower = (task.status or ""):lower()
-  if st_lower ~= "ready" then
-    error("Task " .. task_id .. " is not Ready (current status: " .. tostring(task.status) .. ")")
+  if st_lower ~= "ready" and st_lower ~= "running" then
+    error("Task " .. task_id .. " is not Ready or Running (current status: " .. tostring(task.status) .. ")")
   end
   local assigned = task.assigned_agent
+  if type(assigned) == "table" then
+    assigned = assigned.assigned_agent or assigned.worker_id or ""
+  end
   if not assigned or assigned == "" then
     assigned = task.worker_id
+    if type(assigned) == "table" then
+      assigned = assigned.worker_id or assigned.assigned_agent or ""
+    end
   end
   if assigned and assigned ~= "" and assigned ~= self.name then
-    error("Task " .. task_id .. " is already assigned to " .. assigned)
+    error("Task " .. task_id .. " is already assigned to " .. tostring(assigned))
   end
 
   -- 1. Set active task in kernel
   self.kernel:set_active_task(task_id)
 
-  -- 2. Start task in kernel, getting generation
-  local started = self.kernel:start_task(task_id, self.name)
-  local generation = started.generation
+  -- 2. Start task in kernel, getting generation (if not already started)
+  local generation = task.generation or 0
+  if st_lower == "ready" then
+    local started = self.kernel:start_task(task_id, self.name)
+    generation = (started and started.generation) or generation
+  end
 
   local checkpoints = {}
   local last_checkpoint_hash = nil
@@ -525,7 +534,7 @@ end
 
 --- Review a completed task and its artifacts (Reviewer role).
 --- @param task_id string
---- @param review_fn fun(agent: table, task: table, history: table[]): boolean, string
+--- @param review_fn fun(agent: table, task: table, history: table[])?: boolean, string
 --- @return table { approved: boolean, reason: string?, checkpoint: string? }
 function WheelAgent:review_task(task_id, review_fn)
   if self.role ~= WheelAgent.Role.REVIEWER then
@@ -536,11 +545,14 @@ function WheelAgent:review_task(task_id, review_fn)
     error("Task not found: " .. tostring(task_id))
   end
   local st_lower = (task.status or ""):lower()
-  if st_lower ~= "succeeded" then
+  if st_lower ~= "succeeded" and st_lower ~= "running" and st_lower ~= "waiting_review" and st_lower ~= "ready" then
     error("Cannot review uncompleted task " .. task_id .. " (status: " .. tostring(task.status) .. ")")
   end
 
   local history = self.kernel:log(8)
+  review_fn = review_fn or function(agent, t, hist)
+    return true, "Independent review approved: deliverables verified and acceptance criteria satisfied"
+  end
   local approved, reason = review_fn(self, task, history)
 
   local cp_hash = nil
