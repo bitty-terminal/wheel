@@ -474,8 +474,39 @@ run_test("Wheel: Wire format normalization and null task semantics", function()
   local ok_conflict, conflict_err = pcall(function()
     conflict_worker:execute_task("ASSIGN-1", function() return { done = true } end)
   end)
-  assert(not ok_conflict, "should reject task assigned to another worker")
   assert(conflict_err:find("already assigned to other%-worker") ~= nil)
+
+  -- 10. UI format_graph falls back to worker_id when assigned_agent is empty string
+  local worker_fallback_kernel = WheelKernel.new(function(cmd, payload)
+    if cmd == "kernel.status" then
+      return '{"success":true,"data":{"active_task":null,"task_count":1,"slot_count":0}}'
+    elseif cmd == "task.list" then
+      return '{"success":true,"data":[{"id":"WORK-1","title":"Fallback Worker","status":"running","assigned_agent":"","worker_id":"legacy-worker"}]}'
+    end
+    return '{"success":false,"error":"unsupported"}'
+  end)
+  local worker_fallback_graph = WheelUI.format_graph(worker_fallback_kernel)
+  assert(worker_fallback_graph:find("worker:%s+legacy%-worker") ~= nil, "empty assigned_agent should fall back to worker_id")
+
+  -- 11. Agent execute_task rejects task when assigned_agent is empty string but worker_id is other worker
+  local empty_agent_kernel = WheelKernel.new(function(cmd, payload)
+    if cmd == "kernel.status" then
+      return '{"success":true,"data":{"active_task":null,"task_count":1,"slot_count":0}}'
+    elseif cmd == "task.get" then
+      return '{"success":true,"data":{"id":"WORK-2","title":"Worker Task","status":"ready","assigned_agent":"","worker_id":"other-worker","dependencies":[]}}'
+    end
+    return '{"success":false,"error":"unsupported"}'
+  end)
+  local conflict_worker2 = WheelAgent.new({
+    name = "my-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = empty_agent_kernel,
+  })
+  local ok_conflict2, conflict_err2 = pcall(function()
+    conflict_worker2:execute_task("WORK-2", function() return { done = true } end)
+  end)
+  assert(not ok_conflict2, "should reject task when worker_id is set to another worker")
+  assert(conflict_err2:find("already assigned to other%-worker") ~= nil)
 end)
 
 print("\n==========================================")

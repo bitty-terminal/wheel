@@ -159,7 +159,10 @@ function WheelUI.format_graph(kernel)
         if t.dependencies and #t.dependencies > 0 then
           table.insert(lines, string.format("      deps: %s", table.concat(t.dependencies, ", ")))
         end
-        local worker = t.assigned_agent or t.worker_id
+        local worker = t.assigned_agent
+        if not worker or worker == "" then
+          worker = t.worker_id
+        end
         if worker and worker ~= "" then
           table.insert(lines, string.format("      worker: %s", worker))
         end
