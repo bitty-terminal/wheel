@@ -12,6 +12,7 @@ end
 
 local WheelAgent = load_submodule("agent")
 local WheelContext = load_submodule("context")
+local WheelTool = load_submodule("tool")
 
 local WheelTeam = {}
 WheelTeam.__index = WheelTeam
@@ -46,6 +47,8 @@ function WheelTeam.new(opts)
     bus = opts.bus,
   })
 
+  self.tool_registry = opts.tool_registry or (WheelTool and WheelTool.get_default_registry())
+
   return self
 end
 
@@ -70,6 +73,10 @@ function WheelTeam:register_agent(agent)
 
   -- Mount shared team context and subscribe colleague to context events
   agent.context = self.context
+  if not agent.tool_registry and self.tool_registry then
+    agent.tool_registry = self.tool_registry
+  end
+
   if self.context and self.context.bus and type(self.context.bus.subscribe) == "function" then
     self.context.bus:subscribe(agent.name, function(event)
       local st = self.agent_states[agent.name]
@@ -90,6 +97,7 @@ function WheelTeam:spawn_agent(opts)
   opts.kernel = opts.kernel or self.kernel
   opts.config = opts.config or self.config
   opts.context = opts.context or self.context
+  opts.tool_registry = opts.tool_registry or self.tool_registry
   opts.workspace = opts.workspace or { root = self.workspace_root }
   local agent = WheelAgent.new(opts)
   return self:register_agent(agent)
@@ -401,6 +409,7 @@ function WheelTeam:status()
     handoff_count = #self.handoffs,
     handoffs = self.handoffs,
     context = ctx_status,
+    total_tools = self.tool_registry and #self.tool_registry:list_tools() or 0,
   }
 end
 

@@ -79,6 +79,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
     bun run luaparse --quiet --file lua/wheel/ui.lua
+    bun run luaparse --quiet --file lua/wheel/tool.lua
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
 
 # Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
