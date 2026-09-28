@@ -43,18 +43,19 @@ Wheel is focused on software engineering workflows.
 
 ## Layout
 
-| Path                       | Purpose                                                                                                    |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `bitty-plugin.toml`        | Static manifest: identity, compatibility, capability requests, and lazy triggers.                          |
-| `lua/wheel/init.lua`       | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`). |
-| `lua/wheel/kernel.lua`     | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.         |
-| `lua/wheel/agent.lua`      | WheelAgent runtime: Commander, Worker (Coding, Debug, Research), and Reviewer roles.                       |
-| `lua/wheel/ui.lua`         | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                |
-| `tests/test_wheel.lua`     | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, and registrations.      |
-| `package.json`             | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                 |
-| `bun.lock`                 | Locked dependency graph installed by `just install`.                                                       |
-| `justfile`                 | Quality gates with pinned tool versions.                                                                   |
-| `.github/workflows/ci.yml` | CI gate with a read-only token and SHA-pinned actions.                                                     |
+| Path                          | Purpose                                                                                                                               |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `bitty-plugin.toml`           | Static manifest: identity, compatibility, capability requests, and lazy triggers.                                                     |
+| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`).                            |
+| `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                    |
+| `lua/wheel/agent.lua`         | WheelAgent runtime: Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                  |
+| `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
+| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, and registrations.                                 |
+| `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
+| `package.json`                | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                                            |
+| `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                  |
+| `justfile`                    | Quality gates with pinned tool versions.                                                                                              |
+| `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                |
 
 ## Commands
 
@@ -85,6 +86,13 @@ runs the pinned `luaparse` 0.3.1 CLI over the entry point; `just lua-control`
 feeds the same parser an invalid snippet and requires rejection, so a recipe
 that stopped reading the entry point cannot pass silently. `just check` runs
 all three.
+
+Run the unit test suite and the cross-process end-to-end integration drill:
+
+```sh
+just test      # runs unit tests across lua5.1, luajit, or lua
+just e2e       # runs the 11-step cross-process drill with wheel_stdio_host over Unix FIFOs
+```
 
 ## Capabilities
 
