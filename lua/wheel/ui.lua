@@ -6,6 +6,13 @@ local WheelUI = {}
 
 --- Status glyphs and badges for task states.
 WheelUI.STATUS_BADGES = {
+  ["succeeded"] = "[✓]",
+  ["running"]   = "[▶]",
+  ["ready"]     = "[•]",
+  ["blocked"]   = "[⏸]",
+  ["pending"]   = "[⏳]",
+  ["failed"]    = "[✗]",
+  ["cancelled"] = "[🚫]",
   ["Succeeded"] = "[✓]",
   ["Running"]   = "[▶]",
   ["Ready"]     = "[•]",
@@ -142,7 +149,8 @@ function WheelUI.format_graph(kernel)
     if #wave_tasks > 0 then
       table.insert(lines, string.format("-- Wave %d --------------------------------------------", wave_idx))
       for _, t in ipairs(wave_tasks) do
-        local badge = WheelUI.STATUS_BADGES[t.status] or "[?]"
+        local st = t.status or ""
+        local badge = WheelUI.STATUS_BADGES[st:lower()] or WheelUI.STATUS_BADGES[st] or "[?]"
         local active_tag = (t.id == active_id) and " <-- ACTIVE" or ""
         local prio_tag = (t.priority and t.priority > 0) and string.format(" (P%d)", t.priority) or ""
         local line = string.format("  %s %s%s: %s%s", badge, t.id, prio_tag, t.title or "", active_tag)
@@ -154,8 +162,9 @@ function WheelUI.format_graph(kernel)
         if t.checkpoint then
           table.insert(lines, string.format("      cp:   %s", t.checkpoint:sub(1, 16)))
         end
-        if t.error then
-          table.insert(lines, string.format("      err:  %s", t.error))
+        local err_msg = t.failure_reason or t.error
+        if err_msg and err_msg ~= "" then
+          table.insert(lines, string.format("      err:  %s", err_msg))
         end
       end
       table.insert(lines, "")

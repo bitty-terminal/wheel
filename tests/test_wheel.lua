@@ -32,15 +32,17 @@ end)
 run_test("WheelKernel: task creation and cascade readiness", function()
   local kernel = WheelKernel.new_mock()
   local t1 = kernel:create_task({ id = "CTX-100", title = "Task 1", dependencies = {} })
-  assert(t1.status == "Ready", "task with 0 deps should be Ready")
+  assert(t1.status == "ready", "task with 0 deps should be ready")
 
   local t2 = kernel:create_task({ id = "CTX-101", title = "Task 2", dependencies = { "CTX-100" } })
-  assert(t2.status == "Pending", "task with unmet dep should be Pending")
+  assert(t2.status == "pending", "task with unmet dep should be pending")
 
   -- Start T1
   local started = kernel:start_task("CTX-100", "worker-01")
-  assert(started.status == "Running")
+  assert(started.status == "running")
   assert(started.generation == 1)
+  assert(started.assigned_agent == "worker-01")
+  assert(started.worker_id == "worker-01")
 
   -- Generation fencing test: wrong generation fails
   local ok_stale = pcall(function()
@@ -50,11 +52,11 @@ run_test("WheelKernel: task creation and cascade readiness", function()
 
   -- Complete T1
   local comp = kernel:complete_task("CTX-100", 1, "hash123")
-  assert(comp.status == "Succeeded")
+  assert(comp.status == "succeeded")
 
   -- T2 should automatically become Ready
   local t2_after = kernel:get_task("CTX-101")
-  assert(t2_after.status == "Ready", "T2 should be promoted to Ready")
+  assert(t2_after.status == "ready", "T2 should be promoted to ready")
 end)
 
 run_test("WheelKernel: failure cascades Blocked", function()
@@ -66,10 +68,15 @@ run_test("WheelKernel: failure cascades Blocked", function()
   kernel:start_task("T-A", "worker")
   kernel:fail_task("T-A", 1, "build error")
 
+  local ta = kernel:get_task("T-A")
+  assert(ta.status == "failed")
+  assert(ta.failure_reason == "build error")
+  assert(ta.error == "build error")
+
   local tb = kernel:get_task("T-B")
-  assert(tb.status == "Blocked", "T-B should be Blocked")
+  assert(tb.status == "blocked", "T-B should be Blocked")
   local tc = kernel:get_task("T-C")
-  assert(tc.status == "Blocked", "T-C should be Blocked transitively")
+  assert(tc.status == "blocked", "T-C should be Blocked transitively")
 end)
 
 run_test("WheelKernel: topological sort", function()
@@ -187,8 +194,8 @@ run_test("WheelAgent: Commander plan decomposition", function()
     { id = "P-2", title = "Build", dependencies = { "P-1" } },
   })
   assert(#plan == 2)
-  assert(kernel:get_task("P-1").status == "Ready")
-  assert(kernel:get_task("P-2").status == "Pending")
+  assert(kernel:get_task("P-1").status == "ready")
+  assert(kernel:get_task("P-2").status == "pending")
 end)
 
 run_test("WheelAgent: Worker execution loop and checkpointing", function()
@@ -211,7 +218,7 @@ run_test("WheelAgent: Worker execution loop and checkpointing", function()
   end)
 
   assert(outcome.success == true)
-  assert(outcome.task.status == "Succeeded")
+  assert(outcome.task.status == "succeeded")
   assert(#outcome.checkpoints == 1)
   assert(kernel:status().active_task == nil, "active task should be cleared after execution")
 end)
@@ -243,7 +250,7 @@ run_test("WheelAgent: Read-only authority enforcement", function()
     }
   end)
   assert(outcome.success == false)
-  assert(outcome.task.status == "Failed")
+  assert(outcome.task.status == "failed")
   assert(outcome.error:find("read-only authority", 1, true) ~= nil)
 end)
 
@@ -368,9 +375,79 @@ run_test("Wheel Init: command registration and dispatch", function()
   registered_commands["run"].run()
   assert(#notifications == 5)
   assert(notifications[5].title == "Wheel Run")
-  assert(wheel.kernel:get_task("CTX-0001").status == "Succeeded")
+  assert((wheel.kernel:get_task("CTX-0001").status or ""):lower() == "succeeded")
   -- CTX-0002 should now be Ready
-  assert(wheel.kernel:get_task("CTX-0002").status == "Ready")
+  assert((wheel.kernel:get_task("CTX-0002").status or ""):lower() == "ready")
+end)
+
+-- ===========================================================================
+-- 5. Wire Normalization and Null Semantics Tests
+-- ===========================================================================
+
+run_test("Wheel: Wire format normalization and null task semantics", function()
+  local kernel = WheelKernel.new_mock()
+
+  -- 1. Missing task returns nil (matching Rust null data payload)
+  local missing = kernel:get_task("nonexistent-999")
+  assert(missing == nil, "missing task should return nil")
+
+  -- 2. Mock task.create sets snake_case status, assigned_agent, failure_reason
+  local t = kernel:create_task({ id = "NORM-1", title = "Normalize Test" })
+  assert(t.status == "ready", "status should be snake_case ready")
+  assert(t.assigned_agent == nil)
+
+  local started = kernel:start_task("NORM-1", "worker-wire-01")
+  assert(started.status == "running", "status should be snake_case running")
+  assert(started.assigned_agent == "worker-wire-01")
+  assert(started.worker_id == "worker-wire-01")
+
+  local failed = kernel:fail_task("NORM-1", 1, "test failure reason")
+  assert(failed.status == "failed", "status should be snake_case failed")
+  assert(failed.failure_reason == "test failure reason")
+  assert(failed.error == "test failure reason")
+
+  -- 3. UI format_graph renders snake_case status badges and failure_reason
+  local graph_str = WheelUI.format_graph(kernel)
+  assert(graph_str:find("%[✗%] NORM%-1") ~= nil, "should render failed badge for snake_case status")
+  assert(graph_str:find("err:%s+test failure reason") ~= nil, "should render failure_reason")
+
+  -- 4. UI format_graph also correctly renders legacy PascalCase tasks
+  local custom_kernel = WheelKernel.new(function(cmd, payload)
+    if cmd == "kernel.status" then
+      return '{"success":true,"data":{"active_task":null,"task_count":1,"slot_count":0}}'
+    elseif cmd == "task.list" then
+      return '{"success":true,"data":[{"id":"PASCAL-1","title":"Legacy","status":"Ready","dependencies":[]}]}'
+    end
+    return '{"success":false,"error":"unsupported"}'
+  end)
+  local pascal_graph = WheelUI.format_graph(custom_kernel)
+  assert(pascal_graph:find("%[•%] PASCAL%-1") ~= nil, "should render ready badge for PascalCase status")
+
+  -- 5. Agent execute_task accepts lowercase ready
+  local exec_kernel = WheelKernel.new_mock()
+  exec_kernel:create_task({ id = "EXEC-1", title = "Exec Test" })
+  local worker = WheelAgent.new({
+    name = "worker-norm",
+    role = WheelAgent.Role.CODING,
+    kernel = exec_kernel,
+  })
+  local outcome = worker:execute_task("EXEC-1", function(agent, ctx, iter)
+    return { done = true }
+  end)
+  assert(outcome.success == true)
+  assert(outcome.task.status == "succeeded")
+
+  -- 6. Agent review_task accepts lowercase succeeded
+  local reviewer = WheelAgent.new({
+    name = "reviewer-norm",
+    role = WheelAgent.Role.REVIEWER,
+    kernel = exec_kernel,
+  })
+  local rev = reviewer:review_task("EXEC-1", function(agent, task, history)
+    assert(task.status == "succeeded")
+    return true, "approved"
+  end)
+  assert(rev.approved == true)
 end)
 
 print("\n==========================================")

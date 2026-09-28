@@ -111,7 +111,8 @@ function WheelAgent:execute_task(task_id, step_fn)
   if not task then
     error("Task not found: " .. tostring(task_id))
   end
-  if task.status ~= "Ready" then
+  local st_lower = (task.status or ""):lower()
+  if st_lower ~= "ready" then
     error("Task " .. task_id .. " is not Ready (current status: " .. tostring(task.status) .. ")")
   end
 
@@ -231,7 +232,8 @@ function WheelAgent:review_task(task_id, review_fn)
   if not task then
     error("Task not found: " .. tostring(task_id))
   end
-  if task.status ~= "Succeeded" then
+  local st_lower = (task.status or ""):lower()
+  if st_lower ~= "succeeded" then
     error("Cannot review uncompleted task " .. task_id .. " (status: " .. tostring(task.status) .. ")")
   end
 
