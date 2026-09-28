@@ -545,14 +545,15 @@ function WheelAgent:review_task(task_id, review_fn)
     error("Task not found: " .. tostring(task_id))
   end
   local st_lower = (task.status or ""):lower()
-  if st_lower ~= "succeeded" and st_lower ~= "running" and st_lower ~= "waiting_review" and st_lower ~= "ready" then
+  if st_lower ~= "succeeded" and st_lower ~= "running" and st_lower ~= "waiting_review" then
     error("Cannot review uncompleted task " .. task_id .. " (status: " .. tostring(task.status) .. ")")
   end
 
-  local history = self.kernel:log(8)
-  review_fn = review_fn or function(agent, t, hist)
-    return true, "Independent review approved: deliverables verified and acceptance criteria satisfied"
+  if type(review_fn) ~= "function" then
+    error("review_fn is required for independent review")
   end
+
+  local history = self.kernel:log(8)
   local approved, reason = review_fn(self, task, history)
 
   local cp_hash = nil

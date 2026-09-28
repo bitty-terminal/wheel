@@ -298,8 +298,19 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
       end
-      if #M._team:list_agents() == 0 then
+      local has_worker = false
+      local has_reviewer = false
+      for _, a in ipairs(M._team:list_agents()) do
+        if a.role == WheelAgent.Role.CODING then
+          has_worker = true
+        elseif a.role == WheelAgent.Role.REVIEWER then
+          has_reviewer = true
+        end
+      end
+      if not has_worker then
         M._team:spawn_agent({ name = "worker-coding-01", role = WheelAgent.Role.CODING })
+      end
+      if not has_reviewer then
         M._team:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
       end
 

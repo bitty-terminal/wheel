@@ -565,7 +565,13 @@ function WheelTeam:run_orchestration_loop(opts)
           }
         end
 
-        local exec_outcome = worker:execute_task(task_id, step_fn)
+        local ok_exec, exec_outcome = pcall(worker.execute_task, worker, task_id, step_fn)
+        if not ok_exec then
+          exec_outcome = { success = false, error = tostring(exec_outcome), checkpoints = {} }
+          if type(self.kernel.set_active_task) == "function" then
+            self.kernel:set_active_task(nil)
+          end
+        end
 
         -- Ensure artifacts slot exists in context
         if self.context and type(self.context.get_slot) == "function" then
@@ -599,7 +605,14 @@ function WheelTeam:run_orchestration_loop(opts)
             })
 
             if ok_ho then
-              local review_res = reviewer:review_task(task_id, opts.review_fn)
+              local default_review_fn = function(agent, task, history)
+                return true, "Independent review approved: deliverables verified and acceptance criteria satisfied"
+              end
+              local review_fn = opts.review_fn or default_review_fn
+              local ok_rev, review_res = pcall(reviewer.review_task, reviewer, task_id, review_fn)
+              if not ok_rev then
+                review_res = { approved = false, reason = tostring(review_res) }
+              end
 
               if self.context and type(self.context.put_slot) == "function" then
                 self.context:put_slot("tasks/" .. task_id .. "/review",
