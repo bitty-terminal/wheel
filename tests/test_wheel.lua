@@ -2643,6 +2643,20 @@ run_test("WheelProvider: OpenAI & Anthropic wire format, status check, and error
   local ant_s_res, ant_s_err = error_stream_ant:stream(ant_req, function() end)
   assert(ant_s_res == nil, "stream must fail when Anthropic emits error event")
   assert(string.find(ant_s_err, "Server overloaded", 1, true) ~= nil, "error message must capture Anthropic error")
+
+  -- 5. Parser buffer overflow propagation in streaming
+  local overflow_oai = WheelProvider.OpenAIAdapter.new({
+    http_client = function(req)
+      if req.stream and req.on_stream_chunk then
+        -- Send chunk larger than 1 MiB without newline
+        req.on_stream_chunk(string.rep("A", 1048577))
+      end
+      return { status = 200, body = "" }
+    end,
+  })
+  local ov_res, ov_err = overflow_oai:stream(req, function() end)
+  assert(ov_res == nil, "stream must fail on parser buffer overflow")
+  assert(string.find(ov_err, "SSE line exceeds maximum buffer length", 1, true) ~= nil)
 end)
 
 run_test("WheelProvider.create: strict validation, injection rejection, and no mock fallback", function()

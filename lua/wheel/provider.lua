@@ -512,6 +512,7 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   local tool_calls_map = {}
   local finish_reason = "stop"
   local usage = {}
+  local stream_err = nil
 
   local res, err = client({
     url = endpoint,
@@ -520,7 +521,8 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
     body = body_str,
     stream = true,
     on_stream_chunk = function(chunk)
-      parser:feed(chunk, function(evt)
+      if stream_err then return true end
+      local ok, perr = parser:feed(chunk, function(evt)
         local raw = evt.data
         if not raw or raw == "[DONE]" then
           return true
@@ -585,6 +587,10 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
         end
         return false
       end)
+      if ok == nil and perr then
+        stream_err = perr
+        return true
+      end
     end,
   })
 
@@ -594,6 +600,9 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   if res.status and (res.status < 200 or res.status >= 300) then
     local preview = (res.body or ""):sub(1, 512)
     return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
+  end
+  if stream_err then
+    return nil, stream_err
   end
 
   -- Assemble tool calls
@@ -863,11 +872,11 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
     stream = true,
     on_stream_chunk = function(chunk)
       if stream_err then return true end
-      parser:feed(chunk, function(evt)
+      local ok, perr = parser:feed(chunk, function(evt)
         if evt.event == "error" then
           local err_msg = evt.data or "unknown error"
-          local ok, data = pcall(json.decode, evt.data or "")
-          if ok and type(data) == "table" and data.error and data.error.message then
+          local ok_d, data = pcall(json.decode, evt.data or "")
+          if ok_d and type(data) == "table" and data.error and data.error.message then
             err_msg = data.error.message
           end
           stream_err = "Anthropic stream error: " .. tostring(err_msg)
@@ -877,8 +886,8 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
         local raw = evt.data
         if not raw then return false end
 
-        local ok, data = pcall(json.decode, raw)
-        if not ok or type(data) ~= "table" then return false end
+        local ok_d, data = pcall(json.decode, raw)
+        if not ok_d or type(data) ~= "table" then return false end
 
         local evt_type = data.type or evt.event
 
@@ -920,6 +929,10 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
 
         return false
       end)
+      if ok == nil and perr then
+        stream_err = perr
+        return true
+      end
     end,
   })
 
