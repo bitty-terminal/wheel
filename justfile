@@ -76,6 +76,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/agent.lua
     bun run luaparse --quiet --file lua/wheel/ui.lua
+    bun run luaparse --quiet --file tests/e2e_cross_process.lua
 
 # Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
 test: deps
@@ -87,6 +88,18 @@ test: deps
         lua tests/test_wheel.lua; \
     else \
         echo "No lua interpreter found; skipping runtime test execution" >&2; \
+    fi
+
+# Run end-to-end cross-process host integration drill when binary is available.
+e2e: deps
+    @if command -v lua5.1 >/dev/null 2>&1; then \
+        lua5.1 tests/e2e_cross_process.lua; \
+    elif command -v luajit >/dev/null 2>&1; then \
+        luajit tests/e2e_cross_process.lua; \
+    elif command -v lua >/dev/null 2>&1; then \
+        lua tests/e2e_cross_process.lua; \
+    else \
+        echo "No lua interpreter found; skipping runtime e2e execution" >&2; \
     fi
 
 # Fail-closed control for the `lua` gate: the same pinned parser must reject an
