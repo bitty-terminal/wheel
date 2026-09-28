@@ -142,24 +142,166 @@ end
 WheelConfig.deep_merge = deep_merge
 WheelConfig.deep_copy = deep_copy
 
---- Deterministic multi-prime 64-hex content hash (pure Lua, zero external deps).
-function WheelConfig.compute_hash(str)
-  if type(str) ~= "string" then str = tostring(str or "") end
-  -- 8 prime accumulators modulo 2^32
-  local h = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
-  local primes = { 31, 37, 41, 43, 47, 53, 59, 61 }
-  local len = #str
-  for i = 1, len do
-    local b = string.byte(str, i)
-    for j = 1, 8 do
-      h[j] = (h[j] * primes[j] + b + (i * j)) % 4294967296
+local function sha256_pure(msg)
+  local bit = nil
+  if type(bit32) == "table" then
+    bit = bit32
+  else
+    local ok, b = pcall(require, "bit")
+    if ok and type(b) == "table" then bit = b end
+  end
+
+  local band, bor, bxor, bnot, rshift, ror
+  if bit then
+    band = bit.band
+    bor = bit.bor
+    bxor = bit.bxor
+    bnot = bit.bnot
+    rshift = bit.rshift
+    ror = bit.ror or function(x, n)
+      return bor(rshift(x, n), bit.lshift(x, 32 - n))
+    end
+  else
+    local MOD = 4294967296
+    local function to_bits(n)
+      local t = {}
+      for i = 1, 32 do
+        local r = n % 2
+        t[i] = r
+        n = (n - r) / 2
+      end
+      return t
+    end
+    local function from_bits(t)
+      local n = 0
+      local p = 1
+      for i = 1, 32 do
+        if t[i] == 1 then n = n + p end
+        p = p * 2
+      end
+      return n
+    end
+    band = function(a, b)
+      local ta, tb = to_bits(a % MOD), to_bits(b % MOD)
+      local tr = {}
+      for i = 1, 32 do tr[i] = (ta[i] == 1 and tb[i] == 1) and 1 or 0 end
+      return from_bits(tr)
+    end
+    bor = function(a, b)
+      local ta, tb = to_bits(a % MOD), to_bits(b % MOD)
+      local tr = {}
+      for i = 1, 32 do tr[i] = (ta[i] == 1 or tb[i] == 1) and 1 or 0 end
+      return from_bits(tr)
+    end
+    bxor = function(a, b)
+      local ta, tb = to_bits(a % MOD), to_bits(b % MOD)
+      local tr = {}
+      for i = 1, 32 do tr[i] = (ta[i] ~= tb[i]) and 1 or 0 end
+      return from_bits(tr)
+    end
+    bnot = function(a) return (MOD - 1 - (a % MOD)) end
+    rshift = function(a, n) return math.floor((a % MOD) / (2 ^ n)) end
+    ror = function(a, n)
+      local ta = to_bits(a % MOD)
+      local tr = {}
+      for i = 1, 32 do
+        local src = i + n
+        if src > 32 then src = src - 32 end
+        tr[i] = ta[src]
+      end
+      return from_bits(tr)
     end
   end
-  local hex_parts = {}
-  for j = 1, 8 do
-    hex_parts[j] = string.format("%08x", h[j])
+
+  local K = {
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  }
+
+  local H0, H1, H2, H3, H4, H5, H6, H7 =
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+
+  local len = #msg
+  local bitlen = len * 8
+
+  local pad = msg .. string.char(0x80)
+  local rem = (#pad) % 64
+  local zeros = (56 - rem) % 64
+  pad = pad .. string.rep(string.char(0), zeros)
+
+  local high = math.floor(bitlen / 4294967296) % 4294967296
+  local low = bitlen % 4294967296
+  pad = pad .. string.char(
+    math.floor(high / 16777216) % 256,
+    math.floor(high / 65536) % 256,
+    math.floor(high / 256) % 256,
+    high % 256,
+    math.floor(low / 16777216) % 256,
+    math.floor(low / 65536) % 256,
+    math.floor(low / 256) % 256,
+    low % 256
+  )
+
+  local W = {}
+  local num_blocks = #pad / 64
+  for b = 0, num_blocks - 1 do
+    local offset = b * 64
+    for t = 0, 15 do
+      local idx = offset + t * 4 + 1
+      local b1, b2, b3, b4 = string.byte(pad, idx, idx + 3)
+      W[t + 1] = (((b1 * 256 + b2) * 256 + b3) * 256 + b4) % 4294967296
+    end
+    for t = 16, 63 do
+      local w_t_minus_15 = W[t - 15 + 1]
+      local w_t_minus_2 = W[t - 2 + 1]
+      local s0 = bxor(bxor(ror(w_t_minus_15, 7), ror(w_t_minus_15, 18)), rshift(w_t_minus_15, 3))
+      local s1 = bxor(bxor(ror(w_t_minus_2, 17), ror(w_t_minus_2, 19)), rshift(w_t_minus_2, 10))
+      W[t + 1] = (W[t - 16 + 1] + s0 + W[t - 7 + 1] + s1) % 4294967296
+    end
+
+    local a, b_val, c, d, e, f, g, h = H0, H1, H2, H3, H4, H5, H6, H7
+    for t = 0, 63 do
+      local S1 = bxor(bxor(ror(e, 6), ror(e, 11)), ror(e, 25))
+      local ch = bxor(band(e, f), band(bnot(e), g))
+      local temp1 = (h + S1 + ch + K[t + 1] + W[t + 1]) % 4294967296
+      local S0 = bxor(bxor(ror(a, 2), ror(a, 13)), ror(a, 22))
+      local maj = bxor(bxor(band(a, b_val), band(a, c)), band(b_val, c))
+      local temp2 = (S0 + maj) % 4294967296
+
+      h = g
+      g = f
+      f = e
+      e = (d + temp1) % 4294967296
+      d = c
+      c = b_val
+      b_val = a
+      a = (temp1 + temp2) % 4294967296
+    end
+
+    H0 = (H0 + a) % 4294967296
+    H1 = (H1 + b_val) % 4294967296
+    H2 = (H2 + c) % 4294967296
+    H3 = (H3 + d) % 4294967296
+    H4 = (H4 + e) % 4294967296
+    H5 = (H5 + f) % 4294967296
+    H6 = (H6 + g) % 4294967296
+    H7 = (H7 + h) % 4294967296
   end
-  return table.concat(hex_parts, "")
+
+  return string.format("%08x%08x%08x%08x%08x%08x%08x%08x", H0, H1, H2, H3, H4, H5, H6, H7)
+end
+
+--- Deterministic cryptographic SHA-256 content hash (pure Lua, zero external deps).
+function WheelConfig.compute_hash(str)
+  if type(str) ~= "string" then str = tostring(str or "") end
+  return sha256_pure(str)
 end
 
 --- Read file content safely.
@@ -231,6 +373,10 @@ function WheelConfig.read_trust_store(path_override)
   return {}
 end
 
+local function shell_quote(value)
+  return "'" .. string.gsub(tostring(value or ""), "'", "'\\''") .. "'"
+end
+
 --- Save trust store JSON table.
 --- @param store table
 --- @param path_override string? Optional custom trust store file path
@@ -239,15 +385,34 @@ function WheelConfig.write_trust_store(store, path_override)
   local path = path_override or WheelConfig.get_trust_store_path()
   local K = get_kernel()
   local json_str = K.JSON.encode(store or {})
-  -- Ensure parent directory exists if using standard mkdir
-  os.execute("mkdir -p \"$(dirname '" .. path .. "')\" 2>/dev/null")
+  -- Ensure parent directory exists safely without shell injection
+  local parent_dir = string.match(path, "^(.*)/[^/]+$")
+  if parent_dir and parent_dir ~= "" then
+    os.execute("mkdir -p -- " .. shell_quote(parent_dir) .. " 2>/dev/null")
+  end
   return write_file(path, json_str)
 end
 
---- Normalize a path string for trust store matching.
+--- Normalize a path string to an absolute canonical path for trust store matching.
 local function normalize_path(path)
-  if not path or path == "" then return "." end
-  local p = string.gsub(path, "/+$", "")
+  if not path or path == "" or path == "." then
+    local pwd = os.getenv("PWD")
+    if pwd and pwd ~= "" then
+      path = pwd
+    else
+      path = "."
+    end
+  elseif string.sub(path, 1, 1) ~= "/" then
+    local pwd = os.getenv("PWD")
+    if pwd and pwd ~= "" then
+      path = pwd .. "/" .. path
+    end
+  end
+  local p = string.gsub(path, "\\", "/")
+  p = string.gsub(p, "/%./", "/")
+  p = string.gsub(p, "/+", "/")
+  p = string.gsub(p, "/+$", "")
+  if p == "" then return "/" end
   return p
 end
 
@@ -312,16 +477,33 @@ end
 
 --- Safely evaluate a Lua configuration string in a sandboxed environment.
 local function eval_config_chunk(content, chunk_name)
-  -- Sandbox environment restricting ambient authority
+  local function copy_library(lib)
+    local c = {}
+    for k, v in pairs(lib or {}) do
+      c[k] = v
+    end
+    return c
+  end
+
+  local string_copy = copy_library(string)
+  local orig_rep = string_copy.rep
+  string_copy.rep = function(s, n, sep)
+    if type(n) == "number" and n > 65536 then
+      error("string.rep count exceeds safety bound (max 65536)", 2)
+    end
+    return orig_rep(s, n, sep)
+  end
+
+  -- Sandbox environment restricting ambient authority and isolating standard libraries
   local env = {
     ipairs = ipairs,
     pairs = pairs,
     type = type,
     tostring = tostring,
     tonumber = tonumber,
-    string = string,
-    table = table,
-    math = math,
+    string = string_copy,
+    table = copy_library(table),
+    math = copy_library(math),
     pcall = pcall,
     xpcall = xpcall,
     select = select,
@@ -343,7 +525,20 @@ local function eval_config_chunk(content, chunk_name)
     return false, "syntax error in " .. chunk_name .. ": " .. tostring(err)
   end
 
+  local hook_installed = false
+  if debug and debug.sethook then
+    debug.sethook(function()
+      error("configuration execution exceeded instruction limit", 2)
+    end, "", 100000)
+    hook_installed = true
+  end
+
   local ok, res = pcall(chunk)
+
+  if hook_installed and debug and debug.sethook then
+    debug.sethook()
+  end
+
   if not ok then
     return false, "runtime error in " .. chunk_name .. ": " .. tostring(res)
   end
@@ -382,8 +577,8 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
   end
 
   local discovered = {}
-  -- Scan skills directory if accessible via directory list or ls
-  local handle = io.popen("ls -1 \"" .. skills_dir .. "\" 2>/dev/null")
+  -- Scan skills directory safely with shell_quote
+  local handle = io.popen("ls -1 -- " .. shell_quote(skills_dir) .. " 2>/dev/null")
   if handle then
     for entry in handle:lines() do
       local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"

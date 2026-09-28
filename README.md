@@ -78,7 +78,7 @@ To prevent arbitrary code execution when cloning untrusted repositories, project
 
 - An untrusted `.wheel/init.lua` fails closed (`ok = false, error = "untrusted_project_config"`) and falls back to safe Global and Default configurations.
 - Users explicitly inspect and approve configurations using `bitty-terminal.wheel:trust` or `WheelConfig.trust(path)`.
-- Content tampering invalidates the pinned 64-hex deterministic content hash immediately, requiring re-approval.
+- Content tampering invalidates the pinned 64-hex SHA-256 cryptographic content hash immediately, requiring re-approval.
 
 ## Commands
 

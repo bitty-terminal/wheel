@@ -730,6 +730,16 @@ run_test("WheelConfig: compute_hash deterministic 64-hex string", function()
   assert(h1_a:match("^%x+$") ~= nil, "hash must be valid hex")
   assert(h1_a == h1_b, "identical content must produce identical hash")
   assert(h1_a ~= h2, "different content must produce different hash")
+
+  -- NIST SHA-256 test vectors
+  assert(
+    WheelConfig.compute_hash("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+    "NIST SHA-256 vector for 'abc'"
+  )
+  assert(
+    WheelConfig.compute_hash("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "NIST SHA-256 vector for empty string"
+  )
 end)
 
 run_test("WheelConfig: sandboxed evaluation restricts ambient authority", function()
@@ -737,6 +747,8 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
     local has_io = (io ~= nil)
     local has_os = (os ~= nil)
     local has_loadfile = (loadfile ~= nil)
+    -- Attempt to mutate standard library in sandbox
+    string.polluted = true
     return {
       has_io = has_io,
       has_os = has_os,
@@ -750,6 +762,19 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
   assert(tbl.has_os == false, "ambient os must not be accessible in sandbox")
   assert(tbl.has_loadfile == false, "loadfile must not be accessible in sandbox")
   assert(tbl.safe_val == 12345, "safe variables should evaluate properly")
+  assert(string.polluted == nil, "standard library tables must be isolated from sandbox mutation")
+
+  -- Expensive string.rep bounds check
+  local big_rep = "return { big = string.rep('A', 100000) }"
+  local ok_rep, err_rep = WheelConfig.eval_chunk(big_rep, "big_rep_test")
+  assert(ok_rep == false, "string.rep > 65536 must fail closed")
+  assert(string.find(tostring(err_rep), "safety bound") ~= nil, "error message specifies safety bound")
+
+  -- Infinite loop instruction count limit
+  local infinite_loop = "while true do end return {}"
+  local ok_loop, err_loop = WheelConfig.eval_chunk(infinite_loop, "loop_test")
+  assert(ok_loop == false, "infinite loop must fail closed under instruction limit")
+  assert(string.find(tostring(err_loop), "instruction limit") ~= nil, "error message specifies instruction limit")
 end)
 
 run_test("WheelConfig: hierarchical layering (Defaults < Global < Project)", function()
