@@ -18,16 +18,19 @@ local WheelKernel = load_submodule("kernel")
 local WheelAgent = load_submodule("agent")
 local WheelUI = load_submodule("ui")
 local WheelConfig = load_submodule("config")
+local WheelTeam = load_submodule("team")
 
 local M = {
   kernel = WheelKernel.new(),
   agent = WheelAgent,
   ui = WheelUI,
   config = WheelConfig,
+  team = WheelTeam,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
   WheelConfig = WheelConfig,
+  WheelTeam = WheelTeam,
 }
 
 -- Register plugin commands if running inside Bitty host environment.
@@ -204,6 +207,32 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
           body = "Failed to record trust: " .. tostring(err),
         })
       end
+    end,
+  })
+
+  -- 7. team
+  bitty.commands.register({
+    id = "team",
+    title = "Wheel: team status",
+    description = "Display Wheel multi-agent peer colleague roster and live states.",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local st = M._team:status()
+      local lines = {
+        string.format("Wheel Team: %d colleagues (%d idle, %d busy, %d handoffs)",
+          st.total_agents, st.idle_count, st.busy_count, st.handoff_count)
+      }
+      for _, a in ipairs(st.agents) do
+        local model_info = (a.model and (a.model.provider .. "/" .. a.model.model)) or "default"
+        table.insert(lines, string.format("  [%s] %s (%s) | %s | %s",
+          a.state == "busy" and "RUN" or "IDLE", a.name, a.role, model_info, a.panel_id))
+      end
+      bitty.notify.show({
+        title = "Wheel Team Roster",
+        body = table.concat(lines, "\n"),
+      })
     end,
   })
 end

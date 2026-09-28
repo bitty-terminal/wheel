@@ -977,6 +977,282 @@ run_test("WheelConfig: skill capability discovery with filtering", function()
   os.execute("rm -rf " .. tmp_dir)
 end)
 
+--------------------------------------------------------------------------------
+-- Section 9: Multi-Agent Workspace Collaboration & Model Profiles
+--------------------------------------------------------------------------------
+
+local WheelTeam = require("wheel.team")
+
+run_test("WheelAgent: heterogeneous model profiles and validation", function()
+  -- Default model profiles per role
+  local prof_cmd = WheelAgent.get_default_model_profile(WheelAgent.Role.COMMANDER)
+  assert(prof_cmd.provider == "anthropic", "commander default provider")
+  assert(prof_cmd.model == "claude-3-5-sonnet", "commander default model")
+  assert(prof_cmd.thinking.enabled == true, "commander thinking enabled")
+  assert(prof_cmd.thinking.gear == "medium", "commander thinking gear")
+
+  local prof_dbg = WheelAgent.get_default_model_profile(WheelAgent.Role.DEBUG)
+  assert(prof_dbg.provider == "deepseek", "debug default provider")
+  assert(prof_dbg.model == "deepseek-reasoner", "debug default model")
+  assert(prof_dbg.thinking.enabled == true, "debug thinking enabled")
+  assert(prof_dbg.thinking.budget_tokens == 8192, "debug thinking budget")
+
+  local prof_rev = WheelAgent.get_default_model_profile(WheelAgent.Role.REVIEWER)
+  assert(prof_rev.provider == "openai", "reviewer default provider")
+  assert(prof_rev.model == "gpt-4o", "reviewer default model")
+  assert(prof_rev.temperature == 0.0, "reviewer temperature strict 0")
+
+  -- Validation
+  local valid, err = WheelAgent.validate_model_profile({
+    provider = "anthropic",
+    model = "claude-3-7-sonnet",
+    temperature = 0.3,
+    thinking = { enabled = true, budget_tokens = 4096, gear = "high" },
+    context_budget = { max_tokens = 128000 },
+    retry = { max_retries = 3, backoff_ms = 500 },
+  })
+  assert(valid == true, "valid profile must pass validation: " .. tostring(err))
+
+  local invalid, err2 = WheelAgent.validate_model_profile({
+    provider = "", -- empty provider
+    model = "test",
+  })
+  assert(invalid == false, "invalid provider must fail validation")
+  assert(err2 ~= nil, "error reason returned")
+
+  -- Agent model profile resolution and telemetry
+  local kernel = WheelKernel.new({ in_memory = true })
+  local custom_agent = WheelAgent.new({
+    name = "debugger-01",
+    role = WheelAgent.Role.DEBUG,
+    kernel = kernel,
+    model_profile = {
+      provider = "deepseek",
+      model = "deepseek-r1-custom",
+      temperature = 0.0,
+      thinking = { enabled = true, budget_tokens = 16384 },
+    },
+  })
+
+  local p = custom_agent:get_model_profile()
+  assert(p.provider == "deepseek")
+  assert(p.model == "deepseek-r1-custom")
+  assert(p.thinking.budget_tokens == 16384)
+
+  kernel:create_task({ id = "T-PROF", title = "Profile task" })
+  local outcome = custom_agent:execute_task("T-PROF", function()
+    return { done = true }
+  end)
+  assert(outcome.success == true)
+  assert(outcome.model_profile ~= nil, "telemetry includes model_profile")
+  assert(outcome.model_profile.model == "deepseek-r1-custom")
+  assert(outcome.model_profile.provider == "deepseek")
+end)
+
+run_test("WheelTeam: workspace colleague registration and roster", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({
+    kernel = kernel,
+    workspace_root = "/tmp/bitty/test_workspace",
+  })
+
+  assert(team ~= nil)
+  assert(#team:list_agents() == 0, "initial team is empty")
+
+  -- Spawn peer colleagues
+  local cmd = team:spawn_agent({
+    name = "architect",
+    role = WheelAgent.Role.COMMANDER,
+  })
+  local coder = team:spawn_agent({
+    name = "backend-dev",
+    role = WheelAgent.Role.CODING,
+  })
+  local rev = team:spawn_agent({
+    name = "qa-auditor",
+    role = WheelAgent.Role.REVIEWER,
+  })
+
+  assert(team:get_agent("architect") == cmd)
+  assert(team:get_agent("backend-dev") == coder)
+  assert(team:get_agent("qa-auditor") == rev)
+  assert(#team:list_agents() == 3, "team roster has 3 colleagues")
+
+  -- Peer colleagues start in idle state
+  local st_coder = team:get_agent_state("backend-dev")
+  assert(st_coder.state == "idle")
+  assert(st_coder.active_task_id == nil)
+  assert(st_coder.tasks_completed == 0)
+
+  -- Duplicate agent name rejected
+  local ok_dup, err_dup = pcall(function()
+    team:spawn_agent({ name = "backend-dev", role = WheelAgent.Role.CODING })
+  end)
+  assert(ok_dup == false, "duplicate agent name must fail")
+end)
+
+run_test("WheelTeam: atomic task claim and collision prevention", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  team:spawn_agent({ name = "dev-1", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "dev-2", role = WheelAgent.Role.CODING })
+
+  kernel:create_task({ id = "TASK-CLAIM-01", title = "First task", priority = 10 })
+
+  -- dev-1 claims TASK-CLAIM-01
+  local ok_c1, err_c1 = team:claim_task("dev-1", "TASK-CLAIM-01")
+  assert(ok_c1 == true, "first claim should succeed: " .. tostring(err_c1))
+
+  local st_dev1 = team:get_agent_state("dev-1")
+  assert(st_dev1.state == "busy")
+  assert(st_dev1.active_task_id == "TASK-CLAIM-01")
+
+  -- dev-2 attempts to claim the same task -> must fail closed
+  local ok_c2, err_c2 = team:claim_task("dev-2", "TASK-CLAIM-01")
+  assert(ok_c2 == false, "second claim on same task must fail")
+  assert(string.find(tostring(err_c2), "already claimed") ~= nil, "error explains task is already claimed")
+
+  -- dev-1 attempts to claim another task while busy -> must fail
+  kernel:create_task({ id = "TASK-CLAIM-02", title = "Second task", priority = 5 })
+  local ok_busy, err_busy = team:claim_task("dev-1", "TASK-CLAIM-02")
+  assert(ok_busy == false, "busy agent cannot claim another task")
+  assert(string.find(tostring(err_busy), "not idle") ~= nil, "error explains agent is busy")
+end)
+
+run_test("WheelTeam: task completion and release", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  local worker = team:spawn_agent({ name = "worker-01", role = WheelAgent.Role.CODING })
+  kernel:create_task({ id = "TASK-REL-01", title = "Task to release" })
+
+  team:claim_task("worker-01", "TASK-REL-01")
+  assert(team:get_agent_state("worker-01").state == "busy")
+
+  -- Release task with success
+  local ok_rel, err_rel = team:release_task("worker-01", "TASK-REL-01", {
+    status = "succeeded",
+    checkpoint_hash = "cp-12345",
+  })
+  assert(ok_rel == true, "release should succeed: " .. tostring(err_rel))
+
+  local st_after = team:get_agent_state("worker-01")
+  assert(st_after.state == "idle", "worker returns to idle")
+  assert(st_after.active_task_id == nil)
+  assert(st_after.tasks_completed == 1, "completed task count incremented")
+
+  -- Kernel task is now succeeded
+  local t = kernel:get_task("TASK-REL-01")
+  assert(t.status == "succeeded" or t.status == "Succeeded")
+end)
+
+run_test("WheelTeam: structured handoff from worker to reviewer", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  team:spawn_agent({ name = "coder-bob", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "reviewer-alice", role = WheelAgent.Role.REVIEWER })
+
+  kernel:create_task({ id = "TASK-HANDOFF-01", title = "Implement feature" })
+  team:claim_task("coder-bob", "TASK-HANDOFF-01")
+
+  -- Coder finishes implementation and hands off to Reviewer
+  local ok_ho, ho_record = team:handoff("coder-bob", "reviewer-alice", "TASK-HANDOFF-01", {
+    reason = "implementation_complete",
+    rationale = "Code written and local unit tests green. Requesting security & style audit.",
+    checkpoint_hash = "6a09e667bb67ae853c6ef372a54ff53a",
+  })
+
+  assert(ok_ho == true, "handoff should succeed")
+  assert(ho_record ~= nil)
+  assert(ho_record.from_agent == "coder-bob")
+  assert(ho_record.to_agent == "reviewer-alice")
+  assert(ho_record.task_id == "TASK-HANDOFF-01")
+  assert(ho_record.checkpoint_hash == "6a09e667bb67ae853c6ef372a54ff53a")
+  assert(ho_record.timestamp ~= nil)
+
+  -- Coder is now idle, Reviewer is now busy with the task
+  assert(team:get_agent_state("coder-bob").state == "idle")
+  assert(team:get_agent_state("coder-bob").active_task_id == nil)
+
+  local rev_st = team:get_agent_state("reviewer-alice")
+  assert(rev_st.state == "busy")
+  assert(rev_st.active_task_id == "TASK-HANDOFF-01")
+
+  -- Reviewer audits and finishes
+  team:release_task("reviewer-alice", "TASK-HANDOFF-01", { status = "succeeded" })
+  assert(team:get_agent_state("reviewer-alice").state == "idle")
+  assert(#team.handoffs == 1, "recorded 1 handoff")
+end)
+
+run_test("WheelTeam: wave dispatching across DAG dependencies", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  team:spawn_agent({ name = "c-1", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "c-2", role = WheelAgent.Role.CODING })
+
+  -- Two independent ready tasks and one dependent task
+  kernel:create_task({ id = "T-A", title = "Task A", priority = 10 })
+  kernel:create_task({ id = "T-B", title = "Task B", priority = 8 })
+  kernel:create_task({ id = "T-C", title = "Task C", priority = 5, dependencies = { "T-A", "T-B" } })
+
+  -- Wave 1: T-A and T-B are ready -> dispatch to c-1 and c-2
+  local dispatched = team:dispatch_wave()
+  assert(#dispatched == 2, "expected 2 tasks dispatched in wave 1")
+
+  local task_map = {}
+  for _, d in ipairs(dispatched) do
+    task_map[d.task_id] = d.agent_name
+  end
+  assert(task_map["T-A"] ~= nil)
+  assert(task_map["T-B"] ~= nil)
+  assert(task_map["T-C"] == nil, "T-C has pending dependencies, must not be dispatched")
+
+  -- Complete T-A and T-B
+  team:release_task(task_map["T-A"], "T-A", { status = "succeeded" })
+  team:release_task(task_map["T-B"], "T-B", { status = "succeeded" })
+
+  -- Wave 2: T-C is now ready -> dispatch to now-idle agent
+  local dispatched_w2 = team:dispatch_wave()
+  assert(#dispatched_w2 == 1, "expected 1 task dispatched in wave 2")
+  assert(dispatched_w2[1].task_id == "T-C")
+
+  team:release_task(dispatched_w2[1].agent_name, "T-C", { status = "succeeded" })
+  assert(#team:dispatch_wave() == 0, "no more tasks to dispatch")
+end)
+
+run_test("WheelTeam: organizational status telemetry", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  team:spawn_agent({ name = "lead", role = WheelAgent.Role.COMMANDER })
+  team:spawn_agent({ name = "worker-a", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "worker-b", role = WheelAgent.Role.DEBUG })
+
+  kernel:create_task({ id = "T-ST", title = "Status test task" })
+  team:claim_task("worker-a", "T-ST")
+
+  local st = team:status()
+  assert(st.total_agents == 3)
+  assert(st.idle_count == 2)
+  assert(st.busy_count == 1)
+  assert(#st.agents == 3)
+
+  local worker_entry = nil
+  for _, a in ipairs(st.agents) do
+    if a.name == "worker-a" then worker_entry = a end
+  end
+  assert(worker_entry ~= nil)
+  assert(worker_entry.state == "busy")
+  assert(worker_entry.active_task_id == "T-ST")
+  assert(worker_entry.model ~= nil)
+  assert(worker_entry.panel_id == "headless:panel:worker-a")
+  assert(worker_entry.headless == true)
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
+

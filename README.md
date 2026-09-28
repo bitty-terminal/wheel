@@ -90,6 +90,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:plan`: Initialize or decompose software engineering tasks into the Task DAG (Commander role).
 - `bitty-terminal.wheel:run`: Execute ready tasks in the DAG using WheelAgent (Worker role).
 - `bitty-terminal.wheel:trust`: Inspect and approve project configuration (`.wheel/init.lua`) with hash pinning.
+- `bitty-terminal.wheel:team`: Display multi-agent peer colleague roster, roles, models, and live states.
 
 ## Development
 
