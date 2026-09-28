@@ -374,6 +374,84 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       })
     end,
   })
+
+  -- 12. branch
+  bitty.commands.register({
+    id = "branch",
+    title = "Wheel: branch",
+    description = "List context branches or display active branch and HEAD commit.",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local ctx = M._team.context
+      local branches = ctx:list_branches()
+      local lines = { "=== Wheel Context Branches ===" }
+      for _, b in ipairs(branches) do
+        local marker = b.is_head and "* " or "  "
+        local hash_str = b.hash and b.hash:sub(1, 8) or "(empty)"
+        table.insert(lines, string.format("%s%-16s -> %s", marker, b.name, hash_str))
+      end
+      bitty.notify.show({
+        title = "Wheel Context Branches",
+        body = table.concat(lines, "\n"),
+      })
+    end,
+  })
+
+  -- 13. checkpoint
+  bitty.commands.register({
+    id = "checkpoint",
+    title = "Wheel: checkpoint",
+    description = "Display recent context checkpoints (commit ancestry log).",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local ctx = M._team.context
+      local commits = ctx:log(8)
+      local lines = { "=== Wheel Context Checkpoints ===" }
+      if #commits == 0 then
+        table.insert(lines, "(no checkpoints committed yet)")
+      else
+        for _, c in ipairs(commits) do
+          table.insert(lines, string.format("• %s | %s [%s]",
+            c.hash:sub(1, 8), c.message, c.author or "unknown"))
+        end
+      end
+      bitty.notify.show({
+        title = "Wheel Checkpoints",
+        body = table.concat(lines, "\n"),
+      })
+    end,
+  })
+
+  -- 14. reflog
+  bitty.commands.register({
+    id = "reflog",
+    title = "Wheel: reflog",
+    description = "Display recent context reflog transitions and audit journal.",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local ctx = M._team.context
+      local entries = ctx:reflog(8)
+      local lines = { "=== Wheel Context Reflog ===" }
+      if #entries == 0 then
+        table.insert(lines, "(reflog empty)")
+      else
+        for _, r in ipairs(entries) do
+          table.insert(lines, string.format("• %s..%s %s: %s",
+            r.from_hash:sub(1, 7), r.to_hash:sub(1, 7), r.action, r.message))
+        end
+      end
+      bitty.notify.show({
+        title = "Wheel Reflog",
+        body = table.concat(lines, "\n"),
+      })
+    end,
+  })
 end
 
 return M

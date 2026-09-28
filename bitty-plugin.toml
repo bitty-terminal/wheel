@@ -44,4 +44,7 @@ commands = [
   "bitty-terminal.wheel:tools",
   "bitty-terminal.wheel:orchestrate",
   "bitty-terminal.wheel:models",
+  "bitty-terminal.wheel:branch",
+  "bitty-terminal.wheel:checkpoint",
+  "bitty-terminal.wheel:reflog",
 ]
