@@ -541,28 +541,33 @@ function WheelTeam:run_orchestration_loop(opts)
       local task_id = item.task_id
 
       if worker then
-        -- Default step function writes artifacts slot and rationale
-        local step_fn = opts.step_fn or function(agent, ctx, iter)
-          if agent.context and type(agent.context.put_slot) == "function" then
-            agent.context:put_slot("tasks/" .. task_id .. "/artifacts",
-              string.format("Deliverables and code implementation for %s completed by %s", task_id, agent.name))
+        -- Resolve worker step function or runner options
+        local step_fn = opts.step_fn
+        if opts.use_runner then
+          step_fn = opts.runner_opts or {}
+        elseif not step_fn then
+          step_fn = function(agent, ctx, iter)
+            if agent.context and type(agent.context.put_slot) == "function" then
+              agent.context:put_slot("tasks/" .. task_id .. "/artifacts",
+                string.format("Deliverables and code implementation for %s completed by %s", task_id, agent.name))
+            end
+            return {
+              action = {
+                tool = "run_command",
+                stdout = string.format("Task %s execution step %d completed successfully", task_id, iter),
+                exit_code = 0,
+              },
+              rationale = {
+                why = "Execute planned task " .. task_id,
+                what = "Completed implementation deliverables for " .. task_id,
+                where_focus = "task " .. task_id,
+                how = "autonomous agent execution loop and artifact publishing",
+                expected = "all task acceptance criteria satisfied",
+                observed = "execution step completed with exit code 0",
+              },
+              done = true,
+            }
           end
-          return {
-            action = {
-              tool = "run_command",
-              stdout = string.format("Task %s execution step %d completed successfully", task_id, iter),
-              exit_code = 0,
-            },
-            rationale = {
-              why = "Execute planned task " .. task_id,
-              what = "Completed implementation deliverables for " .. task_id,
-              where_focus = "task " .. task_id,
-              how = "autonomous agent execution loop and artifact publishing",
-              expected = "all task acceptance criteria satisfied",
-              observed = "execution step completed with exit code 0",
-            },
-            done = true,
-          }
         end
 
         local ok_exec, exec_outcome = pcall(worker.execute_task, worker, task_id, step_fn)

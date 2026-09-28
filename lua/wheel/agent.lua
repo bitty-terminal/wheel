@@ -13,6 +13,20 @@ if not ok_tool then
 end
 WheelAgent.Tool = WheelTool
 
+local ok_provider, WheelProvider = pcall(require, "wheel.provider")
+if not ok_provider then
+  local ok_p2, WheelP2 = pcall(require, "lua.wheel.provider")
+  WheelProvider = ok_p2 and WheelP2 or nil
+end
+WheelAgent.Provider = WheelProvider
+
+local ok_runner, WheelRunner = pcall(require, "wheel.runner")
+if not ok_runner then
+  local ok_r2, WheelR2 = pcall(require, "lua.wheel.runner")
+  WheelRunner = ok_r2 and WheelR2 or nil
+end
+WheelAgent.Runner = WheelRunner
+
 --- Agent role definitions.
 WheelAgent.Role = {
   COMMANDER = "commander",
@@ -232,7 +246,24 @@ function WheelAgent.new(opts)
   self.last_prefix_cache_key = nil
   self.last_cache_share_ratio = nil
 
+  self.provider = opts.provider
+  if not self.provider and WheelProvider and self.model_profile then
+    self.provider = WheelProvider.create(self.model_profile)
+  end
+
   return self
+end
+
+--- Get the active LLM Provider adapter.
+--- @return table?: Provider adapter instance
+function WheelAgent:get_provider()
+  return self.provider
+end
+
+--- Set the LLM Provider adapter.
+--- @param provider table Provider adapter instance
+function WheelAgent:set_provider(provider)
+  self.provider = provider
 end
 
 --- Get the active WheelContext engine.
@@ -396,6 +427,25 @@ function WheelAgent:execute_task(task_id, step_fn)
   end
   if assigned and assigned ~= "" and assigned ~= self.name then
     error("Task " .. task_id .. " is already assigned to " .. tostring(assigned))
+  end
+
+  -- Autonomous ReAct loop via WheelRunner when step_fn is nil or table of options
+  if type(step_fn) ~= "function" then
+    if WheelRunner and type(WheelRunner.run_task) == "function" then
+      local runner_opts = (type(step_fn) == "table") and step_fn or {}
+      local runner_res = WheelRunner.run_task(self, task, runner_opts)
+      return {
+        success = runner_res.success,
+        task = self.kernel:get_task(task_id) or task,
+        artifacts = runner_res.artifacts,
+        checkpoints = runner_res.checkpoints,
+        iterations = runner_res.iterations,
+        error = runner_res.error,
+        usage = runner_res.usage,
+      }
+    else
+      error("WheelRunner not available to execute task without step_fn")
+    end
   end
 
   -- 1. Set active task in kernel
@@ -593,6 +643,7 @@ function WheelAgent:status()
     prefix_cache_key = self.last_prefix_cache_key,
     cache_share_ratio = self.last_cache_share_ratio,
     tool_count = self.tool_registry and #self.tool_registry:list_tools() or #self.tools,
+    provider = self.provider and (self.provider.describe and self.provider:describe() or { provider = self.provider.name }) or nil,
   }
 end
 

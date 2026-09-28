@@ -21,6 +21,8 @@ local WheelConfig = load_submodule("config")
 local WheelTeam = load_submodule("team")
 local WheelContext = load_submodule("context")
 local WheelTool = load_submodule("tool")
+local WheelProvider = load_submodule("provider")
+local WheelRunner = load_submodule("runner")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -30,6 +32,8 @@ local M = {
   team = WheelTeam,
   context = WheelContext,
   tool = WheelTool,
+  provider = WheelProvider,
+  runner = WheelRunner,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
@@ -37,6 +41,8 @@ local M = {
   WheelTeam = WheelTeam,
   WheelContext = WheelContext,
   WheelTool = WheelTool,
+  WheelProvider = WheelProvider,
+  WheelRunner = WheelRunner,
   tools = WheelTool and WheelTool.get_default_registry(),
 }
 
@@ -327,6 +333,36 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       bitty.notify.show({
         title = "Wheel Orchestration",
         body = msg,
+      })
+    end,
+  })
+
+  -- 11. models
+  bitty.commands.register({
+    id = "models",
+    title = "Wheel: models",
+    description = "Display configured model profiles, providers, and parameters.",
+    run = function()
+      local roles = {
+        WheelAgent.Role.COMMANDER,
+        WheelAgent.Role.CODING,
+        WheelAgent.Role.DEBUG,
+        WheelAgent.Role.REVIEWER,
+        WheelAgent.Role.RESEARCH,
+      }
+      local lines = { "=== Wheel Heterogeneous Model Profiles ===" }
+      for _, r in ipairs(roles) do
+        local prof = WheelAgent.get_default_model_profile(r)
+        local thinking_str = ""
+        if prof.thinking and prof.thinking.enabled then
+          thinking_str = string.format(" [thinking: %d tokens, %s]", prof.thinking.budget_tokens or 0, prof.thinking.gear or "default")
+        end
+        table.insert(lines, string.format("• %-10s : %s / %s (temp: %.1f)%s", r, prof.provider, prof.model, prof.temperature, thinking_str))
+      end
+
+      bitty.notify.show({
+        title = "Wheel Models",
+        body = table.concat(lines, "\n"),
       })
     end,
   })

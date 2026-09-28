@@ -2049,8 +2049,478 @@ run_test("Wheel: Plugin command orchestrate registration and execution", functio
   _G.bitty = nil
 end)
 
+-- ---------------------------------------------------------------------------
+-- Section 17: Provider Adapters, SSE Streaming Parser & ReAct Autonomous Runner
+-- ---------------------------------------------------------------------------
+
+local WheelProvider = require("wheel.provider")
+local WheelRunner = require("wheel.runner")
+
+run_test("WheelProvider.SSEParser: line buffering, fragmented chunks, and [DONE]", function()
+  local parser = WheelProvider.SSEParser.new()
+  local events = {}
+
+  -- 1. Standard single event
+  parser:feed("event: message\ndata: {\"msg\":\"hello\"}\n\n", function(evt)
+    table.insert(events, evt)
+  end)
+  assert(#events == 1, "must parse single event")
+  assert(events[1].event == "message")
+  assert(events[1].data == "{\"msg\":\"hello\"}")
+
+  -- 2. Fragmented event across chunk boundaries
+  events = {}
+  parser:feed("event: update\n", function(evt) table.insert(events, evt) end)
+  assert(#events == 0, "no event yet")
+  parser:feed("data: line1\n", function(evt) table.insert(events, evt) end)
+  assert(#events == 0, "no event yet")
+  parser:feed("data: line2\n\n", function(evt) table.insert(events, evt) end)
+  assert(#events == 1, "event completed after blank line")
+  assert(events[1].event == "update")
+  assert(events[1].data == "line1\nline2")
+
+  -- 3. Multiple events in a single chunk with comments
+  events = {}
+  local multi_chunk = ": keep-alive comment\nevent: first\ndata: 1\n\n: another comment\nevent: second\ndata: 2\n\n"
+  parser:feed(multi_chunk, function(evt)
+    table.insert(events, evt)
+  end)
+  assert(#events == 2, "must parse two events from single chunk")
+  assert(events[1].event == "first" and events[1].data == "1")
+  assert(events[2].event == "second" and events[2].data == "2")
+
+  -- 4. [DONE] token
+  events = {}
+  parser:feed("data: [DONE]\n\n", function(evt)
+    table.insert(events, evt)
+  end)
+  assert(#events == 1)
+  assert(events[1].data == "[DONE]")
+end)
+
+run_test("WheelProvider: tool formatters and adapter factory", function()
+  local tools = {
+    {
+      name = "read_file",
+      description = "Read a file from workspace",
+      parameters = {
+        type = "object",
+        properties = { path = { type = "string" } },
+        required = { "path" },
+      },
+    },
+    {
+      name = "run_command",
+      description = "Execute a shell command",
+      parameters = {
+        type = "object",
+        properties = { command = { type = "string" } },
+      },
+    },
+  }
+
+  -- 1. OpenAI formatting
+  local oai = WheelProvider.format_tools_for_openai(tools)
+  assert(#oai == 2, "must format 2 tools for openai")
+  assert(oai[1].type == "function")
+  assert(oai[1]["function"].name == "read_file")
+  assert(oai[1]["function"].parameters.type == "object")
+
+  -- 2. Anthropic formatting
+  local anth = WheelProvider.format_tools_for_anthropic(tools)
+  assert(#anth == 2, "must format 2 tools for anthropic")
+  assert(anth[1].name == "read_file")
+  assert(anth[1].input_schema.type == "object")
+
+  -- 3. Factory creation
+  local mock_p = WheelProvider.create({ provider = "mock", model = "test-mock" })
+  assert(mock_p.name == "mock")
+  assert(mock_p:describe().model == "test-mock")
+
+  local oai_p = WheelProvider.create({ provider = "openai", model = "gpt-4o" }, { api_key = "test-key" })
+  assert(oai_p.name == "openai")
+  assert(oai_p.base_url == "https://api.openai.com/v1")
+
+  local dseek_p = WheelProvider.create({ provider = "deepseek", model = "deepseek-reasoner" })
+  assert(dseek_p.name == "openai")
+  assert(dseek_p.base_url == "https://api.deepseek.com/v1")
+
+  local cl_p = WheelProvider.create({ provider = "anthropic", model = "claude-3-5-sonnet" }, { api_key = "ant-key" })
+  assert(cl_p.name == "anthropic")
+  assert(cl_p.base_url == "https://api.anthropic.com/v1")
+
+  local stdio_p = WheelProvider.create({ provider = "local", model = "qwen2.5-coder" })
+  assert(stdio_p.name == "stdio")
+  assert(string.find(stdio_p.command, "ollama run", 1, true) ~= nil)
+end)
+
+run_test("WheelProvider.MockProvider: completions, streaming chunks, and tool calling", function()
+  local mock = WheelProvider.MockProvider.new({
+    stream_chunk_size = 5,
+    responses = {
+      {
+        content = "First answer",
+        thinking_content = "Thinking step 1",
+        tool_calls = {
+          { id = "tc_1", name = "read_file", arguments = { path = "foo.lua" } },
+        },
+        usage = { prompt_tokens = 50, completion_tokens = 20, thinking_tokens = 10, total_tokens = 80 },
+        finish_reason = "tool_calls",
+      },
+      {
+        content = "Second final answer",
+        tool_calls = {},
+        finish_reason = "stop",
+      },
+    },
+  })
+
+  -- 1. Stream first response
+  local chunks = {}
+  local res1, err1 = mock:stream({ messages = { { role = "user", content = "hi" } } }, function(chunk)
+    table.insert(chunks, chunk)
+  end)
+
+  assert(err1 == nil)
+  assert(res1.content == "First answer")
+  assert(res1.thinking_content == "Thinking step 1")
+  assert(#res1.tool_calls == 1)
+  assert(res1.tool_calls[1].name == "read_file")
+  assert(#chunks > 0, "must stream chunks")
+
+  -- Verify chunk types emitted
+  local has_thinking = false
+  local has_content = false
+  local has_tool_call = false
+  for _, c in ipairs(chunks) do
+    if c.type == "thinking" then has_thinking = true end
+    if c.type == "content" then has_content = true end
+    if c.type == "tool_call" then has_tool_call = true end
+  end
+  assert(has_thinking == true, "must emit thinking chunks")
+  assert(has_content == true, "must emit content chunks")
+  assert(has_tool_call == true, "must emit tool_call chunks")
+
+  -- 2. Stream second response
+  local res2, err2 = mock:stream({ messages = { { role = "user", content = "next" } } })
+  assert(err2 == nil)
+  assert(res2.content == "Second final answer")
+  assert(res2.finish_reason == "stop")
+  assert(mock:describe().call_count == 2)
+end)
+
+run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming SSE", function()
+  -- 1. Test OpenAIAdapter with mocked HTTP client emitting SSE stream
+  local mock_http_openai = function(req)
+    assert(req.method == "POST")
+    assert(string.find(req.url, "/chat/completions", 1, true) ~= nil)
+    assert(req.headers["Authorization"] == "Bearer mock-token")
+
+    local chunks = {
+      "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"DeepSeek reasoner thinking...\"}}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \",\"tool_calls\":[{\"index\":0,\"id\":\"call_01\",\"function\":{\"name\":\"search_code\",\"arguments\":\"{\\\"pattern\\\"\"}}]}}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"content\":\"world!\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"main\\\"}\"}}]}}]}\n\n",
+      "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
+      "data: [DONE]\n\n",
+    }
+
+    if req.stream and req.on_stream_chunk then
+      for _, ch in ipairs(chunks) do
+        req.on_stream_chunk(ch)
+      end
+    end
+    return { status = 200, body = "" }
+  end
+
+  local oai_adapter = WheelProvider.OpenAIAdapter.new({
+    api_key = "mock-token",
+    http_client = mock_http_openai,
+  })
+
+  local stream_tokens = {}
+  local oai_res, oai_err = oai_adapter:stream({
+    messages = { { role = "user", content = "Test query" } },
+    tools = { { name = "search_code", description = "search", parameters = { type = "object" } } },
+  }, function(chunk)
+    table.insert(stream_tokens, chunk.delta)
+  end)
+
+  assert(oai_err == nil, "stream must succeed: " .. tostring(oai_err))
+  assert(oai_res.content == "Hello world!", "accumulated content must match")
+  assert(oai_res.thinking_content == "DeepSeek reasoner thinking...", "reasoning content parsed")
+  assert(#oai_res.tool_calls == 1, "tool call parsed")
+  assert(oai_res.tool_calls[1].name == "search_code")
+  assert(oai_res.tool_calls[1].arguments.pattern == "main")
+  assert(oai_res.finish_reason == "tool_calls")
+  assert(oai_res.usage.total_tokens == 25)
+
+  -- 2. Test AnthropicAdapter with mocked HTTP client emitting Anthropic SSE events
+  local mock_http_anthropic = function(req)
+    assert(req.method == "POST")
+    assert(string.find(req.url, "/messages", 1, true) ~= nil)
+    assert(req.headers["x-api-key"] == "ant-token")
+    assert(req.headers["anthropic-version"] == "2023-06-01")
+
+    local events = {
+      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":40}}}\n\n",
+      "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+      "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Claude thinking process\"}}\n\n",
+      "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+      "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+      "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Implementation ready.\"}}\n\n",
+      "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+      "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":20}}\n\n",
+      "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+    }
+
+    if req.stream and req.on_stream_chunk then
+      for _, ev in ipairs(events) do
+        req.on_stream_chunk(ev)
+      end
+    end
+    return { status = 200, body = "" }
+  end
+
+  local ant_adapter = WheelProvider.AnthropicAdapter.new({
+    api_key = "ant-token",
+    http_client = mock_http_anthropic,
+  })
+
+  local ant_res, ant_err = ant_adapter:stream({
+    messages = {
+      { role = "system", content = "You are a software engineer." },
+      { role = "user", content = "Write the function" },
+    },
+  })
+
+  assert(ant_err == nil, "anthropic stream must succeed: " .. tostring(ant_err))
+  assert(ant_res.content == "Implementation ready.")
+  assert(ant_res.thinking_content == "Claude thinking process")
+  assert(ant_res.finish_reason == "end_turn")
+  assert(ant_res.usage.output_tokens == 20)
+end)
+
+run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpointing", function()
+  local kernel = WheelKernel.new_mock()
+  local context = WheelContext.new({ kernel = kernel })
+  local registry = WheelTool.Registry.new()
+
+  -- Register test file tools with dummy execution
+  registry:register_tool({
+    name = "inspect_file",
+    intent = WheelTool.ActionIntent.INSPECT,
+    description = "Inspect file content",
+    execute = function(args, env)
+      return { success = true, exit_code = 0, stdout = "pub fn test_core() -> bool { true }" }
+    end,
+  })
+
+  -- Create agent with registered tools
+  local agent = WheelAgent.new({
+    name = "worker-coding-01",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    context = context,
+    tool_registry = registry,
+    tools = { "inspect_file", "read_file", "write_file" },
+  })
+
+  -- Program MockProvider with multi-turn responses:
+  -- Turn 1: Model issues tool call to inspect_file
+  -- Turn 2: Model finishes with final deliverables
+  local mock = WheelProvider.MockProvider.new({
+    responses = {
+      {
+        content = "Inspecting source code first",
+        thinking_content = "Need to check test_core() definition",
+        tool_calls = {
+          { id = "tc_inspect_1", name = "inspect_file", arguments = { path = "src/lib.rs" } },
+        },
+        usage = { prompt_tokens = 100, completion_tokens = 30, thinking_tokens = 15, total_tokens = 145 },
+      },
+      {
+        content = "Verified test_core() implementation successfully. All tests passing.",
+        thinking_content = "Verification confirmed. Preparing final delivery.",
+        tool_calls = {},
+        finish_reason = "stop",
+        usage = { prompt_tokens = 150, completion_tokens = 25, thinking_tokens = 10, total_tokens = 185 },
+      },
+    },
+  })
+  agent:set_provider(mock)
+
+  -- Create task in kernel
+  local task = kernel:create_task({
+    id = "T-REACT-01",
+    title = "Verify core subsystem",
+    description = "Inspect core function implementation",
+    priority = 8,
+  })
+
+  local tokens_streamed = {}
+  local tools_called = {}
+  local tools_resulted = {}
+
+  local runner_res = WheelRunner.run_task(agent, task, {
+    max_turns = 5,
+    on_token = function(token, kind)
+      table.insert(tokens_streamed, token)
+    end,
+    on_tool_call = function(tc)
+      table.insert(tools_called, tc.name)
+    end,
+    on_tool_result = function(tc, outcome)
+      table.insert(tools_resulted, outcome.success)
+    end,
+  })
+
+  assert(runner_res.success == true, "runner execution must succeed: " .. tostring(runner_res.error))
+  assert(runner_res.iterations == 2, "must complete in exactly 2 turns")
+  assert(#tools_called == 1 and tools_called[1] == "inspect_file", "tool called in turn 1")
+  assert(#tools_resulted == 1 and tools_resulted[1] == true, "tool executed successfully")
+  assert(#tokens_streamed > 0, "tokens streamed to callback")
+  assert(#runner_res.checkpoints >= 2, "checkpoints committed per turn")
+  assert(runner_res.usage.total_tokens == 330, "usage telemetry accumulated across turns")
+
+  -- Verify artifacts written to semantic slot
+  local art_slot = context:get_slot("tasks/" .. task.id .. "/artifacts")
+  assert(art_slot.found == true, "artifacts slot must be created in context")
+  assert(string.find(art_slot.content, "Verified test_core()", 1, true) ~= nil)
+end)
+
+run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", function()
+  local kernel = WheelKernel.new_mock()
+  local context = WheelContext.new({ kernel = kernel })
+
+  local agent = WheelAgent.new({
+    name = "worker-coding-02",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    context = context,
+    model_profile = {
+      provider = "mock",
+      model = "claude-3-5-sonnet",
+      temperature = 0.0,
+      thinking = { enabled = true, budget_tokens = 2048 },
+    },
+  })
+
+  -- Set mock provider returning direct completion
+  local mock = WheelProvider.MockProvider.new({
+    responses = {
+      {
+        content = "Direct autonomous code delivery for task.",
+        thinking_content = "Analyzed specifications and completed code.",
+        tool_calls = {},
+        finish_reason = "stop",
+        usage = { prompt_tokens = 80, completion_tokens = 30, total_tokens = 110 },
+      },
+    },
+  })
+  agent:set_provider(mock)
+
+  local task = kernel:create_task({
+    id = "T-AUTO-01",
+    title = "Implement helper module",
+    description = "Create helper functions",
+    priority = 5,
+  })
+
+  -- Call execute_task with NO step_fn (defaults to autonomous WheelRunner!)
+  local outcome = agent:execute_task(task.id)
+
+  assert(outcome.success == true, "autonomous execute_task must succeed")
+  assert(outcome.iterations == 1, "completed in 1 iteration")
+  assert(#outcome.checkpoints >= 1, "checkpoint committed")
+  assert(string.find(outcome.artifacts, "Direct autonomous", 1, true) ~= nil)
+
+  -- Verify status telemetry contains provider and model profile
+  local st = agent:status()
+  assert(st.provider ~= nil, "status must report provider")
+  assert(st.provider.provider == "mock")
+  assert(st.model_profile.provider == "mock")
+  assert(st.model_profile.thinking.enabled == true)
+end)
+
+run_test("WheelTeam: run_orchestration_loop with autonomous provider runner and models command", function()
+  local kernel = WheelKernel.new_mock()
+  local context = WheelContext.new({ kernel = kernel })
+  local team = WheelTeam.new({ kernel = kernel, context = context })
+
+  -- Spawn coding worker and reviewer
+  local worker = team:spawn_agent({
+    name = "worker-01",
+    role = WheelAgent.Role.CODING,
+    model_profile = { provider = "mock", model = "claude-3-5-sonnet" },
+  })
+  local reviewer = team:spawn_agent({
+    name = "reviewer-01",
+    role = WheelAgent.Role.REVIEWER,
+    model_profile = { provider = "mock", model = "gpt-4o" },
+  })
+
+  -- Configure mock providers on worker
+  local worker_mock = WheelProvider.MockProvider.new({
+    completion_fn = function(req, count)
+      return {
+        content = "Code implementation for task iteration " .. count,
+        thinking_content = "Engineering rationale for step " .. count,
+        tool_calls = {},
+        finish_reason = "stop",
+      }
+    end,
+  })
+  worker:set_provider(worker_mock)
+
+  -- Decompose 2-task linear plan
+  local t1 = kernel:create_task({ id = "T-PIPE-01", title = "Setup architecture", priority = 10 })
+  local t2 = kernel:create_task({ id = "T-PIPE-02", title = "Implement features", priority = 8, dependencies = { t1.id } })
+
+  -- Run orchestration loop with autonomous runner enabled!
+  local report = team:run_orchestration_loop({
+    use_runner = true,
+    max_waves = 5,
+    auto_reviewer = true,
+  })
+
+  assert(report.success == true, "autonomous wave orchestration must succeed: " .. tostring(report.blocked_reason))
+  assert(#report.completed_tasks == 2, "both tasks completed")
+  assert(report.total_handoffs == 2, "2 verification handoffs completed")
+  assert(report.waves_executed == 2, "2 waves executed")
+
+  -- Verify plugin models command registration and formatting
+  package.loaded["wheel.init"] = nil
+  package.loaded["lua.wheel.init"] = nil
+
+  local registered_commands = {}
+  local notifications = {}
+  _G.bitty = {
+    commands = {
+      register = function(def) registered_commands[def.id] = def; return 1 end,
+    },
+    notify = {
+      show = function(n) table.insert(notifications, n); return true end,
+    },
+  }
+
+  local wheel = require("wheel.init")
+  assert(registered_commands["models"] ~= nil, "models command must be registered")
+  assert(registered_commands["models"].title == "Wheel: models")
+
+  registered_commands["models"].run()
+  assert(#notifications > 0, "notification must be emitted")
+  local notif = notifications[#notifications]
+  assert(notif.title == "Wheel Models")
+  assert(string.find(notif.body, "claude-3-5-sonnet", 1, true) ~= nil)
+  assert(string.find(notif.body, "deepseek-reasoner", 1, true) ~= nil)
+  assert(string.find(notif.body, "gpt-4o", 1, true) ~= nil)
+
+  _G.bitty = nil
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
+
 
 
