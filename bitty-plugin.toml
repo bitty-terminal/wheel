@@ -40,4 +40,5 @@ commands = [
   "bitty-terminal.wheel:run",
   "bitty-terminal.wheel:trust",
   "bitty-terminal.wheel:team",
+  "bitty-terminal.wheel:context",
 ]

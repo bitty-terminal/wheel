@@ -2,7 +2,16 @@
 -- Multi-agent peer colleague collaboration protocol per Wheel architecture.
 -- Rejects master-slave hierarchy: each agent is an autonomous peer worker in an engineering workspace.
 
-local WheelAgent = require("wheel.agent")
+local function load_submodule(subpath)
+  local ok, mod = pcall(require, "wheel." .. subpath)
+  if ok then return mod end
+  ok, mod = pcall(require, "lua.wheel." .. subpath)
+  if ok then return mod end
+  return require(subpath)
+end
+
+local WheelAgent = load_submodule("agent")
+local WheelContext = load_submodule("context")
 
 local WheelTeam = {}
 WheelTeam.__index = WheelTeam
@@ -11,6 +20,8 @@ WheelTeam.__index = WheelTeam
 --- @param opts table
 ---   opts.kernel table: WheelKernel instance
 ---   opts.config table?: Resolved WheelConfig instance
+---   opts.context table?: WheelContext instance
+---   opts.bus table?: ContextBus instance
 ---   opts.workspace_root string?: Project workspace root directory
 --- @return table WheelTeam
 function WheelTeam.new(opts)
@@ -27,6 +38,13 @@ function WheelTeam.new(opts)
   self.agent_states = {} -- map of agent_name -> { state = "idle"|"busy"|"waiting_review", active_task_id = string?, tasks_completed = number }
   self.handoffs = {} -- array of structured handoff records
   self.task_assignments = {} -- map of task_id -> agent_name
+
+  -- Shared context engine and event bus across peer colleagues
+  self.context = opts.context or WheelContext.new({
+    kernel = self.kernel,
+    config = self.config,
+    bus = opts.bus,
+  })
 
   return self
 end
@@ -49,6 +67,18 @@ function WheelTeam:register_agent(agent)
     handoffs_sent = 0,
     handoffs_received = 0,
   }
+
+  -- Mount shared team context and subscribe colleague to context events
+  agent.context = self.context
+  if self.context and self.context.bus and type(self.context.bus.subscribe) == "function" then
+    self.context.bus:subscribe(agent.name, function(event)
+      local st = self.agent_states[agent.name]
+      if st then
+        st.last_event = event
+      end
+    end)
+  end
+
   return agent
 end
 
@@ -59,6 +89,7 @@ function WheelTeam:spawn_agent(opts)
   opts = opts or {}
   opts.kernel = opts.kernel or self.kernel
   opts.config = opts.config or self.config
+  opts.context = opts.context or self.context
   opts.workspace = opts.workspace or { root = self.workspace_root }
   local agent = WheelAgent.new(opts)
   return self:register_agent(agent)
@@ -166,6 +197,11 @@ function WheelTeam:claim_task(agent_name, task_id)
   st.active_task_id = task_id
   self.task_assignments[task_id] = agent_name
 
+  -- Record worker assignment in semantic slots
+  if self.context and type(self.context.put_slot) == "function" then
+    self.context:put_slot("tasks/" .. task_id .. "/worker", agent_name)
+  end
+
   return true, started_task or task
 end
 
@@ -255,6 +291,22 @@ function WheelTeam:handoff(from_agent, to_agent, task_id, opts)
 
   self.task_assignments[task_id] = to_agent
 
+  -- Record structured handoff in semantic slots and notify receiver
+  if self.context and type(self.context.put_slot) == "function" then
+    local handoff_payload = string.format("from: %s\nto: %s\ntask: %s\nreason: %s\nrationale: %s\ncheckpoint: %s",
+      from_agent, to_agent, task_id, record.reason, record.rationale, record.checkpoint_hash or "none")
+    self.context:put_slot("tasks/" .. task_id .. "/handoff", handoff_payload)
+    if self.context.bus and type(self.context.bus.publish) == "function" then
+      self.context.bus:publish({
+        type = "handoff_received",
+        handoff = record,
+        from_agent = from_agent,
+        to_agent = to_agent,
+        task_id = task_id,
+      })
+    end
+  end
+
   return true, record
 end
 
@@ -333,7 +385,13 @@ function WheelTeam:status()
     })
   end
 
-  table.sort(agent_summaries, function(a, b) return a.name < b.name end)
+  local ctx_status = nil
+  if self.context and type(self.context.list_slots) == "function" then
+    ctx_status = {
+      tree_hash = self.context:tree_hash(),
+      total_slots = #self.context:list_slots(),
+    }
+  end
 
   return {
     total_agents = total,
@@ -342,6 +400,7 @@ function WheelTeam:status()
     agents = agent_summaries,
     handoff_count = #self.handoffs,
     handoffs = self.handoffs,
+    context = ctx_status,
   }
 end
 

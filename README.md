@@ -50,6 +50,8 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.              |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                    |
 | `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.               |
+| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration protocol, atomic task claims, and structured handoffs.                |
+| `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.    |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
 | `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.           |
 | `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
@@ -80,6 +82,15 @@ To prevent arbitrary code execution when cloning untrusted repositories, project
 - Users explicitly inspect and approve configurations using `bitty-terminal.wheel:trust` or `WheelConfig.trust(path)`.
 - Content tampering invalidates the pinned 64-hex SHA-256 cryptographic content hash immediately, requiring re-approval.
 
+### Shared Context Memory & Prefix-Cache Optimization
+
+Wheel coordinates peer colleague agents through content-addressed shared state:
+
+- **Semantic Slots & CAS**: Structured slots (`workspace/*`, `tasks/<id>/*`, `decisions/*`, `scratch/*`) with optimistic Compare-And-Swap (`expected_version`) concurrency control and Merkle tree root hashing (`tree:v1\0`).
+- **Semantic 3-Way Merge**: Non-conflicting additions or edits merge automatically; concurrent edits surface structured conflict records for explicit resolution.
+- **Context Event Bus**: Real-time in-memory pubsub (`ContextBus`) notifying peer agents of slot modifications, checkpoint commits, and task handoffs without polling.
+- **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)** shared across agents of the same model family for maximum KV cache reuse (>90%), coupled with a multi-tier budget reduction pipeline (Tier 1 scratchpad pruning, Tier 2 rationale compression, Tier 3 tail truncation).
+
 ## Commands
 
 Wheel provides the following commands via Bitty's command registry:
@@ -91,6 +102,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:run`: Execute ready tasks in the DAG using WheelAgent (Worker role).
 - `bitty-terminal.wheel:trust`: Inspect and approve project configuration (`.wheel/init.lua`) with hash pinning.
 - `bitty-terminal.wheel:team`: Display multi-agent peer colleague roster, roles, models, and live states.
+- `bitty-terminal.wheel:context`: Inspect active semantic slots, Merkle root hash, and prefix-cache status.
 
 ## Development
 
