@@ -401,6 +401,9 @@ function WheelTeam:status()
     ctx_status = {
       tree_hash = self.context:tree_hash(),
       total_slots = #self.context:list_slots(),
+      current_branch = self.context.current_branch and self.context:current_branch() or nil,
+      head_commit = self.context.head_commit_hash and self.context:head_commit_hash() or nil,
+      branches_count = self.context.list_branches and #self.context:list_branches() or nil,
     }
   end
 
@@ -414,6 +417,41 @@ function WheelTeam:status()
     context = ctx_status,
     total_tools = self.tool_registry and #self.tool_registry:list_tools() or 0,
   }
+end
+
+--- Create and checkout an isolated context branch for a specific task.
+--- @param task_id string Task ID
+--- @return boolean, table?
+function WheelTeam:branch_for_task(task_id)
+  if not self.context or type(self.context.create_branch) ~= "function" then
+    return false, { error = "no_context", message = "No context engine configured" }
+  end
+  local branch_name = "task/" .. task_id
+  local ok, err = self.context:create_branch(branch_name)
+  if ok or (err and err.error == "branch_exists") then
+    return self.context:checkout(branch_name)
+  end
+  return false, err
+end
+
+--- Merge a task's isolated context branch back into the main branch.
+--- @param task_id string Task ID
+--- @param reviewer_agent table? Reviewer agent performing merge
+--- @return table? merge result
+function WheelTeam:merge_task_branch(task_id, reviewer_agent)
+  if not self.context or type(self.context.merge_branch) ~= "function" then
+    return nil, { error = "no_context", message = "No context engine configured" }
+  end
+  local branch_name = "task/" .. task_id
+  self.context:checkout("main")
+  return self.context:merge_branch(branch_name, {
+    author = reviewer_agent and reviewer_agent.name or "wheel:reviewer",
+    rationale = {
+      goal = "Integrate task " .. task_id .. " deliverables",
+      approach = "Semantic 3-way branch merge into main",
+      confidence = 1.0,
+    },
+  })
 end
 
 --- Run the autonomous multi-agent wave orchestration and execution loop.
@@ -541,6 +579,10 @@ function WheelTeam:run_orchestration_loop(opts)
       local task_id = item.task_id
 
       if worker then
+        if opts.use_task_branches then
+          self:branch_for_task(task_id)
+        end
+
         -- Resolve worker step function or runner options
         local step_fn = opts.step_fn
         if opts.use_runner then
@@ -638,6 +680,9 @@ function WheelTeam:run_orchestration_loop(opts)
               end
 
               if review_res.approved then
+                if opts.use_task_branches then
+                  self:merge_task_branch(task_id, reviewer)
+                end
                 self:release_task(reviewer.name, task_id, {
                   status = "succeeded",
                   checkpoint_hash = review_res.checkpoint or last_cp,
@@ -660,6 +705,9 @@ function WheelTeam:run_orchestration_loop(opts)
               error = "independent reviewer unavailable",
             })
           else
+            if opts.use_task_branches then
+              self:merge_task_branch(task_id, worker)
+            end
             self:release_task(worker.name, task_id, {
               status = "succeeded",
               checkpoint_hash = last_cp,

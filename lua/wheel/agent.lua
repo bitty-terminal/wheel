@@ -528,10 +528,23 @@ function WheelAgent:execute_task(task_id, step_fn)
 
     -- Process cognitive checkpoint rationale
     if step_result.rationale then
-      local cp = self.kernel:commit_checkpoint(step_result.rationale)
-      if cp and cp.hash then
-        last_checkpoint_hash = cp.hash
-        table.insert(checkpoints, cp.hash)
+      if self.context and type(self.context.commit_checkpoint) == "function" then
+        local ctx_cp = self.context:commit_checkpoint({
+          author = self.name,
+          task_id = task_id,
+          rationale = step_result.rationale,
+        })
+        if ctx_cp and ctx_cp.hash then
+          last_checkpoint_hash = ctx_cp.hash
+          table.insert(checkpoints, ctx_cp.hash)
+        end
+      end
+      if self.kernel and type(self.kernel.commit_checkpoint) == "function" then
+        local cp = self.kernel:commit_checkpoint(step_result.rationale)
+        if cp and cp.hash then
+          last_checkpoint_hash = cp.hash
+          table.insert(checkpoints, cp.hash)
+        end
       end
     end
 
@@ -638,6 +651,55 @@ function WheelAgent:review_task(task_id, review_fn)
   }
 end
 
+--- Commit an immutable checkpoint commit to the agent's context.
+--- @param rationale string|table Rationale behind the checkpoint
+--- @param message string? Optional human-readable commit message
+--- @return table|nil ContextCommit
+function WheelAgent:commit_checkpoint(rationale, message)
+  if self.context and type(self.context.commit_checkpoint) == "function" then
+    return self.context:commit_checkpoint({
+      author = self.name,
+      task_id = self.active_task_id,
+      rationale = rationale,
+      message = message,
+    })
+  elseif self.kernel and type(self.kernel.commit_checkpoint) == "function" then
+    return self.kernel:commit_checkpoint(rationale)
+  end
+  return nil
+end
+
+--- Create a new isolated context branch for this agent.
+--- @param name string Branch name
+--- @param start_point string? Optional commit hash or ref
+--- @return boolean, table?
+function WheelAgent:create_branch(name, start_point)
+  if not self.context or type(self.context.create_branch) ~= "function" then
+    error("Agent " .. self.name .. " has no context engine configured")
+  end
+  return self.context:create_branch(name, start_point)
+end
+
+--- Checkout an isolated context branch or commit for this agent.
+--- @param target string Branch name or commit hash
+--- @param opts table? Options
+--- @return boolean, table?
+function WheelAgent:checkout(target, opts)
+  if not self.context or type(self.context.checkout) ~= "function" then
+    error("Agent " .. self.name .. " has no context engine configured")
+  end
+  return self.context:checkout(target, opts)
+end
+
+--- Get the current active context branch name.
+--- @return string
+function WheelAgent:current_branch()
+  if self.context and type(self.context.current_branch) == "function" then
+    return self.context:current_branch()
+  end
+  return "(detached)"
+end
+
 --- Get current agent status summary including headless panel container telemetry and model profile.
 --- @return table
 function WheelAgent:status()
@@ -656,6 +718,8 @@ function WheelAgent:status()
     cache_share_ratio = self.last_cache_share_ratio,
     tool_count = self.tool_registry and #self.tool_registry:list_tools() or #self.tools,
     provider = self.provider and (self.provider.describe and self.provider:describe() or { provider = self.provider.name }) or nil,
+    context_branch = self:current_branch(),
+    context_head = self.context and type(self.context.head_commit_hash) == "function" and self.context:head_commit_hash() or nil,
   }
 end
 

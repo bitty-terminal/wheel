@@ -128,6 +128,18 @@ Wheel integrates heterogeneous large language models and autonomous ReAct execut
 - **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
 - **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
 
+### Git-Inspired Context Versioning Engine
+
+Wheel models agent context as an immutable, content-addressed versioned DAG inspired by Git principles:
+
+- **Checkpoints as Commits**: Checkpoints bind a Merkle context tree snapshot, parent commit hashes, author, task ID, structured 6-field `Rationale`, and timestamp into a deterministic 64-hex SHA-256 commit hash (`commit:v1\0`).
+- **Branching & Checkout**: Cheap context branching (`refs/heads/*`) for isolated hypothesis exploration. Checking out a branch or detached commit automatically restores working slots to that historical snapshot without transcript loss.
+- **Reflog Recovery Journal**: Every `HEAD` movement (commit, branch, checkout, reset, merge) appends an immutable entry to `refs/reflog`, ensuring catastrophic rollback recovery and full auditability.
+- **Context Stash**: In-progress uncommitted working slot modifications can be suspended (`stash_push`) before switching context and cleanly restored (`stash_pop`, `stash_drop`).
+- **3-Way Semantic Merge & Fast-Forward**: Merges branches semantically by computing the lowest common ancestor (LCA) in the commit DAG; non-conflicting slot deltas merge automatically, while conflicting slots are preserved with structured diagnostics in `decisions/conflicts/*`.
+- **Cherry-Pick**: Imports specific findings, artifacts, or decisions from foreign branches (`cherry_pick`) without pulling along entire branch histories or transcripts ("parents absorb conclusions, never transcripts").
+- **Task-Isolated Workflows**: Multi-agent wave orchestration supports running worker tasks in dedicated task branches (`task/<id>`), merging deliverables into `main` upon reviewer acceptance.
+
 ## Commands
 
 Wheel provides the following commands via Bitty's command registry:
@@ -143,6 +155,9 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:tools`: List registered Wheel agent tools, intent categories, and schema descriptions.
 - `bitty-terminal.wheel:orchestrate`: Run autonomous multi-agent wave orchestration loop over Task DAG.
 - `bitty-terminal.wheel:models`: Display configured model profiles, providers, and capabilities.
+- `bitty-terminal.wheel:branch`: List context branches or display active branch and HEAD commit.
+- `bitty-terminal.wheel:checkpoint`: Display recent context checkpoints (commit ancestry log).
+- `bitty-terminal.wheel:reflog`: Display recent context reflog transitions and audit journal.
 
 ## Development
 

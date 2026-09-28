@@ -2774,6 +2774,449 @@ run_test("WheelRunner & WheelAgent: protected dispatch, task finalization, and c
   _G._models_cmd = nil
 end)
 
+-- ===========================================================================
+-- 18. Phase 7: Git-Model Context Versioning, Branches, Checkpoints, Reflog & Stash
+-- ===========================================================================
+
+run_test("WheelContext: Git-model context checkpoint commits and deterministic Merkle hashing", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  -- Initial state: HEAD points to main, no commits yet
+  assert(ctx:current_branch() == "main")
+  assert(ctx:head_commit_hash() == nil)
+  assert(#ctx:log() == 0)
+
+  -- Add initial slots
+  local p1 = ctx:put_slot("workspace/project", "Wheel Harness v0.1")
+  assert(p1.success)
+  local tree1 = ctx:tree_hash()
+  assert(type(tree1) == "string" and #tree1 == 64)
+
+  -- Commit root checkpoint
+  local c1 = ctx:commit_checkpoint({
+    author = "commander-01",
+    task_id = "TASK-01",
+    rationale = {
+      goal = "Initialize project context",
+      approach = "Set baseline project metadata",
+      alternatives = "None",
+      tradeoffs = "None",
+      assumptions = "Pure Lua 5.1 environment",
+      confidence = 1.0,
+    },
+    message = "Initial project context commit",
+  })
+  assert(type(c1.hash) == "string" and #c1.hash == 64)
+  assert(c1.tree_hash == tree1)
+  assert(#c1.parent_hashes == 0)
+  assert(ctx:head_commit_hash() == c1.hash)
+  assert(ctx:get_commit(c1.hash) ~= nil)
+
+  -- Second commit with parent chaining
+  ctx:put_slot("decisions/runtime", "Use Git-model context DAG")
+  local tree2 = ctx:tree_hash()
+  assert(tree2 ~= tree1)
+
+  local c2 = ctx:commit_checkpoint({
+    author = "worker-coding-01",
+    task_id = "TASK-02",
+    rationale = "Adopt Git-inspired context branching",
+  })
+  assert(c2.hash ~= c1.hash)
+  assert(#c2.parent_hashes == 1)
+  assert(c2.parent_hashes[1] == c1.hash)
+  assert(ctx:head_commit_hash() == c2.hash)
+
+  -- Log verification
+  local history = ctx:log(10)
+  assert(#history == 2)
+  assert(history[1].hash == c2.hash)
+  assert(history[2].hash == c1.hash)
+
+  -- ContextBus event publication check
+  local bus_history = ctx.bus:history()
+  local found_event = false
+  for _, ev in ipairs(bus_history) do
+    if ev.type == "checkpoint_committed" and ev.commit.hash == c2.hash then
+      found_event = true
+      break
+    end
+  end
+  assert(found_event, "checkpoint_committed event must be published on ContextBus")
+end)
+
+run_test("WheelContext: Branch creation, listing, validation, and deletion guards", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  ctx:put_slot("workspace/spec", "Architecture spec")
+  local c1 = ctx:commit_checkpoint({ message = "Baseline" })
+
+  -- Branch validation
+  local ok_bad1, err1 = ctx:create_branch("bad..branch")
+  assert(not ok_bad1 and err1.error == "invalid_branch_name")
+  local ok_bad2, err2 = ctx:create_branch("/leading/slash")
+  assert(not ok_bad2 and err2.error == "invalid_branch_name")
+
+  -- Create branch feat/experiment
+  local ok_br, err_br = ctx:create_branch("feat/experiment")
+  assert(ok_br == true and err_br == nil)
+  assert(ctx:current_branch() == "main") -- Still on main until checkout
+
+  -- Branch exists check
+  local ok_dup, err_dup = ctx:create_branch("feat/experiment")
+  assert(not ok_dup and err_dup.error == "branch_exists")
+
+  -- List branches
+  local branches = ctx:list_branches()
+  assert(#branches == 2)
+  local names = {}
+  for _, b in ipairs(branches) do
+    names[b.name] = b
+  end
+  assert(names["main"] and names["main"].is_head == true)
+  assert(names["feat/experiment"] and names["feat/experiment"].is_head == false)
+  assert(names["feat/experiment"].hash == c1.hash)
+
+  -- Deletion guards: cannot delete active branch
+  local ok_del1, err_del1 = ctx:delete_branch("main")
+  assert(not ok_del1 and err_del1.error == "cannot_delete_active_branch")
+
+  -- Delete non-active branch
+  local ok_del2 = ctx:delete_branch("feat/experiment")
+  assert(ok_del2 == true)
+  assert(#ctx:list_branches() == 1)
+end)
+
+run_test("WheelContext: Checkout branch, detached HEAD, and slot tree restoration", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  -- 1. Main branch commit
+  ctx:put_slot("workspace/config", "version: 1.0")
+  local c1 = ctx:commit_checkpoint({ message = "Main v1.0" })
+
+  -- 2. Create and checkout experiment branch
+  local ok_co = ctx:checkout("experiment", { create_branch = true })
+  assert(ok_co == true)
+  assert(ctx:current_branch() == "experiment")
+
+  -- Modify and commit on experiment
+  ctx:put_slot("workspace/config", "version: 2.0-experimental")
+  ctx:put_slot("scratch/hypothesis", "Speculative caching")
+  local c2 = ctx:commit_checkpoint({ message = "Experiment v2.0" })
+
+  -- 3. Switch back to main -> verify slots restore cleanly to v1.0
+  ctx:checkout("main")
+  assert(ctx:current_branch() == "main")
+  local main_slot = ctx:get_slot("workspace/config")
+  assert(main_slot.content == "version: 1.0", "slots must be restored to main snapshot")
+  local hyp_slot = ctx:get_slot("scratch/hypothesis")
+  assert(not hyp_slot.found, "scratch slot from experiment branch must not leak to main")
+
+  -- 4. Switch back to experiment -> verify slots restore to v2.0
+  ctx:checkout("experiment")
+  assert(ctx:current_branch() == "experiment")
+  local exp_slot = ctx:get_slot("workspace/config")
+  assert(exp_slot.content == "version: 2.0-experimental")
+  local exp_hyp = ctx:get_slot("scratch/hypothesis")
+  assert(exp_hyp.found and exp_hyp.content == "Speculative caching")
+
+  -- 5. Detached HEAD checkout by commit hash
+  local ok_det = ctx:checkout(c1.hash)
+  assert(ok_det == true)
+  assert(ctx:current_branch() == "(detached)")
+  assert(ctx:head_commit_hash() == c1.hash)
+  assert(ctx:get_slot("workspace/config").content == "version: 1.0")
+end)
+
+run_test("WheelContext: Reflog audit journal and reset (soft vs hard)", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  ctx:put_slot("workspace/target", "initial")
+  local c1 = ctx:commit_checkpoint({ message = "Commit 1" })
+
+  ctx:put_slot("workspace/target", "updated")
+  local c2 = ctx:commit_checkpoint({ message = "Commit 2" })
+
+  local logs = ctx:reflog(10)
+  assert(#logs >= 2)
+  assert(logs[1].action == "commit")
+  assert(logs[1].to_hash == c2.hash)
+
+  -- Soft reset: HEAD moves to c1, but working slots stay as is
+  ctx:put_slot("workspace/target", "dirty modification")
+  ctx:reset(c1.hash, "soft")
+  assert(ctx:head_commit_hash() == c1.hash)
+  assert(ctx:get_slot("workspace/target").content == "dirty modification")
+
+  -- Hard reset: HEAD moves to c1, and working slots revert to c1
+  ctx:reset(c1.hash, "hard")
+  assert(ctx:head_commit_hash() == c1.hash)
+  assert(ctx:get_slot("workspace/target").content == "initial")
+
+  local reset_logs = ctx:reflog(5)
+  assert(reset_logs[1].action == "reset")
+end)
+
+run_test("WheelContext: Stash push, list, pop, and drop", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  ctx:put_slot("workspace/file", "committed content")
+  ctx:commit_checkpoint({ message = "Initial commit" })
+
+  -- Make uncommitted changes
+  ctx:put_slot("scratch/temp_data", "volatile WIP")
+  ctx:put_slot("workspace/file", "uncommitted edit")
+
+  -- Stash push
+  local st = ctx:stash_push("WIP before branch switch")
+  assert(st.id == "stash@{0}")
+  assert(#ctx:stash_list() == 1)
+
+  -- Working slots reverted to HEAD commit
+  assert(ctx:get_slot("workspace/file").content == "committed content")
+  assert(not ctx:get_slot("scratch/temp_data").found)
+
+  -- Stash pop restores modifications
+  local popped = ctx:stash_pop(1)
+  assert(popped ~= nil)
+  assert(#ctx:stash_list() == 0)
+  assert(ctx:get_slot("workspace/file").content == "uncommitted edit")
+  assert(ctx:get_slot("scratch/temp_data").content == "volatile WIP")
+
+  -- Stash drop test
+  ctx:stash_push("To be dropped")
+  assert(#ctx:stash_list() == 1)
+  local dropped = ctx:stash_drop(1)
+  assert(dropped ~= nil)
+  assert(#ctx:stash_list() == 0)
+end)
+
+run_test("WheelContext: DAG LCA, 3-way semantic branch merge, fast-forward, and conflicts", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  -- Base commit C0
+  ctx:put_slot("shared/config", "base_cfg")
+  ctx:put_slot("main/data", "main_v0")
+  local c0 = ctx:commit_checkpoint({ message = "C0: Base" })
+
+  -- 1. Fast-forward merge test
+  ctx:create_branch("feat-ff")
+  ctx:checkout("feat-ff")
+  ctx:put_slot("feat/extra", "ff_data")
+  local c_ff = ctx:commit_checkpoint({ message = "C_FF: Add extra" })
+
+  ctx:checkout("main")
+  local ff_res = ctx:merge_branch("feat-ff")
+  assert(ff_res.success == true)
+  assert(ff_res.fast_forward == true)
+  assert(ctx:head_commit_hash() == c_ff.hash)
+  assert(ctx:get_slot("feat/extra").content == "ff_data")
+
+  -- 2. Clean 3-way merge test
+  -- Branch side-a and side-b from current tip
+  ctx:create_branch("side-a")
+  ctx:create_branch("side-b")
+
+  ctx:checkout("side-a")
+  ctx:put_slot("features/alpha", "feature alpha implemented")
+  local c_a = ctx:commit_checkpoint({ message = "Implement alpha" })
+
+  ctx:checkout("side-b")
+  ctx:put_slot("features/beta", "feature beta implemented")
+  local c_b = ctx:commit_checkpoint({ message = "Implement beta" })
+
+  -- Verify LCA
+  local lca = ctx:find_common_ancestor(c_a.hash, c_b.hash)
+  assert(lca == c_ff.hash, "LCA must be the branch point")
+
+  -- Merge side-b into side-a
+  ctx:checkout("side-a")
+  local merge_res = ctx:merge_branch("side-b")
+  assert(merge_res.success == true)
+  assert(merge_res.fast_forward == false)
+  assert(merge_res.commit ~= nil)
+  assert(#merge_res.commit.parent_hashes == 2)
+  assert(merge_res.commit.parent_hashes[1] == c_a.hash)
+  assert(merge_res.commit.parent_hashes[2] == c_b.hash)
+
+  -- Merged tree contains both alpha and beta without conflict
+  assert(ctx:get_slot("features/alpha").content == "feature alpha implemented")
+  assert(ctx:get_slot("features/beta").content == "feature beta implemented")
+
+  -- 3. Conflicting merge test
+  ctx:create_branch("conflict-1")
+  ctx:create_branch("conflict-2")
+
+  ctx:checkout("conflict-1")
+  ctx:put_slot("shared/decision", "Use Engine A")
+  ctx:commit_checkpoint({ message = "Decision A" })
+
+  ctx:checkout("conflict-2")
+  ctx:put_slot("shared/decision", "Use Engine B")
+  ctx:commit_checkpoint({ message = "Decision B" })
+
+  ctx:checkout("conflict-1")
+  local conf_res, conf_err = ctx:merge_branch("conflict-2")
+  assert(conf_res == nil, "conflicting merge must fail closed")
+  assert(conf_err.error == "merge_conflict")
+  assert(#conf_err.conflicts == 1)
+
+  -- Conflict diagnostics written to decisions/conflicts/*
+  local diag_slot = ctx:get_slot("decisions/conflicts/shared/decision")
+  assert(diag_slot.found == true)
+  assert(string.find(diag_slot.content, "CONFLICT on shared/decision", 1, true) ~= nil)
+end)
+
+run_test("WheelContext: Cherry-pick and diff report", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+
+  ctx:put_slot("workspace/spec", "spec v1")
+  local c0 = ctx:commit_checkpoint({ message = "Base spec" })
+
+  ctx:create_branch("sub-investigation")
+  ctx:checkout("sub-investigation")
+  ctx:put_slot("decisions/audit", "Audited: Pure Lua 5.1 passed")
+  ctx:put_slot("scratch/junk", "temporary noise")
+  local c_inv = ctx:commit_checkpoint({ message = "Investigation deliverable" })
+
+  -- Diff check between commits
+  local d = ctx:diff(c0.hash, c_inv.hash)
+  assert(d.added["decisions/audit"] ~= nil)
+  assert(d.added["scratch/junk"] ~= nil)
+  assert(d.count == 2)
+
+  -- Switch back to main (which doesn't have the sub-investigation)
+  ctx:checkout("main")
+  assert(not ctx:get_slot("decisions/audit").found)
+
+  -- Cherry-pick the investigation commit into main
+  local cp = ctx:cherry_pick(c_inv.hash)
+  assert(cp ~= nil)
+  assert(ctx:get_slot("decisions/audit").content == "Audited: Pure Lua 5.1 passed")
+  assert(string.find(cp.message, "[cherry-pick]", 1, true) ~= nil)
+end)
+
+run_test("WheelAgent & WheelTeam: Branching, task-isolated context branches, and reviewer merge in orchestration loop", function()
+  local WheelKernel = require("wheel.kernel")
+  local WheelAgent = require("wheel.agent")
+  local WheelTeam = require("wheel.team")
+
+  local kernel = WheelKernel.new_mock()
+  local team = WheelTeam.new({ kernel = kernel })
+  local ctx = team.context
+
+  -- Agent branch methods
+  local worker = team:spawn_agent({ name = "agent-alpha", role = WheelAgent.Role.CODING })
+  worker:commit_checkpoint("Initial worker checkpoint")
+  assert(worker:current_branch() == "main")
+  local ok_b = worker:create_branch("alpha-exp")
+  assert(ok_b == true)
+  worker:checkout("alpha-exp")
+  assert(worker:current_branch() == "alpha-exp")
+  local st = worker:status()
+  assert(st.context_branch == "alpha-exp")
+  assert(st.context_head ~= nil)
+
+  worker:checkout("main")
+  assert(worker:current_branch() == "main")
+
+  -- Team task branching
+  local ok_tb = team:branch_for_task("TASK-99")
+  assert(ok_tb == true)
+  assert(ctx:current_branch() == "task/TASK-99")
+  ctx:put_slot("tasks/TASK-99/artifacts", "Task 99 deliverables")
+  ctx:commit_checkpoint({ message = "Deliver TASK-99" })
+
+  -- Reviewer merges task branch into main
+  local rev_agent = team:spawn_agent({ name = "agent-rev", role = WheelAgent.Role.REVIEWER })
+  local m_res = team:merge_task_branch("TASK-99", rev_agent)
+  assert(m_res ~= nil and m_res.success == true)
+  assert(ctx:current_branch() == "main")
+  assert(ctx:get_slot("tasks/TASK-99/artifacts").content == "Task 99 deliverables")
+
+  -- Team status telemetry includes branches
+  local team_st = team:status()
+  assert(team_st.context ~= nil)
+  assert(team_st.context.current_branch == "main")
+  assert(team_st.context.branches_count >= 2)
+end)
+
+run_test("WheelTeam: run_orchestration_loop with use_task_branches enabled", function()
+  local WheelKernel = require("wheel.kernel")
+  local WheelAgent = require("wheel.agent")
+  local WheelTeam = require("wheel.team")
+
+  local kernel = WheelKernel.new_mock()
+  kernel:create_task({ id = "CTX-A", title = "Task A", priority = 10, dependencies = {} })
+  kernel:create_task({ id = "CTX-B", title = "Task B", priority = 5, dependencies = { "CTX-A" } })
+
+  local team = WheelTeam.new({ kernel = kernel })
+  team:spawn_agent({ name = "branch-worker", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "branch-reviewer", role = WheelAgent.Role.REVIEWER })
+
+  local report = team:run_orchestration_loop({
+    use_task_branches = true,
+  })
+  assert(report.success == true, "wave orchestration with use_task_branches must succeed")
+  assert(#report.completed_tasks == 2)
+
+  -- After orchestration, all task branches were merged back to main
+  local ctx = team.context
+  assert(ctx:current_branch() == "main")
+  assert(ctx:get_slot("tasks/CTX-A/artifacts").found == true)
+  assert(ctx:get_slot("tasks/CTX-B/artifacts").found == true)
+end)
+
+run_test("Wheel: Plugin commands branch, checkpoint, reflog registration and execution", function()
+  package.loaded["wheel.init"] = nil
+  package.loaded["lua.wheel.init"] = nil
+
+  local commands = {}
+  local notifications = {}
+
+  _G.bitty = {
+    commands = {
+      register = function(def)
+        commands[def.id] = def
+        return 1
+      end,
+    },
+    notify = {
+      show = function(n)
+        table.insert(notifications, n)
+        return true
+      end,
+    },
+  }
+
+  local wheel = require("wheel.init")
+  assert(commands["branch"] ~= nil, "branch command must be registered")
+  assert(commands["checkpoint"] ~= nil, "checkpoint command must be registered")
+  assert(commands["reflog"] ~= nil, "reflog command must be registered")
+
+  -- Execute branch command
+  commands["branch"].run()
+  assert(#notifications > 0)
+  assert(string.find(notifications[#notifications].title, "Branch", 1, true) ~= nil)
+
+  -- Execute checkpoint command
+  commands["checkpoint"].run()
+  assert(string.find(notifications[#notifications].title, "Checkpoint", 1, true) ~= nil)
+
+  -- Execute reflog command
+  commands["reflog"].run()
+  assert(string.find(notifications[#notifications].title, "Reflog", 1, true) ~= nil)
+
+  _G.bitty = nil
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
