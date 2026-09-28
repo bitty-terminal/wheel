@@ -713,6 +713,9 @@ end
 --- @return table
 function WheelKernel:start_task(id, worker_id, now_ms)
   local worker = worker_id or "worker"
+  if type(worker) == "table" then
+    worker = worker.worker_id or worker.assigned_agent or "worker"
+  end
   return self:call("task.start", {
     id = id,
     worker_id = worker,

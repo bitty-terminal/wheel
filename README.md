@@ -50,7 +50,7 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.              |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                    |
 | `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.               |
-| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration protocol, atomic task claims, and structured handoffs.                |
+| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.          |
 | `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.    |
 | `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.          |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
@@ -103,6 +103,16 @@ Wheel executes software engineering tools under strict safety and context-budget
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
 - **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (atomic with directory creation), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
 
+### Autonomous Wave Orchestration & Task Execution Loop
+
+Wheel provides an autonomous execution engine (`WheelTeam:run_orchestration_loop`) executing complex Task DAGs across topological execution waves:
+
+- **Topological Wave Decomposition**: Uses dynamic programming (`WheelUI.calculate_waves`) to schedule independent ready tasks in parallel waves.
+- **Worker Execution & Artifact Publishing**: Peer workers claim ready tasks, execute steps, and publish structured deliverables to semantic slots (`tasks/<id>/artifacts`).
+- **Worker-to-Reviewer Verification Handoff**: Completed deliverables automatically hand off to an independent Reviewer peer colleague (`tasks/<id>/handoff`), triggering an acceptance review (`tasks/<id>/review`) and verification checkpoint prior to task release.
+- **Cascading Readiness & Block Detection**: Succeeded tasks automatically promote downstream dependents to `Ready`. Any failed task or reviewer rejection cascades downstream tasks to `Blocked`, terminating the loop cleanly with deadlock diagnostics.
+- **Fail-Closed Execution Telemetry**: Returns structured execution reports (`completed_tasks`, `failed_tasks`, `waves_executed`, `total_handoffs`, `total_checkpoints`, `duration_ms`) and persists summaries to `workspace/orchestration/last_run`.
+
 ## Commands
 
 Wheel provides the following commands via Bitty's command registry:
@@ -116,6 +126,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:team`: Display multi-agent peer colleague roster, roles, models, and live states.
 - `bitty-terminal.wheel:context`: Inspect active semantic slots, Merkle root hash, and prefix-cache status.
 - `bitty-terminal.wheel:tools`: List registered Wheel agent tools, intent categories, and schema descriptions.
+- `bitty-terminal.wheel:orchestrate`: Run autonomous multi-agent wave orchestration loop over Task DAG.
 
 ## Development
 

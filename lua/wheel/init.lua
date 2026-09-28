@@ -288,6 +288,48 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       })
     end,
   })
+
+  -- 10. orchestrate
+  bitty.commands.register({
+    id = "orchestrate",
+    title = "Wheel: orchestrate",
+    description = "Run autonomous multi-agent wave orchestration loop over Task DAG.",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local has_worker = false
+      local has_reviewer = false
+      for _, a in ipairs(M._team:list_agents()) do
+        if a.role == WheelAgent.Role.CODING then
+          has_worker = true
+        elseif a.role == WheelAgent.Role.REVIEWER then
+          has_reviewer = true
+        end
+      end
+      if not has_worker then
+        M._team:spawn_agent({ name = "worker-coding-01", role = WheelAgent.Role.CODING })
+      end
+      if not has_reviewer then
+        M._team:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
+      end
+
+      local report = M._team:run_orchestration_loop()
+      local msg
+      if report.success then
+        msg = string.format("Orchestration completed successfully in %d wave(s)!\nTasks completed: %d\nHandoffs: %d\nCheckpoints: %d\nDuration: %d ms",
+          report.waves_executed, #report.completed_tasks, report.total_handoffs, report.total_checkpoints, report.duration_ms)
+      else
+        msg = string.format("Orchestration halted: %s\nCompleted: %d | Failed: %d\nWaves: %d",
+          report.blocked_reason or "unknown blockage", #report.completed_tasks, #report.failed_tasks, report.waves_executed)
+      end
+
+      bitty.notify.show({
+        title = "Wheel Orchestration",
+        body = msg,
+      })
+    end,
+  })
 end
 
 return M

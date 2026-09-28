@@ -1844,6 +1844,211 @@ run_test("WheelAgent: execute_tool, call_tools, and Action Recording", function(
   os.execute("rm -rf " .. root)
 end)
 
+-- ===========================================================================
+-- 16. Multi-Agent Wave Orchestration Loop & Task Execution Pipeline
+-- ===========================================================================
+
+run_test("WheelTeam: run_orchestration_loop full diamond DAG wave orchestration", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  -- Setup team of peer colleagues
+  local cmd = team:spawn_agent({ name = "commander-01", role = WheelAgent.Role.COMMANDER })
+  local coder1 = team:spawn_agent({ name = "worker-01", role = WheelAgent.Role.CODING })
+  local coder2 = team:spawn_agent({ name = "worker-02", role = WheelAgent.Role.CODING })
+  local reviewer = team:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
+
+  -- Commander decomposes 4-task Diamond DAG
+  -- T1 -> T2, T3 -> T4
+  cmd:decompose_plan({
+    { id = "T-SETUP", title = "Setup architecture and types", priority = 10 },
+    { id = "T-MOD-A", title = "Implement subsystem Alpha", priority = 8, dependencies = { "T-SETUP" } },
+    { id = "T-MOD-B", title = "Implement subsystem Beta", priority = 8, dependencies = { "T-SETUP" } },
+    { id = "T-INTEG", title = "Integration and release", priority = 5, dependencies = { "T-MOD-A", "T-MOD-B" } },
+  })
+
+  local waves_started = {}
+  local completed_events = {}
+
+  local report = team:run_orchestration_loop({
+    max_waves = 10,
+    auto_reviewer = true,
+    on_wave_start = function(wave_num, ready_count)
+      table.insert(waves_started, { wave = wave_num, ready = ready_count })
+    end,
+    on_task_complete = function(task_id, outcome)
+      table.insert(completed_events, task_id)
+    end,
+  })
+
+  -- Verify orchestration report
+  assert(report.success == true, "orchestration loop must succeed: " .. tostring(report.blocked_reason))
+  assert(#report.completed_tasks == 4, "all 4 tasks completed")
+  assert(#report.failed_tasks == 0, "zero failed tasks")
+  assert(report.waves_executed >= 3, "must execute at least 3 topological waves (depth of diamond DAG)")
+  assert(report.waves_calculated == 3, "calculated wave depth of diamond DAG must be 3")
+  assert(report.total_handoffs == 4, "4 worker-to-reviewer verification handoffs must occur")
+  assert(report.total_checkpoints >= 4, "checkpoints committed during worker completion and reviewer acceptance")
+  assert(report.duration_ms >= 0, "duration reported")
+
+  -- Verify all task statuses in kernel are succeeded
+  local all_tasks = kernel:list_tasks()
+  for _, t in ipairs(all_tasks) do
+    local st = string.lower(t.status or "")
+    assert(st == "succeeded", "task " .. t.id .. " must have succeeded status in kernel")
+  end
+
+  -- Verify context slots
+  assert(team.context ~= nil)
+  for _, tid in ipairs({ "T-SETUP", "T-MOD-A", "T-MOD-B", "T-INTEG" }) do
+    local art_slot = team.context:get_slot("tasks/" .. tid .. "/artifacts")
+    assert(art_slot.found == true, "artifacts slot for " .. tid .. " must exist")
+    assert(#art_slot.content > 0, "artifacts slot for " .. tid .. " must not be empty")
+
+    local ho_slot = team.context:get_slot("tasks/" .. tid .. "/handoff")
+    assert(ho_slot.found == true, "handoff slot for " .. tid .. " must exist")
+    assert(string.find(ho_slot.content, "to: reviewer-01", 1, true) ~= nil)
+
+    local rev_slot = team.context:get_slot("tasks/" .. tid .. "/review")
+    assert(rev_slot.found == true, "review slot for " .. tid .. " must exist")
+    assert(string.find(rev_slot.content, "approved: true", 1, true) ~= nil)
+  end
+
+  local last_run_slot = team.context:get_slot("workspace/orchestration/last_run")
+  assert(last_run_slot.found == true, "workspace last_run summary recorded")
+  assert(string.find(last_run_slot.content, "success: true", 1, true) ~= nil)
+
+  -- Verify all colleagues returned to idle state
+  for _, a in ipairs(team:list_agents()) do
+    assert(a.state == "idle", "agent " .. a.name .. " must return to idle state after loop")
+    assert(a.active_task_id == nil)
+  end
+end)
+
+run_test("WheelTeam: run_orchestration_loop failure blocking and deadlock handling", function()
+  -- 1. Worker failure blocks downstream tasks
+  local kernel1 = WheelKernel.new({ in_memory = true })
+  local team1 = WheelTeam.new({ kernel = kernel1 })
+  team1:spawn_agent({ name = "coder-01", role = WheelAgent.Role.CODING })
+  team1:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
+
+  kernel1:create_task({ id = "T-FAIL", title = "Failing task", priority = 10 })
+  kernel1:create_task({ id = "T-DEP", title = "Dependent on failure", dependencies = { "T-FAIL" } })
+
+  local report_fail = team1:run_orchestration_loop({
+    step_fn = function(agent, ctx, iter)
+      return {
+        error = "compiler syntax error on line 42",
+        done = false,
+      }
+    end,
+  })
+
+  assert(report_fail.success == false, "loop must fail when task fails")
+  assert(#report_fail.completed_tasks == 0)
+  assert(#report_fail.failed_tasks >= 1)
+  assert(report_fail.failed_tasks[1] == "T-FAIL")
+  assert(report_fail.blocked_reason ~= nil)
+  assert(string.find(report_fail.blocked_reason, "blocking downstream", 1, true) ~= nil)
+
+  -- Verify downstream task was cascaded to blocked
+  local dep_task = kernel1:get_task("T-DEP")
+  assert(string.lower(dep_task.status) == "blocked", "downstream task must be blocked by prerequisite failure")
+
+  -- 2. Reviewer rejection fails task and blocks downstream
+  local kernel2 = WheelKernel.new({ in_memory = true })
+  local team2 = WheelTeam.new({ kernel = kernel2 })
+  team2:spawn_agent({ name = "coder-01", role = WheelAgent.Role.CODING })
+  team2:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
+
+  kernel2:create_task({ id = "T-AUDIT", title = "Audit task" })
+  kernel2:create_task({ id = "T-NEXT", title = "Next task", dependencies = { "T-AUDIT" } })
+
+  local report_reject = team2:run_orchestration_loop({
+    review_fn = function(agent, task, history)
+      return false, "Security audit rejected: hardcoded credentials detected"
+    end,
+  })
+
+  assert(report_reject.success == false, "loop must report failure when reviewer rejects")
+  assert(#report_reject.failed_tasks >= 1)
+  assert(report_reject.failed_tasks[1] == "T-AUDIT")
+
+  -- 3. Empty DAG returns success immediately
+  local kernel3 = WheelKernel.new({ in_memory = true })
+  local team3 = WheelTeam.new({ kernel = kernel3 })
+  team3:spawn_agent({ name = "coder-01", role = WheelAgent.Role.CODING })
+
+  local report_empty = team3:run_orchestration_loop()
+  assert(report_empty.success == true)
+  assert(report_empty.waves_executed == 0)
+  assert(#report_empty.completed_tasks == 0)
+
+  -- 4. Fail closed when auto_reviewer is true but no reviewer colleague exists
+  local kernel4 = WheelKernel.new({ in_memory = true })
+  local team4 = WheelTeam.new({ kernel = kernel4 })
+  team4:spawn_agent({ name = "solo-coder", role = WheelAgent.Role.CODING })
+  kernel4:create_task({ id = "T-SOLO", title = "Solo task" })
+
+  local report_no_rev = team4:run_orchestration_loop({ auto_reviewer = true })
+  assert(report_no_rev.success == false)
+  assert(#report_no_rev.failed_tasks == 1)
+  assert(report_no_rev.failed_tasks[1] == "T-SOLO")
+
+  -- 5. auto_reviewer = false releases task directly as succeeded without reviewer
+  local kernel5 = WheelKernel.new({ in_memory = true })
+  local team5 = WheelTeam.new({ kernel = kernel5 })
+  team5:spawn_agent({ name = "solo-coder-2", role = WheelAgent.Role.CODING })
+  kernel5:create_task({ id = "T-DIRECT", title = "Direct release task" })
+
+  local report_direct = team5:run_orchestration_loop({ auto_reviewer = false })
+  assert(report_direct.success == true)
+  assert(#report_direct.completed_tasks == 1)
+  assert(report_direct.completed_tasks[1] == "T-DIRECT")
+end)
+
+run_test("Wheel: Plugin command orchestrate registration and execution", function()
+  -- Reset package cache to re-trigger command registration with mock bitty
+  package.loaded["wheel.init"] = nil
+  package.loaded["lua.wheel.init"] = nil
+
+  local notifications = {}
+  local registered_commands = {}
+
+  _G.bitty = {
+    commands = {
+      register = function(def)
+        registered_commands[def.id] = def
+        return 1
+      end,
+    },
+    notify = {
+      show = function(payload)
+        table.insert(notifications, payload)
+        return true
+      end,
+    },
+  }
+
+  local wheel = require("wheel.init")
+  assert(registered_commands["orchestrate"] ~= nil, "orchestrate command must be registered")
+  assert(registered_commands["orchestrate"].title == "Wheel: orchestrate")
+
+  -- Initialize a plan
+  registered_commands["plan"].run()
+  assert(#wheel.kernel:list_tasks() == 3)
+
+  -- Run orchestrate command
+  registered_commands["orchestrate"].run()
+  local last_notif = notifications[#notifications]
+  assert(last_notif ~= nil)
+  assert(last_notif.title == "Wheel Orchestration")
+  assert(string.find(last_notif.body, "completed successfully", 1, true) ~= nil)
+
+  -- Clean up global
+  _G.bitty = nil
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
