@@ -80,6 +80,13 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
     description = "Initialize or decompose a software engineering plan in the Task DAG.",
     run = function()
       local conf_res = WheelConfig.load({ project_root = "." })
+      if not conf_res.ok and conf_res.message then
+        bitty.notify.show({
+          title = "Wheel Config Notice",
+          body = conf_res.message,
+        })
+      end
+
       local commander = WheelAgent.new({
         name = "commander-01",
         role = WheelAgent.Role.COMMANDER,
@@ -122,6 +129,13 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       end
 
       local conf_res = WheelConfig.load({ project_root = "." })
+      if not conf_res.ok and conf_res.message then
+        bitty.notify.show({
+          title = "Wheel Config Notice",
+          body = conf_res.message,
+        })
+      end
+
       local worker = WheelAgent.new({
         name = "worker-coding-01",
         role = WheelAgent.Role.CODING,
@@ -173,11 +187,16 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       local content = file:read("*a")
       file:close()
 
+      local preview = content:sub(1, 120)
+      if #content > 120 then
+        preview = preview .. "..."
+      end
+
       local ok, err, hash = WheelConfig.trust(project_root, content)
       if ok then
         bitty.notify.show({
-          title = "Wheel Trust",
-          body = "Approved project configuration (.wheel/init.lua) with hash: " .. hash:sub(1, 16) .. "...",
+          title = "Wheel Trust Approved",
+          body = string.format("Approved %s (hash: %s):\n%s", proj_path, hash:sub(1, 16), preview),
         })
       else
         bitty.notify.show({

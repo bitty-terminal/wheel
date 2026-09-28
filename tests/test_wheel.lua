@@ -892,8 +892,16 @@ run_test("WheelAgent: headless panel working container invariants and telemetry"
   assert(st.headless == true)
   assert(st.panel_id == "headless:panel:worker-default-01")
 
-  -- Agent configured via loaded WheelConfig
-  local cfg = WheelConfig.load({ project_root = ".", trust_mode = "permissive" }).config
+  -- Agent configured via hermetic WheelConfig (isolated from host/repo environment)
+  local empty_tmp_dir = "/tmp/bitty/test_wheel_empty_cfg"
+  os.execute("rm -rf " .. empty_tmp_dir .. " && mkdir -p " .. empty_tmp_dir)
+  local cfg = WheelConfig.load({
+    project_root = empty_tmp_dir,
+    global_path = empty_tmp_dir .. "/nonexistent_global.lua",
+    trust_mode = "permissive",
+  }).config
+  os.execute("rm -rf " .. empty_tmp_dir)
+
   local agent_configured = WheelAgent.new({
     name = "worker-configured-01",
     role = WheelAgent.Role.DEBUG,

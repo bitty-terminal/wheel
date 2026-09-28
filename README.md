@@ -74,11 +74,11 @@ Wheel configuration is resolved across three hierarchical layers with fail-close
 
 ### Security Trust Gate (Direnv-Style)
 
-To prevent arbitrary code execution when cloning untrusted repositories, project configurations (`.wheel/init.lua`) are gated by a cryptographic trust store (`$XDG_DATA_HOME/wheel/trusted_projects.json`):
+To prevent arbitrary code execution when cloning untrusted repositories, project configurations (`.wheel/init.lua`) are gated by a security trust store (`$XDG_STATE_HOME/wheel/trusted_projects.json`):
 
 - An untrusted `.wheel/init.lua` fails closed (`ok = false, error = "untrusted_project_config"`) and falls back to safe Global and Default configurations.
 - Users explicitly inspect and approve configurations using `bitty-terminal.wheel:trust` or `WheelConfig.trust(path)`.
-- Content tampering invalidates the pinned SHA-256 hash immediately, requiring re-approval.
+- Content tampering invalidates the pinned 64-hex deterministic content hash immediately, requiring re-approval.
 
 ## Commands
 

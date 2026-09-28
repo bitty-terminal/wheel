@@ -312,12 +312,6 @@ end
 
 --- Safely evaluate a Lua configuration string in a sandboxed environment.
 local function eval_config_chunk(content, chunk_name)
-  local load_fn = loadstring or load
-  local chunk, err = load_fn(content, chunk_name)
-  if not chunk then
-    return false, "syntax error in " .. chunk_name .. ": " .. tostring(err)
-  end
-
   -- Sandbox environment restricting ambient authority
   local env = {
     ipairs = ipairs,
@@ -333,7 +327,21 @@ local function eval_config_chunk(content, chunk_name)
     select = select,
     unpack = unpack or table.unpack,
   }
-  setfenv(chunk, env)
+
+  local chunk, err
+  if setfenv then
+    local load_fn = loadstring or load
+    chunk, err = load_fn(content, chunk_name)
+    if chunk then
+      setfenv(chunk, env)
+    end
+  else
+    chunk, err = load(content, chunk_name, "t", env)
+  end
+
+  if not chunk then
+    return false, "syntax error in " .. chunk_name .. ": " .. tostring(err)
+  end
 
   local ok, res = pcall(chunk)
   if not ok then
