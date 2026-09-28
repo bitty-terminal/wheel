@@ -21,11 +21,20 @@ local READ_ONLY_TOOLS = {
   ["view_file"] = true,
   ["search_code"] = true,
   ["find_files"] = true,
+  ["list_directory"] = true,
+  ["inspect"] = true,
   ["git_diff"] = true,
   ["git_log"] = true,
   ["git_status"] = true,
-  ["inspect"] = true,
+  ["read_resource"] = true,
+  ["list_resources"] = true,
+  ["read_url_content"] = true,
+  ["search_web"] = true,
+  ["ask_question"] = true,
+  ["get_outline"] = true,
 }
+
+WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
 
 --- Create a new Agent instance.
 --- @param opts table
