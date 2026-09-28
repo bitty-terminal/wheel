@@ -448,6 +448,34 @@ run_test("Wheel: Wire format normalization and null task semantics", function()
     return true, "approved"
   end)
   assert(rev.approved == true)
+
+  -- 7. UI format_graph renders assigned worker
+  assert(graph_str:find("worker:%s+worker%-wire%-01") ~= nil, "should render assigned worker")
+
+  -- 8. UI format_graph falls back to error when failure_reason is empty string
+  local fallback_kernel = WheelKernel.new(function(cmd, payload)
+    if cmd == "kernel.status" then
+      return '{"success":true,"data":{"active_task":null,"task_count":1,"slot_count":0}}'
+    elseif cmd == "task.list" then
+      return '{"success":true,"data":[{"id":"ERR-1","title":"Fallback","status":"failed","failure_reason":"","error":"fallback error message"}]}'
+    end
+    return '{"success":false,"error":"unsupported"}'
+  end)
+  local fallback_graph = WheelUI.format_graph(fallback_kernel)
+  assert(fallback_graph:find("err:%s+fallback error message") ~= nil, "empty failure_reason should fall back to error")
+
+  -- 9. Agent execute_task rejects task already assigned to a different worker
+  exec_kernel:create_task({ id = "ASSIGN-1", title = "Assigned task", assigned_agent = "other-worker" })
+  local conflict_worker = WheelAgent.new({
+    name = "my-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = exec_kernel,
+  })
+  local ok_conflict, conflict_err = pcall(function()
+    conflict_worker:execute_task("ASSIGN-1", function() return { done = true } end)
+  end)
+  assert(not ok_conflict, "should reject task assigned to another worker")
+  assert(conflict_err:find("already assigned to other%-worker") ~= nil)
 end)
 
 print("\n==========================================")

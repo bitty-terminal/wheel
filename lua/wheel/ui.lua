@@ -159,10 +159,17 @@ function WheelUI.format_graph(kernel)
         if t.dependencies and #t.dependencies > 0 then
           table.insert(lines, string.format("      deps: %s", table.concat(t.dependencies, ", ")))
         end
+        local worker = t.assigned_agent or t.worker_id
+        if worker and worker ~= "" then
+          table.insert(lines, string.format("      worker: %s", worker))
+        end
         if t.checkpoint then
           table.insert(lines, string.format("      cp:   %s", t.checkpoint:sub(1, 16)))
         end
-        local err_msg = t.failure_reason or t.error
+        local err_msg = t.failure_reason
+        if not err_msg or err_msg == "" then
+          err_msg = t.error
+        end
         if err_msg and err_msg ~= "" then
           table.insert(lines, string.format("      err:  %s", err_msg))
         end

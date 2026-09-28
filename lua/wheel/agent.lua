@@ -115,6 +115,10 @@ function WheelAgent:execute_task(task_id, step_fn)
   if st_lower ~= "ready" then
     error("Task " .. task_id .. " is not Ready (current status: " .. tostring(task.status) .. ")")
   end
+  local assigned = task.assigned_agent or task.worker_id
+  if assigned and assigned ~= "" and assigned ~= self.name then
+    error("Task " .. task_id .. " is already assigned to " .. assigned)
+  end
 
   -- 1. Set active task in kernel
   self.kernel:set_active_task(task_id)
