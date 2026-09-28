@@ -19,6 +19,7 @@ local WheelAgent = load_submodule("agent")
 local WheelUI = load_submodule("ui")
 local WheelConfig = load_submodule("config")
 local WheelTeam = load_submodule("team")
+local WheelContext = load_submodule("context")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -26,11 +27,13 @@ local M = {
   ui = WheelUI,
   config = WheelConfig,
   team = WheelTeam,
+  context = WheelContext,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
   WheelConfig = WheelConfig,
   WheelTeam = WheelTeam,
+  WheelContext = WheelContext,
 }
 
 -- Register plugin commands if running inside Bitty host environment.
@@ -231,6 +234,31 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       end
       bitty.notify.show({
         title = "Wheel Team Roster",
+        body = table.concat(lines, "\n"),
+      })
+    end,
+  })
+
+  -- 8. context
+  bitty.commands.register({
+    id = "context",
+    title = "Wheel: context",
+    description = "Inspect active semantic slots, Merkle root, and prefix-cache status.",
+    run = function()
+      if not M._team then
+        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+      end
+      local ctx = M._team.context or WheelContext.new({ kernel = M.kernel, config = M._last_config })
+      local slots = ctx:list_slots()
+      local tree_h = ctx:tree_hash()
+      local lines = {
+        string.format("Wheel Context: %d semantic slots | Tree: %s", #slots, tree_h:sub(1, 16)),
+      }
+      for _, s in ipairs(slots) do
+        table.insert(lines, string.format("  [%s] %s (v%d, %d B)", s.kind:upper(), s.name, s.version, s.size_bytes))
+      end
+      bitty.notify.show({
+        title = "Wheel Context State",
         body = table.concat(lines, "\n"),
       })
     end,

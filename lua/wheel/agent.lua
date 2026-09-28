@@ -220,8 +220,43 @@ function WheelAgent.new(opts)
     self.headless = true
   end
   self.config = opts.config
+  self.context = opts.context
+  self.last_prefix_cache_key = nil
+  self.last_cache_share_ratio = nil
 
   return self
+end
+
+--- Get the active WheelContext engine.
+--- @return table?: WheelContext instance
+function WheelAgent:get_context()
+  return self.context
+end
+
+--- Get a semantic slot from context.
+--- @param name string
+--- @return table: slot retrieval result
+function WheelAgent:get_slot(name)
+  if self.context then
+    return self.context:get_slot(name)
+  elseif self.kernel and type(self.kernel.get_slot) == "function" then
+    return self.kernel:get_slot(name)
+  end
+  return { name = name, found = false }
+end
+
+--- Put a semantic slot into context with optional CAS.
+--- @param name string
+--- @param content string
+--- @param expected_version integer|nil
+--- @return table|nil, table|nil
+function WheelAgent:put_slot(name, content, expected_version)
+  if self.context then
+    return self.context:put_slot(name, content, expected_version)
+  elseif self.kernel and type(self.kernel.put_slot) == "function" then
+    return self.kernel:put_slot(name, content)
+  end
+  return nil, { error = "no_context", message = "No context engine available" }
 end
 
 --- Check if a tool can be invoked under this agent's role authority.
@@ -296,11 +331,27 @@ function WheelAgent:execute_task(task_id, step_fn)
     iterations = iterations + 1
 
     -- Compile three-zone context
-    local ctx = self.kernel:compile_context({
-      system_instruction = string.format("Agent: %s (Role: %s)", self.name, self.role),
-      project_rules = { "Software Engineering domain only", "Fail-closed on security violations" },
-      turn_prompt = string.format("Execute step %d for task %s: %s", iterations, task_id, task.title),
-    })
+    local ctx
+    if self.context and type(self.context.compile_prompt) == "function" then
+      local ctx_res = self.context:compile_prompt({
+        system_instruction = string.format("Agent: %s (Role: %s)", self.name, self.role),
+        project_rules = (self.config and self.config.directives) or { "Software Engineering domain only", "Fail-closed on security violations" },
+        tool_schemas = self.tools or {},
+        active_task = task,
+        turn_prompt = string.format("Execute step %d for task %s: %s", iterations, task_id, task.title),
+      })
+      if ctx_res then
+        self.last_prefix_cache_key = ctx_res.prefix_cache_key
+        self.last_cache_share_ratio = ctx_res.cache_share_ratio
+      end
+      ctx = ctx_res or { prompt_string = "" }
+    else
+      ctx = self.kernel:compile_context({
+        system_instruction = string.format("Agent: %s (Role: %s)", self.name, self.role),
+        project_rules = { "Software Engineering domain only", "Fail-closed on security violations" },
+        turn_prompt = string.format("Execute step %d for task %s: %s", iterations, task_id, task.title),
+      })
+    end
 
     -- Call step callback
     local step_result = step_fn(self, ctx, iterations) or {}
@@ -367,6 +418,8 @@ function WheelAgent:execute_task(task_id, step_fn)
     panel_id = self.panel_id,
     headless = self.headless,
     model_profile = self.model_profile,
+    prefix_cache_key = self.last_prefix_cache_key,
+    cache_share_ratio = self.last_cache_share_ratio,
   }
 end
 
@@ -445,6 +498,8 @@ function WheelAgent:status()
     budget = self.budget,
     workspace = self.workspace,
     active_task = self.kernel and self.kernel.active_task_id,
+    prefix_cache_key = self.last_prefix_cache_key,
+    cache_share_ratio = self.last_cache_share_ratio,
   }
 end
 

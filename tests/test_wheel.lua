@@ -1252,6 +1252,273 @@ run_test("WheelTeam: organizational status telemetry", function()
   assert(worker_entry.headless == true)
 end)
 
+-- ===========================================================================
+-- 10. WheelContext Tests (Shared Context, Slots, CAS, 3-Way Merge, Prefix Cache)
+-- ===========================================================================
+
+local WheelContext = require("wheel.context")
+
+run_test("WheelContext: CAS slot operations and version conflict detection", function()
+  local ctx = WheelContext.new()
+
+  -- Put new slot
+  local put_res, err = ctx:put_slot("workspace/overview", "# Project Overview\nPure Lua Wheel Agent Harness")
+  assert(put_res ~= nil and put_res.success == true, "put_slot should succeed")
+  assert(put_res.version == 1, "initial version should be 1")
+  assert(put_res.kind == "workspace", "slot kind classified as workspace")
+
+  -- Read slot back
+  local get_res = ctx:get_slot("workspace/overview")
+  assert(get_res.found == true)
+  assert(get_res.version == 1)
+  assert(string.find(get_res.content, "Project Overview") ~= nil)
+
+  -- Update with matching expected_version (CAS success)
+  local put_res2, err2 = ctx:put_slot("workspace/overview", "# Project Overview\nUpdated content", 1)
+  assert(put_res2 ~= nil and put_res2.success == true)
+  assert(put_res2.version == 2)
+
+  -- Update with mismatched expected_version (CAS failure)
+  local put_res3, err3 = ctx:put_slot("workspace/overview", "Conflicting overwrite", 1)
+  assert(put_res3 == nil, "CAS mismatch must reject write")
+  assert(err3 ~= nil and err3.error == "cas_conflict", "error kind must be cas_conflict")
+  assert(err3.expected_version == 1)
+  assert(err3.current_version == 2)
+
+  -- Remove slot with matching version
+  local rem_res, rem_err = ctx:remove_slot("workspace/overview", 2)
+  assert(rem_res ~= nil and rem_res.removed == true)
+  assert(ctx:get_slot("workspace/overview").found == false)
+
+  -- Remove nonexistent slot
+  local rem_non = ctx:remove_slot("nonexistent/slot")
+  assert(rem_non.removed == false)
+end)
+
+run_test("WheelContext: canonical Merkle tree hashing and slot listing", function()
+  local ctx = WheelContext.new()
+  ctx:put_slot("tasks/CTX-001/spec", "Spec 1")
+  ctx:put_slot("tasks/CTX-002/spec", "Spec 2")
+  ctx:put_slot("decisions/ADR-001", "Architecture Decision 1")
+  ctx:put_slot("workspace/rules", "Directives")
+
+  -- Prefix listing
+  local task_slots = ctx:list_slots("tasks/")
+  assert(#task_slots == 2, "expected 2 task slots")
+  assert(task_slots[1].name == "tasks/CTX-001/spec")
+  assert(task_slots[2].name == "tasks/CTX-002/spec")
+
+  -- Full canonical sorted list
+  local all_slots = ctx:list_slots()
+  assert(#all_slots == 4)
+  assert(all_slots[1].name == "decisions/ADR-001")
+  assert(all_slots[4].name == "workspace/rules")
+
+  -- Merkle tree hash
+  local th1 = ctx:tree_hash()
+  assert(type(th1) == "string" and #th1 == 64, "tree hash should be 64-hex string")
+  -- Deterministic
+  assert(ctx:tree_hash() == th1)
+
+  -- Modifying a slot changes tree hash
+  ctx:put_slot("decisions/ADR-001", "Updated ADR")
+  local th2 = ctx:tree_hash()
+  assert(th2 ~= th1, "modifying slot must invalidate tree hash")
+end)
+
+run_test("WheelContext: semantic 3-way slot merge", function()
+  local base_tree = {
+    ["workspace/overview"] = { content = "Original Overview", hash = WheelContext.compute_hash("Original Overview") },
+    ["tasks/T-1/spec"] = { content = "Original Spec", hash = WheelContext.compute_hash("Original Spec") },
+    ["decisions/ADR-1"] = { content = "Shared Decision", hash = WheelContext.compute_hash("Shared Decision") },
+  }
+
+  local our_tree = {
+    ["workspace/overview"] = { content = "Our Modified Overview", hash = WheelContext.compute_hash("Our Modified Overview") },
+    ["tasks/T-1/spec"] = { content = "Original Spec", hash = WheelContext.compute_hash("Original Spec") },
+    ["decisions/ADR-1"] = { content = "Shared Decision", hash = WheelContext.compute_hash("Shared Decision") },
+    ["tasks/T-2/spec"] = { content = "Our New Task 2", hash = WheelContext.compute_hash("Our New Task 2") },
+  }
+
+  local their_tree = {
+    ["workspace/overview"] = { content = "Original Overview", hash = WheelContext.compute_hash("Original Overview") },
+    ["tasks/T-1/spec"] = { content = "Their Modified Spec", hash = WheelContext.compute_hash("Their Modified Spec") },
+    ["decisions/ADR-1"] = { content = "Shared Decision", hash = WheelContext.compute_hash("Shared Decision") },
+    ["tasks/T-3/spec"] = { content = "Their New Task 3", hash = WheelContext.compute_hash("Their New Task 3") },
+  }
+
+  -- Merge without conflicts
+  local merge_res = WheelContext.merge_3way(base_tree, our_tree, their_tree)
+  assert(merge_res.conflict_count == 0, "expected 0 conflicts")
+  assert(merge_res.merged["workspace/overview"].content == "Our Modified Overview", "unconflicted edit from us preserved")
+  assert(merge_res.merged["tasks/T-1/spec"].content == "Their Modified Spec", "unconflicted edit from them preserved")
+  assert(merge_res.merged["tasks/T-2/spec"].content == "Our New Task 2", "our addition preserved")
+  assert(merge_res.merged["tasks/T-3/spec"].content == "Their New Task 3", "their addition preserved")
+  assert(merge_res.merged["decisions/ADR-1"].content == "Shared Decision", "unchanged entry preserved")
+
+  -- Now induce concurrent conflicting edits on decisions/ADR-1
+  our_tree["decisions/ADR-1"] = { content = "Our ADR amendment", hash = WheelContext.compute_hash("Our ADR amendment") }
+  their_tree["decisions/ADR-1"] = { content = "Their conflicting ADR amendment", hash = WheelContext.compute_hash("Their conflicting ADR amendment") }
+
+  local conflict_merge = WheelContext.merge_3way(base_tree, our_tree, their_tree)
+  assert(conflict_merge.conflict_count == 1, "expected 1 structured conflict")
+  local c = conflict_merge.conflicts[1]
+  assert(c.slot == "decisions/ADR-1")
+  assert(c.base_content == "Shared Decision")
+  assert(c.our_content == "Our ADR amendment")
+  assert(c.their_content == "Their conflicting ADR amendment")
+  assert(conflict_merge.merged["decisions/ADR-1"].conflict == true)
+end)
+
+run_test("WheelContext.ContextBus: in-memory pubsub event dispatch and agent notification", function()
+  local bus = WheelContext.ContextBus.new()
+  local received_events = {}
+
+  bus:subscribe("agent-reviewer", function(event)
+    table.insert(received_events, event)
+  end)
+
+  assert(bus:is_subscribed("agent-reviewer") == true)
+  assert(bus:is_subscribed("unknown-agent") == false)
+
+  -- Publish event
+  local notified = bus:publish({ type = "slot_updated", name = "tasks/CTX-001/artifacts", hash = "abc123" })
+  assert(notified == 1, "1 subscriber notified")
+  assert(#received_events == 1)
+  assert(received_events[1].type == "slot_updated")
+  assert(received_events[1].name == "tasks/CTX-001/artifacts")
+  assert(received_events[1].timestamp_ms ~= nil)
+
+  -- Unsubscribe
+  bus:unsubscribe("agent-reviewer")
+  assert(bus:is_subscribed("agent-reviewer") == false)
+  local notified2 = bus:publish({ type = "test_event" })
+  assert(notified2 == 0, "0 subscribers notified after unsubscribe")
+  assert(#received_events == 1)
+end)
+
+run_test("WheelContext: prefix-cache-friendly Three-Zone prompt compilation and key stability", function()
+  local ctx = WheelContext.new()
+  ctx:put_slot("workspace/overview", "Wheel Agent Framework")
+  ctx:put_slot("decisions/ADR-001", "Pure Lua 5.1 compatibility")
+
+  local prompt_opts = {
+    system_instruction = "You are Bittie, an elite coding agent.",
+    project_rules = { "Rule B: Zero unwrap", "Rule A: English only" },
+    tool_schemas = { "run_command", "view_file", "write_file" },
+    active_task = { id = "CTX-500", title = "Implement context cache", status = "running", priority = 1 },
+    recent_actions = {
+      { action_id = "act-1", tool = "run_command", exit_code = 0, duration_ms = 45, raw_stdout = "All tests passed" },
+      { action_id = "act-2", tool = "write_file", exit_code = 0, duration_ms = 12, raw_stdout = "Created context.lua" },
+    },
+    turn_prompt = "Verify prompt cache stability across multiple invocations.",
+  }
+
+  local res1, err1 = ctx:compile_prompt(prompt_opts)
+  assert(res1 ~= nil and res1.success == true, "compile_prompt should succeed")
+  assert(res1.prefix_cache_key ~= nil and #res1.prefix_cache_key == 64)
+  assert(res1.cache_share_ratio > 0.0)
+
+  -- Verify Zone 1 canonical sorting: Rule A precedes Rule B regardless of input order
+  local prompt_opts_shuffled = {
+    system_instruction = "You are Bittie, an elite coding agent.",
+    project_rules = { "Rule A: English only", "Rule B: Zero unwrap" }, -- different order
+    tool_schemas = { "write_file", "run_command", "view_file" }, -- different order
+    active_task = { id = "CTX-500", title = "Implement context cache", status = "running", priority = 1 },
+    recent_actions = prompt_opts.recent_actions,
+    turn_prompt = "Different turn prompt should not change Zone 1 prefix hash!",
+  }
+
+  local res2, err2 = ctx:compile_prompt(prompt_opts_shuffled)
+  assert(res2 ~= nil and res2.success == true)
+  -- The prefix_cache_key MUST be byte-identical, achieving 100% prefix cache reuse!
+  assert(res2.prefix_cache_key == res1.prefix_cache_key, "Zone 1 prefix_cache_key must be byte-stable across orderings and turns")
+  assert(res2.zone1_prefix == res1.zone1_prefix, "Zone 1 prefix string must match exactly")
+end)
+
+run_test("WheelContext: multi-tier budget reduction pipeline", function()
+  -- Config with small budgets to trigger reduction tiers
+  local ctx = WheelContext.new({
+    max_budget_bytes = 1000,
+    zone1_max_bytes = 400,
+    zone2_max_bytes = 400,
+    zone3_max_bytes = 300,
+  })
+
+  -- Zone 1 fail-closed on budget violation
+  local huge_sys = string.rep("X", 500)
+  local fail_res, fail_err = ctx:compile_prompt({ system_instruction = huge_sys })
+  assert(fail_res == nil, "Zone 1 over budget must fail closed")
+  assert(fail_err ~= nil and fail_err.error == "zone1_budget_exceeded")
+
+  -- Populate slots with unpinned scratchpad
+  ctx:put_slot("decisions/ADR-001", "Core Decision")
+  ctx:put_slot("scratch/worker/temp_notes", string.rep("Scratchpad note ", 20)) -- candidate for Tier 1 pruning
+
+  local prompt_opts = {
+    system_instruction = "Concise instruction.",
+    turn_prompt = "Step instruction.",
+  }
+
+  local compiled = ctx:compile_prompt(prompt_opts)
+  assert(compiled ~= nil and compiled.success == true)
+  -- If budget pressure triggered, scratchpad is pruned
+  if compiled.tiers_applied.tier1_pruned_scratch then
+    assert(string.find(compiled.prompt_string, "Scratchpad note") == nil, "Tier 1 must prune scratchpad")
+  end
+end)
+
+run_test("WheelTeam & WheelAgent: shared context mounting, task claim, and handoff propagation", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+
+  -- Spawn coding worker and reviewer
+  local worker = team:spawn_agent({ name = "dev-1", role = WheelAgent.Role.CODING })
+  local reviewer = team:spawn_agent({ name = "auditor-1", role = WheelAgent.Role.REVIEWER })
+
+  assert(worker.context == team.context, "worker shares team context")
+  assert(reviewer.context == team.context, "reviewer shares team context")
+
+  -- Create and claim task
+  kernel:create_task({ id = "CTX-777", title = "Multi-agent context sync" })
+  local ok_claim = team:claim_task("dev-1", "CTX-777")
+  assert(ok_claim == true)
+
+  -- Verify active worker slot was written
+  local worker_slot = team.context:get_slot("tasks/CTX-777/worker")
+  assert(worker_slot.found == true)
+  assert(worker_slot.content == "dev-1")
+
+  -- Worker executes task and updates context slot
+  worker:put_slot("tasks/CTX-777/artifacts", "commit-hash: abc999, diff: +120 -10")
+  assert(team.context:get_slot("tasks/CTX-777/artifacts").found == true)
+
+  -- Worker hands off to Reviewer
+  local ok_handoff, handoff_rec = team:handoff("dev-1", "auditor-1", "CTX-777", {
+    reason = "Ready for audit",
+    rationale = "Implemented shared context and prefix cache; 100% tests pass.",
+    checkpoint_hash = "cp-777",
+  })
+  assert(ok_handoff == true)
+
+  -- Verify handoff slot recorded in shared context
+  local handoff_slot = team.context:get_slot("tasks/CTX-777/handoff")
+  assert(handoff_slot.found == true)
+  assert(string.find(handoff_slot.content, "auditor-1", 1, true) ~= nil)
+  assert(string.find(handoff_slot.content, "cp-777", 1, true) ~= nil)
+
+  -- Reviewer immediately inspects artifacts without re-reading files
+  local reviewer_view = reviewer:get_slot("tasks/CTX-777/artifacts")
+  assert(reviewer_view.found == true)
+  assert(string.find(reviewer_view.content, "abc999", 1, true) ~= nil)
+
+  -- Team status reports context telemetry
+  local st = team:status()
+  assert(st.context ~= nil)
+  assert(st.context.total_slots >= 2)
+  assert(type(st.context.tree_hash) == "string")
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
