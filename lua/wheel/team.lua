@@ -606,7 +606,14 @@ function WheelTeam:run_orchestration_loop(opts)
 
             if ok_ho then
               local default_review_fn = function(agent, task, history)
-                return true, "Independent review approved: deliverables verified and acceptance criteria satisfied"
+                -- Inspect that task artifacts exist in context
+                if agent.context and type(agent.context.get_slot) == "function" then
+                  local slot = agent.context:get_slot("tasks/" .. task.id .. "/artifacts")
+                  if not slot or not slot.found or not slot.content or #slot.content == 0 then
+                    return false, "Missing or empty task deliverables in artifacts slot"
+                  end
+                end
+                return true, "Independent review approved: deliverables verified in artifacts slot"
               end
               local review_fn = opts.review_fn or default_review_fn
               local ok_rev, review_res = pcall(reviewer.review_task, reviewer, task_id, review_fn)
@@ -633,10 +640,15 @@ function WheelTeam:run_orchestration_loop(opts)
               end
             else
               self:release_task(worker.name, task_id, {
-                status = "succeeded",
-                checkpoint_hash = last_cp,
+                status = "failed",
+                error = "independent review handoff failed: " .. tostring(ho_record),
               })
             end
+          elseif auto_reviewer then
+            self:release_task(worker.name, task_id, {
+              status = "failed",
+              error = "independent reviewer unavailable",
+            })
           else
             self:release_task(worker.name, task_id, {
               status = "succeeded",

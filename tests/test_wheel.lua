@@ -1983,6 +1983,28 @@ run_test("WheelTeam: run_orchestration_loop failure blocking and deadlock handli
   assert(report_empty.success == true)
   assert(report_empty.waves_executed == 0)
   assert(#report_empty.completed_tasks == 0)
+
+  -- 4. Fail closed when auto_reviewer is true but no reviewer colleague exists
+  local kernel4 = WheelKernel.new({ in_memory = true })
+  local team4 = WheelTeam.new({ kernel = kernel4 })
+  team4:spawn_agent({ name = "solo-coder", role = WheelAgent.Role.CODING })
+  kernel4:create_task({ id = "T-SOLO", title = "Solo task" })
+
+  local report_no_rev = team4:run_orchestration_loop({ auto_reviewer = true })
+  assert(report_no_rev.success == false)
+  assert(#report_no_rev.failed_tasks == 1)
+  assert(report_no_rev.failed_tasks[1] == "T-SOLO")
+
+  -- 5. auto_reviewer = false releases task directly as succeeded without reviewer
+  local kernel5 = WheelKernel.new({ in_memory = true })
+  local team5 = WheelTeam.new({ kernel = kernel5 })
+  team5:spawn_agent({ name = "solo-coder-2", role = WheelAgent.Role.CODING })
+  kernel5:create_task({ id = "T-DIRECT", title = "Direct release task" })
+
+  local report_direct = team5:run_orchestration_loop({ auto_reviewer = false })
+  assert(report_direct.success == true)
+  assert(#report_direct.completed_tasks == 1)
+  assert(report_direct.completed_tasks[1] == "T-DIRECT")
 end)
 
 run_test("Wheel: Plugin command orchestrate registration and execution", function()
