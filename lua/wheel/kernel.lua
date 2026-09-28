@@ -18,6 +18,10 @@ local function escape_str(s)
   for i, c in ipairs(in_char) do
     s = s:gsub(c, out_char[i])
   end
+  -- Escape all remaining ASCII control characters (0x00 to 0x1F) into \u00XX hex escapes
+  s = s:gsub("[%z\1-\31]", function(c)
+    return string.format("\\u00%02x", string.byte(c))
+  end)
   return '"' .. s .. '"'
 end
 
@@ -213,6 +217,7 @@ else
 end
 
 WheelKernel.json = json_codec
+WheelKernel.JSON = JSON
 
 -- ---------------------------------------------------------------------------
 -- In-Memory Mock Dispatcher

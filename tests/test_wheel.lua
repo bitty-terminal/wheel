@@ -569,6 +569,111 @@ run_test("Wheel: Wire format normalization and null task semantics", function()
   assert(conflict_err2:find("already assigned to other%-worker") ~= nil)
 end)
 
+-- ===========================================================================
+-- 6. Pure-Lua JSON Codec Control Character Escaping Tests
+-- ===========================================================================
+
+run_test("WheelKernel.JSON: control character escaping and roundtrip", function()
+  local codec = WheelKernel.JSON
+  assert(codec ~= nil, "WheelKernel.JSON fallback codec must be exported")
+
+  -- 1. NUL (0x00)
+  local nul_str = "hello\0world"
+  local enc_nul = codec.encode(nul_str)
+  assert(enc_nul:find("\\u0000") ~= nil, "should escape NUL byte as \\u0000")
+  local dec_nul = codec.decode(enc_nul)
+  assert(dec_nul == nul_str, "decoded NUL string must match original")
+
+  -- 2. ANSI Escape sequence (0x1B = ESC)
+  local ansi_str = "\27[32mSUCCESS\27[0m"
+  local enc_ansi = codec.encode(ansi_str)
+  assert(enc_ansi:find("\\u001b") ~= nil, "should escape ESC byte as \\u001b")
+  local dec_ansi = codec.decode(enc_ansi)
+  assert(dec_ansi == ansi_str, "decoded ANSI string must match original")
+
+  -- 3. BEL (0x07) and other C0 control chars
+  local c0_str = "bell:\7,soh:\1,etx:\3,syn:\22"
+  local enc_c0 = codec.encode(c0_str)
+  assert(enc_c0:find("\\u0007") ~= nil, "should escape BEL as \\u0007")
+  assert(enc_c0:find("\\u0001") ~= nil, "should escape SOH as \\u0001")
+  assert(enc_c0:find("\\u0003") ~= nil, "should escape ETX as \\u0003")
+  assert(enc_c0:find("\\u0016") ~= nil, "should escape SYN as \\u0016")
+  local dec_c0 = codec.decode(enc_c0)
+  assert(dec_c0 == c0_str, "decoded C0 control string must match original")
+
+  -- 4. Standard whitespace escapes preserved
+  local ws_str = "tab:\t,nl:\n,cr:\r"
+  local enc_ws = codec.encode(ws_str)
+  assert(enc_ws:find("\\t") ~= nil, "should escape tab as \\t")
+  assert(enc_ws:find("\\n") ~= nil, "should escape newline as \\n")
+  assert(enc_ws:find("\\r") ~= nil, "should escape cr as \\r")
+  local dec_ws = codec.decode(enc_ws)
+  assert(dec_ws == ws_str, "decoded whitespace string must match original")
+
+  -- 5. Complex nested table with mixed control characters
+  local complex_tbl = {
+    ansi = ansi_str,
+    nul = nul_str,
+    nested = { count = 42, note = "test\0001" },
+  }
+  local enc_tbl = codec.encode(complex_tbl)
+  local dec_tbl = codec.decode(enc_tbl)
+  assert(dec_tbl.ansi == ansi_str)
+  assert(dec_tbl.nul == nul_str)
+  assert(dec_tbl.nested.count == 42)
+  assert(dec_tbl.nested.note == "test\0001")
+end)
+
+-- ===========================================================================
+-- 7. Expanded Read-Only Tool Allowlist Tests
+-- ===========================================================================
+
+run_test("WheelAgent: expanded read-only tool allowlist", function()
+  assert(type(WheelAgent.READ_ONLY_TOOLS) == "table", "WheelAgent.READ_ONLY_TOOLS must be exported")
+
+  local expected_tools = {
+    "read_file",
+    "view_file",
+    "search_code",
+    "find_files",
+    "list_directory",
+    "inspect",
+    "git_diff",
+    "git_log",
+    "git_status",
+    "read_resource",
+    "list_resources",
+    "read_url_content",
+    "search_web",
+    "ask_question",
+    "get_outline",
+  }
+
+  for _, tool in ipairs(expected_tools) do
+    assert(WheelAgent.READ_ONLY_TOOLS[tool] == true, "tool " .. tool .. " must be in READ_ONLY_TOOLS")
+  end
+
+  local researcher = WheelAgent.new({
+    name = "research-tester",
+    role = WheelAgent.Role.RESEARCH,
+    kernel = WheelKernel.new_mock(),
+    tools = expected_tools,
+  })
+
+  -- All 15 tools must be allowed for Research role
+  for _, tool in ipairs(expected_tools) do
+    local allowed, err = researcher:is_tool_allowed(tool)
+    assert(allowed == true, "researcher should be allowed " .. tool .. ": " .. tostring(err))
+  end
+
+  -- Mutating tools must be denied
+  local mutating_tools = { "write_file", "apply_diff", "run_command", "replace_file_content" }
+  for _, tool in ipairs(mutating_tools) do
+    local allowed, err = researcher:is_tool_allowed(tool)
+    assert(allowed == false, "researcher must be denied mutating tool " .. tool)
+  end
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
