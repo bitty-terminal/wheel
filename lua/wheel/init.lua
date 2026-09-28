@@ -20,6 +20,7 @@ local WheelUI = load_submodule("ui")
 local WheelConfig = load_submodule("config")
 local WheelTeam = load_submodule("team")
 local WheelContext = load_submodule("context")
+local WheelTool = load_submodule("tool")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -28,12 +29,15 @@ local M = {
   config = WheelConfig,
   team = WheelTeam,
   context = WheelContext,
+  tool = WheelTool,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
   WheelConfig = WheelConfig,
   WheelTeam = WheelTeam,
   WheelContext = WheelContext,
+  WheelTool = WheelTool,
+  tools = WheelTool and WheelTool.get_default_registry(),
 }
 
 -- Register plugin commands if running inside Bitty host environment.
@@ -259,6 +263,27 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       end
       bitty.notify.show({
         title = "Wheel Context State",
+        body = table.concat(lines, "\n"),
+      })
+    end,
+  })
+
+  -- 9. tools
+  bitty.commands.register({
+    id = "tools",
+    title = "Wheel: tools",
+    description = "List registered Wheel agent tools and intent schemas.",
+    run = function()
+      local reg = WheelTool.get_default_registry()
+      local list = reg:list_tools()
+      local lines = {
+        string.format("Wheel Tools: %d registered core tools", #list),
+      }
+      for _, t in ipairs(list) do
+        table.insert(lines, string.format("  [%s] %s - %s", t.intent:upper(), t.name, t.description))
+      end
+      bitty.notify.show({
+        title = "Wheel Tools Registry",
         body = table.concat(lines, "\n"),
       })
     end,

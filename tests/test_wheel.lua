@@ -7,6 +7,7 @@ local WheelKernel = require("wheel.kernel")
 local WheelAgent = require("wheel.agent")
 local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
+local WheelTool = require("wheel.tool")
 
 local function run_test(name, fn)
   local ok, err = pcall(fn)
@@ -1519,7 +1520,332 @@ run_test("WheelTeam & WheelAgent: shared context mounting, task claim, and hando
   assert(type(st.context.tree_hash) == "string")
 end)
 
+-- ===========================================================================
+-- 11. WheelTool: Sandboxing, Path Traversal & Dangerous Command Guards
+-- ===========================================================================
+
+run_test("WheelTool: ActionIntent enum and schema validation", function()
+  assert(WheelTool.ActionIntent.INSPECT == "inspect")
+  assert(WheelTool.ActionIntent.MODIFY == "modify")
+  assert(WheelTool.ActionIntent.EXECUTE == "execute")
+  assert(WheelTool.ActionIntent.VERIFY == "verify")
+  assert(WheelTool.ActionIntent.CUSTOM == "custom")
+
+  local reg = WheelTool.get_default_registry()
+  assert(reg ~= nil)
+  local tools = reg:list_tools()
+  assert(#tools >= 7, "at least 7 core tools registered")
+
+  local tool_names = {}
+  for _, t in ipairs(tools) do
+    tool_names[t.name] = t.intent
+  end
+  assert(tool_names["read_file"] == WheelTool.ActionIntent.INSPECT)
+  assert(tool_names["write_file"] == WheelTool.ActionIntent.MODIFY)
+  assert(tool_names["edit_file"] == WheelTool.ActionIntent.MODIFY)
+  assert(tool_names["run_command"] == WheelTool.ActionIntent.EXECUTE)
+  assert(tool_names["list_directory"] == WheelTool.ActionIntent.INSPECT)
+  assert(tool_names["search_code"] == WheelTool.ActionIntent.INSPECT)
+  assert(tool_names["read_blob"] == WheelTool.ActionIntent.INSPECT)
+end)
+
+run_test("WheelTool: Path sandboxing and directory traversal rejection", function()
+  local root = "/tmp/bitty/test_tool_sandbox"
+
+  -- Safe relative paths resolve within root
+  local p1, err1 = WheelTool.sanitize_path("foo/bar.txt", root)
+  assert(p1 == root .. "/foo/bar.txt", "relative path inside root: " .. tostring(err1))
+
+  -- Inner . and .. that stay inside root resolve cleanly
+  local p2, err2 = WheelTool.sanitize_path("foo/./baz/../bar.txt", root)
+  assert(p2 == root .. "/foo/bar.txt", "inner .. inside root: " .. tostring(err2))
+
+  -- Path traversal attempts escaping root fail closed
+  local p3, err3 = WheelTool.sanitize_path("../../etc/passwd", root)
+  assert(p3 == nil, "path traversal must return nil")
+  assert(string.find(err3, "path_traversal_denied", 1, true) ~= nil, "error message specifies path_traversal_denied")
+
+  local p4, err4 = WheelTool.sanitize_path("foo/../../../etc/shadow", root)
+  assert(p4 == nil, "excessive .. traversal must fail closed")
+  assert(string.find(err4, "path_traversal_denied", 1, true) ~= nil)
+
+  -- Absolute path not starting with root fails closed
+  local p5, err5 = WheelTool.sanitize_path("/etc/passwd", root)
+  assert(p5 == nil, "external absolute path must fail closed")
+  assert(string.find(err5, "path_traversal_denied", 1, true) ~= nil)
+end)
+
+run_test("WheelTool: Catastrophic dangerous command detection", function()
+  -- Dangerous commands must be blocked
+  local bad_commands = {
+    "rm -rf /",
+    "rm -rf /*",
+    "rm -rf /etc",
+    "rm -rf ~",
+    "rm -rf ../",
+    "mkfs.ext4 /dev/nvme0n1",
+    "dd if=/dev/zero of=/dev/sda bs=1M",
+    ":(){ :|:& };:",
+    "chmod -R 777 /",
+    "shutdown -h now",
+    "reboot",
+  }
+
+  for _, cmd in ipairs(bad_commands) do
+    local is_bad, reason = WheelTool.check_dangerous_command(cmd)
+    assert(is_bad == true, "command must be blocked: " .. cmd)
+    assert(string.find(reason, "dangerous_command_blocked", 1, true) ~= nil)
+  end
+
+  -- Safe commands must be allowed
+  local safe_commands = {
+    "cargo test --workspace",
+    "git status",
+    "ls -la src/",
+    "echo 'hello world'",
+    "bun run prettier --check .",
+  }
+
+  for _, cmd in ipairs(safe_commands) do
+    local is_bad, _ = WheelTool.check_dangerous_command(cmd)
+    assert(is_bad == false, "safe command should not be blocked: " .. cmd)
+  end
+end)
+
+-- ===========================================================================
+-- 12. WheelTool: Core Engineering Tools Execution
+-- ===========================================================================
+
+run_test("WheelTool: Core file tools (read_file, write_file, edit_file)", function()
+  local root = "/tmp/bitty/test_tool_sandbox"
+  os.execute("mkdir -p " .. root)
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+
+  -- 1. write_file: create a sample text file
+  local sample_text = "Line 1: Alpha\nLine 2: Beta\nLine 3: Gamma\nLine 4: Delta\nLine 5: Epsilon\n"
+  local w_res = reg:dispatch("write_file", { path = "nested/sample.txt", content = sample_text, overwrite = true }, env)
+  assert(w_res.success == true, "write_file should succeed: " .. tostring(w_res.stderr))
+  assert(w_res.exit_code == 0)
+
+  -- 2. write_file without overwrite fails if file exists
+  local w_no_ov = reg:dispatch("write_file", { path = "nested/sample.txt", content = "new text", overwrite = false }, env)
+  assert(w_no_ov.success == false, "write_file without overwrite must fail")
+  assert(string.find(w_no_ov.stderr, "already exists", 1, true) ~= nil)
+
+  -- 3. read_file: full read
+  local r_full = reg:dispatch("read_file", { path = "nested/sample.txt" }, env)
+  assert(r_full.success == true)
+  assert(string.find(r_full.stdout, "Line 1: Alpha", 1, true) ~= nil)
+  assert(string.find(r_full.stdout, "Line 5: Epsilon", 1, true) ~= nil)
+
+  -- 4. read_file: bounded line slicing (lines 2 to 4)
+  local r_slice = reg:dispatch("read_file", { path = "nested/sample.txt", start_line = 2, end_line = 4 }, env)
+  assert(r_slice.success == true)
+  assert(string.find(r_slice.stdout, "Line 1: Alpha", 1, true) == nil)
+  assert(string.find(r_slice.stdout, "Line 2: Beta", 1, true) ~= nil)
+  assert(string.find(r_slice.stdout, "Line 4: Delta", 1, true) ~= nil)
+  assert(string.find(r_slice.stdout, "Line 5: Epsilon", 1, true) == nil)
+
+  -- 5. edit_file: exact target replacement
+  local e_res = reg:dispatch("edit_file", {
+    path = "nested/sample.txt",
+    target = "Line 3: Gamma",
+    replacement = "Line 3: Gamma (MODIFIED)",
+  }, env)
+  assert(e_res.success == true, "edit_file should succeed: " .. tostring(e_res.stderr))
+
+  -- Verify replacement persisted
+  local r_check = reg:dispatch("read_file", { path = "nested/sample.txt" }, env)
+  assert(string.find(r_check.stdout, "Line 3: Gamma (MODIFIED)", 1, true) ~= nil)
+
+  -- 6. edit_file: non-existent target fails cleanly
+  local e_fail = reg:dispatch("edit_file", {
+    path = "nested/sample.txt",
+    target = "Non-existent string 12345",
+    replacement = "Replacement",
+  }, env)
+  assert(e_fail.success == false)
+  assert(string.find(e_fail.stderr, "not found", 1, true) ~= nil)
+
+  -- Cleanup
+  os.execute("rm -rf " .. root)
+end)
+
+-- ===========================================================================
+-- 13. WheelTool: Role Authority Gating & Intent Enforcement
+-- ===========================================================================
+
+run_test("WheelTool: Role authority gating and intent enforcement", function()
+  local reg = WheelTool.get_default_registry()
+  local root = "/tmp/bitty/test_tool_sandbox"
+  os.execute("mkdir -p " .. root)
+
+  -- Research role: strictly read-only (Inspect & Verify allowed; Modify & Execute denied)
+  local env_research = { workspace_root = root, role = WheelAgent.Role.RESEARCH }
+
+  -- Research attempts write_file -> MUST BE DENIED
+  local res_write = reg:dispatch("write_file", { path = "test.txt", content = "data" }, env_research)
+  assert(res_write.success == false)
+  assert(res_write.status == WheelTool.OutcomeStatus.DENIED)
+  assert(res_write.exit_code == 126)
+  assert(string.find(res_write.stderr, "role_authority_violation", 1, true) ~= nil)
+  assert(string.find(res_write.stderr, "read-only authority", 1, true) ~= nil)
+
+  -- Research attempts run_command -> MUST BE DENIED
+  local res_cmd = reg:dispatch("run_command", { command = "ls" }, env_research)
+  assert(res_cmd.success == false)
+  assert(res_cmd.status == WheelTool.OutcomeStatus.DENIED)
+  assert(string.find(res_cmd.stderr, "role_authority_violation", 1, true) ~= nil)
+
+  -- Research calls read_file (inspect) -> ALLOWED (fails on missing file, not authority)
+  local res_read = reg:dispatch("read_file", { path = "nonexistent.txt" }, env_research)
+  assert(res_read.status ~= WheelTool.OutcomeStatus.DENIED, "inspect intent allowed for Research")
+  assert(string.find(res_read.stderr, "File not found", 1, true) ~= nil)
+
+  -- Reviewer role: strictly read-only
+  local env_reviewer = { workspace_root = root, role = WheelAgent.Role.REVIEWER }
+  local rev_edit = reg:dispatch("edit_file", { path = "test.txt", target = "a", replacement = "b" }, env_reviewer)
+  assert(rev_edit.success == false)
+  assert(rev_edit.status == WheelTool.OutcomeStatus.DENIED)
+
+  -- Commander role: plans and inspects; direct code modification denied
+  local env_commander = { workspace_root = root, role = WheelAgent.Role.COMMANDER }
+  local cmd_write = reg:dispatch("write_file", { path = "test.txt", content = "data" }, env_commander)
+  assert(cmd_write.success == false)
+  assert(cmd_write.status == WheelTool.OutcomeStatus.DENIED)
+  assert(string.find(cmd_write.stderr, "role 'Commander' plans and orchestrates", 1, true) ~= nil)
+
+  -- Coding Worker role: full access
+  local env_coding = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local code_write = reg:dispatch("write_file", { path = "allowed.txt", content = "ok", overwrite = true }, env_coding)
+  assert(code_write.success == true, "Coding role has modify authority")
+
+  os.execute("rm -rf " .. root)
+end)
+
+-- ===========================================================================
+-- 14. WheelTool: Auto-Spillover Pipeline & Content-Addressed Blob Recovery
+-- ===========================================================================
+
+run_test("WheelTool: Auto-spillover pipeline and content-addressed blob recovery", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local context = WheelContext.new({ kernel = kernel })
+
+  -- Generate 6 KiB payload (150 lines > 4096 threshold)
+  local line_pattern = "Record #%04d: Event telemetry outcome payload for pipeline\n"
+  local lines = {}
+  for i = 1, 150 do
+    table.insert(lines, string.format(line_pattern, i))
+  end
+  local big_output = table.concat(lines)
+  assert(#big_output > 4096, "output is over 4 KiB spillover threshold")
+
+  -- Process outcome through spillover pipeline
+  local outcome = WheelTool.process_spillover({
+    tool = "run_command",
+    intent = WheelTool.ActionIntent.EXECUTE,
+    success = true,
+    exit_code = 0,
+    stdout = big_output,
+    stderr = "",
+    duration_ms = 45,
+  }, {
+    threshold_bytes = 4096,
+    context = context,
+    kernel = kernel,
+  })
+
+  assert(outcome.spilled == true, "outcome must be marked spilled")
+  assert(outcome.spillover_bytes == #big_output)
+  assert(type(outcome.spillover_hash) == "string")
+  assert(#outcome.spillover_hash == 64, "spillover hash is 64 hex characters")
+
+  -- Preview contains first 10 lines, notice, and last 5 lines
+  assert(string.find(outcome.preview, "Record #0001:", 1, true) ~= nil, "preview contains head")
+  assert(string.find(outcome.preview, "Record #0010:", 1, true) ~= nil)
+  assert(string.find(outcome.preview, "spilled to blob: " .. outcome.spillover_hash, 1, true) ~= nil, "preview contains notice")
+  assert(string.find(outcome.preview, "Record #0150:", 1, true) ~= nil, "preview contains tail")
+  assert(string.find(outcome.preview, "Record #0050:", 1, true) == nil, "preview omits middle lines")
+
+  -- Formatted observation contains tool header and preview
+  local obs = outcome:format_observation()
+  assert(string.find(obs, "[Tool: run_command (exit=0, 45ms, spilled=", 1, true) ~= nil)
+
+  -- Content-addressed blob was written to context
+  local slot = context:get_slot("blobs/" .. outcome.spillover_hash)
+  assert(slot.found == true, "blob must be stored in context")
+  assert(#slot.content == #big_output)
+
+  -- read_blob tool recovers full content and slices
+  local reg = WheelTool.get_default_registry()
+  local blob_res = reg:dispatch("read_blob", {
+    hash = outcome.spillover_hash,
+    offset = 0,
+    length = 50,
+  }, { context = context })
+  assert(blob_res.success == true)
+  assert(#blob_res.stdout == 50)
+  assert(string.find(blob_res.stdout, "Record #0001:", 1, true) ~= nil)
+end)
+
+-- ===========================================================================
+-- 15. WheelAgent: execute_tool, call_tools, and Action Recording
+-- ===========================================================================
+
+run_test("WheelAgent: execute_tool, call_tools, and Action Recording", function()
+  local root = "/tmp/bitty/test_agent_tools"
+  os.execute("mkdir -p " .. root)
+  local kernel = WheelKernel.new({ in_memory = true })
+  local context = WheelContext.new({ kernel = kernel })
+
+  local agent = WheelAgent.new({
+    name = "dev-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    context = context,
+    workspace = { root = root },
+    tools = { "read_file", "write_file", "search_code", "run_command" },
+  })
+
+  assert(agent.tool_registry ~= nil, "agent has bound tool_registry")
+  local st = agent:status()
+  assert(st.tool_count >= 7)
+
+  -- 1. agent:execute_tool writes a file
+  local w_out = agent:execute_tool("write_file", {
+    path = "workspace_note.md",
+    content = "# Architecture Note\nDesign approved.",
+    overwrite = true,
+  })
+  assert(w_out.success == true)
+  assert(w_out.exit_code == 0)
+
+  -- 2. agent:execute_tool reads file back
+  local r_out = agent:execute_tool("read_file", { path = "workspace_note.md" })
+  assert(r_out.success == true)
+  assert(string.find(r_out.stdout, "# Architecture Note", 1, true) ~= nil)
+
+  -- 3. agent:call_tools handles batch requests
+  local batch_outcomes = agent:call_tools({
+    { id = "call-1", name = "read_file", arguments = { path = "workspace_note.md" } },
+    { id = "call-2", name = "search_code", arguments = { query = "Architecture", path = "." } },
+  })
+  assert(#batch_outcomes == 2)
+  assert(batch_outcomes[1].call_id == "call-1")
+  assert(batch_outcomes[1].success == true)
+  assert(batch_outcomes[2].call_id == "call-2")
+  assert(batch_outcomes[2].success == true)
+
+  -- 4. Kernel recorded the executed actions
+  local rec_actions = kernel:recent_actions() or {}
+  assert(#rec_actions >= 3, "actions recorded in kernel")
+
+  os.execute("rm -rf " .. root)
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
+
 

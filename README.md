@@ -52,6 +52,7 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.               |
 | `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration protocol, atomic task claims, and structured handoffs.                |
 | `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.    |
+| `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.          |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
 | `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.           |
 | `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
@@ -91,6 +92,17 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
 - **Context Event Bus**: Real-time in-memory pubsub (`ContextBus`) notifying peer agents of slot modifications, checkpoint commits, and task handoffs without polling.
 - **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)** shared across agents of the same model family for maximum KV cache reuse (>90%), coupled with a multi-tier budget reduction pipeline (Tier 1 scratchpad pruning, Tier 2 rationale compression, Tier 3 tail truncation).
 
+### Standardized Action Protocol & Tool Execution Engine
+
+Wheel executes software engineering tools under strict safety and context-budget guarantees:
+
+- **Action Intents**: Typed action intents (`Inspect`, `Modify`, `Execute`, `Verify`, `Custom`) aligned with upstream Rust architecture (`bitty-ai-slice`).
+- **Fail-Closed Path Sandboxing**: Strict workspace boundary verification (`sanitize_path`), rejecting all directory traversal attacks (`../../`) and uncontained path escapes.
+- **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
+- **Catastrophic Command Protection**: Proactive pattern scanning blocking destructive irreversible shell commands (`rm -rf /`, `mkfs`, fork bombs, etc.).
+- **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
+- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (atomic with directory creation), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
+
 ## Commands
 
 Wheel provides the following commands via Bitty's command registry:
@@ -103,6 +115,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:trust`: Inspect and approve project configuration (`.wheel/init.lua`) with hash pinning.
 - `bitty-terminal.wheel:team`: Display multi-agent peer colleague roster, roles, models, and live states.
 - `bitty-terminal.wheel:context`: Inspect active semantic slots, Merkle root hash, and prefix-cache status.
+- `bitty-terminal.wheel:tools`: List registered Wheel agent tools, intent categories, and schema descriptions.
 
 ## Development
 

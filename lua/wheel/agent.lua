@@ -6,6 +6,13 @@
 local WheelAgent = {}
 WheelAgent.__index = WheelAgent
 
+local ok_tool, WheelTool = pcall(require, "wheel.tool")
+if not ok_tool then
+  local ok_tool2, WheelTool2 = pcall(require, "lua.wheel.tool")
+  WheelTool = ok_tool2 and WheelTool2 or nil
+end
+WheelAgent.Tool = WheelTool
+
 --- Agent role definitions.
 WheelAgent.Role = {
   COMMANDER = "commander",
@@ -221,6 +228,7 @@ function WheelAgent.new(opts)
   end
   self.config = opts.config
   self.context = opts.context
+  self.tool_registry = opts.tool_registry or (WheelTool and WheelTool.get_default_registry())
   self.last_prefix_cache_key = nil
   self.last_cache_share_ratio = nil
 
@@ -275,7 +283,19 @@ function WheelAgent:is_tool_allowed(tool_name)
     return false, "tool '" .. tool_name .. "' is not in declared tools for " .. self.name
   end
 
-  -- 2. Role-based read-only gating: Research and Reviewer cannot call mutating tools
+  -- 2. If tool is in registry, enforce intent-based role authority gating
+  if self.tool_registry and type(self.tool_registry.get_tool) == "function" and WheelTool then
+    local tool_def = self.tool_registry:get_tool(tool_name)
+    if tool_def then
+      local ok_auth, auth_err = WheelTool.check_role_authority(self.role, tool_def)
+      if not ok_auth then
+        return false, auth_err
+      end
+      return true, nil
+    end
+  end
+
+  -- 3. Fallback role-based read-only gating: Research and Reviewer cannot call mutating tools
   if self.role == WheelAgent.Role.RESEARCH or self.role == WheelAgent.Role.REVIEWER then
     if not READ_ONLY_TOOLS[tool_name] then
       return false, "role '" .. self.role .. "' has read-only authority; denied: " .. tool_name
@@ -283,6 +303,65 @@ function WheelAgent:is_tool_allowed(tool_name)
   end
 
   return true, nil
+end
+
+--- Execute a tool directly under this agent's security boundary and role authority.
+--- Measures execution latency, auto-spills oversized output into context memory,
+--- and records action outcome into kernel and ContextBus.
+--- @param tool_name string Name of tool to execute
+--- @param args table? Tool arguments
+--- @return table ActionOutcome instance
+function WheelAgent:execute_tool(tool_name, args)
+  args = args or {}
+  local allowed, reason = self:is_tool_allowed(tool_name)
+  if not allowed then
+    if WheelTool and type(WheelTool.process_spillover) == "function" then
+      return WheelTool.process_spillover({
+        tool = tool_name,
+        success = false,
+        status = WheelTool.OutcomeStatus.DENIED,
+        exit_code = 126,
+        stderr = reason,
+      })
+    end
+    error(reason)
+  end
+
+  if not self.tool_registry then
+    error("Agent " .. self.name .. " has no tool_registry configured")
+  end
+
+  return self.tool_registry:dispatch(tool_name, args, {
+    role = self.role,
+    agent_name = self.name,
+    workspace_root = self.workspace and self.workspace.root or ".",
+    kernel = self.kernel,
+    context = self.context,
+  })
+end
+
+--- Execute a batch of tool calls (e.g. from an LLM response).
+--- @param tool_calls table[] Array of { id = string?, name = string, arguments = table|string? }
+--- @return table[] Array of ActionOutcome instances
+function WheelAgent:call_tools(tool_calls)
+  tool_calls = tool_calls or {}
+  local outcomes = {}
+  for _, tc in ipairs(tool_calls) do
+    local name = tc.name or tc.tool
+    local args = tc.arguments or tc.args or {}
+    if type(args) == "string" and WheelKernel and WheelKernel.json then
+      local ok, decoded = pcall(WheelKernel.json.decode, args)
+      if ok and type(decoded) == "table" then
+        args = decoded
+      end
+    end
+    local outcome = self:execute_tool(name, args)
+    if tc.id then
+      outcome.call_id = tc.id
+    end
+    table.insert(outcomes, outcome)
+  end
+  return outcomes
 end
 
 --- Execute a task in the DAG as a Worker.
@@ -500,6 +579,7 @@ function WheelAgent:status()
     active_task = self.kernel and self.kernel.active_task_id,
     prefix_cache_key = self.last_prefix_cache_key,
     cache_share_ratio = self.last_cache_share_ratio,
+    tool_count = self.tool_registry and #self.tool_registry:list_tools() or #self.tools,
   }
 end
 
