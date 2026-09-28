@@ -53,6 +53,8 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.          |
 | `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.    |
 | `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.          |
+| `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).        |
+| `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                  |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
 | `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.           |
 | `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
@@ -113,6 +115,19 @@ Wheel provides an autonomous execution engine (`WheelTeam:run_orchestration_loop
 - **Cascading Readiness & Block Detection**: Succeeded tasks automatically promote downstream dependents to `Ready`. Any failed task or reviewer rejection cascades downstream tasks to `Blocked`, terminating the loop cleanly with deadlock diagnostics.
 - **Fail-Closed Execution Telemetry**: Returns structured execution reports (`completed_tasks`, `failed_tasks`, `waves_executed`, `total_handoffs`, `total_checkpoints`, `duration_ms`) and persists summaries to `workspace/orchestration/last_run`.
 
+### Live LLM Provider Adapters & Streaming Execution Runner
+
+Wheel integrates heterogeneous large language models and autonomous ReAct execution loops:
+
+- **Universal Model Provider Abstraction**: Uniform interface (`complete`, `stream`) across vendor protocols with pure Lua line-buffered SSE stream parsing (`WheelProvider.SSEParser`).
+- **Pluggable Model Adapters**:
+  - `MockProvider`: In-memory deterministic completion and chunk streaming simulation for offline tests and CI.
+  - `OpenAIAdapter`: OpenAI-compatible `/v1/chat/completions` REST and SSE streaming (supporting OpenAI GPT-4o, DeepSeek Reasoner, Ollama `/v1`, vLLM, OpenRouter).
+  - `AnthropicAdapter`: Anthropic Messages API (`/v1/messages`) supporting Claude 3.5 Sonnet, `thinking` token blocks, and `tool_use` blocks.
+  - `StdioAdapter`: Subprocess CLI streaming runner (pipes to `ollama run`, `llm`, or local model binaries).
+- **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
+- **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
+
 ## Commands
 
 Wheel provides the following commands via Bitty's command registry:
@@ -127,6 +142,7 @@ Wheel provides the following commands via Bitty's command registry:
 - `bitty-terminal.wheel:context`: Inspect active semantic slots, Merkle root hash, and prefix-cache status.
 - `bitty-terminal.wheel:tools`: List registered Wheel agent tools, intent categories, and schema descriptions.
 - `bitty-terminal.wheel:orchestrate`: Run autonomous multi-agent wave orchestration loop over Task DAG.
+- `bitty-terminal.wheel:models`: Display configured model profiles, providers, and capabilities.
 
 ## Development
 
