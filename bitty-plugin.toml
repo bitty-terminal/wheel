@@ -19,7 +19,10 @@ description = "Wheel — the official Agent Harness plugin for the Bitty termina
 [compat]
 # Application and Plugin API ranges. Adjust to the host release you target;
 # both are syntax-validated here and resolved by the host at install time.
-bitty = ">=0.5,<1.0"
+# First-batch integration (wheel#39, CTX-0019): the bitty floor is pinned to
+# the verified-against-current host 0.0.21, ceiling restrictive (<0.1)
+# because 0.x minors may break (composer DEC-0001 pattern). Revisit on API bumps.
+bitty = ">=0.0.21,<0.1"
 plugin-api = "^1.0"
 
 [capabilities]
