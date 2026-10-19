@@ -15,6 +15,12 @@ local WheelContext = load_submodule("context")
 local WheelTool = load_submodule("tool")
 local WheelUI = load_submodule("ui")
 
+local ok_host, WheelHost = pcall(require, "wheel.host")
+if not ok_host then
+  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
+  WheelHost = ok_host2 and WheelHost2 or nil
+end
+
 local WheelTeam = {}
 WheelTeam.__index = WheelTeam
 
@@ -286,7 +292,7 @@ function WheelTeam:handoff(from_agent, to_agent, task_id, opts)
     reason = opts.reason or "handoff",
     rationale = opts.rationale or "",
     checkpoint_hash = opts.checkpoint_hash,
-    timestamp = os.time(),
+    timestamp = WheelHost.time.now(),
   }
 
   table.insert(self.handoffs, record)

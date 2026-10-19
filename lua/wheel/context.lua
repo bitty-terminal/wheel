@@ -17,6 +17,12 @@ end
 
 local WheelConfig = load_submodule("config")
 
+local ok_host, WheelHost = pcall(require, "wheel.host")
+if not ok_host then
+  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
+  WheelHost = ok_host2 and WheelHost2 or nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Constants & Limits
 -- ---------------------------------------------------------------------------
@@ -109,7 +115,7 @@ function ContextBus:publish(event)
   if type(event) ~= "table" then
     error("ContextBus: event must be a table")
   end
-  event.timestamp_ms = event.timestamp_ms or os.time() * 1000
+  event.timestamp_ms = event.timestamp_ms or WheelHost.time.now() * 1000
 
   -- Record event in bounded history ring
   table.insert(self._history, event)
@@ -257,7 +263,7 @@ function WheelContext:put_slot(name, content, expected_version)
   local h = WheelContext.compute_hash(content)
   local new_ver = current_ver + 1
   local kind = classify_slot_kind(name)
-  local now_ms = os.time() * 1000
+  local now_ms = WheelHost.time.now() * 1000
 
   local slot = {
     name = name,
@@ -328,7 +334,7 @@ function WheelContext:get_slot(name)
         version = 1,
         kind = classify_slot_kind(name),
         size_bytes = #(res.content or ""),
-        updated_at_ms = os.time() * 1000,
+        updated_at_ms = WheelHost.time.now() * 1000,
       }
       self._slots[name] = cached
       return {
@@ -377,7 +383,7 @@ function WheelContext:remove_slot(name, expected_version)
     type = "slot_removed",
     name = name,
     version = existing.version + 1,
-    timestamp_ms = os.time() * 1000,
+    timestamp_ms = WheelHost.time.now() * 1000,
   })
 
   return { success = true, removed = true }
@@ -550,7 +556,7 @@ function WheelContext:_append_reflog(entry)
     ref = entry.ref or self._head,
     action = entry.action or "unknown",
     message = entry.message or "",
-    timestamp_ms = entry.timestamp_ms or (os.time() * 1000),
+    timestamp_ms = entry.timestamp_ms or (WheelHost.time.now() * 1000),
   }
   table.insert(self._reflog, record)
   if #self._reflog > 256 then
@@ -576,7 +582,7 @@ function WheelContext:commit_checkpoint(opts)
   local task_id = opts.task_id
   local rationale = opts.rationale
   local message = opts.message
-  local timestamp_ms = opts.timestamp_ms or (os.time() * 1000)
+  local timestamp_ms = opts.timestamp_ms or (WheelHost.time.now() * 1000)
 
   local parents = opts.parents
   if not parents then
@@ -881,7 +887,7 @@ function WheelContext:stash_push(message)
     slots = deep_copy_slots(self._slots),
     head_hash = cur_head,
     branch = cur_branch,
-    timestamp_ms = os.time() * 1000,
+    timestamp_ms = WheelHost.time.now() * 1000,
   }
 
   table.insert(self._stash, 1, entry)
@@ -925,7 +931,7 @@ function WheelContext:stash_pop(index)
       version = (self._slots[k] and self._slots[k].version or 0) + 1,
       kind = v.kind,
       size_bytes = v.size_bytes or (v.content and #v.content) or 0,
-      updated_at_ms = os.time() * 1000,
+      updated_at_ms = WheelHost.time.now() * 1000,
     }
   end
   self._tree_hash = nil
@@ -1042,7 +1048,7 @@ function WheelContext:cherry_pick(commit_hash, opts)
       version = (self._slots[k] and self._slots[k].version or 0) + 1,
       kind = classify_slot_kind(k),
       size_bytes = (v.content and #v.content) or 0,
-      updated_at_ms = os.time() * 1000,
+      updated_at_ms = WheelHost.time.now() * 1000,
     }
   end
   self._tree_hash = nil
@@ -1140,7 +1146,7 @@ function WheelContext:merge_branch(source, opts)
       version = 1,
       kind = classify_slot_kind(k),
       size_bytes = (v.content and #v.content) or 0,
-      updated_at_ms = os.time() * 1000,
+      updated_at_ms = WheelHost.time.now() * 1000,
     }
   end
   self._tree_hash = nil
