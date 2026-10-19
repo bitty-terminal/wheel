@@ -17,8 +17,7 @@ local WheelUI = load_submodule("ui")
 
 local ok_host, WheelHost = pcall(require, "wheel.host")
 if not ok_host then
-  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
-  WheelHost = ok_host2 and WheelHost2 or nil
+  WheelHost = require("lua.wheel.host")
 end
 
 local WheelTeam = {}
