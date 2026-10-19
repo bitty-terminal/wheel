@@ -5,6 +5,12 @@
 
 local WheelKernel = nil
 
+local ok_host, WheelHost = pcall(require, "wheel.host")
+if not ok_host then
+  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
+  WheelHost = ok_host2 and WheelHost2 or nil
+end
+
 local function get_kernel()
   if not WheelKernel then
     local ok, mod = pcall(require, "wheel.kernel")
@@ -388,7 +394,7 @@ function WheelConfig.write_trust_store(store, path_override)
   -- Ensure parent directory exists safely without shell injection
   local parent_dir = string.match(path, "^(.*)/[^/]+$")
   if parent_dir and parent_dir ~= "" then
-    os.execute("mkdir -p -- " .. shell_quote(parent_dir) .. " 2>/dev/null")
+    WheelHost.fs.mkdir_p(parent_dir)
   end
   return write_file(path, json_str)
 end
@@ -578,9 +584,9 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
 
   local discovered = {}
   -- Scan skills directory safely with shell_quote
-  local handle = io.popen("ls -1 -- " .. shell_quote(skills_dir) .. " 2>/dev/null")
-  if handle then
-    for entry in handle:lines() do
+  local list_res = WheelHost.proc.run_command("ls -1 -- " .. shell_quote(skills_dir) .. " 2>/dev/null")
+  if list_res.ok then
+    for entry in (list_res.stdout or ""):gmatch("[^\n]+") do
       local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"
       local skill_file = io.open(skill_path, "r")
       if skill_file then
@@ -601,7 +607,6 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
         end
       end
     end
-    handle:close()
   end
 
   return {

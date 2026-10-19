@@ -21,6 +21,12 @@ if not ok_kernel then
   WheelKernel = ok_kernel2 and WheelKernel2 or nil
 end
 
+local ok_host, WheelHost = pcall(require, "wheel.host")
+if not ok_host then
+  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
+  WheelHost = ok_host2 and WheelHost2 or nil
+end
+
 local json = (WheelKernel and WheelKernel.JSON) or nil
 if not json then
   local ok_json, cjson = pcall(require, "cjson")
@@ -1023,7 +1029,7 @@ function StdioAdapter:complete(request, opts)
   end
 
   -- Secure command execution via redirected temporary file
-  local tmp_file = os.tmpname()
+  local tmp_file = WheelHost.tmp.name()
   local f = io.open(tmp_file, "w")
   if not f then
     return nil, "Failed to open temporary file for stdio prompt: " .. tostring(tmp_file)
@@ -1032,18 +1038,17 @@ function StdioAdapter:complete(request, opts)
   f:close()
 
   local safe_cmd = string.format("%s < %q 2>&1", self.command, tmp_file)
-  local p = io.popen(safe_cmd, "r")
-  if not p then
+  local res = WheelHost.proc.run_command(safe_cmd)
+  if not res.ok then
     os.remove(tmp_file)
     return nil, "Failed to spawn stdio model process: " .. tostring(self.command)
   end
 
-  local out = p:read("*a") or ""
-  local close_ok, close_reason, exit_code = p:close()
+  local out = res.stdout or ""
   os.remove(tmp_file)
 
-  if close_ok ~= true then
-    local code = exit_code or 1
+  if res.code ~= 0 then
+    local code = res.code or 1
     return nil, string.format("Command '%s' failed (exit code %s): %s", self.command, tostring(code), out:sub(1, 512))
   end
 

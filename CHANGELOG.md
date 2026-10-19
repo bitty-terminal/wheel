@@ -24,6 +24,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Host filesystem, process, tmp, and time operations now route through a
+  single injectable `WheelHost` seam (`lua/wheel/host.lua`) with the previous
+  POSIX behavior as the default backend; a future Bitty host ABI adapter swaps
+  only the backend. No user-visible behavior change.
 - Repository repositioned as an independent agent-harness repository: removed
   from the official plugin set (bitty-plugins #98); descriptors, documentation,
   and the GitHub repository description aligned with the independence direction

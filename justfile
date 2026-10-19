@@ -75,6 +75,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/init.lua
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/config.lua
+    bun run luaparse --quiet --file lua/wheel/host.lua
     bun run luaparse --quiet --file lua/wheel/agent.lua
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
