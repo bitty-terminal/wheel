@@ -1,8 +1,8 @@
 # Contributing to wheel
 
 This guide is for contributors to the `wheel` repository. The repository is
-pre-implementation: the Lua sources, manifest, and tests are reviewed
-scaffolding, not shipped plugin behavior.
+pre-integration: the Lua sources, manifest, and tests are reviewed as an
+implementation pending host integration, not shipped plugin behavior.
 
 ## Repository ground rules
 

@@ -1,14 +1,16 @@
 # Wheel
 
-Wheel — the official Agent Harness plugin for the Bitty terminal (mascot: Bittie the hamster). Pre-implementation scaffold.
+Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster). Independent repository, pre-integration.
 
-This repository was generated from
-[bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template).
-It is a minimal Bitty plugin package: a static manifest, one Lua entry point,
-and a CI quality gate.
+This repository began as a
+[bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template)
+scaffold and now carries the Wheel harness implementation under `lua/wheel/`,
+its unit and cross-process test suites, and the CI quality gates.
 
-> Status: pre-implementation. The Bitty plugin host and the accepted Plugin
-> API v1 bindings are still landing. `just check` validates the manifest with
+> Status: pre-integration. The harness implementation lives in `lua/wheel/`
+> with unit and cross-process test suites; it is not yet validated against a
+> released Bitty plugin host, and the accepted Plugin API v1 bindings are
+> still landing. `just check` validates the manifest with
 > the authoritative `bitty-plugin-lint` from
 > [bitty-plugin-sdk](https://github.com/bitty-terminal/bitty-plugin-sdk)
 > (pinned by commit in `package.json` and `bun.lock`) and parses the Lua entry
@@ -18,8 +20,8 @@ and a CI quality gate.
 
 ## Scope
 
-Wheel is the official Agent Harness plugin for the Bitty terminal, scoped to
-software engineering only: its task domain is always software development. It
+Wheel is the agent harness for the Bitty terminal, scoped to software
+engineering only: its task domain is always software development. It
 may support multi-agent, multi-role, multi-model, and multi-workspace/panel
 operation within that domain. Roles (Primary, Commander, Coding, Review,
 Debug, Research) vary by configuration, never by class explosion. The staged
@@ -223,5 +225,5 @@ when it lands, and do not use surface the contract does not define.
 ## Security
 
 Report vulnerabilities through the process in the umbrella project's security
-policy rather than a public issue. This scaffold contains no credentials and no
-install-time execution.
+policy rather than a public issue. This repository contains no credentials and
+no install-time execution.

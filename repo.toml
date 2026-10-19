@@ -3,9 +3,9 @@
 name = "wheel"
 kind = "plugin"
 lang = "lua/ts"
-role = "independent plugin: official Agent Harness (Bittie the hamster)"
+role = "independent agent-harness plugin (Bittie the hamster); built on bitty-ai"
 owner = "bitty-ai"
-docs = "bitty-plugins-docs"
+docs = "bitty-ai-docs"
 
 [contracts.consumes]
 manifest-v1 = "OQ-012 plugin-platform-rfc" # bitty-plugin.toml header

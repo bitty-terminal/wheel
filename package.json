@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "description": "Wheel — the official Agent Harness plugin for the Bitty terminal (mascot: Bittie the hamster).",
+  "description": "Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster).",
   "license": "MIT",
   "packageManager": "bun@1.4.2",
   "devDependencies": {

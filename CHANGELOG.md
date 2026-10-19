@@ -11,10 +11,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repository scaffold generated from
   [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template):
   static manifest (`bitty-plugin.toml`), Lua entry point (`lua/wheel/init.lua`),
-  and the CI quality gate. No harness code yet: plugin behavior lands only
-  after `bitty-ai` is stable and a scoped task authorizes it.
+  and the CI quality gate.
+- Wheel harness implementation under `lua/wheel/`: kernel dispatch, hierarchical
+  configuration, agent runtime, team orchestration, Git-inspired context
+  versioning, tool execution engine, model provider adapters, execution runner,
+  and UI visualizer, with unit and cross-process test suites.
 - Repository governance: `AGENTS.md`, `CONTRIBUTING.md`, `SECURITY.md`,
   CarryCtx baseline (`.carryctx/config.toml`), and the Wheel/Bittie naming
   record (bitty-ai-docs `DEC-0003`).
 - Wheel Coding-Agent scope and Non-goals recorded in `README.md` and
   `AGENTS.md` (owner-approved scope, research record 046).
+
+### Changed
+
+- Repository repositioned as an independent agent-harness repository: removed
+  from the official plugin set (bitty-plugins #98); descriptors, documentation,
+  and the GitHub repository description aligned with the independence direction
+  (wheel #45). No behavior changes.
