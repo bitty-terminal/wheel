@@ -217,20 +217,31 @@ when it lands, and do not use surface the contract does not define.
 ### Command error contract
 
 Every command handler crosses the typed failure boundary in
-`lua/wheel/errors.lua`. A failure is a catchable Lua error table with exactly
-three fields, matching the accepted bridge error shape
+`lua/wheel/errors.lua`. A public failure is a catchable Lua error table with
+exactly three fields, matching the accepted bridge error shape
 (`bitty-plugins-docs/sdk/reference/overview.md`): `class`, `code`, and
 `message`. Match on `code`, never on message text.
 
+The boundary enforces that shape. A typed table that matches it passes
+through unchanged; a recognized nil-global message becomes
+`E_CAPABILITY_DENIED`; a table with extra fields, non-string fields, or a
+message longer than the 160-character Wheel bound is normalized to
+`E_INTERNAL`, as is every other non-capability failure. A malformed table is
+never presented as a capability denial. One internal exception exists: the
+dispatch-budget sentinel is explicitly marked as an opaque passthrough
+(`WheelErrors.passthrough`) and keeps its identity so the budget failure is
+not misreported. That marker is not part of the public error contract.
+
 | `code`                | `class`   | Meaning                                                                                                            |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------ |
-| `E_CAPABILITY_DENIED` | `runtime` | The sandbox removed a host surface the command needs. The message names the missing capability.                    |
+| `E_CAPABILITY_DENIED` | `runtime` | The sandbox removed a host surface the command needs. The message names the missing capability family.             |
 | `E_INTERNAL`          | `runtime` | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
 
-Capability denials use the accepted host spelling and wording, for example
-`capability 'env.read' is not granted`. They cover `env.read`, `fs.read`,
-`fs.write`, `process.spawn`, and `tmp.create`; the manifest and its granted
-capability set are unchanged.
+Capability denials use host wording, for example
+`capability 'env.read' is not granted`, and name the capability family
+(`env.read`, `fs.read`, `fs.write`, or `process.spawn`) the host would have to
+grant. Temporary-file creation maps to `fs.write`; there is no separate temp
+capability. The manifest and its granted capability set are unchanged.
 
 `E_INTERNAL` has no accepted host code yet. It is deliberately Wheel-local
 until the host vocabulary defines a generic internal or runtime failure code;

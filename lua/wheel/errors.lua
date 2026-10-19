@@ -99,21 +99,21 @@ function WheelErrors.internal(command_id)
   )
 end
 
--- Missing sandbox surfaces mapped to the capability a host would have to
--- grant. Globals and member names are interpreter vocabulary, never echoed.
+-- Missing sandbox globals mapped to the capability a host would have to
+-- grant. Only globals are classified: a bare field name such as `remove` or
+-- `open` has no owning table in the interpreter message, so treating it as a
+-- capability would mask ordinary table bugs. Table-member cases are covered
+-- by the explicit guards at the call sites.
 local NIL_CAPABILITIES = {
   io = "fs.read",
   loadfile = "fs.read",
   dofile = "fs.read",
-  getenv = "env.read",
-  execute = "process.spawn",
-  tmpname = "tmp.create",
-  remove = "fs.write",
-  popen = "process.spawn",
-  open = "fs.read",
+  -- A wholly absent `os` table can only be classified conservatively at the
+  -- boundary; explicit guards name the precise fs/process surface.
+  os = "env.read",
 }
 
---- Map a raw nil-global or nil-member failure to a capability identifier.
+--- Map a raw nil-global failure to a capability identifier.
 -- Supports the legacy Lua 5.1/LuaJIT wording and the Lua 5.2+ wording.
 -- @param message string
 -- @return string?
@@ -126,22 +126,27 @@ local function missing_capability(message)
     return NIL_CAPABILITIES[global]
   end
 
-  local field = message:match("attempt to call field '([%w_]+)' %(a nil value%)")
-    or message:match("attempt to index field '([%w_]+)' %(a nil value%)")
-    or message:match("attempt to call a nil value %(field '([%w_]+)'%)")
-    or message:match("attempt to index a nil value %(field '([%w_]+)'%)")
-  if field and NIL_CAPABILITIES[field] then
-    return NIL_CAPABILITIES[field]
-  end
-
   return nil
 end
 
---- Return true when `err` already matches the accepted bridge error shape.
+--- Return true when `err` matches the exact accepted bridge error shape.
+-- Exactly three fields (`class`, `code`, `message`) are required; extra
+-- fields, non-string values, and over-bound messages are treated as
+-- malformed and normalized to E_INTERNAL.
 -- @param err any
 -- @return boolean
 function WheelErrors.is_typed(err)
   if type(err) ~= "table" then
+    return false
+  end
+  local fields = 0
+  for key in pairs(err) do
+    if key ~= "class" and key ~= "code" and key ~= "message" then
+      return false
+    end
+    fields = fields + 1
+  end
+  if fields ~= 3 then
     return false
   end
   if type(err.class) ~= "string" or not CLASSES[err.class] then
@@ -162,11 +167,33 @@ function WheelErrors.is_typed(err)
   return true
 end
 
+local PASSTHROUGH_FIELD = "__wheel_passthrough"
+
+--- Mark an internal structured value as intentionally opaque.
+-- The dispatch budget sentinel uses this so the boundary preserves its
+-- identity instead of normalizing it to E_INTERNAL. This is not part of the
+-- public error contract.
+-- @param err table
+-- @return table
+function WheelErrors.passthrough(err)
+  assert(type(err) == "table", "passthrough value must be a table")
+  rawset(err, PASSTHROUGH_FIELD, true)
+  return err
+end
+
+--- Return true when `err` is an explicitly marked passthrough value.
+-- @param err any
+-- @return boolean
+function WheelErrors.is_passthrough(err)
+  return type(err) == "table" and rawget(err, PASSTHROUGH_FIELD) == true
+end
+
 --- Normalize a handler failure into a typed error table.
--- Typed errors pass through unchanged. A raw nil-global or nil-member failure
--- from the sandbox becomes a capability denial for the missing surface.
--- Opaque structured values (including the dispatch budget sentinel) pass
--- through so their meaning is preserved. Everything else becomes E_INTERNAL.
+-- Typed errors pass through unchanged. A raw nil-global failure from the
+-- sandbox becomes a capability denial for the missing surface. Tables are
+-- shape-enforced: malformed tables become E_INTERNAL, except for values
+-- explicitly marked with `WheelErrors.passthrough` (the dispatch budget
+-- sentinel). Everything else becomes E_INTERNAL.
 -- @param err any
 -- @param command_id string
 -- @return any
@@ -174,7 +201,7 @@ function WheelErrors.normalize(err, command_id)
   if WheelErrors.is_typed(err) then
     return err
   end
-  if type(err) == "table" then
+  if WheelErrors.is_passthrough(err) then
     return err
   end
   if type(err) == "string" then

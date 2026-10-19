@@ -337,10 +337,23 @@ end
 
 --- Read an environment variable through the checked host surface.
 local function getenv(name)
-  if type(os.getenv) ~= "function" then
+  if type(os) ~= "table" or type(os.getenv) ~= "function" then
     error(WheelErrors.capability_denied("env.read"), 0)
   end
   return os.getenv(name)
+end
+
+--- Cheap file-existence check (open/close, no content read).
+local function file_exists(filepath)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    error(WheelErrors.capability_denied("fs.read"), 0)
+  end
+  local f = io.open(filepath, "r")
+  if not f then
+    return false
+  end
+  f:close()
+  return true
 end
 
 --- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
@@ -603,8 +616,7 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
   if list_res.ok then
     for entry in (list_res.stdout or ""):gmatch("[^\n]+") do
       local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"
-      local skill_content = read_file(skill_path)
-      if skill_content then
+      if file_exists(skill_path) then
         local is_allowed = true
         if disabled_map[entry] then
           is_allowed = false

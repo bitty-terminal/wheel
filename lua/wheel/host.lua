@@ -124,7 +124,7 @@ end
 -- @param path string
 -- @return boolean ok, number code
 function standalone.mkdir_p(path)
-  require_surface(type(os.execute) == "function", "fs.write")
+  require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
   local ok, _, code = os.execute("mkdir -p -- " .. shell_quote(path) .. " 2>/dev/null")
   if ok == true or ok == 0 then
     return true, 0
@@ -242,7 +242,7 @@ end
 -- created; the caller owns creation and cleanup).
 -- @return string
 function standalone.tmpname()
-  require_surface(type(os.tmpname) == "function", "tmp.create")
+  require_surface(type(os) == "table" and type(os.tmpname) == "function", "fs.write")
   return os.tmpname()
 end
 

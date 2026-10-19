@@ -655,7 +655,7 @@ AnthropicAdapter.__index = AnthropicAdapter
 
 --- Read an environment variable through the checked host surface.
 local function getenv(name)
-  if type(os.getenv) ~= "function" then
+  if type(os) ~= "table" or type(os.getenv) ~= "function" then
     error(WheelErrors.capability_denied("env.read"), 0)
   end
   return os.getenv(name)
@@ -663,7 +663,7 @@ end
 
 --- Remove a temporary file through the checked host surface.
 local function remove_file(path)
-  if type(os.remove) ~= "function" then
+  if type(os) ~= "table" or type(os.remove) ~= "function" then
     error(WheelErrors.capability_denied("fs.write"), 0)
   end
   return os.remove(path)

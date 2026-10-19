@@ -462,19 +462,19 @@ local EXPECTED_COMMANDS = {
 -- error table rather than an unbounded traceback.
 local COMMAND_TITLE_MAX_LENGTH = 32
 local COMMAND_DESCRIPTION_MAX_LENGTH = 128
-local DENIAL_MESSAGE_MAX_LENGTH = 512
 -- Host-sandbox dispatch budget, enforced while the handler executes by a debug
 -- count hook (see dispatch_with_budget). A handler that exceeds the CPU
 -- ceiling or the instruction budget is interrupted at the next hook tick
--- instead of blocking the suite.
+-- instead of blocking the suite. The sentinel is explicitly marked opaque so
+-- the typed boundary preserves it instead of normalizing it to E_INTERNAL.
 local SANDBOX_DISPATCH_TIMEOUT_SECONDS = 10
 local SANDBOX_HOOK_INSTRUCTION_INTERVAL = 100000
 local SANDBOX_DISPATCH_INSTRUCTION_BUDGET = 10000000
-local SANDBOX_BUDGET_EXCEEDED = setmetatable({}, {
+local SANDBOX_BUDGET_EXCEEDED = WheelErrors.passthrough(setmetatable({}, {
   __tostring = function()
     return "sandbox dispatch budget exceeded"
   end,
-})
+}))
 
 -- Commands that complete under the accepted v1 sandbox (no io, no process or
 -- env authority) and the notification title each must emit.
@@ -567,12 +567,13 @@ local function assert_typed_error(err, expected_code)
   assert(err.class == "runtime", "typed error class must be runtime, got " .. tostring(err.class))
   assert(err.code == expected_code, "unexpected typed error code: " .. tostring(err.code))
   assert(type(err.message) == "string" and #err.message > 0
-    and #err.message <= DENIAL_MESSAGE_MAX_LENGTH, "typed error message must be non-empty and bounded")
+    and #err.message <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "typed error message must be non-empty and within WheelErrors.MESSAGE_MAX_LENGTH")
   assert(err.message:find("\n", 1, true) == nil and err.message:find("\r", 1, true) == nil,
     "typed error message must be a single line")
   local rendered = tostring(err)
-  assert(#rendered > 0 and #rendered <= DENIAL_MESSAGE_MAX_LENGTH,
-    "rendered typed error must be non-empty and bounded")
+  assert(#rendered > 0 and #rendered <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "rendered typed error must be non-empty and within WheelErrors.MESSAGE_MAX_LENGTH")
   assert(rendered:find("\n", 1, true) == nil, "rendered typed error must not contain a traceback")
   return err
 end
@@ -749,22 +750,44 @@ run_test("Wheel Init: command registration and dispatch", function()
 end)
 
 run_test("WheelErrors: typed capability and internal classification", function()
-  -- Both interpreter wordings normalize to the same typed capability denial.
-  local legacy_call = WheelErrors.normalize(
-    "lua/wheel/config.lua:333: attempt to call field 'getenv' (a nil value)", "plan")
-  assert_sandbox_denial(legacy_call, "env.read")
-
-  local modern_call = WheelErrors.normalize(
-    "lua/wheel/config.lua:333: attempt to call a nil value (field 'getenv')", "plan")
-  assert_sandbox_denial(modern_call, "env.read")
-
-  local legacy_index = WheelErrors.normalize(
+  -- Unambiguous global wording normalizes to a typed capability denial.
+  local legacy_global = WheelErrors.normalize(
     "lua/wheel/init.lua:195: attempt to index global 'io' (a nil value)", "trust")
-  assert_sandbox_denial(legacy_index, "fs.read")
+  assert_sandbox_denial(legacy_global, "fs.read")
 
-  local modern_index = WheelErrors.normalize(
+  local modern_global = WheelErrors.normalize(
     "lua/wheel/init.lua:195: attempt to index a nil value (global 'io')", "trust")
-  assert_sandbox_denial(modern_index, "fs.read")
+  assert_sandbox_denial(modern_global, "fs.read")
+
+  local legacy_os = WheelErrors.normalize(
+    "lua/wheel/config.lua:340: attempt to index global 'os' (a nil value)", "plan")
+  assert_sandbox_denial(legacy_os, "env.read")
+
+  local modern_os = WheelErrors.normalize(
+    "lua/wheel/config.lua:340: attempt to index a nil value (global 'os')", "plan")
+  assert_sandbox_denial(modern_os, "env.read")
+
+  -- A bare field name has no owning table and must not be classified as a
+  -- capability; it is an ordinary Wheel defect.
+  local legacy_field = WheelErrors.normalize(
+    "lua/wheel/provider.lua:661: attempt to call field 'getenv' (a nil value)", "orchestrate")
+  assert_typed_error(legacy_field, "E_INTERNAL")
+
+  local modern_field = WheelErrors.normalize(
+    "lua/wheel/provider.lua:661: attempt to call a nil value (field 'getenv')", "orchestrate")
+  assert_typed_error(modern_field, "E_INTERNAL")
+
+  -- Regression: a missing standard table helper is a Wheel bug, not a
+  -- filesystem denial.
+  local saved_table_remove = table.remove
+  table.remove = nil
+  local table_bug_ok, table_bug_err = pcall(WheelErrors.wrap("table-bug", function()
+    return table.remove({ 1 }, 1)
+  end))
+  table.remove = saved_table_remove
+
+  assert(not table_bug_ok, "a missing table helper must fail the handler")
+  assert_typed_error(table_bug_err, "E_INTERNAL")
 
   -- An unexpected failure stays generic and never echoes its raw message.
   local internal = assert_typed_error(
@@ -778,6 +801,22 @@ run_test("WheelErrors: typed capability and internal classification", function()
   local passthrough = WheelErrors.capability_denied("env.read")
   assert(WheelErrors.normalize(passthrough, "plan") == passthrough,
     "typed denials must pass through the dispatch boundary unchanged")
+
+  -- Tables are shape-enforced: extra fields and oversized messages become
+  -- E_INTERNAL rather than leaking a malformed public error.
+  local extra_field = WheelErrors.capability_denied("env.read")
+  extra_field.extra = true
+  assert_typed_error(WheelErrors.normalize(extra_field, "plan"), "E_INTERNAL")
+
+  local oversized = WheelErrors.capability_denied("env.read")
+  oversized.message = string.rep("x", WheelErrors.MESSAGE_MAX_LENGTH + 1)
+  assert_typed_error(WheelErrors.normalize(oversized, "plan"), "E_INTERNAL")
+
+  -- The dispatch-budget sentinel is explicitly marked opaque and keeps its
+  -- identity through the boundary.
+  local sentinel = WheelErrors.passthrough({ reason = "budget" })
+  assert(WheelErrors.normalize(sentinel, "plan") == sentinel,
+    "a marked passthrough value must keep its identity")
 end)
 
 run_test("Wheel Init: host sandbox activation and denial paths", function()
@@ -907,6 +946,23 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
     assert(fallback_enforced == budget_enforced, "dispatch budget enforcement drifted for fallback denial")
     assert(not fallback_ok, "a raw nil-surface failure must be denied at the dispatch boundary")
     assert_sandbox_denial(fallback_err, "fs.read")
+
+    -- Direct guard coverage for the write, process, and temp surfaces.
+    local function assert_host_denial(call, capability)
+      local host_ok, host_err = pcall(call)
+      assert(not host_ok, "host surface must be denied without authority")
+      assert_sandbox_denial(host_err, capability)
+    end
+
+    assert_host_denial(function()
+      return WheelHost.fs.write_file("denied.txt", "x")
+    end, "fs.write")
+    assert_host_denial(function()
+      return WheelHost.proc.run_command("true")
+    end, "process.spawn")
+    assert_host_denial(function()
+      return WheelHost.tmp.name()
+    end, "fs.write")
   end)
 end)
 
