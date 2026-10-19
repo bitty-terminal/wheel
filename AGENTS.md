@@ -12,21 +12,24 @@
   architecture, API, security, packaging, compatibility, and public-behavior
   contracts. This repository must not invent capabilities, lifecycle
   semantics, or release policy.
-- The project is pre-implementation. Repository existence, a manifest, or a
-  proposed file tree is not evidence of usable plugin behavior.
+- The project is pre-integration: the harness implementation and its tests
+  exist under `lua/wheel/`, but they are not yet validated against a released
+  Bitty plugin host. Repository existence, a manifest, or a file tree is not
+  evidence of usable plugin behavior.
 
 ## Plugin identity and scope
 
 - Plugin id: `bitty-terminal.wheel` (manifest `plugin.id`), repository
   `wheel`, Lua module `lua/wheel/`.
-- Purpose: the official Agent Harness plugin for the Bitty terminal,
+- Purpose: the agent harness for the Bitty terminal,
   built on Bitty AI. Mascot: Bittie the hamster (Wheel is short for
   hamster wheel). Naming recorded as a durable CarryCtx decision
   (bitty-ai-docs `DEC-0003`, superseding `DEC-0002`).
-- The plugin does not exist yet beyond this scaffold: no harness code is
-  written here until `bitty-ai` is stable and a scoped task authorizes it.
-  Sibling future plugins (LLM provider/model management, Agent dashboard,
-  and others) are separate repositories, not this one.
+- The harness implementation is developed in this repository under scoped
+  tasks; it is not yet integrated with a released Bitty plugin host, and the
+  deferral tracked in issue #41 remains in force. Sibling future plugins (LLM
+  provider/model management, Agent dashboard, and others) are separate
+  repositories, not this one.
 - Authority boundary: only `platform.notify` is requested, backing the
   generated `hello` example command. No filesystem, process, network,
   clipboard, terminal input, or persistent-state authority; no install-time

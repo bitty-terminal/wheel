@@ -12,7 +12,7 @@
 id = "bitty-terminal.wheel"
 name = "Wheel"
 version = "0.0.1"
-description = "Wheel — the official Agent Harness plugin for the Bitty terminal (mascot: Bittie the hamster). Pre-implementation scaffold."
+description = "Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster). Independent, pre-integration."
 # Optional SPDX expression. Add a LICENSE file and set this before publishing.
 # license = "MIT"
 
