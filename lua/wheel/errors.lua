@@ -167,7 +167,11 @@ function WheelErrors.is_typed(err)
   return true
 end
 
-local PASSTHROUGH_FIELD = "__wheel_passthrough"
+-- Unforgeable passthrough marker: a module-local key and token. Neither value
+-- is reachable from a handler, so no table shaped like a sentinel can claim
+-- passthrough by copying a field name or a boolean.
+local PASSTHROUGH_KEY = {}
+local PASSTHROUGH_TOKEN = {}
 
 --- Mark an internal structured value as intentionally opaque.
 -- The dispatch budget sentinel uses this so the boundary preserves its
@@ -177,15 +181,16 @@ local PASSTHROUGH_FIELD = "__wheel_passthrough"
 -- @return table
 function WheelErrors.passthrough(err)
   assert(type(err) == "table", "passthrough value must be a table")
-  rawset(err, PASSTHROUGH_FIELD, true)
+  rawset(err, PASSTHROUGH_KEY, PASSTHROUGH_TOKEN)
   return err
 end
 
---- Return true when `err` is an explicitly marked passthrough value.
+--- Return true when `err` carries the module-local passthrough token.
 -- @param err any
 -- @return boolean
 function WheelErrors.is_passthrough(err)
-  return type(err) == "table" and rawget(err, PASSTHROUGH_FIELD) == true
+  return type(err) == "table"
+    and rawget(err, PASSTHROUGH_KEY) == PASSTHROUGH_TOKEN
 end
 
 --- Normalize a handler failure into a typed error table.

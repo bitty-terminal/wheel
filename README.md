@@ -228,9 +228,10 @@ through unchanged; a recognized nil-global message becomes
 message longer than the 160-character Wheel bound is normalized to
 `E_INTERNAL`, as is every other non-capability failure. A malformed table is
 never presented as a capability denial. One internal exception exists: the
-dispatch-budget sentinel is explicitly marked as an opaque passthrough
+dispatch-budget sentinel is marked with a module-local token
 (`WheelErrors.passthrough`) and keeps its identity so the budget failure is
-not misreported. That marker is not part of the public error contract.
+not misreported. The token is not reachable from a handler and cannot be
+forged with a table field; it is not part of the public error contract.
 
 | `code`                | `class`   | Meaning                                                                                                            |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------ |

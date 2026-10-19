@@ -817,6 +817,24 @@ run_test("WheelErrors: typed capability and internal classification", function()
   local sentinel = WheelErrors.passthrough({ reason = "budget" })
   assert(WheelErrors.normalize(sentinel, "plan") == sentinel,
     "a marked passthrough value must keep its identity")
+
+  -- A forged public marker must not grant passthrough: the marker is a
+  -- module-local token, so this table is shape-enforced to E_INTERNAL and
+  -- none of its fields leak.
+  local forged_ok, forged_err = pcall(WheelErrors.wrap("forged-passthrough", function()
+    error({
+      __wheel_passthrough = true,
+      message = string.rep("x", 1000),
+      secret = "/host/path",
+    }, 0)
+  end))
+  assert(not forged_ok, "a forged passthrough table must fail the handler")
+  local forged = assert_typed_error(forged_err, "E_INTERNAL")
+  assert(forged.message == "internal error in wheel command 'forged-passthrough'",
+    "a forged passthrough table must become a generic internal error")
+  assert(forged.__wheel_passthrough == nil, "a forged marker must not survive normalization")
+  assert(forged.secret == nil, "forged extra fields must not survive normalization")
+  assert(forged.message:find("xxxx", 1, true) == nil, "a forged message must not survive normalization")
 end)
 
 run_test("Wheel Init: host sandbox activation and denial paths", function()
