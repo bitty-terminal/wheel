@@ -462,9 +462,18 @@ local EXPECTED_COMMANDS = {
 local COMMAND_TITLE_MAX_LENGTH = 32
 local COMMAND_DESCRIPTION_MAX_LENGTH = 128
 local DENIAL_MESSAGE_MAX_LENGTH = 512
--- Generous CPU-clock ceiling per dispatched command; a CPU-bound hang would
--- exceed it instead of blocking the suite indefinitely.
+-- Host-sandbox dispatch budget, enforced while the handler executes by a debug
+-- count hook (see dispatch_with_budget). A handler that exceeds the CPU
+-- ceiling or the instruction budget is interrupted at the next hook tick
+-- instead of blocking the suite.
 local SANDBOX_DISPATCH_TIMEOUT_SECONDS = 10
+local SANDBOX_HOOK_INSTRUCTION_INTERVAL = 100000
+local SANDBOX_DISPATCH_INSTRUCTION_BUDGET = 10000000
+local SANDBOX_BUDGET_EXCEEDED = setmetatable({}, {
+  __tostring = function()
+    return "sandbox dispatch budget exceeded"
+  end,
+})
 
 -- Commands that complete under the accepted v1 sandbox (no io, no process or
 -- env authority) and the notification title each must emit.
@@ -480,6 +489,12 @@ local SANDBOX_HANDLED_TITLES = {
   branch = "Wheel Context Branches",
   checkpoint = "Wheel Checkpoints",
   reflog = "Wheel Reflog",
+}
+
+-- Deterministic handled bodies asserted where the text is stable. `run` with
+-- no ready task is the only authority-free handled branch with fixed text.
+local SANDBOX_HANDLED_BODIES = {
+  run = "No ready tasks available to execute.",
 }
 
 -- Commands that need authority the sandbox removes. `kind` distinguishes an
@@ -572,12 +587,48 @@ local function assert_sandbox_denial(err, expected)
     "unexpected sandbox denial: " .. err)
 end
 
+--- Run one command handler under an interrupting dispatch budget.
+-- A debug count hook is installed before the handler starts, so a CPU-bound
+-- hang is interrupted at the next tick (or as soon as the instruction budget
+-- is spent) instead of blocking the suite. The hook is always cleared before
+-- returning to the caller. Returns `ok, err, enforced`; `enforced` is false
+-- only when the interpreter lacks `debug.sethook`, in which case the ceiling
+-- is explicitly skipped and the caller must not claim a bound.
+local function dispatch_with_budget(def)
+  local hook_supported = type(debug) == "table" and type(debug.sethook) == "function"
+  if not hook_supported then
+    local ok, err = pcall(def.run)
+    return ok, err, false
+  end
+
+  local started_clock = os.clock()
+  local instructions = 0
+  local function budget_hook()
+    instructions = instructions + SANDBOX_HOOK_INSTRUCTION_INTERVAL
+    if instructions >= SANDBOX_DISPATCH_INSTRUCTION_BUDGET
+      or os.clock() - started_clock > SANDBOX_DISPATCH_TIMEOUT_SECONDS then
+      -- Clear first so the sentinel unwinds without re-entering the hook.
+      debug.sethook()
+      error(SANDBOX_BUDGET_EXCEEDED, 0)
+    end
+  end
+
+  debug.sethook(budget_hook, "", SANDBOX_HOOK_INSTRUCTION_INTERVAL)
+  local ok, err = pcall(def.run)
+  debug.sethook()
+  return ok, err, true
+end
+
 local function is_wheel_module(name)
   return name == "wheel" or name:match("^wheel%.") ~= nil
     or name == "lua.wheel" or name:match("^lua%.wheel%.") ~= nil
 end
 
---- Run `fn` with the accepted v1 Lua sandbox applied to this interpreter.
+--- Run `fn` with the authority-relevant surface of the accepted v1 Lua sandbox.
+-- Modeled absent: io, loadfile, dofile, os.execute, os.getenv, os.tmpname, and
+-- os.remove. Retained: os.time, os.clock, and os.date. Other os entries
+-- (os.exit, os.rename, ...) are intentionally not modeled because no Wheel
+-- call site reaches them during activation or command dispatch.
 -- The fixture is hermetic: it mutates only process globals for the duration of
 -- the call, never reads user files or the network, and restores package state
 -- and every removed global on both success and failure.
@@ -703,7 +754,8 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
   local notifications = {}
 
   run_in_host_sandbox(function()
-    -- Fixture preconditions: model the accepted v1 Lua sandbox exactly.
+    -- Fixture preconditions: authority-relevant surface of the accepted v1
+    -- Lua sandbox. Other os entries are intentionally not modeled.
     assert(_G.io == nil, "sandbox must remove io")
     assert(_G.loadfile == nil and _G.dofile == nil, "sandbox must remove file-based loading")
     assert(type(os) == "table", "sandbox retains the os table")
@@ -714,6 +766,11 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
     assert(type(os.time) == "function", "sandbox retains os.time")
     assert(type(os.clock) == "function", "sandbox retains os.clock")
     assert(type(os.date) == "function", "sandbox retains os.date")
+
+    local budget_enforced = type(debug) == "table" and type(debug.sethook) == "function"
+    if not budget_enforced then
+      print("[SKIP] host-sandbox dispatch ceiling: debug.sethook is unavailable in " .. _VERSION)
+    end
 
     _G.bitty = {
       commands = {
@@ -738,12 +795,11 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
       local denial = SANDBOX_DENIALS[expected.id]
       local notifications_before = #notifications
 
-      local clock_start = os.clock()
-      local ok, err = pcall(def.run)
-      local elapsed = os.clock() - clock_start
-
-      assert(elapsed <= SANDBOX_DISPATCH_TIMEOUT_SECONDS,
-        string.format("%s exceeded the bounded dispatch budget (%.2fs)", expected.id, elapsed))
+      local ok, err, enforced = dispatch_with_budget(def)
+      assert(enforced == budget_enforced, "dispatch budget enforcement drifted for " .. expected.id)
+      assert(err ~= SANDBOX_BUDGET_EXCEEDED,
+        string.format("%s exceeded the sandbox dispatch budget (%ds CPU or %d instructions)",
+          expected.id, SANDBOX_DISPATCH_TIMEOUT_SECONDS, SANDBOX_DISPATCH_INSTRUCTION_BUDGET))
       assert(#capture.order == #EXPECTED_COMMANDS,
         "command dispatch must not register or duplicate commands: " .. expected.id)
 
@@ -758,6 +814,11 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
           expected.id .. " must emit exactly one notification")
         assert(notifications[#notifications].title == SANDBOX_HANDLED_TITLES[expected.id],
           expected.id .. " emitted an unexpected notification title")
+        local expected_body = SANDBOX_HANDLED_BODIES[expected.id]
+        if expected_body then
+          assert(notifications[#notifications].body == expected_body,
+            expected.id .. " emitted an unexpected notification body")
+        end
       end
     end
 
@@ -770,7 +831,11 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
     assert(ready_task ~= nil, "sandbox fixture must seed a ready task")
 
     local notifications_before = #notifications
-    local ok, err = pcall(capture.defs["run"].run)
+    local ok, err, enforced = dispatch_with_budget(capture.defs["run"])
+    assert(enforced == budget_enforced, "dispatch budget enforcement drifted for seeded run")
+    assert(err ~= SANDBOX_BUDGET_EXCEEDED,
+      string.format("run with a ready task exceeded the sandbox dispatch budget (%ds CPU or %d instructions)",
+        SANDBOX_DISPATCH_TIMEOUT_SECONDS, SANDBOX_DISPATCH_INSTRUCTION_BUDGET))
     assert(not ok, "run with a ready task must be denied without host authority")
     assert_sandbox_denial(err, SANDBOX_CONFIG_DENIAL)
     assert(#notifications == notifications_before,
