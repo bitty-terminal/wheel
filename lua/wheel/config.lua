@@ -4,6 +4,7 @@
 -- per bitty-ai-docs specifications.
 
 local WheelKernel = nil
+local WheelErrors = require("wheel.errors")
 
 local ok_host, WheelHost = pcall(require, "wheel.host")
 if not ok_host then
@@ -312,6 +313,9 @@ end
 
 --- Read file content safely.
 local function read_file(filepath)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    error(WheelErrors.capability_denied("fs.read"), 0)
+  end
   local f = io.open(filepath, "r")
   if not f then return nil end
   local content = f:read("*a")
@@ -321,6 +325,9 @@ end
 
 --- Write file content safely.
 local function write_file(filepath, content)
+  if type(io) ~= "table" or type(io.open) ~= "function" then
+    error(WheelErrors.capability_denied("fs.write"), 0)
+  end
   local f = io.open(filepath, "w")
   if not f then return false end
   f:write(content)
@@ -328,13 +335,21 @@ local function write_file(filepath, content)
   return true
 end
 
+--- Read an environment variable through the checked host surface.
+local function getenv(name)
+  if type(os.getenv) ~= "function" then
+    error(WheelErrors.capability_denied("env.read"), 0)
+  end
+  return os.getenv(name)
+end
+
 --- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
 function WheelConfig.get_global_config_path()
-  local xdg_config = os.getenv("XDG_CONFIG_HOME")
+  local xdg_config = getenv("XDG_CONFIG_HOME")
   if xdg_config and xdg_config ~= "" then
     return xdg_config .. "/wheel/init.lua"
   end
-  local home = os.getenv("HOME") or ""
+  local home = getenv("HOME") or ""
   if home ~= "" then
     return home .. "/.config/wheel/init.lua"
   end
@@ -351,11 +366,11 @@ end
 
 --- Resolve trust store path ($XDG_STATE_HOME/wheel/trusted_projects.json).
 function WheelConfig.get_trust_store_path()
-  local xdg_state = os.getenv("XDG_STATE_HOME")
+  local xdg_state = getenv("XDG_STATE_HOME")
   if xdg_state and xdg_state ~= "" then
     return xdg_state .. "/wheel/trusted_projects.json"
   end
-  local home = os.getenv("HOME") or ""
+  local home = getenv("HOME") or ""
   if home ~= "" then
     return home .. "/.local/state/wheel/trusted_projects.json"
   end
@@ -402,14 +417,14 @@ end
 --- Normalize a path string to an absolute canonical path for trust store matching.
 local function normalize_path(path)
   if not path or path == "" or path == "." then
-    local pwd = os.getenv("PWD")
+    local pwd = getenv("PWD")
     if pwd and pwd ~= "" then
       path = pwd
     else
       path = "."
     end
   elseif string.sub(path, 1, 1) ~= "/" then
-    local pwd = os.getenv("PWD")
+    local pwd = getenv("PWD")
     if pwd and pwd ~= "" then
       path = pwd .. "/" .. path
     end
@@ -588,9 +603,8 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
   if list_res.ok then
     for entry in (list_res.stdout or ""):gmatch("[^\n]+") do
       local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"
-      local skill_file = io.open(skill_path, "r")
-      if skill_file then
-        skill_file:close()
+      local skill_content = read_file(skill_path)
+      if skill_content then
         local is_allowed = true
         if disabled_map[entry] then
           is_allowed = false

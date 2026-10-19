@@ -49,6 +49,7 @@
 -- `status` or `duration_ms`) continues to pass through untouched.
 
 local WheelHost = {}
+local WheelErrors = require("wheel.errors")
 
 -- ---------------------------------------------------------------------------
 -- Standalone POSIX backend (the documented swap point)
@@ -108,12 +109,22 @@ local function close_exit_code(ok_close, exit_code)
   return nil
 end
 
+--- Fail with a typed capability denial when the standalone surface is absent.
+-- @param available boolean
+-- @param capability string
+local function require_surface(available, capability)
+  if not available then
+    error(WheelErrors.capability_denied(capability), 0)
+  end
+end
+
 --- Create <path> and all missing parents (POSIX `mkdir -p`).
 -- Mirrors the previous per-call-site `os.execute("mkdir -p ...")`; errors are
 -- suppressed on stderr like the trust-store call site did.
 -- @param path string
 -- @return boolean ok, number code
 function standalone.mkdir_p(path)
+  require_surface(type(os.execute) == "function", "fs.write")
   local ok, _, code = os.execute("mkdir -p -- " .. shell_quote(path) .. " 2>/dev/null")
   if ok == true or ok == 0 then
     return true, 0
@@ -128,6 +139,7 @@ end
 -- @param path string
 -- @return table { ok = boolean, code = number, stdout = string, stderr = string, entries = string[], total = number }
 function standalone.list_dir(path)
+  require_surface(type(io) == "table" and type(io.popen) == "function", "fs.read")
   local cmd = string.format("ls -la %q 2>&1", path)
   local p = io.popen(cmd, "r")
   if not p then
@@ -161,6 +173,7 @@ end
 -- @param path string
 -- @return string? content, string? err
 function standalone.read_file(path)
+  require_surface(type(io) == "table" and type(io.open) == "function", "fs.read")
   local f, err = io.open(path, "r")
   if not f then
     return nil, tostring(err)
@@ -175,6 +188,7 @@ end
 -- @param content string
 -- @return boolean ok, string? err
 function standalone.write_file(path, content)
+  require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
   local f, err = io.open(path, "w")
   if not f then
     return false, tostring(err)
@@ -194,6 +208,7 @@ end
 -- @param shell_string string
 -- @return table { ok = boolean, code = number, stdout = string, stderr = string }
 function standalone.run_command(shell_string)
+  require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
   local p = io.popen(shell_string, "r")
   if not p then
     return { ok = false, code = 1, stdout = "", stderr = "Failed to spawn shell process" }
@@ -227,6 +242,7 @@ end
 -- created; the caller owns creation and cleanup).
 -- @return string
 function standalone.tmpname()
+  require_surface(type(os.tmpname) == "function", "tmp.create")
   return os.tmpname()
 end
 

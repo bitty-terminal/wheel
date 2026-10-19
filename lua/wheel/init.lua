@@ -23,6 +23,8 @@ local WheelContext = load_submodule("context")
 local WheelTool = load_submodule("tool")
 local WheelProvider = load_submodule("provider")
 local WheelRunner = load_submodule("runner")
+local WheelHost = load_submodule("host")
+local WheelErrors = load_submodule("errors")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -48,8 +50,16 @@ local M = {
 
 -- Register plugin commands if running inside Bitty host environment.
 if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands.register then
+  -- Every handler crosses the same typed failure boundary, so a missing host
+  -- surface becomes a stable capability denial while real defects stay
+  -- distinguishable as internal errors. Registration metadata is untouched.
+  local function register_command(def)
+    def.run = WheelErrors.wrap(def.id, def.run)
+    bitty.commands.register(def)
+  end
+
   -- 1. hello
-  bitty.commands.register({
+  register_command({
     id = "hello",
     title = "Wheel: hello",
     description = "Print a greeting from Wheel.",
@@ -62,7 +72,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 2. status
-  bitty.commands.register({
+  register_command({
     id = "status",
     title = "Wheel: status",
     description = "Display Wheel kernel status and telemetry summary.",
@@ -76,7 +86,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 3. graph
-  bitty.commands.register({
+  register_command({
     id = "graph",
     title = "Wheel: graph",
     description = "Render ASCII Task DAG and topological execution waves.",
@@ -90,7 +100,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 4. plan
-  bitty.commands.register({
+  register_command({
     id = "plan",
     title = "Wheel: plan",
     description = "Initialize or decompose a software engineering plan in the Task DAG.",
@@ -122,7 +132,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 5. run
-  bitty.commands.register({
+  register_command({
     id = "run",
     title = "Wheel: run",
     description = "Execute the next ready task in the DAG using WheelAgent.",
@@ -185,23 +195,21 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 6. trust
-  bitty.commands.register({
+  register_command({
     id = "trust",
     title = "Wheel: trust",
     description = "Inspect and approve project configuration (.wheel/init.lua).",
     run = function()
       local project_root = "."
       local proj_path = WheelConfig.get_project_config_path(project_root)
-      local file = io.open(proj_path, "r")
-      if not file then
+      local content = WheelHost.fs.read_file(proj_path)
+      if not content then
         bitty.notify.show({
           title = "Wheel Trust",
           body = "No project configuration found at " .. proj_path,
         })
         return
       end
-      local content = file:read("*a")
-      file:close()
 
       local preview = content:sub(1, 120)
       if #content > 120 then
@@ -224,7 +232,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 7. team
-  bitty.commands.register({
+  register_command({
     id = "team",
     title = "Wheel: team status",
     description = "Display Wheel multi-agent peer colleague roster and live states.",
@@ -250,7 +258,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 8. context
-  bitty.commands.register({
+  register_command({
     id = "context",
     title = "Wheel: context",
     description = "Inspect active semantic slots, Merkle root, and prefix-cache status.",
@@ -275,7 +283,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 9. tools
-  bitty.commands.register({
+  register_command({
     id = "tools",
     title = "Wheel: tools",
     description = "List registered Wheel agent tools and intent schemas.",
@@ -296,7 +304,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 10. orchestrate
-  bitty.commands.register({
+  register_command({
     id = "orchestrate",
     title = "Wheel: orchestrate",
     description = "Run autonomous multi-agent wave orchestration loop over Task DAG.",
@@ -338,7 +346,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 11. models
-  bitty.commands.register({
+  register_command({
     id = "models",
     title = "Wheel: models",
     description = "Display configured model profiles, providers, and parameters.",
@@ -376,7 +384,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 12. branch
-  bitty.commands.register({
+  register_command({
     id = "branch",
     title = "Wheel: branch",
     description = "List context branches or display active branch and HEAD commit.",
@@ -400,7 +408,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 13. checkpoint
-  bitty.commands.register({
+  register_command({
     id = "checkpoint",
     title = "Wheel: checkpoint",
     description = "Display recent context checkpoints (commit ancestry log).",
@@ -427,7 +435,7 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
   })
 
   -- 14. reflog
-  bitty.commands.register({
+  register_command({
     id = "reflog",
     title = "Wheel: reflog",
     description = "Display recent context reflog transitions and audit journal.",
