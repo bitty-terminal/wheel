@@ -380,17 +380,268 @@ end)
 -- 4. Plugin Init and Command Registration Tests
 -- ===========================================================================
 
+-- The complete v1 command catalog registered by lua/wheel/init.lua. Keep this
+-- in the same order as the manifest's [lazy].commands list so ordering drift
+-- is caught alongside missing, duplicate, or extra registrations.
+local EXPECTED_COMMANDS = {
+  {
+    id = "hello",
+    title = "Wheel: hello",
+    description = "Print a greeting from Wheel.",
+  },
+  {
+    id = "status",
+    title = "Wheel: status",
+    description = "Display Wheel kernel status and telemetry summary.",
+  },
+  {
+    id = "graph",
+    title = "Wheel: graph",
+    description = "Render ASCII Task DAG and topological execution waves.",
+  },
+  {
+    id = "plan",
+    title = "Wheel: plan",
+    description = "Initialize or decompose a software engineering plan in the Task DAG.",
+  },
+  {
+    id = "run",
+    title = "Wheel: run",
+    description = "Execute the next ready task in the DAG using WheelAgent.",
+  },
+  {
+    id = "trust",
+    title = "Wheel: trust",
+    description = "Inspect and approve project configuration (.wheel/init.lua).",
+  },
+  {
+    id = "team",
+    title = "Wheel: team status",
+    description = "Display Wheel multi-agent peer colleague roster and live states.",
+  },
+  {
+    id = "context",
+    title = "Wheel: context",
+    description = "Inspect active semantic slots, Merkle root, and prefix-cache status.",
+  },
+  {
+    id = "tools",
+    title = "Wheel: tools",
+    description = "List registered Wheel agent tools and intent schemas.",
+  },
+  {
+    id = "orchestrate",
+    title = "Wheel: orchestrate",
+    description = "Run autonomous multi-agent wave orchestration loop over Task DAG.",
+  },
+  {
+    id = "models",
+    title = "Wheel: models",
+    description = "Display configured model profiles, providers, and parameters.",
+  },
+  {
+    id = "branch",
+    title = "Wheel: branch",
+    description = "List context branches or display active branch and HEAD commit.",
+  },
+  {
+    id = "checkpoint",
+    title = "Wheel: checkpoint",
+    description = "Display recent context checkpoints (commit ancestry log).",
+  },
+  {
+    id = "reflog",
+    title = "Wheel: reflog",
+    description = "Display recent context reflog transitions and audit journal.",
+  },
+}
+
+-- Registration-time bounds. Titles and descriptions are user-visible catalog
+-- metadata, so both stay short and bounded; a denial stays a single bounded
+-- Lua error line rather than an unbounded traceback.
+local COMMAND_TITLE_MAX_LENGTH = 32
+local COMMAND_DESCRIPTION_MAX_LENGTH = 128
+local DENIAL_MESSAGE_MAX_LENGTH = 512
+-- Generous CPU-clock ceiling per dispatched command; a CPU-bound hang would
+-- exceed it instead of blocking the suite indefinitely.
+local SANDBOX_DISPATCH_TIMEOUT_SECONDS = 10
+
+-- Commands that complete under the accepted v1 sandbox (no io, no process or
+-- env authority) and the notification title each must emit.
+local SANDBOX_HANDLED_TITLES = {
+  hello = "Wheel",
+  status = "Wheel Status",
+  graph = "Wheel Task DAG",
+  run = "Wheel Run",
+  team = "Wheel Team Roster",
+  context = "Wheel Context State",
+  tools = "Wheel Tools Registry",
+  models = "Wheel Models",
+  branch = "Wheel Context Branches",
+  checkpoint = "Wheel Checkpoints",
+  reflog = "Wheel Reflog",
+}
+
+-- Commands that need authority the sandbox removes. `kind` distinguishes an
+-- absent global table ("index", e.g. io) from an absent member on the retained
+-- os table ("call", e.g. os.getenv); `file` pins the seam that raises.
+local SANDBOX_CONFIG_DENIAL = { file = "config.lua", kind = "call", member = "getenv" }
+local SANDBOX_DENIALS = {
+  plan = SANDBOX_CONFIG_DENIAL,
+  trust = { file = "init.lua", kind = "index", member = "io" },
+  orchestrate = { file = "provider.lua", kind = "call", member = "getenv" },
+}
+
+--- Collect command registrations and preserve duplicate evidence.
+-- The accepted v1 bridge captures `commands.register` calls and exposes no
+-- registry listing, so capture set equality is the available bounds check.
+local function new_command_capture()
+  local capture = { defs = {}, counts = {}, order = {} }
+  capture.register = function(def)
+    capture.defs[def.id] = def
+    capture.counts[def.id] = (capture.counts[def.id] or 0) + 1
+    capture.order[#capture.order + 1] = def.id
+    return #capture.order
+  end
+  return capture
+end
+
+--- Assert the exact 14-command catalog, richer metadata, and registration bounds.
+local function assert_command_catalog(capture)
+  assert(
+    #capture.order == #EXPECTED_COMMANDS,
+    string.format("expected %d command registrations, got %d", #EXPECTED_COMMANDS, #capture.order)
+  )
+
+  local expected_ids = {}
+  for index, expected in ipairs(EXPECTED_COMMANDS) do
+    expected_ids[expected.id] = true
+
+    local def = capture.defs[expected.id]
+    assert(def ~= nil, "missing command registration: " .. expected.id)
+    assert(capture.counts[expected.id] == 1, "duplicate command registration: " .. expected.id)
+    assert(capture.order[index] == expected.id,
+      string.format("registration %d must be %s, got %s", index, expected.id, tostring(capture.order[index])))
+
+    assert(def.id == expected.id, "command id drifted for " .. expected.id)
+    assert(def.title == expected.title, "command title drifted for " .. expected.id)
+    assert(def.description == expected.description, "command description drifted for " .. expected.id)
+    assert(type(def.title) == "string" and #def.title > 0 and #def.title <= COMMAND_TITLE_MAX_LENGTH,
+      "command title must be non-empty and bounded for " .. expected.id)
+    assert(type(def.description) == "string" and #def.description > 0
+      and #def.description <= COMMAND_DESCRIPTION_MAX_LENGTH,
+      "command description must be non-empty and bounded for " .. expected.id)
+    assert(type(def.run) == "function", "command handler must be a function for " .. expected.id)
+  end
+
+  for id in pairs(capture.defs) do
+    assert(expected_ids[id], "unexpected command registration: " .. id)
+  end
+end
+
+--- Remove the source-location prefix Lua prepends to runtime errors.
+local function strip_source_location(message)
+  local text = tostring(message)
+  local stripped = text:match("^.-%.lua:%d+: (.*)$")
+  return stripped or text
+end
+
+--- Expected nil-member runtime error for the active interpreter.
+-- Lua 5.1/LuaJIT use the legacy wording; Lua 5.2+ reverses it.
+local function nil_member_error(kind, member)
+  if _VERSION == "Lua 5.1" then
+    if kind == "call" then
+      return "attempt to call field '" .. member .. "' (a nil value)"
+    end
+    return "attempt to index global '" .. member .. "' (a nil value)"
+  end
+  if kind == "call" then
+    return "attempt to call a nil value (field '" .. member .. "')"
+  end
+  return "attempt to index a nil value (global '" .. member .. "')"
+end
+
+--- Assert the deterministic, bounded denial for an unavailable host authority.
+local function assert_sandbox_denial(err, expected)
+  assert(type(err) == "string", "denial must be a string, got " .. type(err))
+  assert(#err > 0 and #err <= DENIAL_MESSAGE_MAX_LENGTH, "denial must be non-empty and bounded")
+  assert(err:find("\n", 1, true) == nil, "denial must be a single line, not a traceback")
+  assert(err:find(expected.file, 1, true) ~= nil,
+    "denial must originate in " .. expected.file .. ": " .. err)
+  assert(strip_source_location(err) == nil_member_error(expected.kind, expected.member),
+    "unexpected sandbox denial: " .. err)
+end
+
+local function is_wheel_module(name)
+  return name == "wheel" or name:match("^wheel%.") ~= nil
+    or name == "lua.wheel" or name:match("^lua%.wheel%.") ~= nil
+end
+
+--- Run `fn` with the accepted v1 Lua sandbox applied to this interpreter.
+-- The fixture is hermetic: it mutates only process globals for the duration of
+-- the call, never reads user files or the network, and restores package state
+-- and every removed global on both success and failure.
+local function run_in_host_sandbox(fn)
+  local saved = {
+    io = _G.io,
+    loadfile = _G.loadfile,
+    dofile = _G.dofile,
+    os_execute = os.execute,
+    os_getenv = os.getenv,
+    os_tmpname = os.tmpname,
+    os_remove = os.remove,
+    bitty = _G.bitty,
+    modules = {},
+  }
+
+  for name, module in pairs(package.loaded) do
+    if is_wheel_module(name) then
+      saved.modules[name] = module
+      package.loaded[name] = nil
+    end
+  end
+
+  _G.io = nil
+  _G.loadfile = nil
+  _G.dofile = nil
+  os.execute = nil
+  os.getenv = nil
+  os.tmpname = nil
+  os.remove = nil
+
+  local ok, err = pcall(fn)
+
+  _G.io = saved.io
+  _G.loadfile = saved.loadfile
+  _G.dofile = saved.dofile
+  os.execute = saved.os_execute
+  os.getenv = saved.os_getenv
+  os.tmpname = saved.os_tmpname
+  os.remove = saved.os_remove
+  _G.bitty = saved.bitty
+
+  for name in pairs(package.loaded) do
+    if is_wheel_module(name) then
+      package.loaded[name] = nil
+    end
+  end
+  for name, module in pairs(saved.modules) do
+    package.loaded[name] = module
+  end
+
+  if not ok then
+    error(err, 0)
+  end
+end
+
 run_test("Wheel Init: command registration and dispatch", function()
   -- Mock bitty host API
-  local registered_commands = {}
+  local capture = new_command_capture()
   local notifications = {}
 
-  bitty = {
+  _G.bitty = {
     commands = {
-      register = function(def)
-        registered_commands[def.id] = def
-        return 1
-      end,
+      register = capture.register,
     },
     notify = {
       show = function(payload)
@@ -406,41 +657,127 @@ run_test("Wheel Init: command registration and dispatch", function()
   assert(wheel.agent ~= nil)
   assert(wheel.ui ~= nil)
 
-  -- Verify all 5 commands were registered
-  assert(registered_commands["hello"] ~= nil, "hello command registered")
-  assert(registered_commands["status"] ~= nil, "status command registered")
-  assert(registered_commands["graph"] ~= nil, "graph command registered")
-  assert(registered_commands["plan"] ~= nil, "plan command registered")
-  assert(registered_commands["run"] ~= nil, "run command registered")
+  -- Verify all 14 commands were registered exactly once with expected metadata.
+  assert_command_catalog(capture)
+
+  local function dispatch(id)
+    local registered_before = #capture.order
+    capture.defs[id].run()
+    assert(#capture.order == registered_before, "command dispatch must not register commands: " .. id)
+  end
 
   -- Test running hello
-  registered_commands["hello"].run()
+  dispatch("hello")
   assert(#notifications == 1)
   assert(notifications[1].title == "Wheel")
 
   -- Test running plan
-  registered_commands["plan"].run()
+  dispatch("plan")
   assert(#notifications == 2)
   assert(notifications[2].title == "Wheel Plan")
   assert(#wheel.kernel:list_tasks() == 3)
 
   -- Test running status
-  registered_commands["status"].run()
+  dispatch("status")
   assert(#notifications == 3)
   assert(notifications[3].title == "Wheel Status")
 
   -- Test running graph
-  registered_commands["graph"].run()
+  dispatch("graph")
   assert(#notifications == 4)
   assert(notifications[4].title == "Wheel Task DAG")
 
   -- Test running run (executes CTX-0001)
-  registered_commands["run"].run()
+  dispatch("run")
   assert(#notifications == 5)
   assert(notifications[5].title == "Wheel Run")
   assert((wheel.kernel:get_task("CTX-0001").status or ""):lower() == "succeeded")
   -- CTX-0002 should now be Ready
   assert((wheel.kernel:get_task("CTX-0002").status or ""):lower() == "ready")
+
+  _G.bitty = nil
+end)
+
+run_test("Wheel Init: host sandbox activation and denial paths", function()
+  local capture = new_command_capture()
+  local notifications = {}
+
+  run_in_host_sandbox(function()
+    -- Fixture preconditions: model the accepted v1 Lua sandbox exactly.
+    assert(_G.io == nil, "sandbox must remove io")
+    assert(_G.loadfile == nil and _G.dofile == nil, "sandbox must remove file-based loading")
+    assert(type(os) == "table", "sandbox retains the os table")
+    assert(os.execute == nil, "sandbox must remove os.execute")
+    assert(os.getenv == nil, "sandbox must remove os.getenv")
+    assert(os.tmpname == nil, "sandbox must remove os.tmpname")
+    assert(os.remove == nil, "sandbox must remove os.remove")
+    assert(type(os.time) == "function", "sandbox retains os.time")
+    assert(type(os.clock) == "function", "sandbox retains os.clock")
+    assert(type(os.date) == "function", "sandbox retains os.date")
+
+    _G.bitty = {
+      commands = {
+        register = capture.register,
+      },
+      notify = {
+        show = function(payload)
+          table.insert(notifications, payload)
+          return true
+        end,
+      },
+    }
+
+    -- Fresh package state: every Wheel submodule loads under the sandbox.
+    local wheel = require("wheel.init")
+    assert(type(wheel) == "table", "activation must return the module table")
+    assert(type(wheel.kernel) == "table", "activation must instantiate the kernel")
+    assert_command_catalog(capture)
+
+    for _, expected in ipairs(EXPECTED_COMMANDS) do
+      local def = capture.defs[expected.id]
+      local denial = SANDBOX_DENIALS[expected.id]
+      local notifications_before = #notifications
+
+      local clock_start = os.clock()
+      local ok, err = pcall(def.run)
+      local elapsed = os.clock() - clock_start
+
+      assert(elapsed <= SANDBOX_DISPATCH_TIMEOUT_SECONDS,
+        string.format("%s exceeded the bounded dispatch budget (%.2fs)", expected.id, elapsed))
+      assert(#capture.order == #EXPECTED_COMMANDS,
+        "command dispatch must not register or duplicate commands: " .. expected.id)
+
+      if denial then
+        assert(not ok, expected.id .. " must be denied without host authority")
+        assert_sandbox_denial(err, denial)
+        assert(#notifications == notifications_before,
+          expected.id .. " must not emit a notification when denied")
+      else
+        assert(ok, expected.id .. " must complete under the host sandbox: " .. tostring(err))
+        assert(#notifications == notifications_before + 1,
+          expected.id .. " must emit exactly one notification")
+        assert(notifications[#notifications].title == SANDBOX_HANDLED_TITLES[expected.id],
+          expected.id .. " emitted an unexpected notification title")
+      end
+    end
+
+    -- run with no ready task is a handled return above; with a ready task it
+    -- reaches the same unavailable project-config authority as plan.
+    local ready_task = wheel.kernel:create_task({
+      id = "CTX-SANDBOX-READY",
+      title = "Sandbox ready task",
+    })
+    assert(ready_task ~= nil, "sandbox fixture must seed a ready task")
+
+    local notifications_before = #notifications
+    local ok, err = pcall(capture.defs["run"].run)
+    assert(not ok, "run with a ready task must be denied without host authority")
+    assert_sandbox_denial(err, SANDBOX_CONFIG_DENIAL)
+    assert(#notifications == notifications_before,
+      "denied run must not emit a notification")
+    assert(#capture.order == #EXPECTED_COMMANDS,
+      "denied run must not register or duplicate commands")
+  end)
 end)
 
 -- ===========================================================================
