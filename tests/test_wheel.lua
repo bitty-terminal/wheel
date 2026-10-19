@@ -8,6 +8,7 @@ local WheelAgent = require("wheel.agent")
 local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
 local WheelTool = require("wheel.tool")
+local WheelHost = require("wheel.host")
 
 local function run_test(name, fn)
   local ok, err = pcall(fn)
@@ -3215,6 +3216,228 @@ run_test("Wheel: Plugin commands branch, checkpoint, reflog registration and exe
   assert(string.find(notifications[#notifications].title, "Reflog", 1, true) ~= nil)
 
   _G.bitty = nil
+end)
+
+-- ===========================================================================
+-- WheelHost: Host-Capability Seam (fs / proc / tmp / time)
+-- ===========================================================================
+
+run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", function()
+  local root = "/tmp/bitty/test_host_seam_fs"
+  os.execute("rm -rf " .. root)
+
+  -- mkdir_p creates the whole nested tree
+  local made = WheelHost.fs.mkdir_p(root .. "/nested/deep")
+  assert(made == true, "mkdir_p must report success")
+
+  -- write_file + read_file roundtrip
+  local target = root .. "/nested/deep/sample.txt"
+  local wrote = WheelHost.fs.write_file(target, "host seam payload\n")
+  assert(wrote == true, "write_file must report success")
+  local content = WheelHost.fs.read_file(target)
+  assert(content == "host seam payload\n", "read_file must return the written content")
+
+  -- read_file on a missing file returns nil + err
+  local missing, err = WheelHost.fs.read_file(root .. "/nested/deep/absent.txt")
+  assert(missing == nil, "missing file must return nil")
+  assert(type(err) == "string" and #err > 0, "missing file must return an error string")
+
+  -- mkdir_p fails cleanly under a regular file
+  local failed = WheelHost.fs.mkdir_p(target .. "/child")
+  assert(failed == false, "mkdir_p must fail under a regular file")
+
+  -- list_dir exposes the raw ls -la lines with an accurate total
+  local listing = WheelHost.fs.list_dir(root .. "/nested/deep")
+  assert(listing.ok == true, "existing directory must list")
+  assert(listing.total == #listing.entries, "total must equal the entry count")
+  local found = false
+  for _, line in ipairs(listing.entries) do
+    if string.find(line, "sample.txt", 1, true) then
+      found = true
+    end
+  end
+  assert(found, "listing must contain the written file")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: proc primitives (run_command, run_program, command_runner)", function()
+  -- run_command executes a shell command and captures stdout
+  local res = WheelHost.proc.run_command("echo wheel-host-ok")
+  assert(res.ok == true, "run_command must launch")
+  assert(res.code == 0, "echo must exit 0")
+  assert(string.find(res.stdout, "wheel-host-ok", 1, true) ~= nil, "stdout must be captured")
+
+  -- A failing command is still launched; Lua 5.1/LuaJIT close() does not
+  -- expose the popen exit status (5.2+ reports code 7), so the code is
+  -- interpreter-dependent exactly as it was before the seam
+  local fail = WheelHost.proc.run_command("exit 7")
+  assert(fail.ok == true, "a spawned failing command is still launched")
+  assert(fail.code == 0 or fail.code == 7, "exit code must be captured when the interpreter exposes it")
+
+  -- run_program passes an argv verbatim (no shell word splitting)
+  local argv = WheelHost.proc.run_program("echo", { "argv", "with spaces" })
+  assert(argv.ok == true and argv.code == 0)
+  assert(string.find(argv.stdout, "argv with spaces", 1, true) ~= nil, "argv must not be word-split")
+
+  -- env.command_runner (the existing tool override) is honored and normalized
+  local seen_args = nil
+  local doubled = WheelHost.proc.run_command("ignored-command", {
+    command_runner = function(args, env)
+      seen_args = args
+      assert(type(env) == "table", "runner must receive its env")
+      return { success = true, exit_code = 0, stdout = "runner-double", stderr = "" }
+    end,
+  })
+  assert(seen_args ~= nil and seen_args.command == "ignored-command", "runner must see the shell string")
+  assert(doubled.ok == true and doubled.code == 0)
+  assert(doubled.stdout == "runner-double", "runner output is normalized into the seam shape")
+
+  local failing = WheelHost.proc.run_command("ignored-command", {
+    command_runner = function()
+      return { success = false, exit_code = 3, stdout = "", stderr = "boom" }
+    end,
+  })
+  assert(failing.ok == true and failing.code == 3, "runner exit code is preserved")
+  assert(failing.stderr == "boom")
+end)
+
+run_test("WheelHost: tool call sites route through the seam (capture doubles)", function()
+  local root = "/tmp/bitty/test_host_seam_routes"
+  os.execute("rm -rf " .. root)
+
+  local backend = WheelHost.backend
+  local saved = {
+    mkdir_p = backend.mkdir_p,
+    list_dir = backend.list_dir,
+    run_command = backend.run_command,
+    now = backend.now,
+  }
+  local calls = {}
+  backend.mkdir_p = function(path)
+    table.insert(calls, { kind = "mkdir_p", path = path })
+    return saved.mkdir_p(path)
+  end
+  backend.list_dir = function(path)
+    table.insert(calls, { kind = "list_dir", path = path })
+    return {
+      ok = true,
+      code = 0,
+      stdout = "listing-a\nlisting-b",
+      stderr = "",
+      entries = { "listing-a", "listing-b" },
+      total = 2,
+    }
+  end
+  backend.run_command = function(shell_string)
+    table.insert(calls, { kind = "run_command", command = shell_string })
+    return { ok = true, code = 0, stdout = "seam-stdout", stderr = "" }
+  end
+  backend.now = function()
+    return 1234567890
+  end
+
+  local ok, err = pcall(function()
+    local reg = WheelTool.get_default_registry()
+    local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+
+    -- write_file -> fs.mkdir_p
+    local w = reg:dispatch("write_file", { path = "routed/sample.txt", content = "x", overwrite = true }, env)
+    assert(w.success == true, "write_file must succeed: " .. tostring(w.stderr))
+
+    -- run_command -> proc.run_command
+    local r = reg:dispatch("run_command", { command = "echo routed" }, env)
+    assert(r.success == true, "run_command must succeed")
+    assert(r.stdout == "seam-stdout", "run_command output must come from the seam")
+
+    -- list_directory -> fs.list_dir
+    local l = reg:get_tool("list_directory").execute({ path = "." }, env)
+    assert(l.success == true)
+    assert(l.stdout == "listing-a\nlisting-b", "list_directory output must come from the seam")
+    assert(l.total_entries == 2)
+
+    -- search_code -> proc.run_command
+    local s = reg:dispatch("search_code", { query = "routed" }, env)
+    assert(s.success == true)
+    assert(s.stdout == "seam-stdout", "search_code output must come from the seam")
+
+    -- auto-spillover action ids -> time.now
+    local outcome = WheelTool.process_spillover({ tool = "probe", success = true, stdout = "", stderr = "" })
+    assert(outcome.action_id == "act-1234567890", "action id must use WheelHost.time.now")
+  end)
+
+  backend.mkdir_p = saved.mkdir_p
+  backend.list_dir = saved.list_dir
+  backend.run_command = saved.run_command
+  backend.now = saved.now
+  if not ok then
+    error(err)
+  end
+
+  -- Each primitive was exercised by the expected call sites
+  local mkdir_path, list_path = nil, nil
+  local run_cmds = {}
+  for _, call in ipairs(calls) do
+    if call.kind == "mkdir_p" then
+      mkdir_path = call.path
+    end
+    if call.kind == "list_dir" then
+      list_path = call.path
+    end
+    if call.kind == "run_command" then
+      table.insert(run_cmds, call.command)
+    end
+  end
+  assert(mkdir_path == root .. "/routed", "write_file must create parents through fs.mkdir_p")
+  assert(list_path == root, "list_directory must list through fs.list_dir: " .. tostring(list_path))
+  assert(#run_cmds == 2, "run_command and search_code must execute through proc.run_command")
+  local saw_shell, saw_grep = false, false
+  for _, cmd in ipairs(run_cmds) do
+    if string.find(cmd, "(echo routed) 2>&1", 1, true) then
+      saw_shell = true
+    end
+    if string.find(cmd, "grep -rn", 1, true) then
+      saw_grep = true
+    end
+  end
+  assert(saw_shell, "run_command must keep wrapping the command with cd/2>&1")
+  assert(saw_grep, "search_code must keep its grep pipeline")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: StdioAdapter routes tmp and process through the seam", function()
+  local backend = WheelHost.backend
+  local saved_tmpname = backend.tmpname
+  local saved_run = backend.run_command
+  local tmp_seen, run_seen = false, false
+
+  backend.tmpname = function()
+    tmp_seen = true
+    return saved_tmpname()
+  end
+  backend.run_command = function(shell_string)
+    run_seen = true
+    assert(string.find(shell_string, "mock_model_cli", 1, true) ~= nil, "stdio command must reach the seam")
+    return { ok = true, code = 0, stdout = "stdio-seam-output", stderr = "" }
+  end
+
+  local ok, err = pcall(function()
+    local stdio = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+    local res, complete_err = stdio:complete({
+      messages = { { role = "user", content = "hello seam" } },
+    })
+    assert(res ~= nil, "stdio complete must succeed: " .. tostring(complete_err))
+    assert(res.content == "stdio-seam-output")
+  end)
+
+  backend.tmpname = saved_tmpname
+  backend.run_command = saved_run
+  if not ok then
+    error(err)
+  end
+  assert(tmp_seen, "StdioAdapter must obtain its temp file through WheelHost.tmp.name")
+  assert(run_seen, "StdioAdapter must execute through WheelHost.proc.run_command")
 end)
 
 print("\n==========================================")

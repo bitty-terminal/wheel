@@ -45,25 +45,26 @@ Wheel is focused on software engineering workflows.
 
 ## Layout
 
-| Path                          | Purpose                                                                                                                               |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `bitty-plugin.toml`           | Static manifest: identity, compatibility, capability requests, and lazy triggers.                                                     |
-| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`, `trust`).                   |
-| `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.              |
-| `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                    |
-| `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.               |
-| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.          |
-| `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.    |
-| `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.          |
-| `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).        |
-| `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                  |
-| `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                           |
-| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.           |
-| `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs. |
-| `package.json`                | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                                            |
-| `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                  |
-| `justfile`                    | Quality gates with pinned tool versions.                                                                                              |
-| `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                |
+| Path                          | Purpose                                                                                                                                            |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bitty-plugin.toml`           | Static manifest: identity, compatibility, capability requests, and lazy triggers.                                                                  |
+| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers commands (`hello`, `status`, `graph`, `plan`, `run`, `trust`).                                |
+| `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.                           |
+| `lua/wheel/host.lua`          | WheelHost host-capability seam: filesystem, process, tmp, and time primitives over a swappable standalone POSIX backend (future host-ABI adapter). |
+| `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                 |
+| `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                            |
+| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                       |
+| `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                 |
+| `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                       |
+| `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                     |
+| `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                               |
+| `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                        |
+| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.                        |
+| `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.              |
+| `package.json`                | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                                                         |
+| `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                               |
+| `justfile`                    | Quality gates with pinned tool versions.                                                                                                           |
+| `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                             |
 
 ## Configuration and Architecture
 

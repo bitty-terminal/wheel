@@ -19,6 +19,12 @@ if not ok_config then WheelConfig = nil end
 local ok_context, WheelContext = pcall(require, "wheel.context")
 if not ok_context then WheelContext = nil end
 
+local ok_host, WheelHost = pcall(require, "wheel.host")
+if not ok_host then
+  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
+  WheelHost = ok_host2 and WheelHost2 or nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Constants & Enums
 -- ---------------------------------------------------------------------------
@@ -305,7 +311,7 @@ function WheelTool.process_spillover(raw, opts)
   local total_bytes = #stdout + #stderr
 
   local self = setmetatable({}, ActionOutcome)
-  self.action_id = raw.action_id or ("act-" .. tostring(os.time()))
+  self.action_id = raw.action_id or ("act-" .. tostring(WheelHost.time.now()))
   self.tool = raw.tool or "unknown"
   self.intent = raw.intent or WheelTool.ActionIntent.INSPECT
   self.success = (raw.success ~= false)
@@ -491,7 +497,7 @@ local tool_write_file = {
     -- Ensure parent directory exists
     local parent = clean_path:match("^(.*)/[^/]+$")
     if parent and parent ~= "" and parent ~= "." then
-      os.execute(string.format("mkdir -p %q", parent))
+      WheelHost.fs.mkdir_p(parent)
     end
 
     local f, write_err = io.open(clean_path, "w")
@@ -630,30 +636,16 @@ local tool_run_command = {
     end
 
     local full_cmd = string.format("cd %q && (%s) 2>&1", cwd, cmd)
-    local p = io.popen(full_cmd, "r")
-    if not p then
-      return { success = false, exit_code = 1, stderr = "Failed to spawn shell process" }
-    end
-
-    local out = p:read("*a") or ""
-    local ok_close, exit_type, exit_code = p:close()
-
-    local code = 0
-    if ok_close == true or ok_close == 0 then
-      code = 0
-    elseif type(exit_code) == "number" then
-      code = exit_code
-    elseif type(ok_close) == "number" then
-      code = ok_close
-    else
-      code = (out:find("error") or out:find("FAILED")) and 1 or 0
+    local res = WheelHost.proc.run_command(full_cmd, env)
+    if not res.ok then
+      return { success = false, exit_code = 1, stderr = res.stderr or "Failed to spawn shell process" }
     end
 
     return {
-      success = (code == 0),
-      exit_code = code,
-      stdout = out,
-      stderr = "",
+      success = (res.code == 0),
+      exit_code = res.code,
+      stdout = res.stdout,
+      stderr = res.stderr,
     }
   end,
 }
@@ -679,21 +671,19 @@ local tool_list_directory = {
     end
 
     local max_entries = args.max_entries or 100
-    local cmd = string.format("ls -la %q 2>&1", clean_path)
-    local p = io.popen(cmd, "r")
-    if not p then
+    local listing = WheelHost.fs.list_dir(clean_path)
+    if not listing.ok then
       return { success = false, exit_code = 1, stderr = "Failed to list directory: " .. clean_path }
     end
 
     local entries = {}
     local count = 0
-    for line in p:lines() do
+    for _, line in ipairs(listing.entries) do
       count = count + 1
       if count <= max_entries then
         table.insert(entries, line)
       end
     end
-    p:close()
 
     return {
       success = true,
@@ -734,17 +724,15 @@ local tool_search_code = {
 
     local flag = (args.case_sensitive == false) and "-i" or ""
     local cmd = string.format("grep -rn %s -F %q %q 2>/dev/null | head -n 100", flag, query, clean_path)
-    local p = io.popen(cmd, "r")
-    if not p then
+    local res = WheelHost.proc.run_command(cmd)
+    if not res.ok then
       return { success = false, exit_code = 1, stderr = "Failed to execute search" }
     end
-    local out = p:read("*a") or ""
-    p:close()
 
     return {
       success = true,
       exit_code = 0,
-      stdout = out,
+      stdout = res.stdout,
       stderr = "",
     }
   end,
