@@ -3440,6 +3440,51 @@ run_test("WheelHost: StdioAdapter routes tmp and process through the seam", func
   assert(run_seen, "StdioAdapter must execute through WheelHost.proc.run_command")
 end)
 
+run_test("WheelHost: context and team wall-clock sites route through time.now", function()
+  local backend = WheelHost.backend
+  local saved_now = backend.now
+  local fixed_now = 1700000000
+  backend.now = function()
+    return fixed_now
+  end
+
+  local ok, err = pcall(function()
+    -- Context event bus -> ContextBus:publish
+    local bus = WheelContext.ContextBus.new()
+    local event = { type = "time_seam_probe" }
+    bus:publish(event)
+    assert(event.timestamp_ms == fixed_now * 1000, "bus event must use WheelHost.time.now")
+
+    -- Context slot metadata and commit -> put_slot / commit_checkpoint
+    local ctx = WheelContext.new({})
+    local put = ctx:put_slot("seam/time", "routed")
+    assert(put ~= nil and put.success == true, "put_slot must succeed")
+    assert(ctx._slots["seam/time"].updated_at_ms == fixed_now * 1000,
+      "slot updated_at_ms must use WheelHost.time.now")
+
+    local commit = ctx:commit_checkpoint({ message = "time seam" })
+    assert(commit.timestamp_ms == fixed_now * 1000,
+      "commit timestamp must use WheelHost.time.now")
+
+    -- Team handoff -> WheelTeam:handoff
+    local kernel = WheelKernel.new({ in_memory = true })
+    local team = WheelTeam.new({ kernel = kernel })
+    team:spawn_agent({ name = "seam-worker", role = WheelAgent.Role.CODING })
+    team:spawn_agent({ name = "seam-reviewer", role = WheelAgent.Role.REVIEWER })
+    kernel:create_task({ id = "TASK-TIME-SEAM", title = "Wall-clock seam" })
+    local claimed = team:claim_task("seam-worker", "TASK-TIME-SEAM")
+    assert(claimed == true, "seam-worker must claim the task")
+    local ho_ok, ho_record = team:handoff("seam-worker", "seam-reviewer", "TASK-TIME-SEAM")
+    assert(ho_ok == true, "handoff must succeed: " .. tostring(ho_record))
+    assert(ho_record.timestamp == fixed_now, "handoff timestamp must use WheelHost.time.now")
+  end)
+
+  backend.now = saved_now
+  if not ok then
+    error(err)
+  end
+end)
+
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")

@@ -4,9 +4,12 @@
 -- Pure Lua 5.1 / LuaJIT implementation with zero external C dependencies.
 --
 -- WheelHost is the single seam between the Wheel harness and the machine it
--- runs on. Migrated filesystem, process, temporary-file, and wall-clock
--- operations are expressed here as primitives; the remaining direct `os.time()`
--- reads in `context.lua` and `team.lua` are staged for a follow-up migration:
+-- runs on. The migration is complete: filesystem, process, temporary-file, and
+-- wall-clock primitives are expressed here, and no `lua/wheel` call site invokes
+-- `os.execute`, `io.popen`, `os.tmpname`, or `os.time` directly. The standalone
+-- backend below is the only place those four primitives appear; direct
+-- `io.open` / `os.remove` / `os.clock` use outside this module is deliberately
+-- out of scope:
 --
 --   WheelHost.fs.mkdir_p(path)              create a directory tree
 --   WheelHost.fs.list_dir(path)             list directory entries
