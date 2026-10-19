@@ -9,6 +9,7 @@ local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
 local WheelTool = require("wheel.tool")
 local WheelHost = require("wheel.host")
+local WheelErrors = require("wheel.errors")
 
 local function run_test(name, fn)
   local ok, err = pcall(fn)
@@ -457,23 +458,23 @@ local EXPECTED_COMMANDS = {
 }
 
 -- Registration-time bounds. Titles and descriptions are user-visible catalog
--- metadata, so both stay short and bounded; a denial stays a single bounded
--- Lua error line rather than an unbounded traceback.
+-- metadata, so both stay short and bounded; a denial is a typed, single-line
+-- error table rather than an unbounded traceback.
 local COMMAND_TITLE_MAX_LENGTH = 32
 local COMMAND_DESCRIPTION_MAX_LENGTH = 128
-local DENIAL_MESSAGE_MAX_LENGTH = 512
 -- Host-sandbox dispatch budget, enforced while the handler executes by a debug
 -- count hook (see dispatch_with_budget). A handler that exceeds the CPU
 -- ceiling or the instruction budget is interrupted at the next hook tick
--- instead of blocking the suite.
+-- instead of blocking the suite. The sentinel is explicitly marked opaque so
+-- the typed boundary preserves it instead of normalizing it to E_INTERNAL.
 local SANDBOX_DISPATCH_TIMEOUT_SECONDS = 10
 local SANDBOX_HOOK_INSTRUCTION_INTERVAL = 100000
 local SANDBOX_DISPATCH_INSTRUCTION_BUDGET = 10000000
-local SANDBOX_BUDGET_EXCEEDED = setmetatable({}, {
+local SANDBOX_BUDGET_EXCEEDED = WheelErrors.passthrough(setmetatable({}, {
   __tostring = function()
     return "sandbox dispatch budget exceeded"
   end,
-})
+}))
 
 -- Commands that complete under the accepted v1 sandbox (no io, no process or
 -- env authority) and the notification title each must emit.
@@ -497,14 +498,13 @@ local SANDBOX_HANDLED_BODIES = {
   run = "No ready tasks available to execute.",
 }
 
--- Commands that need authority the sandbox removes. `kind` distinguishes an
--- absent global table ("index", e.g. io) from an absent member on the retained
--- os table ("call", e.g. os.getenv); `file` pins the seam that raises.
-local SANDBOX_CONFIG_DENIAL = { file = "config.lua", kind = "call", member = "getenv" }
+-- Commands that need authority the sandbox removes, mapped to the capability
+-- the host would have to grant. Messages are host-worded and stable; the
+-- interpreter's nil-member wording is never pinned.
 local SANDBOX_DENIALS = {
-  plan = SANDBOX_CONFIG_DENIAL,
-  trust = { file = "init.lua", kind = "index", member = "io" },
-  orchestrate = { file = "provider.lua", kind = "call", member = "getenv" },
+  plan = "env.read",
+  trust = "fs.read",
+  orchestrate = "env.read",
 }
 
 --- Collect command registrations and preserve duplicate evidence.
@@ -554,37 +554,37 @@ local function assert_command_catalog(capture)
   end
 end
 
---- Remove the source-location prefix Lua prepends to runtime errors.
-local function strip_source_location(message)
-  local text = tostring(message)
-  local stripped = text:match("^.-%.lua:%d+: (.*)$")
-  return stripped or text
+--- Assert the accepted bridge error shape: exactly class/code/message.
+local function assert_typed_error(err, expected_code)
+  assert(type(err) == "table", "error must be a typed table, got " .. type(err))
+  local fields = 0
+  for key in pairs(err) do
+    assert(key == "class" or key == "code" or key == "message",
+      "unexpected typed error field: " .. tostring(key))
+    fields = fields + 1
+  end
+  assert(fields == 3, "typed error must carry exactly class/code/message")
+  assert(err.class == "runtime", "typed error class must be runtime, got " .. tostring(err.class))
+  assert(err.code == expected_code, "unexpected typed error code: " .. tostring(err.code))
+  assert(type(err.message) == "string" and #err.message > 0
+    and #err.message <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "typed error message must be non-empty and within WheelErrors.MESSAGE_MAX_LENGTH")
+  assert(err.message:find("\n", 1, true) == nil and err.message:find("\r", 1, true) == nil,
+    "typed error message must be a single line")
+  local rendered = tostring(err)
+  assert(#rendered > 0 and #rendered <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "rendered typed error must be non-empty and within WheelErrors.MESSAGE_MAX_LENGTH")
+  assert(rendered:find("\n", 1, true) == nil, "rendered typed error must not contain a traceback")
+  return err
 end
 
---- Expected nil-member runtime error for the active interpreter.
--- Lua 5.1/LuaJIT use the legacy wording; Lua 5.2+ reverses it.
-local function nil_member_error(kind, member)
-  if _VERSION == "Lua 5.1" then
-    if kind == "call" then
-      return "attempt to call field '" .. member .. "' (a nil value)"
-    end
-    return "attempt to index global '" .. member .. "' (a nil value)"
-  end
-  if kind == "call" then
-    return "attempt to call a nil value (field '" .. member .. "')"
-  end
-  return "attempt to index a nil value (global '" .. member .. "')"
-end
-
---- Assert the deterministic, bounded denial for an unavailable host authority.
-local function assert_sandbox_denial(err, expected)
-  assert(type(err) == "string", "denial must be a string, got " .. type(err))
-  assert(#err > 0 and #err <= DENIAL_MESSAGE_MAX_LENGTH, "denial must be non-empty and bounded")
-  assert(err:find("\n", 1, true) == nil, "denial must be a single line, not a traceback")
-  assert(err:find(expected.file, 1, true) ~= nil,
-    "denial must originate in " .. expected.file .. ": " .. err)
-  assert(strip_source_location(err) == nil_member_error(expected.kind, expected.member),
-    "unexpected sandbox denial: " .. err)
+--- Assert the typed, bounded denial for an unavailable host capability.
+local function assert_sandbox_denial(err, expected_capability)
+  local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
+  assert(denial.message == "capability '" .. expected_capability .. "' is not granted",
+    "unexpected sandbox denial message: " .. denial.message)
+  assert(denial.message:find("attempt to", 1, true) == nil,
+    "capability denial must not echo raw interpreter wording")
 end
 
 --- Run one command handler under an interrupting dispatch budget.
@@ -749,6 +749,94 @@ run_test("Wheel Init: command registration and dispatch", function()
   _G.bitty = nil
 end)
 
+run_test("WheelErrors: typed capability and internal classification", function()
+  -- Unambiguous global wording normalizes to a typed capability denial.
+  local legacy_global = WheelErrors.normalize(
+    "lua/wheel/init.lua:195: attempt to index global 'io' (a nil value)", "trust")
+  assert_sandbox_denial(legacy_global, "fs.read")
+
+  local modern_global = WheelErrors.normalize(
+    "lua/wheel/init.lua:195: attempt to index a nil value (global 'io')", "trust")
+  assert_sandbox_denial(modern_global, "fs.read")
+
+  local legacy_os = WheelErrors.normalize(
+    "lua/wheel/config.lua:340: attempt to index global 'os' (a nil value)", "plan")
+  assert_sandbox_denial(legacy_os, "env.read")
+
+  local modern_os = WheelErrors.normalize(
+    "lua/wheel/config.lua:340: attempt to index a nil value (global 'os')", "plan")
+  assert_sandbox_denial(modern_os, "env.read")
+
+  -- A bare field name has no owning table and must not be classified as a
+  -- capability; it is an ordinary Wheel defect.
+  local legacy_field = WheelErrors.normalize(
+    "lua/wheel/provider.lua:661: attempt to call field 'getenv' (a nil value)", "orchestrate")
+  assert_typed_error(legacy_field, "E_INTERNAL")
+
+  local modern_field = WheelErrors.normalize(
+    "lua/wheel/provider.lua:661: attempt to call a nil value (field 'getenv')", "orchestrate")
+  assert_typed_error(modern_field, "E_INTERNAL")
+
+  -- Regression: a missing standard table helper is a Wheel bug, not a
+  -- filesystem denial.
+  local saved_table_remove = table.remove
+  table.remove = nil
+  local table_bug_ok, table_bug_err = pcall(WheelErrors.wrap("table-bug", function()
+    return table.remove({ 1 }, 1)
+  end))
+  table.remove = saved_table_remove
+
+  assert(not table_bug_ok, "a missing table helper must fail the handler")
+  assert_typed_error(table_bug_err, "E_INTERNAL")
+
+  -- An unexpected failure stays generic and never echoes its raw message.
+  local internal = assert_typed_error(
+    WheelErrors.normalize("boom: /host/path leaked", "plan"), "E_INTERNAL")
+  assert(internal.message == "internal error in wheel command 'plan'",
+    "internal failure must stay generic")
+  assert(internal.message:find("host/path", 1, true) == nil,
+    "internal failure must not leak a host path")
+
+  -- An already-typed host denial passes through unchanged.
+  local passthrough = WheelErrors.capability_denied("env.read")
+  assert(WheelErrors.normalize(passthrough, "plan") == passthrough,
+    "typed denials must pass through the dispatch boundary unchanged")
+
+  -- Tables are shape-enforced: extra fields and oversized messages become
+  -- E_INTERNAL rather than leaking a malformed public error.
+  local extra_field = WheelErrors.capability_denied("env.read")
+  extra_field.extra = true
+  assert_typed_error(WheelErrors.normalize(extra_field, "plan"), "E_INTERNAL")
+
+  local oversized = WheelErrors.capability_denied("env.read")
+  oversized.message = string.rep("x", WheelErrors.MESSAGE_MAX_LENGTH + 1)
+  assert_typed_error(WheelErrors.normalize(oversized, "plan"), "E_INTERNAL")
+
+  -- The dispatch-budget sentinel is explicitly marked opaque and keeps its
+  -- identity through the boundary.
+  local sentinel = WheelErrors.passthrough({ reason = "budget" })
+  assert(WheelErrors.normalize(sentinel, "plan") == sentinel,
+    "a marked passthrough value must keep its identity")
+
+  -- A forged public marker must not grant passthrough: the marker is a
+  -- module-local token, so this table is shape-enforced to E_INTERNAL and
+  -- none of its fields leak.
+  local forged_ok, forged_err = pcall(WheelErrors.wrap("forged-passthrough", function()
+    error({
+      __wheel_passthrough = true,
+      message = string.rep("x", 1000),
+      secret = "/host/path",
+    }, 0)
+  end))
+  assert(not forged_ok, "a forged passthrough table must fail the handler")
+  local forged = assert_typed_error(forged_err, "E_INTERNAL")
+  assert(forged.message == "internal error in wheel command 'forged-passthrough'",
+    "a forged passthrough table must become a generic internal error")
+  assert(forged.__wheel_passthrough == nil, "a forged marker must not survive normalization")
+  assert(forged.secret == nil, "forged extra fields must not survive normalization")
+  assert(forged.message:find("xxxx", 1, true) == nil, "a forged message must not survive normalization")
+end)
+
 run_test("Wheel Init: host sandbox activation and denial paths", function()
   local capture = new_command_capture()
   local notifications = {}
@@ -837,11 +925,62 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
       string.format("run with a ready task exceeded the sandbox dispatch budget (%ds CPU or %d instructions)",
         SANDBOX_DISPATCH_TIMEOUT_SECONDS, SANDBOX_DISPATCH_INSTRUCTION_BUDGET))
     assert(not ok, "run with a ready task must be denied without host authority")
-    assert_sandbox_denial(err, SANDBOX_CONFIG_DENIAL)
+    assert_sandbox_denial(err, SANDBOX_DENIALS.plan)
     assert(#notifications == notifications_before,
       "denied run must not emit a notification")
     assert(#capture.order == #EXPECTED_COMMANDS,
       "denied run must not register or duplicate commands")
+
+    -- A defect inside a handler must remain a distinguishable generic internal
+    -- error; it must never be reported as a capability denial.
+    local original_list_tasks = wheel.kernel.list_tasks
+    wheel.kernel.list_tasks = function()
+      error("simulated internal defect with /host/path", 0)
+    end
+    local internal_notifications_before = #notifications
+    local internal_ok, internal_err, internal_enforced = dispatch_with_budget(capture.defs["run"])
+    wheel.kernel.list_tasks = original_list_tasks
+
+    assert(internal_enforced == budget_enforced, "dispatch budget enforcement drifted for internal failure")
+    assert(not internal_ok, "an internal defect must fail the command")
+    local internal = assert_typed_error(internal_err, "E_INTERNAL")
+    assert(internal.message == "internal error in wheel command 'run'",
+      "internal failure must stay generic")
+    assert(internal.message:find("capability", 1, true) == nil,
+      "internal failure must not be reported as a capability denial")
+    assert(internal.message:find("host/path", 1, true) == nil,
+      "internal failure must not leak a host path")
+    assert(#notifications == internal_notifications_before,
+      "an internal failure must not emit a notification")
+    assert(#capture.order == #EXPECTED_COMMANDS,
+      "an internal failure must not register or duplicate commands")
+
+    -- The dispatch boundary itself recognizes a raw nil-surface failure, so a
+    -- future unguarded call site still yields a typed capability denial.
+    local fallback = WheelErrors.wrap("sandbox-fallback", function()
+      return io.open("denied", "r")
+    end)
+    local fallback_ok, fallback_err, fallback_enforced = dispatch_with_budget({ run = fallback })
+    assert(fallback_enforced == budget_enforced, "dispatch budget enforcement drifted for fallback denial")
+    assert(not fallback_ok, "a raw nil-surface failure must be denied at the dispatch boundary")
+    assert_sandbox_denial(fallback_err, "fs.read")
+
+    -- Direct guard coverage for the write, process, and temp surfaces.
+    local function assert_host_denial(call, capability)
+      local host_ok, host_err = pcall(call)
+      assert(not host_ok, "host surface must be denied without authority")
+      assert_sandbox_denial(host_err, capability)
+    end
+
+    assert_host_denial(function()
+      return WheelHost.fs.write_file("denied.txt", "x")
+    end, "fs.write")
+    assert_host_denial(function()
+      return WheelHost.proc.run_command("true")
+    end, "process.spawn")
+    assert_host_denial(function()
+      return WheelHost.tmp.name()
+    end, "fs.write")
   end)
 end)
 

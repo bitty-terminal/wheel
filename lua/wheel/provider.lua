@@ -14,6 +14,7 @@
 -- 5. Factory (WheelProvider.create) binding heterogeneous ModelProfiles to adapters.
 
 local WheelProvider = {}
+local WheelErrors = require("wheel.errors")
 
 local ok_kernel, WheelKernel = pcall(require, "wheel.kernel")
 if not ok_kernel then
@@ -652,6 +653,22 @@ WheelProvider.OpenAIAdapter = OpenAIAdapter
 local AnthropicAdapter = {}
 AnthropicAdapter.__index = AnthropicAdapter
 
+--- Read an environment variable through the checked host surface.
+local function getenv(name)
+  if type(os) ~= "table" or type(os.getenv) ~= "function" then
+    error(WheelErrors.capability_denied("env.read"), 0)
+  end
+  return os.getenv(name)
+end
+
+--- Remove a temporary file through the checked host surface.
+local function remove_file(path)
+  if type(os) ~= "table" or type(os.remove) ~= "function" then
+    error(WheelErrors.capability_denied("fs.write"), 0)
+  end
+  return os.remove(path)
+end
+
 --- Create a new Anthropic provider adapter (Claude 3.5 Sonnet, Claude 3 Opus).
 -- @param opts table:
 --   opts.api_key string?
@@ -665,7 +682,7 @@ function AnthropicAdapter.new(opts)
   opts = opts or {}
   local self = setmetatable({}, AnthropicAdapter)
   self.name = "anthropic"
-  self.api_key = opts.api_key or os.getenv("ANTHROPIC_API_KEY") or ""
+  self.api_key = opts.api_key or getenv("ANTHROPIC_API_KEY") or ""
   self.base_url = opts.base_url or "https://api.anthropic.com/v1"
   self.model = opts.model or "claude-3-5-sonnet-20241022"
   self.version = opts.version or "2023-06-01"
@@ -1030,22 +1047,20 @@ function StdioAdapter:complete(request, opts)
 
   -- Secure command execution via redirected temporary file
   local tmp_file = WheelHost.tmp.name()
-  local f = io.open(tmp_file, "w")
-  if not f then
+  local wrote_prompt = WheelHost.fs.write_file(tmp_file, prompt)
+  if not wrote_prompt then
     return nil, "Failed to open temporary file for stdio prompt: " .. tostring(tmp_file)
   end
-  f:write(prompt)
-  f:close()
 
   local safe_cmd = string.format("%s < %q 2>&1", self.command, tmp_file)
   local res = WheelHost.proc.run_command(safe_cmd)
   if not res.ok then
-    os.remove(tmp_file)
+    remove_file(tmp_file)
     return nil, "Failed to spawn stdio model process: " .. tostring(self.command)
   end
 
   local out = res.stdout or ""
-  os.remove(tmp_file)
+  remove_file(tmp_file)
 
   if res.code ~= 0 then
     local code = res.code or 1
@@ -1099,7 +1114,7 @@ function WheelProvider.create(profile, opts)
       stream_chunk_size = opts.stream_chunk_size,
     })
   elseif p_type == "openai" then
-    local api_key = opts.api_key or os.getenv("OPENAI_API_KEY") or ""
+    local api_key = opts.api_key or getenv("OPENAI_API_KEY") or ""
     return OpenAIAdapter.new({
       api_key = api_key,
       base_url = opts.base_url or "https://api.openai.com/v1",
@@ -1109,7 +1124,7 @@ function WheelProvider.create(profile, opts)
       http_client = opts.http_client,
     })
   elseif p_type == "deepseek" then
-    local api_key = opts.api_key or os.getenv("DEEPSEEK_API_KEY") or ""
+    local api_key = opts.api_key or getenv("DEEPSEEK_API_KEY") or ""
     return OpenAIAdapter.new({
       api_key = api_key,
       base_url = opts.base_url or "https://api.deepseek.com/v1",
@@ -1119,7 +1134,7 @@ function WheelProvider.create(profile, opts)
       http_client = opts.http_client,
     })
   elseif p_type == "anthropic" then
-    local api_key = opts.api_key or os.getenv("ANTHROPIC_API_KEY") or ""
+    local api_key = opts.api_key or getenv("ANTHROPIC_API_KEY") or ""
     return AnthropicAdapter.new({
       api_key = api_key,
       base_url = opts.base_url or "https://api.anthropic.com/v1",
