@@ -50,9 +50,9 @@ The targets below take effect once this repository accepts them:
 
 ## Scope Note
 
-The plugin requests only `ui.rich` and `ui.overlay`: it composes declarative
-overlay scenes and holds no filesystem, process, network, clipboard, terminal
-input, or persistent-state authority, and it executes no install-time code.
+The plugin requests only `platform.notify`: it holds no filesystem, process,
+network, clipboard, terminal input, or persistent-state authority, and it
+executes no install-time code.
 Findings that contradict those boundaries — including a manifest change that
 would widen the capability set, unbounded input handling, or an escape from
 the declarative UI primitives — are security-relevant defects.

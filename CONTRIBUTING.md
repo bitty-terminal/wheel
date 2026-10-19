@@ -72,10 +72,9 @@ mapping `/` to `-`; one branch per task.
 ## Capabilities and privacy
 
 Manifest capability requests are deny by default and must stay minimal. This
-plugin requests only `ui.rich` and `ui.overlay` (overlay composition through
-declarative list and text primitives); filesystem, process, network, clipboard,
-terminal input, and persistent-state authority, and install-time code
-execution, stay out. A wider request needs an explicitly scoped task plus a
+plugin requests only `platform.notify`; filesystem, process, network,
+clipboard, terminal input, persistent-state authority, and install-time code
+execution stay out. A wider request needs an explicitly scoped task plus a
 reviewed privacy and security note; never widen silently.
 
 ## Workflow snapshots
