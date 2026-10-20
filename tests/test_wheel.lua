@@ -5671,20 +5671,23 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
   assert(parent_dir == root .. "/linked-parent/runtime",
     "a non-owned parent symlink must not be rejected: " .. tostring(parent_err))
 
-  -- A symlinked final directory is rejected before chmod follows it.
-  os.execute("chmod 755 " .. root .. "/real-target")
-  local linked_backend = WheelHost.create_backend("standalone", {
-    tmp_root = root .. "/linked-runtime",
-  })
-  local ok, err = pcall(linked_backend.tmp_dir)
-  assert(not ok, "a symlinked harness-owned temp directory must be rejected")
-  local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
-  assert(denial.message == "capability 'fs.write' is not granted")
+  -- A symlinked final directory is rejected before chmod follows it, including
+  -- unnormalized trailing-slash and `/.` forms.
+  for _, suffix in ipairs({ "", "/", "/.", "/./" }) do
+    os.execute("chmod 755 " .. root .. "/real-target")
+    local linked_backend = WheelHost.create_backend("standalone", {
+      tmp_root = root .. "/linked-runtime" .. suffix,
+    })
+    local ok, err = pcall(linked_backend.tmp_dir)
+    assert(not ok, "a symlinked harness-owned temp directory must be rejected: '" .. suffix .. "'")
+    local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
+    assert(denial.message == "capability 'fs.write' is not granted")
 
-  local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(root .. "/real-target"))
-  local mode = listing.stdout:match("^(%S+)")
-  assert(string.sub(mode or "", 1, 10) == "drwxr-xr-x",
-    "rejecting the link must not chmod its target, got " .. tostring(mode))
+    local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(root .. "/real-target"))
+    local mode = listing.stdout:match("^(%S+)")
+    assert(string.sub(mode or "", 1, 10) == "drwxr-xr-x",
+      "rejecting the link must not chmod its target, got " .. tostring(mode) .. " for '" .. suffix .. "'")
+  end
 
   -- The state fallback's harness-owned `wheel` component is also guarded.
   os.execute("mkdir -p " .. root .. "/state/other")
@@ -5699,7 +5702,35 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
   os.execute("rm -rf " .. root)
 end)
 
-run_test("WheelHost: typed platform denials survive tool and provider loaders", function()
+run_test("WheelHost: default temp directory still resolves", function()
+  local backend = WheelHost.create_backend("standalone")
+  local runtime = os.getenv("XDG_RUNTIME_DIR")
+  local state = os.getenv("XDG_STATE_HOME")
+  local home = os.getenv("HOME")
+  local expected
+  if runtime and runtime ~= "" then
+    expected = runtime .. "/wheel"
+  elseif state and state ~= "" then
+    expected = state .. "/wheel/tmp"
+  elseif home and home ~= "" then
+    expected = home .. "/.local/state/wheel/tmp"
+  end
+
+  local ok, dir = pcall(backend.tmp_dir)
+  if not expected then
+    assert(not ok, "tmp_dir without any runtime/state/home base must fail closed")
+    assert_typed_error(dir, "E_CAPABILITY_DENIED")
+    return
+  end
+  assert(ok, "default temp directory must resolve: " .. tostring(dir))
+  assert(dir == expected, "default temp directory drifted: " .. tostring(dir))
+  local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(dir))
+  local mode = listing.stdout:match("^(%S+)")
+  assert(string.sub(mode or "", 1, 10) == "drwx------",
+    "default temp directory must be 0700, got " .. tostring(mode))
+end)
+
+run_test("WheelHost: typed platform denials survive config, tool, and provider loaders", function()
   local saved_config = package.config
   package.config = "\\\n?\n!\n-\n"
 
@@ -5710,9 +5741,15 @@ run_test("WheelHost: typed platform denials survive tool and provider loaders", 
     return ok, err
   end
 
+  local config_ok, config_err = probe("wheel.config")
   local tool_ok, tool_err = probe("wheel.tool")
   local provider_ok, provider_err = probe("wheel.provider")
   package.config = saved_config
+
+  assert(not config_ok, "wheel.config must fail closed on a non-POSIX platform")
+  local config_denial = assert_typed_error(config_err, "E_CAPABILITY_DENIED")
+  assert(config_denial.message == "capability 'host.backend.standalone' is not granted",
+    "wheel.config must preserve the typed host-backend denial")
 
   assert(not tool_ok, "wheel.tool must fail closed on a non-POSIX platform")
   local tool_denial = assert_typed_error(tool_err, "E_CAPABILITY_DENIED")
@@ -5723,6 +5760,33 @@ run_test("WheelHost: typed platform denials survive tool and provider loaders", 
   local provider_denial = assert_typed_error(provider_err, "E_CAPABILITY_DENIED")
   assert(provider_denial.message == "capability 'host.backend.standalone' is not granted",
     "wheel.provider must preserve the typed host-backend denial")
+end)
+
+run_test("Wheel Init: repeated lazy host failure keeps the typed cause", function()
+  local saved_config = package.config
+  local saved_modules = detach_wheel_modules()
+  package.config = "\\\n?\n!\n-\n"
+
+  local init_ok, wheel = pcall(require, "wheel.init")
+  local first_ok, first_err, second_ok, second_err
+  if init_ok then
+    first_ok, first_err = pcall(function() return wheel.host end)
+    second_ok, second_err = pcall(function() return wheel.host end)
+  end
+
+  package.config = saved_config
+  restore_wheel_modules(saved_modules)
+
+  assert(init_ok, "activation must stay loadable on a non-POSIX platform: " .. tostring(wheel))
+  assert(not first_ok and not second_ok, "both lazy host accesses must fail")
+  local first_activation = assert_typed_error(first_err, "E_MODULE_LOAD_FAILED", "resolution")
+  local second_activation = assert_typed_error(second_err, "E_MODULE_LOAD_FAILED", "resolution")
+  assert(first_activation.message:find("host.backend.standalone", 1, true) ~= nil,
+    "first failure must preserve the seam cause")
+  assert(second_activation.message:find("host.backend.standalone", 1, true) ~= nil,
+    "second failure must keep the seam cause instead of the sentinel error")
+  assert(second_activation.message:find("loop or previous error", 1, true) == nil,
+    "the failed-require sentinel must be cleared")
 end)
 
 run_test("WheelHost: routed harness paths contain no direct host primitives", function()

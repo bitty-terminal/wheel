@@ -188,6 +188,30 @@ local function owned_parent_path(dir)
   return nil
 end
 
+--- Normalize a temporary-directory path for the symlink guard and filesystem
+-- calls. Trailing separators and `/.` segments are stripped so `test -L` sees
+-- the harness-owned directory itself rather than a path that follows a link.
+-- @param path string
+-- @return string
+local function normalize_tmp_dir(path)
+  if type(path) ~= "string" then
+    return path
+  end
+  local normalized = path
+  while true do
+    local next_path = normalized:gsub("/+$", "")
+    next_path = next_path:gsub("/%.$", "")
+    if next_path == normalized then
+      break
+    end
+    normalized = next_path
+  end
+  if normalized == "" then
+    return "/"
+  end
+  return normalized
+end
+
 --- Return the backend platform selected for construction.
 -- An explicit `opts.platform` is honored for tests and embedding; otherwise the
 -- interpreter's directory separator identifies a POSIX surface.
@@ -231,8 +255,8 @@ function standalone.new(opts)
 
   local tmp_root = opts.tmp_root
   local tmp_sequence = 0
-  -- A process-instance token keeps paths unique across concurrent harnesses
-  -- even when they share a runtime directory and a wall-clock second.
+  -- A backend-instance token narrows collisions within this process. It is not
+  -- a cross-process uniqueness guarantee; exclusive 0600 creation is CTX-0016.
   local process_token = tostring({}):match("0x(%x+)") or "0"
 
   --- Create <path> and all missing parents (POSIX `mkdir -p`).
@@ -381,10 +405,11 @@ function standalone.new(opts)
   end
 
   --- Resolve, create, and repair the private temporary directory.
-  -- The harness-owned directory (and the `wheel` component of the state
-  -- fallback) must not be a symbolic link: `chmod` must never follow a
-  -- pre-existing link. Legitimate parent links such as `/tmp` are allowed
-  -- because only the harness-owned path is inspected.
+  -- The path is normalized (trailing `/`, `/.` stripped) before inspection. The
+  -- harness-owned directory (and the `wheel` component of the state fallback)
+  -- must not be a symbolic link: `chmod` must never follow a pre-existing link.
+  -- Legitimate parent links such as `/tmp` are allowed because only the
+  -- harness-owned path is inspected.
   -- @return string dir
   function backend.tmp_dir()
     local dir = tmp_root
@@ -408,6 +433,7 @@ function standalone.new(opts)
     if not dir or dir == "" then
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
+    dir = normalize_tmp_dir(dir)
 
     local parent = owned_parent_path(dir)
     require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
