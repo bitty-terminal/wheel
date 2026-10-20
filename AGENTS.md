@@ -8,41 +8,54 @@
   neither owns this repository's Git or CarryCtx state.
 - Enter this repository before running Git, CarryCtx, validation, or toolchain
   commands.
-- [bitty-docs](https://github.com/bitty-terminal/bitty-docs) and [bitty-plugins-docs](https://github.com/bitty-terminal/bitty-plugins-docs) are the canonical sources for plugin
+- [bitty-docs](https://github.com/bitty-terminal/bitty-docs) and [bitty-plugins-docs](https://github.com/bitty-terminal/bitty-plugins-docs) are the canonical sources for platform
   architecture, API, security, packaging, compatibility, and public-behavior
-  contracts. This repository must not invent capabilities, lifecycle
-  semantics, or release policy.
-- The project is pre-integration: the harness implementation and its tests
-  exist under `lua/wheel/`, but they are not yet validated against a released
-  Bitty plugin host. Repository existence, a manifest, or a file tree is not
-  evidence of usable plugin behavior.
+  contracts. This repository must not invent platform capabilities, lifecycle
+  semantics, or release policy. Wheel's own authority policy lives in
+  [`SECURITY-MODEL.md`](SECURITY-MODEL.md) and is subordinate to the owner
+  decisions recorded in wheel#51 and the `bitty-docs` security corpus.
+- Position (owner decision 2026-10-20, wheel#51): Wheel is an independent
+  out-of-process harness (Option B). The harness process holds execution
+  authority; a Bitty panel or terminal supplies presentation and input only.
+  No harness artifact has been released, and no plugin compatibility,
+  released-host integration, or OS-level sandbox claim may be made without
+  evidence.
 
-## Plugin identity and scope
+## Harness identity and scope
 
-- Plugin id: `bitty-terminal.wheel` (manifest `plugin.id`), repository
-  `wheel`, Lua module `lua/wheel/`.
+- Identity: repository `wheel`, Lua module `lua/wheel/`. The
+  `bitty-terminal.wheel` id and `bitty-plugin.toml` are the transitional plugin
+  surface, not the 0.1.0 distribution path.
 - Purpose: the agent harness for the Bitty terminal,
   built on Bitty AI. Mascot: Bittie the hamster (Wheel is short for
   hamster wheel). Naming recorded as a durable CarryCtx decision
   (bitty-ai-docs `DEC-0003`, superseding `DEC-0002`).
 - The harness implementation is developed in this repository under scoped
-  tasks; it is not yet integrated with a released Bitty plugin host, and the
-  deferral tracked in issue #41 remains in force. Sibling future plugins (LLM
-  provider/model management, Agent dashboard, and others) are separate
-  repositories, not this one.
-- Authority boundary: only `platform.notify` is requested, backing the
-  generated `hello` example command. No filesystem, process, network,
-  clipboard, terminal input, or persistent-state authority; no install-time
-  code execution. A wider request needs an explicitly scoped task and a
-  reviewed security note; never widen silently.
+  tasks. The 0.1.0 deliverable is a single harness artifact; plugin packaging
+  and `compat.plugin-api` are dropped (owner D6). A thin plugin facade may
+  return later only if a host-brokered execution service is accepted. Sibling
+  future repositories (LLM provider/model management, Agent dashboard, and
+  others) are separate, not this one.
+- Authority (0.1.0): the harness holds the user's OS authority under
+  [`SECURITY-MODEL.md`](SECURITY-MODEL.md). The approved ceiling is workspace
+  read, workspace write, arbitrary argv, shell command strings, network egress,
+  and secret environment reads. Shell strings and secret environment reads are
+  the higher-risk class and require the controls and evidence in that document.
+  The manifest is not the harness authority source and must not be widened.
+- Executable project configuration is retained (owner D5): `.wheel/init.lua`
+  requires explicit per-project consent, content-hash pinning, revocation,
+  restricted evaluation, and no ambient or execute-on-load behavior. This is a
+  deliberate divergence from OQ-068, recorded in
+  [`SECURITY-MODEL.md`](SECURITY-MODEL.md); do not rewrite OQ-068 or claim the
+  platform accepted the divergence.
 - Coding-only domain: Wheel fixes its task domain to software engineering;
-  roles (Primary, Commander, Coding, Review, Debug, Research) vary by
-  configuration inside that domain, never by class explosion (owner-approved
-  scope, research record 046). Personal, Office, and always-on agents are
-  separate future repositories, never this one.
+  roles (Primary, Commander, Coding, Debug, Research, Reviewer) vary by
+  configuration inside that domain, never by class explosion. Personal, Office,
+  and always-on agents are separate future repositories, never this one.
 - Origin: scaffolded from
   [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template)
-  via its deterministic generator.
+  via its deterministic generator; the harness core is now independent of that
+  scaffold.
 
 ## CarryCtx and agents
 
@@ -106,13 +119,22 @@
 
 ## Security and supply chain
 
-- The manifest, Lua sources, and any external input are untrusted data.
+- The transitional manifest, Lua sources, and any external input are untrusted
+  data. Project configuration is untrusted code until explicitly trusted.
   Validate before use.
 - No secrets, tokens, or local configuration in the repository, fixtures,
   logs, or CI output.
-- Keep the requested capability set minimal and declared in
-  `bitty-plugin.toml`; the manifest is the single source of the authority the
-  plugin receives.
+- Do not widen `bitty-plugin.toml`. It is retained unchanged pending a
+  follow-up removal task and is not the harness authority model. Harness
+  authority is defined only in [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
+- Never execute `.wheel/init.lua` during clone, checkout, scan, editor open, or
+  command listing. The explicit trust gate, hash pinning, revocation,
+  restricted evaluation, and no-ambient-execution rules are mandatory.
+- Read secret environment values only from the named allowlist through the
+  provider boundary; never log, persist, display, or pass them to child
+  processes. Redaction applies before every persistence sink.
+- High-risk operations (shell strings, secret reads, trust approval, new
+  network destinations) fail closed when audit cannot record them.
 
 ## Verification and handoff
 
@@ -120,5 +142,9 @@
 - Ephemeral scratch goes under `/tmp/bitty/`; durable material goes under repo-local `recording/` (gitignored).
 - Run `just check` plus `actionlint` on affected workflows and
   `gitleaks detect --source .` before concluding a change.
-- Update this guide, `README.md`, `CHANGELOG.md`, and affected canonical docs
-  whenever behavior, capabilities, or compatibility change.
+- Security-sensitive changes require independent security review by an agent
+  that did not implement them, plus mock/unit and real host fixture evidence
+  before any capability widening (owner D7). Green CI is not security evidence.
+- Update this guide, `README.md`, `SECURITY.md`, `SECURITY-MODEL.md`,
+  `CHANGELOG.md`, and affected canonical docs whenever behavior, authority, or
+  packaging changes.

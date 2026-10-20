@@ -1,32 +1,56 @@
 # Wheel
 
-Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster). Independent repository, pre-integration.
+Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster). Independent out-of-process harness for the 0.1.0 window.
 
 This repository began as a
 [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template)
 scaffold and now carries the Wheel harness implementation under `lua/wheel/`,
-its unit and cross-process test suites, and the CI quality gates.
+its unit and cross-process test suites, and the CI quality gates. The owner
+decision of 2026-10-20 (wheel#51) positions Wheel as an independent harness
+process rather than a Bitty plugin: the harness holds execution authority, a
+Bitty panel or terminal supplies only presentation and input, and plugin
+packaging is not part of the 0.1.0 deliverable.
 
-> Status: pre-integration. The harness implementation lives in `lua/wheel/`
-> with unit and cross-process test suites; it is not yet validated against a
-> released Bitty plugin host, and the accepted Plugin API v1 bindings are
-> still landing. `just check` validates the manifest with
-> the authoritative `bitty-plugin-lint` from
-> [bitty-plugin-sdk](https://github.com/bitty-terminal/bitty-plugin-sdk)
-> (pinned by commit in `package.json` and `bun.lock`) and parses the Lua entry
-> point, with a fail-closed parser control so the parse cannot silently pass.
-> The `lua/<module>/` layout follows the candidate plugin-repository structure
-> in bitty-docs; confirm it against the host loader contract before publishing.
+> Status: pre-release. The harness implementation lives in `lua/wheel/` with
+> unit and cross-process test suites. No harness artifact has been released and
+> no released-host integration is claimed. The 0.1.0 scope is a **single harness
+> artifact**: plugin packaging and `compat.plugin-api` are dropped (owner D6).
+> Authority and its controls are defined in [SECURITY-MODEL.md](SECURITY-MODEL.md);
+> the 0.1.0 ceiling is workspace read/write, arbitrary argv, shell command
+> strings, network egress, and secret environment reads, with shell strings and
+> secret reads in the higher-risk class. The in-tree `bitty-plugin.toml` is
+> retained unchanged by the position record as a transitional artifact and is
+> not a supported distribution path.
+
+## Product position
+
+- **Independent harness process (Option B).** Wheel runs as its own OS process
+  with the user's authority, constrained by Wheel's policy layer. It does not
+  run inside the Bitty plugin VM and receives no plugin capability grant at
+  runtime (owner decisions D1/D2).
+- **Software-engineering domain only.** The product position does not change
+  the task domain, the role model, or the non-goals below.
+- **One artifact.** The 0.1.0 deliverable is the harness itself. A thin plugin
+  facade may return later only if a host-brokered execution service is accepted
+  (owner D6).
+- **Optional Bitty integration.** Running in a Bitty panel or terminal is
+  presentation, not authority. An optional host IPC client for host-visible
+  operations is a post-decision follow-up, not a 0.1.0 claim.
+- **Policy before code.** [SECURITY-MODEL.md](SECURITY-MODEL.md) owns the
+  authority policy, path and role gates, command deny-list, audit, secret
+  handling, executable project-config gate, and evidence gates. No capability
+  widens without an independent security review plus mock/unit and real host
+  fixture evidence (owner D7).
 
 ## Scope
 
 Wheel is the agent harness for the Bitty terminal, scoped to software
 engineering only: its task domain is always software development. It
 may support multi-agent, multi-role, multi-model, and multi-workspace/panel
-operation within that domain. Roles (Primary, Commander, Coding, Review,
-Debug, Research) vary by configuration, never by class explosion. The staged
+operation within that domain. Roles (Primary, Commander, Coding, Debug,
+Research, Reviewer) vary by configuration, never by class explosion. The staged
 MVP direction is a single Primary Coding Agent, then Primary plus Subagents,
-then a Commander (research record 046).
+then a Commander.
 
 ### Non-goals
 
@@ -45,27 +69,27 @@ Wheel is focused on software engineering workflows.
 
 ## Layout
 
-| Path                          | Purpose                                                                                                                                                                                                      |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `bitty-plugin.toml`           | Static manifest: identity, compatibility, capability requests, and lazy triggers.                                                                                                                            |
-| `lua/wheel/init.lua`          | Entry point evaluated once per activation; registers 14 commands: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`. |
-| `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape and a Wheel-local generic internal error.                                                                                    |
-| `lua/wheel/config.lua`        | WheelConfig loader: 8 function classes schema, hierarchical layering, direnv trust gate, and skill capability discovery.                                                                                     |
-| `lua/wheel/host.lua`          | WheelHost host-capability seam: filesystem, process, tmp, and time primitives over a swappable standalone POSIX backend (future host-ABI adapter).                                                           |
-| `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                           |
-| `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                      |
-| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                 |
-| `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                           |
-| `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                 |
-| `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                               |
-| `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                         |
-| `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                  |
-| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.                                                                                  |
-| `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                        |
-| `package.json`                | Pinned dev dependencies: the authoritative `bitty-plugin-lint` (by commit) and `luaparse`.                                                                                                                   |
-| `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                                                                                         |
-| `justfile`                    | Quality gates with pinned tool versions.                                                                                                                                                                     |
-| `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                       |
+| Path                          | Purpose                                                                                                                                                                                                             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bitty-plugin.toml`           | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                         |
+| `lua/wheel/init.lua`          | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
+| `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape and a Wheel-local generic internal error.                                                                                           |
+| `lua/wheel/config.lua`        | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
+| `lua/wheel/host.lua`          | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
+| `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
+| `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                             |
+| `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                        |
+| `lua/wheel/context.lua`       | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                  |
+| `lua/wheel/tool.lua`          | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                        |
+| `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                      |
+| `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                |
+| `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                         |
+| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.                                                                                         |
+| `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                               |
+| `package.json`                | Pinned dev dependencies: the transitional `bitty-plugin-lint` (by commit) and `luaparse`.                                                                                                                           |
+| `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                                                                                                |
+| `justfile`                    | Quality gates with pinned tool versions.                                                                                                                                                                            |
+| `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                              |
 
 ## Configuration and Architecture
 
@@ -81,13 +105,44 @@ Wheel configuration is resolved across three hierarchical layers with fail-close
 2. **Global (Layer 1)**: User-wide defaults located at `~/.config/wheel/init.lua` (`$XDG_CONFIG_HOME/wheel/init.lua`).
 3. **Project (Layer 2)**: Project-specific overrides located at `.wheel/init.lua` in the repository root (highest precedence).
 
-### Security Trust Gate (Direnv-Style)
+The security model restricts project-layer effects to narrowing within the
+approved ceiling; project configuration may not add a root, destination, secret
+name, or authority for a role. Current loader behavior is not evidence of that
+restriction until the evidence gates in
+[SECURITY-MODEL.md](SECURITY-MODEL.md) pass.
 
-To prevent arbitrary code execution when cloning untrusted repositories, project configurations (`.wheel/init.lua`) are gated by a security trust store (`$XDG_STATE_HOME/wheel/trusted_projects.json`):
+### Executable Project Configuration Trust Gate
 
-- An untrusted `.wheel/init.lua` fails closed (`ok = false, error = "untrusted_project_config"`) and falls back to safe Global and Default configurations.
-- Users explicitly inspect and approve configurations using `bitty-terminal.wheel:trust` or `WheelConfig.trust(path)`.
-- Content tampering invalidates the pinned 64-hex SHA-256 cryptographic content hash immediately, requiring re-approval.
+Project configuration (`.wheel/init.lua`) is executable code, and cloning or
+entering a repository never executes it silently. The full policy is in
+[SECURITY-MODEL.md](SECURITY-MODEL.md); the gates are:
+
+- First contact is inert. Discovery, scan, help, and status do not evaluate the
+  entry; only a command that needs project configuration reaches the gate.
+- Approval is explicit and per project. The user sees the canonical project
+  root, the full entry, its SHA-256 content hash, and the configuration effects
+  it can request. There is no trust-on-first-use, no inherited trust, and no
+  `--yes` default.
+- The trust record binds the canonical root and the entry hash in
+  `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
+  whitespace, invalidates trust and forces re-approval.
+- Revocation and store deletion remove trust. A missing, corrupt, or unreadable
+  store fails closed; it is never recreated with existing approvals.
+- Evaluation must run in a restricted environment with no filesystem, process,
+  network, environment, or module-loading access, under instruction,
+  wall-clock, and memory budgets. The current instruction hook is catchable and
+  the wall-clock and memory budgets are not implemented; the result is validated
+  as data only after those gates exist (see
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
+- Project configuration may narrow behavior inside the approved ceiling. It may
+  not add a workspace root, network destination, secret name, or authority for a
+  role, and it may not disable audit, redaction, the deny-list, the path
+  sandbox, or the trust gate.
+
+Keeping the executable entry is a deliberate departure from OQ-068. It is
+recorded as a Wheel-local divergence in
+[SECURITY-MODEL.md](SECURITY-MODEL.md#oq-068-divergence-record); it does not
+change OQ-068 or grant any other consumer permission to execute project code.
 
 ### Shared Context Memory & Prefix-Cache Optimization
 
@@ -100,14 +155,15 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
 
 ### Standardized Action Protocol & Tool Execution Engine
 
-Wheel executes software engineering tools under strict safety and context-budget guarantees:
+Wheel executes software engineering tools under policy gates and bounded
+context budgets:
 
 - **Action Intents**: Typed action intents (`Inspect`, `Modify`, `Execute`, `Verify`, `Custom`) aligned with upstream Rust architecture (`bitty-ai-slice`).
-- **Fail-Closed Path Sandboxing**: Strict workspace boundary verification (`sanitize_path`), rejecting all directory traversal attacks (`../../`) and uncontained path escapes.
+- **Path Sandboxing**: Lexical workspace-boundary verification (`sanitize_path`) rejects `..` traversal and absolute paths outside the root. Symlink target resolution, non-regular file rejection, and atomic writes are required by [SECURITY-MODEL.md](SECURITY-MODEL.md) and are not yet evidenced.
 - **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
-- **Catastrophic Command Protection**: Proactive pattern scanning blocking destructive irreversible shell commands (`rm -rf /`, `mkfs`, fork bombs, etc.).
+- **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
-- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (atomic with directory creation), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
+- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
 
 ### Autonomous Wave Orchestration & Task Execution Loop
 
@@ -130,7 +186,7 @@ Wheel integrates heterogeneous large language models and autonomous ReAct execut
   - `AnthropicAdapter`: Anthropic Messages API (`/v1/messages`) supporting Claude 3.5 Sonnet, `thinking` token blocks, and `tool_use` blocks.
   - `StdioAdapter`: Subprocess CLI streaming runner (pipes to `ollama run`, `llm`, or local model binaries).
 - **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
-- **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
+- **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, path-sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
 
 ### Git-Inspired Context Versioning Engine
 
@@ -146,7 +202,9 @@ Wheel models agent context as an immutable, content-addressed versioned DAG insp
 
 ## Commands
 
-Wheel provides the following commands via Bitty's command registry:
+The harness currently defines the following commands. The
+`bitty-terminal.wheel:` qualification and the host command registry belong to
+the transitional plugin surface; they are not the 0.1.0 distribution path.
 
 - `bitty-terminal.wheel:hello`: Print a greeting from Wheel (Bittie the hamster 🐹).
 - `bitty-terminal.wheel:status`: Display kernel status, active task, checkpoint count, and telemetry.
@@ -174,14 +232,15 @@ just check
 
 `just install` materializes `bitty-plugin-lint` (bitty-plugin-sdk, pinned by
 commit in `package.json` and `bun.lock`) and `luaparse`; every gate then runs
-offline. `just manifest` validates `bitty-plugin.toml` with the authoritative
-SDK linter against the accepted contract in bitty-docs
+offline. `just manifest` validates the transitional `bitty-plugin.toml` with the
+authoritative SDK linter against the accepted contract in bitty-docs
 `docs/specifications/plugin-platform-rfc.md` (file name, identity,
 compatibility, capability closed set, lazy triggers, hard limits). `just lua`
 runs the pinned `luaparse` 0.3.1 CLI over the entry point; `just lua-control`
 feeds the same parser an invalid snippet and requires rejection, so a recipe
 that stopped reading the entry point cannot pass silently. `just check` runs
-all three.
+all three. The manifest gate keeps the transitional artifact honest until a
+follow-up removes it; it is not evidence of plugin compatibility.
 
 Run the unit test suite and the cross-process end-to-end integration drill:
 
@@ -190,29 +249,39 @@ just test      # runs unit tests across lua5.1, luajit, or lua
 just e2e       # runs the 11-step cross-process drill with wheel_stdio_host over Unix FIFOs
 ```
 
-## Capabilities
+## Authority
 
-Capabilities are deny by default: a request absent from `[capabilities]` is
-denied, identifiers come from a closed set, and there is no allow-all entry.
-Request the narrowest identifier the plugin actually uses, one at a time.
-High-risk identifiers (`terminal.raw-read`, `terminal.input.all`,
-`ui.protocol-register`, `debug.control`, `runtime.plugin-manage`, and similar)
-trigger distinct consent and should not be added without a reviewed need.
+Wheel 0.1.0 runs as an independent harness process and holds the user's OS
+authority under its own policy, not under a plugin manifest. The owner-approved
+ceiling is:
 
-Filesystem access is declared as structured requests with explicit patterns:
+- workspace read and workspace write inside the session's workspace root;
+- arbitrary argv with a workspace working directory;
+- shell command strings, a higher-risk class with session opt-in for unattended
+  runs, deny-list screening, and mandatory audit;
+- network egress to configured provider endpoints, with no inbound service;
+- secret environment reads for named provider keys only. Child-process
+  non-inheritance is a required control and is not implemented yet; the current
+  process path inherits the parent environment (see
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
 
-```toml
-[[capabilities.filesystem]]
-access = "read"
-paths = ["~/Documents/**/*.md"]
-```
+[SECURITY-MODEL.md](SECURITY-MODEL.md) is the normative repository policy for
+these classes, the path sandbox, role gates, command deny-list, audit,
+redaction, project-config trust gate, residual risk, and evidence gates. Any
+widening requires independent security review plus mock/unit and real host
+fixture evidence (owner D7).
 
-## API contract
+The in-tree `bitty-plugin.toml` still requests only `platform.notify` and is
+unchanged by the position record. It is transitional, must not be widened, and
+does not describe harness authority; removal is a follow-up task.
 
-The `bitty` namespace used by `init.lua` is the accepted Plugin API v1 surface
-sketch. The authoritative Lua bindings and type definitions are generated by
-the SDK (`bitty.d.lua`, R-SDK-1); re-check `init.lua` against that contract
-when it lands, and do not use surface the contract does not define.
+## Plugin API surface (transitional)
+
+The `bitty` namespace used by `init.lua` is the accepted Plugin API v1 surface.
+The authoritative Lua bindings and type definitions are generated by the SDK
+(`bitty.d.lua`, R-SDK-1). This surface is retained only while the transitional
+manifest remains in tree; the 0.1.0 harness does not depend on plugin
+activation, and no plugin compatibility is claimed.
 
 ### Command error contract
 
@@ -235,32 +304,43 @@ forged with a table field; it is not part of the public error contract.
 
 | `code`                | `class`   | Meaning                                                                                                            |
 | --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------ |
-| `E_CAPABILITY_DENIED` | `runtime` | The sandbox removed a host surface the command needs. The message names the missing capability family.             |
+| `E_CAPABILITY_DENIED` | `runtime` | The host removed a surface the command needs. The message names the missing capability family.                     |
 | `E_INTERNAL`          | `runtime` | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family
 (`env.read`, `fs.read`, `fs.write`, or `process.spawn`) the host would have to
 grant. Temporary-file creation maps to `fs.write`; there is no separate temp
-capability. The manifest and its granted capability set are unchanged.
+capability. These denials apply only to the transitional host command surface;
+the manifest and its granted capability set are unchanged, and harness
+authority is governed by [SECURITY-MODEL.md](SECURITY-MODEL.md).
 
 `E_INTERNAL` has no accepted host code yet. It is deliberately Wheel-local
 until the host vocabulary defines a generic internal or runtime failure code;
 replace it when that code lands. Messages are bounded to one line and never
 include tracebacks, host paths, secrets, or raw interpreter wording.
 
-## Before publishing
+## Release checklist (0.1.0)
 
-1. Add a `LICENSE` file and set `plugin.license` in `bitty-plugin.toml`.
-2. Confirm `compat.bitty` and `compat.plugin-api` match the host releases you
-   support.
-3. Replace this README's status note once the plugin is functional and tested
-   against a released host.
-4. Keep the repository free of secrets, install scripts, and ambient
+1. Ship a single harness artifact with a version and an install/launch
+   contract; do not ship the plugin packaging path or claim `plugin-api`
+   compatibility.
+2. Complete the controls in [SECURITY-MODEL.md](SECURITY-MODEL.md) for the
+   approved ceiling, pass both evidence gates, and obtain independent security
+   review.
+3. Replace this README's status note once the harness artifact is functional,
+   tested against a real host fixture, and the evidence is recorded.
+4. Remove or retire the transitional `bitty-plugin.toml` and its SDK lint gate
+   in a scoped follow-up; do not widen the manifest in the meantime.
+5. Keep the repository free of secrets and of install scripts with ambient
    authority.
 
 ## Security
 
-Report vulnerabilities through the process in the umbrella project's security
-policy rather than a public issue. This repository contains no credentials and
-no install-time execution.
+Report vulnerabilities through the process in [SECURITY.md](SECURITY.md), not a
+public issue. The 0.1.0 harness holds workspace read/write, arbitrary argv,
+shell command strings, network egress, and secret environment reads under the
+policy in [SECURITY-MODEL.md](SECURITY-MODEL.md). Executable project
+configuration requires explicit per-project trust, and secrets are read only
+from a named allowlist and redacted before persistence. The repository contains
+no credentials.

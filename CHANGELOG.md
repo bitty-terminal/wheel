@@ -24,14 +24,30 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bounded message naming the missing capability, and unexpected handler
   failures stay distinguishable as a Wheel-local `E_INTERNAL` error.
 - Wheel Coding-Agent scope and Non-goals recorded in `README.md` and
-  `AGENTS.md` (owner-approved scope, research record 046).
+  `AGENTS.md` (owner-approved scope).
+- `SECURITY-MODEL.md`: the 0.1.0 authority policy for workspace read/write,
+  arbitrary argv, shell command strings, network egress, and secret environment
+  reads, including the path sandbox, role gates, command deny-list, audit and
+  redaction rules, executable project-config trust gate, trust boundary,
+  residual risks, and the mock/unit plus real host fixture evidence gates.
+- Explicit OQ-068 divergence record for executable `.wheel/init.lua`, scoped to
+  the Wheel harness and bounded by the trust gate.
 
 ### Changed
 
-- Host filesystem, process, tmp, and time operations now route through a
-  single injectable `WheelHost` seam (`lua/wheel/host.lua`) with the previous
-  POSIX behavior as the default backend; a future Bitty host ABI adapter swaps
-  only the backend. No user-visible behavior change.
+- Product position recorded (owner decisions D1-D7, wheel#51, 2026-10-20):
+  Wheel is an independent out-of-process harness that holds execution
+  authority, ships a single artifact for 0.1.0, and drops plugin packaging and
+  `compat.plugin-api`. `repo.toml`, `README.md`, `AGENTS.md`, `SECURITY.md`,
+  and `CONTRIBUTING.md` now describe the harness position. The transitional
+  `bitty-plugin.toml` is unchanged and is not the authority model.
+- Process, tmp, and wall-clock time operations route through an injectable
+  `WheelHost` seam (`lua/wheel/host.lua`); the standalone POSIX backend is the
+  production backend for the 0.1.0 harness, and a host ABI adapter is not part
+  of the 0.1.0 path. Several file and configuration paths still call `io.open`
+  directly, and CPU time (`os.clock`) is still read directly; the seam does not
+  yet cover them (recorded in `SECURITY-MODEL.md`). No user-visible behavior
+  change.
 - Command handlers now cross the typed failure boundary: `plan`, `trust`, and
   `orchestrate` report missing `env.read`/`fs.read` authority instead of raw
   nil-member failures, and the `trust` command reads project configuration

@@ -1,12 +1,15 @@
 # wheel: workspace identity descriptor (kind/lang/role mirror workspace.toml).
 [repo]
 name = "wheel"
-kind = "plugin"
+kind = "tooling"
 lang = "lua/ts"
-role = "independent agent-harness plugin (Bittie the hamster); built on bitty-ai"
+role = "out-of-process software-engineering agent harness (Bittie the hamster); holds execution authority under SECURITY-MODEL.md; built on bitty-ai"
 owner = "bitty-ai"
 docs = "bitty-ai-docs"
 
-[contracts.consumes]
-manifest-v1 = "OQ-012 plugin-platform-rfc" # bitty-plugin.toml header
-plugin-api-v1 = "ADR-0009 Lua Surface" # lua/wheel/init.lua cites Plugin API v1
+# 0.1.0 position (owner D1/D2/D6, wheel#51): independent harness process, single
+# artifact; plugin packaging and compat.plugin-api are dropped from scope. The
+# legacy bitty-plugin.toml remains in tree unchanged pending a follow-up removal
+# task and is not a supported distribution contract.
+[contracts]
+status = "no plugin-api contract consumed in 0.1.0; execution authority is held by the harness, not granted by a plugin manifest"

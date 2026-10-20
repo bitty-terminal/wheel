@@ -1,8 +1,10 @@
 # Contributing to wheel
 
 This guide is for contributors to the `wheel` repository. The repository is
-pre-integration: the Lua sources, manifest, and tests are reviewed as an
-implementation pending host integration, not shipped plugin behavior.
+pre-release: the Lua sources, tests, and transitional manifest are reviewed as
+harness implementation, not shipped plugin behavior. The 0.1.0 product position
+is an independent out-of-process harness that holds execution authority; see
+[SECURITY-MODEL.md](SECURITY-MODEL.md).
 
 ## Repository ground rules
 
@@ -11,11 +13,11 @@ implementation pending host integration, not shipped plugin behavior.
   capability constraints that override convenience.
 - The binding rules under [.carryctx/rules/](.carryctx/rules/) (delivery,
   documentation, security) apply to every agent and contributor.
-- Canonical plugin architecture, API, packaging, compatibility, and security
-  contracts live in `bitty-docs` and `bitty-plugins-docs`. This repository must
-  not invent capabilities, lifecycle semantics, or release policy
-  independently; the manifest is the single source of the authority the plugin
-  receives.
+- Canonical platform architecture, API, packaging, compatibility, and security
+  contracts live in `bitty-docs` and `bitty-plugins-docs`. Wheel's own authority
+  policy lives in [SECURITY-MODEL.md](SECURITY-MODEL.md). This repository must
+  not invent platform capabilities, lifecycle semantics, or release policy
+  independently; the transitional manifest is not the harness authority source.
 - Never commit, push, publish packages, or mutate remote state without
   explicit authorization from the owning task.
 
@@ -32,7 +34,8 @@ or linters by name):
 - `markdownlint-cli2`, `prettier`, `commitlint`, `lefthook` — materialized by
   `just install` and invoked through the justfile.
 - `bitty-plugin-lint` (bitty-plugin-sdk, commit-pinned), `luaparse`, and
-  `lua5.4` — manifest, Lua parse, and Lua 5.4 behavior/conformance gates.
+  `lua5.4` — transitional manifest, Lua parse, and Lua 5.4 behavior/conformance
+  gates.
 
 ## Development setup
 
@@ -41,7 +44,8 @@ or linters by name):
    (`bun install --frozen-lockfile`).
 3. Enable Git hooks (optional): `just hooks-install`.
 4. Run all quality gates: `just check` (Markdown lint, Prettier format check,
-   manifest validation, Lua parse, Lua behavior suite, and LuaLS conformance).
+   transitional manifest validation, Lua parse, Lua behavior suite, and LuaLS
+   conformance).
    CI runs the same aggregate target, and `just check` runs offline once
    `just install` has completed.
 5. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
@@ -51,8 +55,8 @@ or linters by name):
 
 Changes follow Issue -> Branch -> Commit -> Pull Request -> Review -> Merge,
 where independent review plus required CI must pass before merge. Every pull
-request states its Issue and CarryCtx task links, impact areas (manifest
-capabilities, SDK/API, security, DX, CI/release, documentation,
+request states its Issue and CarryCtx task links, impact areas (authority
+policy, manifest transition, SDK/API, security, DX, CI/release, documentation,
 compatibility), reproducible gate evidence, dependencies, cross-repository
 ordering, and documentation synchronization status. Labels
 (`feat`/`fix`/`docs`/`chore`, `P0`/`P1`/`P2`, `area:*`) and milestone `v0.1.0`
@@ -69,13 +73,16 @@ must use a distinguishable prefix, for example `<github-handle>/<type>-<slug>`.
 CarryCtx-bound worktrees live at `.worktrees/ctx-XXXX-<type>-<short-slug>`,
 mapping `/` to `-`; one branch per task.
 
-## Capabilities and privacy
+## Authority and privacy
 
-Manifest capability requests are deny by default and must stay minimal. This
-plugin requests only `platform.notify`; filesystem, process, network,
-clipboard, terminal input, persistent-state authority, and install-time code
-execution stay out. A wider request needs an explicitly scoped task plus a
-reviewed privacy and security note; never widen silently.
+Wheel 0.1.0 is an independent harness with the owner-approved ceiling of
+workspace read/write, arbitrary argv, shell command strings, network egress, and
+secret environment reads. Shell strings and secret reads are the higher-risk
+class. The controls, path and role gates, audit, redaction, project-config trust
+gate, and widening process are normative in [SECURITY-MODEL.md](SECURITY-MODEL.md);
+do not widen authority or weaken a control without an explicitly scoped task,
+both evidence gates, and independent security review. The transitional
+`bitty-plugin.toml` must not be widened and is not the authority model.
 
 ## Workflow snapshots
 
