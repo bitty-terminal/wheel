@@ -7294,6 +7294,30 @@ run_test("WheelTool: list_directory fails closed on missing ls and timeout", fun
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelTool: list_directory paginates entries", function()
+  local root = "/tmp/bitty/test_tool_list_pagination"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  for index = 1, 5 do
+    local fh = assert(io.open(root .. "/file-" .. index .. ".txt", "w"))
+    fh:write("x\n")
+    fh:close()
+  end
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local res = reg:get_tool("list_directory").execute({ path = ".", max_entries = 2 }, env)
+  assert(res.success == true)
+  assert(res.total_entries >= 5, "pagination must count all entries")
+  local returned = 0
+  for _ in res.stdout:gmatch("\n") do
+    returned = returned + 1
+  end
+  if #res.stdout > 0 and res.stdout:sub(-1) ~= "\n" then
+    returned = returned + 1
+  end
+  assert(returned <= 2, "pagination must cap returned entries, got " .. returned)
+  os.execute("rm -rf " .. root)
+end)
+
 run_test("WheelHost: tool call sites route through the seam (capture doubles)", function()
   local root = "/tmp/bitty/test_host_seam_routes"
   os.execute("rm -rf " .. root)
