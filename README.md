@@ -412,9 +412,14 @@ function classes.
   `sha256sum`/`shasum`/`openssl`, `realpath`/`readlink`, `stat`, `test`, `id`,
   and `mktemp` through `PATH`, which is same-user authority. `trust_file` and
   `global_path` are internal call-site/test overrides, not command or
-  environment inputs. See
+  environment inputs. The consent result body is a host-body-bounded summary;
+  the notification series is authoritative, a line longer than a notification
+  chunk may span bodies under the same nonce, and zero-byte entries or stores
+  are refused as unreadable rather than treated as empty. See
   [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
-  inventory is not a claim of compliance.
+  inventory is not a claim of compliance. The independent review that closes
+  wheel#54 is recorded in
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#security-review-record).
 - **Future plugin facade.** If a later facade declares `[settings]` in
   `bitty-plugin.toml`, the SDK-rendered `Setting`/`Type`/`Default`/`Description`
   table replaces the no-settings sentence above and is generated from the

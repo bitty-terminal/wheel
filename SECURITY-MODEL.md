@@ -966,6 +966,37 @@ An independent reviewer verifies at least:
 - Widening and release evidence are tracked as follow-up work, not asserted
   here.
 
+## Security review record
+
+- Date: 2026-10-21
+- Reviewer: `ctx-0020-reviewer` (independent; did not implement CTX-0020)
+- PR: [wheel#77](https://github.com/bitty-terminal/wheel/pull/77)
+- Head: `4ac757d3d6e460ebe535e8555a6ec098377bb9e4` (parent `e272de6`; base `41151a9`)
+- Scope: CTX-0020 re-review of CTX-0019 / PX-0099 / PX-0112 for wheel#54;
+  D5 executable `.wheel/init.lua` trust gate in the standalone harness;
+  OQ-068, RFC-0005, and the platform corpora unchanged.
+- Evidence: `just check` exit 0 on a clean 4ac757d; `just test-real-host`
+  2,210 checks; `just shell`; `actionlint`; `gitleaks` (93 commits, no leaks);
+  `git diff --check a3eab25..4ac757d`; CI 6/6 (Quality gates, CodeQL, workflow
+  lint) green; CodeRabbit 4329452842/4329452853 resolved; unit and real-host
+  tests for consent, pure-Lua diff, method-form caps and restoration, 32 KiB
+  bounds, canonical/alias revocation, schema migration, store read/write caps
+  and preserve, parent repair/foreign/symlink/non-directory denial, and
+  true-process restart.
+- Verdict: **APPROVE**; no high-severity open finding.
+- Residuals: in-process evaluation with best-effort instruction/string-table
+  caps and unmetered C-library allocations; unvalidated merge/narrowing-only
+  enforcement; home-rooted workspace self-approval; same-user trust store and
+  PATH-resolved host tools; no audit fail-closed stream; the consent result
+  body is a host-body-bounded summary with the notification series
+  authoritative; zero-byte entries/stores are refused as unreadable; long
+  lines may span notification chunks under the per-run nonce.
+- Follow-ups (tracked; not #54 blockers): summary hash/status before path
+  fields plus a 4 KiB path test; EOF vs read-error for zero-byte files; wrap
+  long consent lines with the prefix; fix the CHANGELOG `trust revoke` line
+  break; expand tests (non-ASCII, forged diff marker, long line, restoration
+  after success/hook, store value validation).
+
 ## References
 
 - wheel#51, owner decision comments of 2026-10-20 (D1-D7).

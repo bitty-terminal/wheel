@@ -139,8 +139,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   line diff against the previously trusted bytes, the full 64-hex SHA-256, and
   a statement that effects are evaluated only after confirmation. The returned
   result is a bounded consent summary; the full view is the notification
-  series. `trust confirm <sha256>` requires the exact current hash; `trust
-revoke [path]` is user-facing and removes the canonical record plus aliases.
+  series. `trust confirm <sha256>` requires the exact current hash;
+  `trust revoke [path]` is user-facing and removes the canonical record plus
+  aliases.
   The trust store has no `/tmp` fallback, is created `0700`/`0600` with atomic
   temp-plus-rename, checks ownership and group/world-writable modes, surfaces
   corruption instead of returning an empty store, enforces matching read/write
