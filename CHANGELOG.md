@@ -56,11 +56,40 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   This is implementation evidence only, not a release claim or full Gate 2
   evidence; process timeout, cancellation, process-group, and scrubbed
   environment bounds remain CTX-0016 work.
+- Versioned 0.1.0 harness artifact (CTX-0018 / wheel#58): the root `VERSION`
+  file is the single version source, and `just package` builds the deterministic
+  `dist/wheel-0.1.0.tar.gz` with a SHA-256 sidecar and a manifest record. The
+  archive contains `lua/`, `LICENSE`, `README.md`, `SECURITY-MODEL.md`,
+  `repo.toml`, and `VERSION`, and excludes tests, recording, dependencies, Git
+  metadata, CI, scripts, the justfile, and `dist/`. The release build refuses a
+  dirty worktree, a missing input, or an unsupported version; `--allow-dirty`
+  and `--version` are local test-build options only.
+- Local install, upgrade, and rollback path (`just install-local`,
+  `just rollback-local`): installed versions live at
+  `<prefix>/wheel/<version>/`, `current` is a relative symlink, and the outgoing
+  version is recorded in `previous`. The offline installer verifies the digest,
+  rejects absolute/traversal/symlinked archive members, refuses `/`,
+  trailing-slash, `..`, symlinked, and non-owned prefixes, extracts into
+  staging, and switches `current` atomically. There is no `eval`, no
+  archive-supplied shell string, and no post-install script.
+- `just verify-package` builds the release artifact twice to prove determinism,
+  installs it into a temporary prefix, runs the real-host fixture against the
+  installed tree, upgrades to a locally built 0.1.1, rolls back, and exercises
+  the refusal paths. CI runs it after `just test-real-host`.
+- The real-host fixture accepts `WHEEL_ROOT` to test an installed artifact tree
+  and `WHEEL_EVIDENCE_PATH` to keep evidence out of the repository. It asserts
+  that loaded modules resolved from `WHEEL_ROOT`; the real-host boundary and
+  measurements are unchanged.
 
 ### Changed
 
 - CI installs Lua 5.1 before the quality gates, so `just test` runs the Lua
-  suite in CI, and runs `just test-real-host` after `just check`.
+  suite in CI, runs `just test-real-host` after `just check`, and then runs
+  `just verify-package`. The `package.json` version follows the canonical
+  `VERSION` file, and `dist/` is ignored.
+- The README Install section now documents the artifact contents, digest,
+  install/launch, upgrade/rollback, compatibility, and `v0.1.0` release target.
+  `SECURITY-MODEL.md` records the install/upgrade trust path and its limits.
 - The harness now selects the standalone POSIX backend explicitly through
   `WheelHost.select_backend("standalone")` and fails closed on non-POSIX
   platforms or unknown backends with a typed `E_CAPABILITY_DENIED` error. Every
@@ -102,6 +131,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Packaging normalizes generated file modes independently of the caller's
+  umask (the artifact `VERSION` was previously 0644 under 022 and 0600 under
+  077, changing the digest). The verifier now rebuilds under both umasks and
+  compares the archive, sidecar, and manifest byte-for-byte.
+- Packaging copies only Git-tracked files under `lua/`, so ignored or
+  untracked files (for example an ignored `lua/wheel/agent.luac`) cannot enter
+  the release archive. The manifest now records `source_revision` (full HEAD
+  for clean builds, `null` for `--allow-dirty` test builds), and the verifier
+  asserts both the ignored-file exclusion and the recorded revision.
 - CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
   substitutes a `"0"` stamp (uniqueness is process-local; cross-process
   exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators,

@@ -4,3 +4,11 @@ node_modules/
 recording/
 .worktrees/
 .carryctx/config.local.toml
+
+# Built harness artifacts (just package). Digests and manifests live here too;
+# they are release outputs, not sources.
+dist/
+
+# Lua compiler output is never a source input. The packaging regression uses
+# this ignore rule to prove ignored files cannot enter the release archive.
+*.luac
