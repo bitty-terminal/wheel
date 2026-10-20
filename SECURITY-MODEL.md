@@ -6,6 +6,11 @@
 > is implemented, verified, or released. Where it names a mechanism that exists
 > in the repository, that mechanism is unverified until the evidence gates in
 > this document pass. No capability is widened by this record.
+>
+> Policy statements use **must** for a required control. They are normative
+> requirements, not evidence that the current code implements them. The current
+> implementation inventory, including every known gap, is in
+> [Relationship to current code](#relationship-to-current-code).
 
 ## Purpose and scope
 
@@ -101,14 +106,14 @@ level.
 
 ### Authority ledger
 
-| Authority class       | 0.1.0 status        | Default scope                                                     | Default mode                                                         |
-| --------------------- | ------------------- | ----------------------------------------------------------------- | -------------------------------------------------------------------- |
-| Workspace read        | Approved            | The session workspace root                                        | Enabled for Inspect-intent tools                                     |
-| Workspace write       | Approved            | The session workspace root                                        | Enabled for Modify-intent tools, subject to role gates               |
-| Arbitrary argv        | Approved            | Programs resolved on `PATH` or by absolute path; cwd in workspace | Enabled for Execute-intent tools                                     |
-| Shell command strings | Approved, high risk | Non-login shell; cwd in workspace                                 | Interactive sessions only unless an unattended session opts in       |
-| Network egress        | Approved            | Outbound TLS to configured provider endpoints                     | Enabled for harness provider clients; no inbound or listening socket |
-| Secret environment    | Approved, high risk | Named provider keys only                                          | Enabled per configured provider; never inherited by child processes  |
+| Authority class       | 0.1.0 status        | Default scope                                                     | Default mode                                                                                         |
+| --------------------- | ------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| Workspace read        | Approved            | The session workspace root                                        | Enabled for Inspect-intent tools                                                                     |
+| Workspace write       | Approved            | The session workspace root                                        | Enabled for Modify-intent tools, subject to role gates                                               |
+| Arbitrary argv        | Approved            | Programs resolved on `PATH` or by absolute path; cwd in workspace | Enabled for Execute-intent tools                                                                     |
+| Shell command strings | Approved, high risk | Non-login shell; cwd in workspace                                 | Interactive sessions only unless an unattended session opts in                                       |
+| Network egress        | Approved            | Outbound TLS to configured provider endpoints                     | Enabled for harness provider clients; no inbound or listening socket                                 |
+| Secret environment    | Approved, high risk | Named provider keys only                                          | Enabled per configured provider; child-process non-inheritance is required but not implemented (gap) |
 
 Every class is deny-by-default at the policy layer even though the owner
 approved the ceiling: a session, role, or tool that is not granted a class does
@@ -125,16 +130,20 @@ not receive it.
   normalizes separators and `.`/`..`, rejects NUL and control bytes, rejects
   absolute paths outside the root, and rejects a symlink whose canonical target
   leaves the root. Lexical prefix checks alone are insufficient.
-- Writes use a temporary file inside the destination directory plus an atomic
-  rename, never a direct truncate of an existing file. Parent directories are
-  created only inside the root.
+- Writes must use a temporary file inside the destination directory plus an
+  atomic rename, never a direct truncate of an existing file. Parent directories
+  are created only inside the root. The current file tools truncate in place;
+  atomic replace is a known gap.
 - The harness's own global configuration, trust store, audit log, and secret
-  material are outside model-visible workspace authority. Tools cannot read or
-  write them even when they live under the user's home directory.
+  material must be outside model-visible workspace authority. Tools must not
+  read or write them even when they live under the user's home directory. A
+  home-rooted workspace is not currently excluded from file-tool authority;
+  this is a known gap.
 - `.git` is workspace content for Git operations, but direct rewrites of Git
-  internals are not a tool primitive. Destructive repository operations
-  (`reset --hard`, `clean -fdx`, force-push, history rewrite) require explicit
-  user confirmation.
+  internals are not an intended tool primitive. Destructive repository
+  operations (`reset --hard`, `clean -fdx`, force-push, history rewrite)
+  require explicit user confirmation. The current `write_file` can still write
+  `.git` content; a guard is a known gap.
 - Writing `.wheel/init.lua` changes its hash and therefore invalidates its trust
   record. A tool may write it only with Modify authority; the next load must
   re-enter the trust gate.
@@ -152,10 +161,12 @@ not receive it.
   vector, with no shell parsing.
 - The working directory must resolve inside the workspace root. The resolver
   rules above apply.
-- The child environment is a scrubbed baseline plus explicitly allowed
-  variables. Secret names in the ledger are never included. `HOME` is passed
+- The child environment must be a scrubbed baseline plus explicitly allowed
+  variables. Secret names in the ledger must never be included. `HOME` is passed
   only because ordinary build tools require it; that still grants the child the
   user's ambient file access, which is a residual risk, not a sandbox claim.
+  The current `run_command` path calls `io.popen` with the parent environment,
+  so allowlisted provider keys are inherited today; this is a known gap.
 - The harness records the resolved executable path, argv, cwd, exit status, and
   duration before the process is allowed to run.
 - Each invocation has a finite timeout, bounded output, and a process group
@@ -191,8 +202,8 @@ controls are mandatory:
 5. **Scrubbed environment.** The shell receives the same scrubbed environment
    as argv. Secret environment variables are absent.
 6. **Deny-list screening.** Every command string is screened before execution
-   against the categorical deny-list below. A match is refused, not confirmed
-   into.
+   against the deny-list below (the current scanner covers a subset; see the
+   known gaps). A match is refused, not confirmed into.
 7. **Audit before execution.** The full command is redacted and recorded before
    spawn. If the audit sink is unavailable, shell execution fails closed.
 8. **Unattended opt-in.** Autonomous or scheduled runs are argv-only by
@@ -255,9 +266,10 @@ authority.
   or model prompts.
 - Provider clients place the value only in the authorization header for that
   provider. Project configuration cannot redirect the header to another host.
-- Child processes never inherit an allowlisted secret. A command that needs a
-  credential must obtain it outside Wheel or through a future explicit
-  credential-helper design with its own review.
+- Child processes must never inherit an allowlisted secret. A command that needs
+  a credential must obtain it outside Wheel or through a future explicit
+  credential-helper design with its own review. The current `run_command` path
+  inherits the parent environment; this is a release-blocking known gap.
 - Every output sink applies two redaction passes: exact-value redaction for
   loaded secrets, and shape-based redaction for bearer tokens, key prefixes,
   `api_key`/`token`/`secret` assignments, and long token-like runs. Redaction
@@ -283,8 +295,9 @@ authority.
   configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
   outside model-visible workspace authority. No state path is hardcoded to a
   developer checkout.
-- The trust store and audit log are written atomically and with restrictive
-  permissions.
+- The trust store and audit log must be written atomically and with restrictive
+  permissions. The current trust store has a non-XDG fallback and no atomic
+  replace; this is a known gap.
 
 ## Path sandbox and role gates
 
@@ -334,8 +347,10 @@ security principals. The following matrix is mandatory and fail-closed:
 
 ## Command deny-list
 
-The deny-list is categorical defense-in-depth, not a sandbox and not a complete
-enumeration. A match refuses the command before spawn. The categories are:
+The deny-list is intended as categorical defense-in-depth, not a sandbox and not
+a complete enumeration. A match refuses the command before spawn. The current
+scanner implements only a subset of the categories below; the missing categories
+are a known gap. The categories are:
 
 - recursive or forced deletion of a filesystem root, the user's home directory,
   the workspace root itself, or any path outside the workspace root;
@@ -468,8 +483,8 @@ rejected as a policy error, not silently clamped.
 
 OQ-068 (owner ruling 2026-09-23) records the platform position that Git-tracked
 `.wheel/` is declarative-data-only (`project.toml`, `agents/`, `workflows/`,
-`prompts/`, `policies/`, `tools/`, `skills/`) and that no consumer executes a
-project entry.
+`prompts/`, `policies/`, `tools/`, `skills/`) and does not authorize execution
+of a project entry.
 
 The owner decision of 2026-10-20 (wheel#51, D5) keeps executable
 `.wheel/init.lua` for Wheel 0.1.0. This is a deliberate Wheel-local divergence,
@@ -668,44 +683,69 @@ Before widening:
 This section is inventory, not assurance. The repository contains mechanisms
 that the policy relies on, and they remain unverified until the gates pass:
 
-- a path resolver and canonicalization routine used by file and cwd arguments;
-- role gates for read-only and commander roles;
-- a categorical dangerous-command scanner;
+- a lexical path resolver and canonicalization routine used by file and cwd
+  arguments (containment only; see gaps);
+- role gates for the read-only roles and Commander Modify, plus a partial
+  custom-tool check;
+- a dangerous-command scanner covering a subset of the policy categories;
 - a project-configuration loader with a content hash, an explicit trust action,
   a revocation action, and a restricted evaluation environment;
 - a provider adapter boundary that reads named environment variables;
-- a `WheelHost` seam that concentrates filesystem, process, temporary-file, and
-  time calls behind one backend.
+- a `WheelHost` seam for process, temporary-file, and time calls; several file
+  and configuration paths still call `io.open` directly.
 
 Known gaps relative to this policy (not claims of compliance):
 
-- path containment is lexical; symlink target resolution, non-regular file
-  rejection, and atomic write/rename are not implemented in the current file
-  tools;
-- the process backend does not yet enforce the accepted timeout, output bound,
-  or owned process group; shell invocation currently builds a command string
-  for the local shell;
-- temporary-file creation still uses the ambient `os.tmpname` location, and the
-  trust store has a non-XDG fallback and no explicit restrictive permissions or
-  atomic replace;
-- no append-only execution audit stream with pre-spawn records and fail-closed
-  behavior;
-- project configuration is merged as an unvalidated table; field validation and
-  narrowing-only enforcement are absent;
-- role-gate and deny-list rejections use free-form errors rather than the typed
-  failure boundary;
-- no exact-value secret redaction across every sink;
-- no instruction, wall-clock, or memory budget for project-configuration
-  evaluation;
-- no full-content consent view or change diff in the trust flow;
-- no OS-level confinement for argv or shell execution;
-- no reviewed in-tree network client; provider adapters accept an injected
-  client, so egress controls are policy rather than current behavior;
-- no signed release artifact or update channel;
-- no Gate 1 or Gate 2 evidence recorded for the 0.1.0 ceiling;
-- the in-tree plugin manifest still describes `platform.notify` and is retained
-  unchanged pending a follow-up removal task. It is not the harness authority
-  model and must not be widened.
+- Path containment is lexical only. The resolver rejects `..` traversal and
+  absolute paths outside the root, but does not reject NUL/control bytes,
+  resolve symlink targets, reject non-regular files, or re-validate at open
+  time. Writes truncate in place; there is no atomic temp-file-plus-rename.
+- File tools build shell strings for `list_directory`, `search_code`, and cwd
+  selection with Lua `%q` interpolation. Those values are not screened by the
+  deny-list, and `%q` is not a shell-safe argv boundary; a crafted path can
+  execute shell substitution. These tools must move to argv or a reviewed
+  quoting primitive.
+- `run_command` and several file tools call `io.popen`/`io.open` directly, so
+  the `WheelHost` seam does not yet concentrate all filesystem, process,
+  temporary-file, and time calls.
+- The child environment is inherited from the parent. `run_command` does not
+  scrub allowlisted provider keys, so spawned processes can read them.
+  Non-inheritance is required before release.
+- A home-rooted workspace does not exclude the harness's own
+  `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` files, so a file tool can read or write
+  the trust store or audit log when they fall under the root. The trust-store
+  self-approval path is open.
+- `write_file` can write `.git/hooks/*` and `.git/config`; there is no guard
+  against direct Git-internals rewrites.
+- The dangerous-command scanner covers only a subset of the policy categories:
+  it does not implement privilege-transition (`sudo`, `su`, `doas`, `pkexec`),
+  setuid/setgid, credential-store exfiltration, remote-pipe, audit/trust
+  tampering, ownership-outside-root, or detach screening. Rejections are
+  free-form errors, not the typed failure boundary.
+- The role matrix is only partially enforced: `Research`/`Reviewer` are
+  read-only and `Commander` is denied Modify, but there is no `Primary` role,
+  and Commander Custom-mutating and the full matrix are not enforced.
+- The process backend does not enforce the accepted timeout, bounded output,
+  interactive stdin/TTY-off default, detached-execution denial, or an owned
+  process group; cancellation by recorded PID/process group is policy only.
+- The project-configuration instruction hook is catchable through the exposed
+  `pcall`; there is no wall-clock or memory budget, and the full-content
+  consent view/change diff is absent. The trust store has a non-XDG fallback
+  and no explicit restrictive permissions or atomic replace.
+- There is no append-only execution audit stream with pre-spawn records and
+  fail-closed behavior, and no exact-value secret redaction across every sink.
+- Project configuration is merged as an unvalidated table; field validation and
+  narrowing-only enforcement are absent. Multi-root operation is not
+  implemented (one `workspace_root` per session).
+- CI and unattended runs have no implicit-trust enforcement in the current
+  loader; trust behavior in CI is not gated.
+- There is no OS-level confinement for argv or shell execution, no reviewed
+  in-tree network client (provider adapters accept an injected client), no
+  signed release artifact or update channel, and no Gate 1/Gate 2 evidence for
+  the 0.1.0 ceiling.
+- The in-tree plugin manifest still describes `platform.notify` and
+  `compat.plugin-api`; it is retained unchanged pending a follow-up removal
+  task. It is not the harness authority model and must not be widened.
 
 These gaps are blockers for release evidence, not for recording the policy.
 

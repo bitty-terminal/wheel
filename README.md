@@ -75,7 +75,7 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/init.lua`          | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
 | `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape and a Wheel-local generic internal error.                                                                                           |
 | `lua/wheel/config.lua`        | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
-| `lua/wheel/host.lua`          | WheelHost authority seam: filesystem, process, tmp, and time primitives over the production standalone POSIX backend for the out-of-process harness.                                                                |
+| `lua/wheel/host.lua`          | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
 | `lua/wheel/agent.lua`         | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                             |
 | `lua/wheel/team.lua`          | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                        |
@@ -158,9 +158,9 @@ context budgets:
 - **Action Intents**: Typed action intents (`Inspect`, `Modify`, `Execute`, `Verify`, `Custom`) aligned with upstream Rust architecture (`bitty-ai-slice`).
 - **Path Sandboxing**: Lexical workspace-boundary verification (`sanitize_path`) rejects `..` traversal and absolute paths outside the root. Symlink target resolution, non-regular file rejection, and atomic writes are required by [SECURITY-MODEL.md](SECURITY-MODEL.md) and are not yet evidenced.
 - **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
-- **Catastrophic Command Protection**: Pattern scanning against a categorical deny-list (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
+- **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
-- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (atomic with directory creation), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
+- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
 
 ### Autonomous Wave Orchestration & Task Execution Loop
 
@@ -257,8 +257,10 @@ ceiling is:
 - shell command strings, a higher-risk class with session opt-in for unattended
   runs, deny-list screening, and mandatory audit;
 - network egress to configured provider endpoints, with no inbound service;
-- secret environment reads for named provider keys only, never inherited by
-  child processes.
+- secret environment reads for named provider keys only. Child-process
+  non-inheritance is a required control and is not implemented yet; the current
+  process path inherits the parent environment (see
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
 
 [SECURITY-MODEL.md](SECURITY-MODEL.md) is the normative repository policy for
 these classes, the path sandbox, role gates, command deny-list, audit,

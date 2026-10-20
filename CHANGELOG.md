@@ -41,10 +41,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `compat.plugin-api`. `repo.toml`, `README.md`, `AGENTS.md`, `SECURITY.md`,
   and `CONTRIBUTING.md` now describe the harness position. The transitional
   `bitty-plugin.toml` is unchanged and is not the authority model.
-- Host filesystem, process, tmp, and time operations now route through a
-  single injectable `WheelHost` seam (`lua/wheel/host.lua`); the standalone
-  POSIX backend is the production backend for the 0.1.0 harness, and a host ABI
-  adapter is not part of the 0.1.0 path. No user-visible behavior change.
+- Process, tmp, and time operations route through an injectable `WheelHost`
+  seam (`lua/wheel/host.lua`); the standalone POSIX backend is the production
+  backend for the 0.1.0 harness, and a host ABI adapter is not part of the 0.1.0
+  path. Several file and configuration paths still call `io.open` directly; the
+  seam does not yet cover them (recorded in `SECURITY-MODEL.md`). No
+  user-visible behavior change.
 - Command handlers now cross the typed failure boundary: `plan`, `trust`, and
   `orchestrate` report missing `env.read`/`fs.read` authority instead of raw
   nil-member failures, and the `trust` command reads project configuration
