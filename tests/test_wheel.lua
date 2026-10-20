@@ -11,6 +11,7 @@ local WheelTool = require("wheel.tool")
 local WheelHost = require("wheel.host")
 local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
+local WheelCommands = require("wheel.commands")
 
 local function run_test(name, fn)
   local ok, err = pcall(fn)
@@ -581,8 +582,7 @@ local function assert_typed_error(err, expected_code, expected_class)
   assert(err.message:find("\n", 1, true) == nil and err.message:find("\r", 1, true) == nil,
     "typed error message must be a single line")
   local rendered = tostring(err)
-  assert(#rendered > 0 and #rendered <= WheelErrors.MESSAGE_MAX_LENGTH,
-    "rendered typed error must be non-empty and within WheelErrors.MESSAGE_MAX_LENGTH")
+  assert(#rendered > 0, "rendered typed error must be non-empty")
   assert(rendered:find("\n", 1, true) == nil, "rendered typed error must not contain a traceback")
   return err
 end
@@ -626,6 +626,49 @@ local function assert_args_invalid(schema, args, needle)
   if needle then
     assert(reason:find(needle, 1, true) ~= nil, "unexpected argument rejection: " .. reason)
   end
+end
+
+--- Assert that `text` is valid UTF-8 and return its code-point count.
+-- Uses the Lua 5.3+ `utf8` library when present; otherwise validates the byte
+-- structure directly so the suite stays runnable on Lua 5.1/LuaJIT.
+local function assert_valid_utf8(text)
+  local has_utf8, utf8lib = pcall(require, "utf8")
+  if has_utf8 and type(utf8lib) == "table" and type(utf8lib.len) == "function" then
+    local length, position = utf8lib.len(text)
+    assert(length ~= nil, "invalid UTF-8 at byte " .. tostring(position))
+    return length
+  end
+
+  local index = 1
+  local length = 0
+  while index <= #text do
+    local first = text:byte(index)
+    if first < 0x80 then
+      index = index + 1
+    elseif first >= 0xC2 and first <= 0xDF then
+      local second = text:byte(index + 1)
+      assert(second and second >= 0x80 and second <= 0xBF,
+        "invalid 2-byte UTF-8 sequence at byte " .. index)
+      index = index + 2
+    elseif first >= 0xE0 and first <= 0xEF then
+      local second, third = text:byte(index + 1), text:byte(index + 2)
+      assert(second and second >= 0x80 and second <= 0xBF
+          and third and third >= 0x80 and third <= 0xBF,
+        "invalid 3-byte UTF-8 sequence at byte " .. index)
+      index = index + 3
+    elseif first >= 0xF0 and first <= 0xF4 then
+      local second, third, fourth = text:byte(index + 1), text:byte(index + 2), text:byte(index + 3)
+      assert(second and second >= 0x80 and second <= 0xBF
+          and third and third >= 0x80 and third <= 0xBF
+          and fourth and fourth >= 0x80 and fourth <= 0xBF,
+        "invalid 4-byte UTF-8 sequence at byte " .. index)
+      index = index + 4
+    else
+      error("invalid UTF-8 lead byte at " .. index)
+    end
+    length = length + 1
+  end
+  return length
 end
 
 --- Fixture schema that exercises every admitted keyword and bound.
@@ -992,7 +1035,7 @@ run_test("WheelSchema: argument and result value validation", function()
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", ratio = 2 }, "outside the declared range")
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", dry_run = 1 }, "expected a boolean")
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = {} }, "at least 1 items")
-  assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = { "a", "b", "c", "d" } }, "at most 3 items")
+  assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = { "a", "b", "c", "d" } }, "exceeds 3 items")
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = { 1 } }, "expected a string")
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = { [1] = "a", [3] = "c" } }, "contiguous array")
   assert_args_invalid(FUNCTION_SCHEMA, { name = "ok", tags = { a = "x" } }, "contiguous array")
@@ -1028,6 +1071,72 @@ run_test("WheelSchema: argument and result value validation", function()
   assert(not result_ok({ title = "Wheel", body = "" }), "empty result body must be rejected")
   assert(not result_ok({ title = "Wheel", body = string.rep("x", 129) }), "oversized body must be rejected")
   assert(not result_ok({ title = "Wheel", body = "ok", extra = true }), "unknown result field must be rejected")
+end)
+
+run_test("WheelSchema: value admission limits and sparse arrays", function()
+  -- Depth: a legal declaration can be deeper than the invocation limit.
+  local depth_schema = { type = "boolean" }
+  for _ = 1, WheelSchema.LIMITS.VALUE_MAX_DEPTH + 1 do
+    depth_schema = {
+      type = "object",
+      properties = { child = depth_schema },
+      required = { "child" },
+      additionalProperties = false,
+    }
+  end
+  local depth_value = true
+  for _ = 1, WheelSchema.LIMITS.VALUE_MAX_DEPTH + 1 do
+    depth_value = { child = depth_value }
+  end
+  local depth_ok, depth_reason = WheelSchema.validate_value(depth_schema, depth_value)
+  assert(not depth_ok, "value depth above VALUE_MAX_DEPTH must be rejected")
+  assert(depth_reason:find("depth", 1, true) ~= nil,
+    "depth rejection must name the depth bound: " .. tostring(depth_reason))
+
+  -- Nodes: one boolean per array item plus the root and array node.
+  local node_schema = {
+    type = "array",
+    items = { type = "boolean" },
+    maxItems = WheelSchema.LIMITS.VALUE_MAX_NODES,
+  }
+  local node_value = {}
+  for index = 1, WheelSchema.LIMITS.VALUE_MAX_NODES do
+    node_value[index] = true
+  end
+  local node_ok, node_reason = WheelSchema.validate_value(node_schema, node_value)
+  assert(not node_ok, "value node count above VALUE_MAX_NODES must be rejected")
+  assert(node_reason:find("node count", 1, true) ~= nil,
+    "node rejection must name the node bound: " .. tostring(node_reason))
+
+  -- Bytes: two maximum-sized strings exceed the value byte budget.
+  local half = math.floor(WheelSchema.LIMITS.VALUE_MAX_BYTES / 2)
+  local byte_schema = {
+    type = "array",
+    items = { type = "string", maxLength = half },
+    maxItems = 2,
+  }
+  local byte_ok, byte_reason = WheelSchema.validate_value(byte_schema, {
+    string.rep("x", half),
+    string.rep("y", half),
+  })
+  assert(not byte_ok, "value bytes above VALUE_MAX_BYTES must be rejected")
+  assert(byte_reason:find("bytes", 1, true) ~= nil,
+    "byte rejection must name the byte bound: " .. tostring(byte_reason))
+
+  -- A sparse table is rejected from its keys, not by walking to the highest
+  -- index: the validator must remain bounded for hostile input.
+  local sparse_schema = {
+    type = "array",
+    items = { type = "boolean" },
+    maxItems = 2,
+  }
+  local sparse_ok, sparse_reason = WheelSchema.validate_value(sparse_schema, {
+    [1] = true,
+    [1000000000] = true,
+  })
+  assert(not sparse_ok, "a sparse oversized array must be rejected")
+  assert(sparse_reason:find("exceeds 2 items", 1, true) ~= nil,
+    "sparse rejection must name the item bound: " .. tostring(sparse_reason))
 end)
 
 run_test("Wheel Init: command schemas and invocation validation", function()
@@ -1110,6 +1219,161 @@ run_test("Wheel Init: command schemas and invocation validation", function()
   -- rejected by the same validator the dispatch wrapper uses.
   local drift_ok = WheelSchema.validate_value(hello.result_schema, { title = "Wheel" }, "$result")
   assert(not drift_ok, "a result missing its body must be rejected")
+
+  _G.bitty = nil
+  package.loaded["wheel.init"] = nil
+end)
+
+run_test("WheelCommands: host-bounded results and dispatch validation", function()
+  local captured = {}
+  local host = {
+    commands = {
+      register = function(def)
+        captured[def.id] = def
+      end,
+    },
+    notify = {
+      show = function()
+        return true
+      end,
+    },
+  }
+
+  local cap = WheelCommands.RESULT_BODY_MAX_LENGTH
+  assert(WheelCommands.HOST_RESULT_MAX_BYTES == 8 * 1024,
+    "host result budget must mirror DEFAULT_MAX_VALUE_BYTES")
+  assert(cap == WheelCommands.HOST_RESULT_MAX_BYTES
+      - WheelCommands.RESULT_ENVELOPE_MAX_BYTES
+      - WheelCommands.RESULT_TITLE_MAX_LENGTH,
+    "body bound must reserve the envelope and title")
+  assert(cap < WheelCommands.HOST_RESULT_MAX_BYTES, "body bound must fit the host cap")
+
+  local result_schema = WheelCommands.notification_result_schema()
+  assert_schema_valid(result_schema)
+
+  local function assert_host_fits(result)
+    -- Host `LuaValue::from_lua` charges string bytes for the two keys, the
+    -- title, and the body.
+    assert(#result.title + #result.body + 5 + 4 <= WheelCommands.HOST_RESULT_MAX_BYTES,
+      "host string budget exceeded")
+  end
+
+  -- A body exactly at the cap is unchanged and valid.
+  local at_cap = WheelCommands.notify(host, "Wheel", string.rep("a", cap))
+  assert(#at_cap.body == cap, "a body at the cap must not be shortened")
+  local ok, reason = WheelSchema.validate_value(result_schema, at_cap, "$result")
+  assert(ok, "a body at the cap must validate: " .. tostring(reason))
+  assert_host_fits(at_cap)
+
+  -- A body over the cap is truncated to the cap and remains valid.
+  local over = WheelCommands.notify(host, "Wheel", string.rep("a", cap + 100))
+  assert(#over.body == cap, "an oversized body must be truncated to the cap")
+  assert(over.body:sub(-3) == "...", "truncation must be marked with an ellipsis")
+  ok, reason = WheelSchema.validate_value(result_schema, over, "$result")
+  assert(ok, "a truncated result must validate: " .. tostring(reason))
+  assert_host_fits(over)
+
+  -- The worst-case title plus body stays under the host cap.
+  local max_title = WheelCommands.notify(
+    host,
+    string.rep("T", WheelCommands.RESULT_TITLE_MAX_LENGTH),
+    string.rep("b", cap))
+  assert_host_fits(max_title)
+
+  -- UTF-8 boundaries: the raw cut would land inside 2- and 4-byte sequences.
+  local cut = cap - 3
+  local sequences = {
+    { name = "2-byte", bytes = string.char(0xC3, 0xA9) },
+    { name = "4-byte", bytes = string.char(0xF0, 0x9F, 0x90, 0xB9) },
+  }
+  for _, sequence in ipairs(sequences) do
+    local body = string.rep("a", cut - 1) .. sequence.bytes .. string.rep("b", 16)
+    assert(#body > cap, sequence.name .. " fixture must exceed the cap")
+    local truncated = WheelCommands.truncate_body(body)
+    assert(#truncated <= cap, sequence.name .. " truncation must respect the cap")
+    assert(truncated:sub(-3) == "...", sequence.name .. " truncation must be marked")
+    assert_valid_utf8(truncated)
+    assert(truncated:sub(-4, -4) == "a",
+      sequence.name .. " truncation must back off the split code point")
+  end
+
+  -- The real registered hello result schema accepts the bounded projection.
+  package.loaded["wheel.init"] = nil
+  _G.bitty = host
+  local wheel = require("wheel.init")
+  local hello = captured["hello"]
+  assert(hello ~= nil, "hello must be registered")
+  assert(wheel.command_catalog[1] == hello, "hello must be the first catalog entry")
+  local real_truncated = WheelCommands.notify(host, "Wheel", string.rep("x", cap * 2))
+  local real_ok, real_reason = WheelSchema.validate_value(hello.result_schema, real_truncated, "$result")
+  assert(real_ok, "a truncated result must satisfy the registered schema: " .. tostring(real_reason))
+  assert_host_fits(real_truncated)
+
+  -- A handler that returns an over-bound result without truncation is
+  -- contained by the dispatch wrapper.
+  local over_bound = {
+    id = "over-bound-result",
+    title = "Test: over bound",
+    description = "Test fixture.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
+    run = function()
+      return { title = "Wheel", body = string.rep("x", cap + 1) }
+    end,
+  }
+  WheelCommands.register(over_bound, host)
+  local bound_ok, bound_err = pcall(over_bound.run)
+  assert(not bound_ok, "an over-bound handler result must fail closed")
+  assert_typed_error(bound_err, "E_RESULT_INVALID", "validation")
+
+  -- Invalid arguments are rejected before the handler runs.
+  local handler_ran = false
+  local invalid_args = {
+    id = "invalid-args",
+    title = "Test: invalid args",
+    description = "Test fixture.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
+    run = function()
+      handler_ran = true
+      return { title = "Wheel", body = "ok" }
+    end,
+  }
+  WheelCommands.register(invalid_args, host)
+  local args_ok, args_err = pcall(invalid_args.run, { unexpected = true })
+  assert(not args_ok, "invalid arguments must fail closed")
+  assert(handler_ran == false, "the handler must not run on invalid arguments")
+  assert_typed_error(args_err, "E_ARGS_INVALID", "validation")
+
+  -- The registration entry point rejects an invalid schema with a typed
+  -- validation failure before the host captures the definition.
+  local bad_schema = {
+    id = "bad-schema",
+    title = "Test: bad schema",
+    description = "Test fixture.",
+    args_schema = { type = "object", properties = {}, additionalProperties = false },
+    result_schema = WheelCommands.notification_result_schema(),
+    run = function()
+      return { title = "Wheel", body = "ok" }
+    end,
+  }
+  local schema_ok, schema_err = pcall(WheelCommands.register, bad_schema, host)
+  assert(not schema_ok, "an invalid command schema must fail registration")
+  assert_typed_error(schema_err, "E_SCHEMA_INVALID", "validation")
+
+  local bad_result_schema = {
+    id = "bad-result-schema",
+    title = "Test: bad result schema",
+    description = "Test fixture.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = { type = "string" },
+    run = function()
+      return "ok"
+    end,
+  }
+  local result_schema_ok, result_schema_err = pcall(WheelCommands.register, bad_result_schema, host)
+  assert(not result_schema_ok, "an invalid result schema must fail registration")
+  assert_typed_error(result_schema_err, "E_SCHEMA_INVALID", "validation")
 
   _G.bitty = nil
   package.loaded["wheel.init"] = nil

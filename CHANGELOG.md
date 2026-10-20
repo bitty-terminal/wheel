@@ -36,8 +36,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   closed `args_schema` and `result_schema` in one lazy command table.
   Registration rejects unsupported or unbounded schemas with `E_SCHEMA_INVALID`,
   invocation arguments are validated before dispatch with `E_ARGS_INVALID`, and
-  handlers return the bounded `{ title, body }` notification projection.
-  The transitional manifest is unchanged.
+  handlers return the bounded `{ title, body }` notification projection. The
+  result body (8000 bytes) and title (64 bytes) fit the host bridge's 8 KiB
+  `DEFAULT_MAX_VALUE_BYTES`, and oversized bodies are truncated at a UTF-8
+  boundary. The transitional manifest is unchanged.
 
 ### Changed
 

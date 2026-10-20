@@ -75,6 +75,7 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/init.lua`          | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
 | `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                     |
 | `lua/wheel/schema.lua`        | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                             |
+| `lua/wheel/commands.lua`      | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                   |
 | `lua/wheel/config.lua`        | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
 | `lua/wheel/host.lua`          | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
@@ -226,9 +227,15 @@ Every command is declared once in the lazy command table in `lua/wheel/init.lua`
 with an explicit `args_schema` and `result_schema`. All 14 commands currently
 accept no arguments: their argument schema is a closed object with no declared
 properties, so any supplied field is rejected with `E_ARGS_INVALID` (class
-`validation`) before the handler runs. Each command returns the notification projection it displays,
-`{ title, body }`, with bounded title and body lengths, so CLI, palette, IPC,
-and agent consumers can type the result without scraping presentation text. A
+`validation`) before the handler runs. Each command returns the notification
+projection it displays, `{ title, body }`, so CLI, palette, IPC, and agent
+consumers can type the result without scraping presentation text. The title is
+bounded at 64 bytes and the body at 8000 bytes: the current host bridge
+marshals a command result through `DEFAULT_MAX_VALUE_BYTES` (8 KiB), and the
+body bound reserves a 128-byte marshalling margin (the two keys plus headroom)
+above the title. A
+larger body is truncated at a UTF-8 boundary before the notification is shown,
+so the visible and returned text stay schema-valid and host-compatible. A
 malformed or unbounded schema fails registration with `E_SCHEMA_INVALID`, and a
 handler result that drifts from its schema fails with `E_RESULT_INVALID`; both
 are `validation` errors. The schema vocabulary is finite: `string`, `integer`,
@@ -253,7 +260,8 @@ offline. `just manifest` validates the transitional `bitty-plugin.toml` with the
 authoritative SDK linter against the accepted contract in bitty-docs
 `docs/specifications/plugin-platform-rfc.md` (file name, identity,
 compatibility, capability closed set, lazy triggers, hard limits). `just lua`
-runs the pinned `luaparse` 0.3.1 CLI over every Lua source; `just lua-control`
+runs the pinned `luaparse` 0.3.1 CLI over every Lua source under `lua/` and
+`tests/`; `just lua-control`
 feeds the same parser an invalid snippet and requires rejection, so a recipe
 that stopped reading the entry point cannot pass silently. `just check` runs
 all three. The manifest gate keeps the transitional artifact honest until a
@@ -262,12 +270,12 @@ follow-up removes it; it is not evidence of plugin compatibility.
 `bitty-plugin-lint` also validates table-form `[lazy].commands` schemas when a
 manifest carries them, but the transitional manifest is intentionally unchanged
 and stays in string form, so the linter never sees the Lua registration
-schemas. `lua/wheel/schema.lua` is therefore the registration authority: it
-admits the finite vocabulary above and rejects unknown keywords, unbounded
-strings, arrays, or numbers, missing `additionalProperties = false`, cycles,
-and over-deep schemas before a command is captured. The unit suite exercises
-those admission bounds and the invocation checks; it does not claim host-side
-validation evidence.
+schemas. `lua/wheel/schema.lua` is therefore the admission authority, applied
+by `lua/wheel/commands.lua` at registration: it rejects unknown keywords,
+unbounded strings, arrays, or numbers, missing `additionalProperties = false`,
+cycles, and over-deep schemas before a command is captured. The unit suite
+exercises those admission bounds, the host result budget, truncation, and the
+invocation checks; it does not claim host-side validation evidence.
 
 Run the unit test suite and the cross-process end-to-end integration drill:
 

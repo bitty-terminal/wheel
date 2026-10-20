@@ -38,8 +38,11 @@ local LIMITS = {
   SCHEMA_MAX_ARRAY_ITEMS = 256,
   SCHEMA_MAX_ABSOLUTE_NUMBER = 1000000000,
   -- Value admission bounds. Arguments and results are untrusted data, so the
-  -- validator bounds depth, node count, and bytes before it walks them.
-  VALUE_MAX_DEPTH = 16,
+  -- validator bounds depth, node count, and bytes before it walks them. The
+  -- invocation depth is deliberately lower than the schema declaration depth:
+  -- command payloads are flat envelopes, and the lower runtime bound keeps a
+  -- deep value from consuming the schema recursion budget.
+  VALUE_MAX_DEPTH = 8,
   VALUE_MAX_NODES = 256,
   VALUE_MAX_BYTES = 16 * 1024,
 }
@@ -86,20 +89,28 @@ local function is_integer(value)
   return is_finite_number(value) and value % 1 == 0
 end
 
-local function array_length(value)
+-- Count a contiguous array and stop as soon as `max_items` is exceeded.
+-- Iterating to the highest index would let a sparse table such as
+-- `{[1] = true, [1000000000] = true}` cost linear time before the caller can
+-- apply `maxItems`; the count/highest comparison detects holes without that
+-- walk.
+local function array_length(value, max_items)
   local count = 0
+  local highest = 0
   for key in pairs(value) do
     if not is_non_negative_integer(key) or key < 1 then
       return nil, "expected a contiguous array"
     end
-    if key > count then
-      count = key
+    count = count + 1
+    if key > highest then
+      highest = key
+    end
+    if count > max_items or highest > max_items then
+      return nil, "exceeds " .. max_items .. " items"
     end
   end
-  for index = 1, count do
-    if value[index] == nil then
-      return nil, "expected a contiguous array"
-    end
+  if count ~= highest then
+    return nil, "expected a contiguous array"
   end
   return count, nil
 end
@@ -207,7 +218,7 @@ local function validate_required(schema, properties, path)
   if type(required) ~= "table" then
     return nil, path .. ".required: expected an array of strings"
   end
-  local count, reason = array_length(required)
+  local count, reason = array_length(required, LIMITS.SCHEMA_MAX_REQUIRED)
   if not count then
     return nil, path .. ".required: " .. reason
   end
@@ -240,7 +251,7 @@ local function validate_enum(schema, path)
   if type(enum) ~= "table" then
     return nil, path .. ".enum: expected an array"
   end
-  local count, reason = array_length(enum)
+  local count, reason = array_length(enum, LIMITS.SCHEMA_MAX_ENUM_VALUES)
   if not count then
     return nil, path .. ".enum: " .. reason
   end
@@ -484,13 +495,10 @@ local function check_array(schema, value, path, depth, state)
     return nil, path .. ": expected a plain table"
   end
 
-  local count, reason = array_length(value)
+  local max_items = schema.maxItems
+  local count, reason = array_length(value, max_items)
   if not count then
     return nil, path .. ": " .. reason
-  end
-  local max_items = schema.maxItems
-  if count > max_items then
-    return nil, path .. ": at most " .. max_items .. " items are allowed"
   end
   local min_items = schema.minItems or 0
   if count < min_items then

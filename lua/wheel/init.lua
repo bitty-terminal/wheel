@@ -24,8 +24,8 @@ local WheelTool = load_submodule("tool")
 local WheelProvider = load_submodule("provider")
 local WheelRunner = load_submodule("runner")
 local WheelHost = load_submodule("host")
-local WheelErrors = load_submodule("errors")
 local WheelSchema = load_submodule("schema")
+local WheelCommands = load_submodule("commands")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -38,6 +38,7 @@ local M = {
   provider = WheelProvider,
   runner = WheelRunner,
   schema = WheelSchema,
+  command_runtime = WheelCommands,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
@@ -48,69 +49,17 @@ local M = {
   WheelProvider = WheelProvider,
   WheelRunner = WheelRunner,
   WheelSchema = WheelSchema,
+  WheelCommands = WheelCommands,
   tools = WheelTool and WheelTool.get_default_registry(),
 }
 
--- User-visible notification projection returned by every command. Both
--- lengths are named bounds and are mirrored in the registered result schema;
--- `notify` enforces the body bound before the result is returned.
-local RESULT_TITLE_MAX_LENGTH = 64
-local RESULT_BODY_MAX_LENGTH = 16 * 1024
-
---- Build the closed argument schema for a command that takes no arguments.
--- The accepted host contract validates arguments before dispatch. An explicit
--- empty object with `additionalProperties = false` makes "no arguments" a
--- typed contract instead of an unstated convention: any field is rejected.
--- `properties` is omitted rather than set to an empty table because the host
--- marshaller encodes an empty Lua table as a JSON array; with no declared
--- properties and `additionalProperties = false`, the host still rejects every
--- supplied field.
--- @return table
-local function no_args_schema()
-  return {
-    type = "object",
-    additionalProperties = false,
-  }
-end
-
---- Build the shared bounded result schema for the notification projection.
--- Every command returns exactly the `{ title, body }` it displays, so CLI,
--- palette, IPC, and agent consumers can type the result without scraping
--- presentation text. Each command owns its own table, so a later per-command
--- narrowing does not mutate another command's contract.
--- @return table
-local function notification_result_schema()
-  return {
-    type = "object",
-    properties = {
-      title = { type = "string", minLength = 1, maxLength = RESULT_TITLE_MAX_LENGTH },
-      body = { type = "string", minLength = 1, maxLength = RESULT_BODY_MAX_LENGTH },
-    },
-    required = { "title", "body" },
-    additionalProperties = false,
-  }
-end
-
---- Show a notification and return the exact projection declared by the result
--- schema. The body is truncated at the named bound so a large DAG, roster, or
--- context listing can never violate the registered contract.
+-- Show a notification through the shared command layer, which owns the
+-- host-compatible result bounds and the UTF-8-safe truncation.
 -- @param title string
 -- @param body string
 -- @return table { title: string, body: string }
 local function notify(title, body)
-  assert(type(title) == "string" and #title >= 1 and #title <= RESULT_TITLE_MAX_LENGTH,
-    "notification title must be non-empty and bounded")
-  if type(body) ~= "string" then
-    body = tostring(body)
-  end
-  if #body > RESULT_BODY_MAX_LENGTH then
-    body = body:sub(1, RESULT_BODY_MAX_LENGTH - 3) .. "..."
-  end
-  bitty.notify.show({
-    title = title,
-    body = body,
-  })
-  return { title = title, body = body }
+  return WheelCommands.notify(bitty, title, body)
 end
 
 -- Lazy command table: metadata, argument schema, result schema, and handler
@@ -122,8 +71,8 @@ local WHEEL_COMMANDS = {
     id = "hello",
     title = "Wheel: hello",
     description = "Print a greeting from Wheel.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       return notify("Wheel", "Hello from bitty-terminal.wheel (Bittie 🐹).")
     end,
@@ -134,8 +83,8 @@ local WHEEL_COMMANDS = {
     id = "status",
     title = "Wheel: status",
     description = "Display Wheel kernel status and telemetry summary.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local text = WheelUI.format_status(M.kernel)
       return notify("Wheel Status", text)
@@ -147,8 +96,8 @@ local WHEEL_COMMANDS = {
     id = "graph",
     title = "Wheel: graph",
     description = "Render ASCII Task DAG and topological execution waves.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local text = WheelUI.format_graph(M.kernel)
       return notify("Wheel Task DAG", text)
@@ -160,8 +109,8 @@ local WHEEL_COMMANDS = {
     id = "plan",
     title = "Wheel: plan",
     description = "Initialize or decompose a software engineering plan in the Task DAG.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local conf_res = WheelConfig.load({ project_root = "." })
       if not conf_res.ok and conf_res.message then
@@ -188,8 +137,8 @@ local WHEEL_COMMANDS = {
     id = "run",
     title = "Wheel: run",
     description = "Execute the next ready task in the DAG using WheelAgent.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local tasks = M.kernel:list_tasks()
       local ready_task = nil
@@ -243,8 +192,8 @@ local WHEEL_COMMANDS = {
     id = "trust",
     title = "Wheel: trust",
     description = "Inspect and approve project configuration (.wheel/init.lua).",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local project_root = "."
       local proj_path = WheelConfig.get_project_config_path(project_root)
@@ -273,8 +222,8 @@ local WHEEL_COMMANDS = {
     id = "team",
     title = "Wheel: team status",
     description = "Display Wheel multi-agent peer colleague roster and live states.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -298,8 +247,8 @@ local WHEEL_COMMANDS = {
     id = "context",
     title = "Wheel: context",
     description = "Inspect active semantic slots, Merkle root, and prefix-cache status.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -322,8 +271,8 @@ local WHEEL_COMMANDS = {
     id = "tools",
     title = "Wheel: tools",
     description = "List registered Wheel agent tools and intent schemas.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local reg = WheelTool.get_default_registry()
       local list = reg:list_tools()
@@ -342,8 +291,8 @@ local WHEEL_COMMANDS = {
     id = "orchestrate",
     title = "Wheel: orchestrate",
     description = "Run autonomous multi-agent wave orchestration loop over Task DAG.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -383,8 +332,8 @@ local WHEEL_COMMANDS = {
     id = "models",
     title = "Wheel: models",
     description = "Display configured model profiles, providers, and parameters.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local roles = {
         WheelAgent.Role.COMMANDER,
@@ -420,8 +369,8 @@ local WHEEL_COMMANDS = {
     id = "branch",
     title = "Wheel: branch",
     description = "List context branches or display active branch and HEAD commit.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -443,8 +392,8 @@ local WHEEL_COMMANDS = {
     id = "checkpoint",
     title = "Wheel: checkpoint",
     description = "Display recent context checkpoints (commit ancestry log).",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -469,8 +418,8 @@ local WHEEL_COMMANDS = {
     id = "reflog",
     title = "Wheel: reflog",
     description = "Display recent context reflog transitions and audit journal.",
-    args_schema = no_args_schema(),
-    result_schema = notification_result_schema(),
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -493,52 +442,13 @@ local WHEEL_COMMANDS = {
 
 M.command_catalog = WHEEL_COMMANDS
 
--- Register plugin commands if running inside Bitty host environment.
+-- Register plugin commands if running inside Bitty host environment. The
+-- command layer validates both schemas before the host captures a definition,
+-- validates arguments before a handler runs, and validates the result before
+-- returning it.
 if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands.register then
-  -- Every handler crosses the same typed failure boundary, so a missing host
-  -- surface becomes a stable capability denial while real defects stay
-  -- distinguishable as internal errors. Registration metadata is untouched.
-  local function register_command(def)
-    assert(type(def) == "table", "command definition must be a table")
-    local id = def.id
-    assert(type(id) == "string" and id ~= "", "command definition requires an id")
-    assert(type(def.run) == "function", "command handler must be a function for " .. id)
-
-    -- Reuse the shared validator at registration so an unbounded, unknown, or
-    -- internally inconsistent schema fails closed before the host captures the
-    -- definition. The manifest linter validates table-form schemas only when
-    -- the transitional manifest carries them; this repository keeps that
-    -- manifest unchanged, so this validator is the registration authority.
-    local ok, reason = WheelSchema.validate_schema(def.args_schema, "args_schema")
-    if not ok then
-      error(WheelErrors.schema_invalid(id, reason), 0)
-    end
-    ok, reason = WheelSchema.validate_schema(def.result_schema, "result_schema")
-    if not ok then
-      error(WheelErrors.schema_invalid(id, reason), 0)
-    end
-
-    local args_schema = def.args_schema
-    local result_schema = def.result_schema
-    local handler = def.run
-    def.run = WheelErrors.wrap(id, function(args)
-      local valid, arg_reason = WheelSchema.validate_args(args_schema, args)
-      if not valid then
-        error(WheelErrors.args_invalid(id, arg_reason), 0)
-      end
-      local result = handler(args or {})
-      local result_ok, result_reason = WheelSchema.validate_value(result_schema, result, "$result")
-      if not result_ok then
-        error(WheelErrors.result_invalid(id, result_reason), 0)
-      end
-      return result
-    end)
-
-    bitty.commands.register(def)
-  end
-
   for _, def in ipairs(WHEEL_COMMANDS) do
-    register_command(def)
+    WheelCommands.register(def, bitty)
   end
 end
 
