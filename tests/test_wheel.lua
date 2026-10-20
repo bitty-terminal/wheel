@@ -5702,7 +5702,13 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
   os.execute("rm -rf " .. root)
 end)
 
-run_test("WheelHost: temp roots reject root and parent traversal", function()
+run_test("WheelHost: temp roots reject root, dot-only, and symlink traversal", function()
+  local root = "/tmp/bitty/test_host_tmp_guard"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root .. "/base " .. root .. "/real-parent")
+  -- `...` is a symlink to the parent directory; it must not be followed.
+  os.execute("ln -s .. " .. root .. "/base/...")
+  os.execute("ln -s " .. root .. "/real-parent " .. root .. "/alias")
+
   local function root_mode()
     local listing = WheelHost.proc.run_command("ls -ld /")
     return listing.stdout:match("^(%S+)")
@@ -5719,7 +5725,13 @@ run_test("WheelHost: temp roots reject root and parent traversal", function()
     return saved_execute(command)
   end
 
-  local forms = { "/", "//", "/.", "/./", "/tmp/..", "/tmp/../..", ".." }
+  local forms = {
+    "/", "//", "/.", "/./", "/tmp/..", "/tmp/../..", "..",
+    root .. "/base/.../victim",
+    root .. "/base//.../victim",
+    root .. "/base/./.../victim",
+    root .. "/base/.../../victim",
+  }
   local results = {}
   for _, form in ipairs(forms) do
     local backend = WheelHost.create_backend("standalone", { tmp_root = form })
@@ -5737,6 +5749,14 @@ run_test("WheelHost: temp roots reject root and parent traversal", function()
       "unsafe tmp_root must report the typed fs.write denial: '" .. result.form .. "'")
   end
   assert(root_mode() == mode_before, "the filesystem root mode must not change")
+  assert(not WheelHost.fs.exists(root .. "/victim"),
+    "the symlinked traversal must not create a file outside base")
+
+  -- A legitimate parent symlink is still allowed.
+  local alias_backend = WheelHost.create_backend("standalone", { tmp_root = root .. "/alias/runtime" })
+  local alias_dir, alias_err = alias_backend.tmp_dir()
+  assert(alias_dir == root .. "/alias/runtime",
+    "a non-owned parent symlink must still resolve: " .. tostring(alias_err))
 
   -- Legitimate relative roots still normalize (trailing separator and `/.`).
   local relative = "ctx0015_relative_tmp_dir"
@@ -5744,10 +5764,24 @@ run_test("WheelHost: temp roots reject root and parent traversal", function()
   local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
   local slash_dir, slash_err = with_slash.tmp_dir()
   assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
+  local slash_listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(relative))
+  local slash_mode = slash_listing.stdout:match("^(%S+)")
+  assert(string.sub(slash_mode or "", 1, 10) == "drwx------",
+    "relative trailing-slash root must be 0700, got " .. tostring(slash_mode))
   local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
   local dot_dir, dot_err = with_dot.tmp_dir()
   assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
-  os.execute("rm -rf " .. relative)
+  os.execute("rm -rf " .. relative .. " " .. root)
+end)
+
+run_test("WheelHost: non-string tmp_root fails typed", function()
+  for _, value in ipairs({ 42, false, {}, function() end }) do
+    local backend = WheelHost.create_backend("standalone", { tmp_root = value })
+    local ok, err = pcall(backend.tmp_dir)
+    assert(not ok, "non-string tmp_root must be rejected")
+    local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
+    assert(denial.message == "capability 'fs.write' is not granted")
+  end
 end)
 
 run_test("WheelHost: default temp directory still resolves", function()

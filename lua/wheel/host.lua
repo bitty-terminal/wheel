@@ -188,12 +188,15 @@ local function owned_parent_path(dir)
   return nil
 end
 
---- Return true when any normalized path segment is `..`.
+--- Return true when any normalized path segment consists only of dots
+-- (`.`, `..`, `...`, ...). This blocks both literal parent traversal and a
+-- symlink whose name is all dots, which `test -L` would otherwise accept while
+-- the path resolves through it.
 -- @param path string
 -- @return boolean
-local function has_parent_segment(path)
+local function has_dot_only_segment(path)
   for segment in path:gmatch("[^/]+") do
-    if segment == ".." then
+    if segment:match("^%.+$") then
       return true
     end
   end
@@ -417,16 +420,17 @@ function standalone.new(opts)
   end
 
   --- Resolve, create, and repair the private temporary directory.
-  -- The path is normalized (trailing `/`, `/.` stripped) before inspection. The
-  -- filesystem root and any `..` segment are rejected before mkdir/chmod. The
-  -- harness-owned directory (and the `wheel` component of the state fallback)
-  -- must not be a symbolic link: `chmod` must never follow a pre-existing link.
-  -- Legitimate parent links such as `/tmp` are allowed because only the
-  -- harness-owned path is inspected.
+  -- The path is normalized (trailing `/`, `/.` stripped) before inspection.
+  -- The filesystem root and any all-dots segment (`.`, `..`, `...`, ...) are
+  -- rejected before mkdir/chmod, so an all-dots symlink component cannot be
+  -- followed. The harness-owned directory (and the `wheel` component of the
+  -- state fallback) must not be a symbolic link: `chmod` must never follow a
+  -- pre-existing link. Legitimate parent links such as `/tmp` are allowed
+  -- because only the harness-owned path is inspected.
   -- @return string dir
   function backend.tmp_dir()
     local dir = tmp_root
-    if not dir or dir == "" then
+    if dir == nil or dir == "" then
       require_surface(type(os) == "table" and type(os.getenv) == "function", "fs.write")
       local runtime = os.getenv("XDG_RUNTIME_DIR")
       if runtime and runtime ~= "" then
@@ -443,13 +447,13 @@ function standalone.new(opts)
         end
       end
     end
-    if not dir or dir == "" then
+    if type(dir) ~= "string" or dir == "" then
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
     dir = normalize_tmp_dir(dir)
     -- The harness-owned temp directory must not be the filesystem root or
-    -- escape through parent traversal; reject before any mkdir/chmod.
-    if dir == "/" or has_parent_segment(dir) then
+    -- contain an all-dots segment; reject before any mkdir/chmod.
+    if dir == "/" or has_dot_only_segment(dir) then
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
 
