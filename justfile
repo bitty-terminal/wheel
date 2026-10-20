@@ -98,6 +98,7 @@ lua: deps
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
     bun run luaparse --quiet --file tests/test_wheel.lua
     bun run luaparse --quiet --file tests/test_live_openrouter.lua
+    bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
 test: deps
@@ -110,6 +111,19 @@ test: deps
     else \
         echo "No lua interpreter found; skipping runtime test execution" >&2; \
     fi
+
+# Opt-in real-host activation and command-smoke fixture for the standalone
+# Option B harness. Requires lua5.1 and fails closed when it is absent instead
+# of skipping. CI installs Lua 5.1 and runs this after `just check`; the fixture
+# execution is deliberately not part of the local `check` aggregate, while the
+# Lua gate still parses the file.
+test-real-host:
+    @set -e; \
+    if ! command -v lua5.1 >/dev/null 2>&1; then \
+        echo "test-real-host requires lua5.1 on PATH" >&2; \
+        exit 1; \
+    fi; \
+    lua5.1 tests/real_host_fixture.lua
 
 # Opt-in live provider test against OpenRouter. Manual only; never part of
 # `just check` or CI. It always runs the key-free redirect-policy test first

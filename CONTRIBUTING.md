@@ -46,8 +46,11 @@ or linters by name):
 4. Run all quality gates: `just check` (Markdown lint, Prettier format check,
    transitional manifest validation, README user-documentation check, Lua
    parse, the parser control, and the Lua behavior suite).
-   CI runs the same aggregate target, and `just check` runs offline once
-   `just install` has completed.
+   CI runs the same aggregate target and then the real-host fixture with
+   `just test-real-host`; `just check` runs offline once `just install` has
+   completed. Run `just test-real-host` locally when changing the host seam,
+   activation, or command dispatch; it requires `lua5.1` and fails closed
+   without it.
 5. Run the opt-in live provider test only when needed: `just test-live` first
    runs a key-free loopback redirect-policy test, then requires
    `OPENROUTER_API_KEY` in the inherited environment for the live portion. It

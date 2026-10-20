@@ -40,9 +40,27 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   result body (8000 bytes) and title (64 bytes) fit the host bridge's 8 KiB
   `DEFAULT_MAX_VALUE_BYTES`, and oversized bodies are truncated at a UTF-8
   boundary. The transitional manifest is unchanged.
+- Real-host activation and command-smoke fixture (`tests/real_host_fixture.lua`,
+  opt-in `just test-real-host`) for the standalone Option B harness. It creates
+  an ephemeral base and workspace, sets private `XDG_RUNTIME_DIR`,
+  `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `HOME` before requiring Wheel, and
+  selects the standalone POSIX backend explicitly. The only host double is the
+  presentation table `bitty` (`commands.register`, `notify.show`); it is not an
+  fs/process/temp/time mock, and no plugin VM or loader runs. The fixture
+  asserts the exact 14 registrations and eager/lazy split, `hello` notification
+  behavior, real filesystem/process/temporary-file/tool paths, path-escape and
+  destructive-command denials, read-only role gating, and typed backend
+  denials. Cold and warm activation are measured against RC-1 (10^7
+  instructions, 50 ms CPU, 8 ms warning) with the series, interpreter, CPU, OS,
+  and revision recorded in gitignored `recording/real-host-2026-10-21.md`.
+  This is implementation evidence only, not a release claim or full Gate 2
+  evidence; process timeout, cancellation, process-group, and scrubbed
+  environment bounds remain CTX-0016 work.
 
 ### Changed
 
+- CI installs Lua 5.1 before the quality gates, so `just test` runs the Lua
+  suite in CI, and runs `just test-real-host` after `just check`.
 - The harness now selects the standalone POSIX backend explicitly through
   `WheelHost.select_backend("standalone")` and fails closed on non-POSIX
   platforms or unknown backends with a typed `E_CAPABILITY_DENIED` error. Every

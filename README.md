@@ -97,6 +97,11 @@ drill against the separate `wheel_stdio_host` binary. The drill skips cleanly
 when no Lua interpreter is available; it reports a failure when the host binary
 is absent.
 
+`just test-real-host` runs the opt-in real-host activation and command-smoke
+fixture. It requires `lua5.1` and fails closed when the interpreter is absent.
+CI installs Lua 5.1 before the quality gates, so `just check` runs the Lua
+suite there, and then runs `just test-real-host` after `just check`.
+
 The in-tree `bitty-plugin.toml` is a transitional v1 plugin manifest, not an
 installation path. Installing Wheel through a Bitty plugin manager, or claiming
 `plugin-api` compatibility from that file, is outside the 0.1.0 deliverable. A
@@ -348,6 +353,8 @@ Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_proj
   or the no-settings sentence in `## Configuration`.
 - `just e2e` cannot find `wheel_stdio_host` — the cross-process drill needs the
   separate Rust host binary; unit tests do not.
+- `test-real-host requires lua5.1 on PATH` — the real-host fixture fails closed
+  instead of skipping; install Lua 5.1. CI installs it before the quality gates.
 - `E_COMPLETION_BUDGET_INVALID` — a `max_completion_tokens` override was zero,
   negative, fractional, non-numeric, or above `MAX_COMPLETION_TOKENS` (32768).
   Use a positive integer within the bound or omit the override for the named
@@ -480,6 +487,9 @@ exactly one location pair; update `package.json` and refresh `bun.lock` with
 - `just lint` and `just fmt-check` run markdownlint-cli2 and Prettier over the
   repository.
 - `just test` runs the unit suite across `lua5.1`, `luajit`, or `lua`.
+- `just test-real-host` runs the opt-in real-host fixture with `lua5.1`; the
+  fixture execution is not part of `just check` locally (the Lua gate still
+  parses the file), and CI runs it after the quality gates.
 - `just check` runs lint, format check, manifest, docs check, Lua parse, the
   parser control, and the test suite. It fails closed when dependencies are
   missing instead of fetching.
@@ -507,6 +517,44 @@ just e2e       # runs the 11-step cross-process drill with wheel_stdio_host over
 The unit suite also parses `README.md` and asserts that the documented command
 catalog, the eight configuration classes, the troubleshooting error codes, and
 the named configuration failures match the Lua sources.
+
+### Real-host fixture
+
+`just test-real-host` runs `tests/real_host_fixture.lua` against the real OS
+boundary of the standalone harness process (Option B). The fixture creates an
+ephemeral base and workspace, points `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`,
+`XDG_STATE_HOME`, and `HOME` at it before `require("wheel")`, and selects the
+standalone POSIX backend explicitly. No Bitty plugin VM, plugin loader, or
+plugin capability grant is involved.
+
+The only host double is the presentation table `bitty`, carrying
+`commands.register` and `notify.show`. It is a presentation boundary, not an
+fs/process/temp/time mock: every filesystem, process, temporary-file,
+wall-clock, and CPU-time operation in the harness under test is real OS
+behavior through `WheelHost`. Lua 5.1 has no `os.setenv`, so the fixture's
+bootstrap parent creates the ephemeral base and re-executes the child with the
+private environment; the parent performs no harness operation.
+
+The fixture asserts the exact 14 command ids in catalog order and the
+eager/lazy module split, dispatches `hello` and checks the notification, and
+exercises real filesystem, process, temporary-file, and tool paths
+(`read_file`, `write_file`, `edit_file`, `list_directory`, `search_code`,
+`run_command`). It also checks typed denials for `..` and absolute
+outside-workspace paths, the destructive-command deny-list, the read-only role
+gate, and unsupported backends. Activation is measured cold and warm with
+`os.clock()` and a `debug.sethook` instruction count against RC-1 (10^7
+instructions, 50 ms CPU, 8 ms warning); the series, interpreter, CPU, OS, and
+revision are written to `recording/real-host-2026-10-21.md`, which is
+gitignored durable scratch rather than a committed artifact.
+
+Evidence limits: the fixture is offline and uses no credentials. It is
+implementation evidence, not a release claim and not full Gate 2 evidence. It
+does not cover process timeout, cancellation, process-group, or
+scrubbed-environment bounds (CTX-0016), OS sandboxing, or a Bitty
+panel/terminal presentation run. `os.clock()` measures process CPU time, not
+elapsed wall clock; CPU frequency is not pinned, and one host runs one
+interpreter per run. The record is not a canonical specification and does not
+satisfy SECURITY-MODEL.md Gate 2 on its own.
 
 ### Offline and live tests
 
