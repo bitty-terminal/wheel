@@ -142,6 +142,10 @@
 - Ephemeral scratch goes under `/tmp/bitty/`; durable material goes under repo-local `recording/` (gitignored).
 - Run `just check` plus `actionlint` on affected workflows and
   `gitleaks detect --source .` before concluding a change.
+- Packaging changes additionally run `just package` and `just verify-package`,
+  and the `just shell` gate (`shellcheck -S warning` and `shfmt -d` over the
+  packaging scripts). The 0.1.0 artifact is a harness library, not a plugin: do
+  not add a plugin manifest or a `compat.plugin-api` contract to it.
 - Security-sensitive changes require independent security review by an agent
   that did not implement them, plus mock/unit and real host fixture evidence
   before any capability widening (owner D7). Green CI is not security evidence.

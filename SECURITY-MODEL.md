@@ -507,6 +507,51 @@ recorded here rather than edited into the accepted corpus:
   Wheel reconciles with it through a new scoped decision rather than treating
   this divergence as precedent.
 
+## Installation and upgrade trust path
+
+Wheel 0.1.0 installs from a local artifact, not a registry or plugin manager.
+The install path is part of the trust boundary because it decides which code
+runs with the user's authority.
+
+- **Artifact definition.** The root `VERSION` file is the single source of the
+  harness version. `just package` builds `dist/wheel-<version>.tar.gz` from
+  tracked inputs only and refuses a dirty worktree, a missing input, or a
+  version outside `X.Y.Z`. The archive contains `lua/`, `LICENSE`, `README.md`,
+  `SECURITY-MODEL.md`, `repo.toml`, and `VERSION`; it excludes tests,
+  recording, dependency trees, Git metadata, CI, scripts, the justfile, and
+  `dist/`. It carries no plugin manifest and no plugin-api compatibility field.
+- **Determinism and integrity.** The archive uses sorted members, fixed mtime
+  and ownership, normalized modes, and timestamp-free gzip. A SHA-256 sidecar
+  and a manifest record the digest and contents. The installer verifies the
+  sidecar before extraction. The digest is integrity only; 0.1.0 is unsigned,
+  has no publisher authentication, and has no update channel. An attacker who
+  can replace both the archive and its sidecar is outside this control.
+- **No evaluation or network.** The installer contains no `eval`, does not
+  construct shell commands from archive members, does not execute post-install
+  scripts, and performs no network request. Artifact content is data until a
+  Lua 5.1 process requires the module tree.
+- **Prefix and target rules.** A prefix must be absolute, exist, be writable,
+  and must not be `/`, end with `/`, contain `.`/`..` components, or be a
+  symlink. The install root `<prefix>/wheel` must carry the Wheel ownership
+  marker; an existing root without it is refused as non-owned. Version
+  directories, `current`, and `previous` targets must be real directories or
+  the expected relative symlink and are never followed outside the root.
+- **Archive member rules.** Extraction rejects absolute paths, `..` segments,
+  members outside `wheel-<version>/`, symlinks, hard links, devices, and other
+  non-regular members. The tree is extracted into a private staging directory,
+  its `VERSION` and allowed top-level entries are validated, and only then is
+  it renamed into place.
+- **Switch and rollback.** `current` is replaced atomically with a relative
+  symlink (GNU `mv -T`); the outgoing version is written to `previous`. Rollback is an
+  explicit local action that swaps the two; it does not fetch, verify a
+  signature, or contact a registry. A failed digest check, extraction, or tree
+  validation leaves no version directory; a failure after the rename leaves
+  the version unreferenced by `current`.
+- **Not a security boundary.** The marker, digest, and path checks defend
+  against accidental clobbering and corrupted transport, not against a
+  same-user attacker who controls the prefix or the repository checkout.
+  Installing as root or into a system prefix is not a 0.1.0 use case.
+
 ## Audit and logging
 
 - The harness writes a local, append-only audit stream under
@@ -755,7 +800,10 @@ Known gaps relative to this policy (not claims of compliance):
 - There is no OS-level confinement for argv or shell execution, no reviewed
   in-tree network client (provider adapters accept an injected client), no
   signed release artifact or update channel, and no Gate 1/Gate 2 evidence for
-  the 0.1.0 ceiling.
+  the 0.1.0 ceiling. The local install path verifies a SHA-256 digest and
+  rejects unsafe members and targets, but it provides integrity only: it does
+  not authenticate the publisher, and the marker and sidecar are same-user
+  mutable.
 - The in-tree plugin manifest still describes `platform.notify` and
   `compat.plugin-api`; it is retained unchanged pending a follow-up removal
   task. It is not the harness authority model and must not be widened.
@@ -813,6 +861,9 @@ An independent reviewer verifies at least:
   owner.
 - `bitty-plugin.toml` is unchanged by this task. It remains a transitional
   artifact and is not the 0.1.0 distribution path.
+- The 0.1.0 artifact path (`VERSION`, `just package`, `just install-local`,
+  `just rollback-local`) is repository-local implementation. It consumes no
+  Bitty plugin, registry, or package contract and claims no host compatibility.
 - OQ-068 and RFC-0005 remain in force for their own consumers. The divergence
   is Wheel-local and recorded above.
 

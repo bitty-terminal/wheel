@@ -36,3 +36,5 @@ jobs:
         run: just check
       - name: Run real-host fixture
         run: just test-real-host
+      - name: Verify package install, upgrade, and rollback
+        run: just verify-package

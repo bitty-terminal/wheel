@@ -13,3 +13,10 @@ docs = "bitty-ai-docs"
 # task and is not a supported distribution contract.
 [contracts]
 status = "no plugin-api contract consumed in 0.1.0; execution authority is held by the harness, not granted by a plugin manifest"
+
+# The root VERSION file is the single source of truth for the harness version.
+# This descriptor points at it instead of duplicating the number.
+[release]
+version_source = "VERSION"
+artifact = "dist/wheel-<version>.tar.gz"
+digest = "SHA-256 sidecar published with each artifact; unsigned in 0.1.0"

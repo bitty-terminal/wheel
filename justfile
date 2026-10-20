@@ -125,6 +125,37 @@ test-real-host:
     fi; \
     lua5.1 tests/real_host_fixture.lua
 
+# Build the deterministic standalone harness artifact for the version in the
+# root VERSION file: dist/wheel-<version>.tar.gz, its SHA-256 sidecar, and a
+# manifest record. The release gate refuses a dirty worktree or unsupported
+# version. Extra arguments go to scripts/package.sh (--allow-dirty and
+# --version are local test-build options only).
+package *args:
+    bash scripts/package.sh {{args}}
+
+# Install a locally built artifact under <prefix>/wheel/<version> and switch
+# the relative `current` symlink. Verifies the digest, archive members, target
+# ownership, and prefix shape before extracting; never uses the network.
+install-local prefix *args:
+    bash scripts/install-local.sh "{{prefix}}" {{args}}
+
+# Switch <prefix>/wheel/current back to the recorded previous version.
+rollback-local prefix:
+    bash scripts/install-local.sh --rollback "{{prefix}}"
+
+# Build the 0.1.0 artifact, install it into a temporary prefix, run the
+# real-host fixture against the installed tree, upgrade to a locally built
+# 0.1.1, roll back, and verify the refusal paths. Offline; no release.
+verify-package:
+    bash scripts/verify-package.sh
+
+# Shell gates for the packaging scripts (not part of `check` because the CI
+# image does not guarantee shfmt). The older workflow-*.sh scripts are outside
+# this gate; reformatting them is a separate change.
+shell:
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh
+
 # Opt-in live provider test against OpenRouter. Manual only; never part of
 # `just check` or CI. It always runs the key-free redirect-policy test first
 # and fails closed if that test fails. When OPENROUTER_API_KEY is absent, only

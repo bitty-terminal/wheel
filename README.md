@@ -12,9 +12,11 @@ Bitty panel or terminal supplies only presentation and input, and plugin
 packaging is not part of the 0.1.0 deliverable.
 
 > Status: pre-release. The harness implementation lives in `lua/wheel/` with
-> unit and cross-process test suites. No harness artifact has been released and
-> no released-host integration is claimed. The 0.1.0 scope is a **single harness
-> artifact**: plugin packaging and `compat.plugin-api` are dropped (owner D6).
+> unit and cross-process test suites. The 0.1.0 artifact and its local
+> install/upgrade path are defined and validated, but no artifact has been
+> published and no released-host integration is claimed. The 0.1.0 scope is a
+> **single harness artifact**: plugin packaging and `compat.plugin-api` are
+> dropped (owner D6).
 > Authority and its controls are defined in [SECURITY-MODEL.md](SECURITY-MODEL.md);
 > the 0.1.0 ceiling is workspace read/write, arbitrary argv, shell command
 > strings, network egress, and secret environment reads, with shell strings and
@@ -71,10 +73,116 @@ Wheel is focused on software engineering workflows.
 
 ## Install
 
-Wheel has no released artifact. The 0.1.0 harness artifact, its version, and its
-install/launch contract do not exist yet, so there is nothing to download and no
-released-host integration to claim. The supported path today is a source
-checkout for development and validation.
+Wheel 0.1.0 defines the harness artifact and its local install, upgrade, and
+rollback path. No release artifact has been published: there is no tag, no
+registry entry, and no released-host integration claim. `just package` builds
+the same archive locally, and `just verify-package` proves install, activation,
+upgrade, and rollback. The release target is `v0.1.0`; see
+[Release checklist (0.1.0)](#release-checklist-010).
+
+### Artifact
+
+`dist/wheel-0.1.0.tar.gz` contains the standalone harness library:
+
+- `lua/` — the `wheel` module tree (`lua/wheel/*.lua`).
+- `LICENSE`, `README.md`, and `SECURITY-MODEL.md`.
+- `repo.toml` — repository identity and release pointer.
+- `VERSION` — the artifact version (`0.1.0`).
+
+It excludes tests, `recording/`, `node_modules`, `.git`, CI workflows, `dist/`,
+`scripts/`, the justfile, `package.json`, `bun.lock`, and the transitional
+`bitty-plugin.toml`. It is a Lua library tree, not a Bitty plugin: there is no
+plugin packaging, no `compat.plugin-api` field, and no Bitty host version
+requirement. The installed layout is `<prefix>/wheel/<version>/` with a
+relative `current` symlink at `<prefix>/wheel/current`.
+
+Build the artifact and its sidecar:
+
+```sh
+just package
+(cd dist && sha256sum -c wheel-0.1.0.tar.gz.sha256)
+```
+
+`just package` is offline. It writes `dist/wheel-0.1.0.tar.gz`, the
+`.sha256` sidecar, and a `.manifest.json` record with the artifact name,
+version, contents, per-file digests, and archive digest. It fails closed on a
+dirty worktree, a missing input, or an unsupported version. The archive is
+deterministic — sorted member order, fixed mtime and ownership, normalized
+modes, and gzip without a name or timestamp — so the same revision and
+packaging toolchain produce the same bytes and digest. The digest provides
+integrity checking only; 0.1.0 is unsigned and has no update channel.
+
+### Install and launch
+
+`just install-local <prefix>` installs a built archive under
+`<prefix>/wheel/<version>/` and switches the `current` symlink:
+
+```sh
+just package
+just install-local "$HOME/.local"
+```
+
+The installer verifies the SHA-256 sidecar, accepts only regular files and
+directories under the expected archive root, rejects absolute, `..`, and
+symlinked members, refuses `/`, trailing-slash, `..`-containing, symlinked, and
+non-owned prefixes, extracts into a private staging directory, and switches
+`current` atomically. It records the outgoing version in
+`<prefix>/wheel/previous`. It is offline and contains no `eval`, no
+archive-supplied shell string, and no post-install script.
+
+There is no standalone launcher executable in the 0.1.0 artifact. The launch
+contract is the Lua 5.1 module root:
+
+```sh
+LUA_PATH="$HOME/.local/wheel/current/lua/?.lua;$HOME/.local/wheel/current/lua/?/init.lua;;" \
+  lua5.1 -e 'local wheel = require("wheel"); print(wheel.command_catalog[1].id)'
+```
+
+When Wheel runs in a Bitty panel or terminal, the presentation table `_G.bitty`
+supplies `commands.register` and `notify.show`; it supplies presentation and
+input only, never execution authority.
+
+### Upgrade and rollback
+
+Update `VERSION` and the sources for the next release, then build and install:
+
+```sh
+just package
+just install-local "$HOME/.local"
+```
+
+For a specific locally built archive, build it with an explicit test version
+(the `--allow-dirty` flag marks a non-release build), then install it:
+
+```sh
+scripts/package.sh --version 0.1.1 --allow-dirty --output-dir dist
+just install-local "$HOME/.local" \
+  --version 0.1.1 --archive dist/wheel-0.1.1.tar.gz
+```
+
+The old version stays installed and is recorded as `previous`. Roll back to it
+with:
+
+```sh
+just rollback-local "$HOME/.local"
+```
+
+Rollback swaps `current` and `previous`, so repeating the command returns to
+the newer version. Remove a retired version directory only when it is neither
+the current nor the previous version.
+
+### Compatibility
+
+- **Gate interpreter:** Lua 5.1 (PUC-Rio 5.1.5 in CI and the real-host
+  fixture). LuaJIT may run the development suites but is not the release gate.
+- **Platform:** POSIX hosts with GNU coreutils, tar, and gzip; Linux is
+  tested. Windows is not supported and macOS is not verified.
+- **Bitty host:** no host version is required. Wheel is an independent
+  process; a host supplies presentation and input only.
+- **Plugin API:** none. `bitty-plugin.toml` is transitional, is not in the
+  artifact, and grants no authority or compatibility claim.
+- **Versioning:** semantic versioning. Before 1.0, only the documented module
+  path and command catalog are stable enough to rely on.
 
 Standalone harness development does not require a Bitty host. Prerequisites:
 
@@ -101,6 +209,11 @@ is absent.
 fixture. It requires `lua5.1` and fails closed when the interpreter is absent.
 CI installs Lua 5.1 before the quality gates, so `just check` runs the Lua
 suite there, and then runs `just test-real-host` after `just check`.
+
+`just verify-package` builds the 0.1.0 artifact, installs it into a temporary
+prefix, runs the same fixture against the installed tree, upgrades to a locally
+built 0.1.1, rolls back, and checks the refusal paths. It is offline and does
+not publish anything. CI runs it after the real-host fixture.
 
 The in-tree `bitty-plugin.toml` is a transitional v1 plugin manifest, not an
 installation path. Installing Wheel through a Bitty plugin manager, or claiming
@@ -388,9 +501,14 @@ Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_proj
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the key from its inherited environment, rejects redirects, and never accepts the key through argv, files, or request JSON.                               |
 | `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                            |
 | `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                |
+| `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                       |
+| `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                |
+| `scripts/install-local.sh`                | Offline install/upgrade/rollback under `<prefix>/wheel/<version>` with digest, prefix, ownership, and symlink checks.                                                                                                |
+| `scripts/verify-package.sh`               | Builds, installs, runs the real-host fixture on the installed tree, upgrades, rolls back, and tests refusals.                                                                                                        |
+| `dist/`                                   | Gitignored package output (`wheel-<version>.tar.gz`, `.sha256`, `.manifest.json`).                                                                                                                                   |
 | `package.json`                            | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                     |
 | `bun.lock`                                | Locked dependency graph installed by `just install`.                                                                                                                                                                 |
-| `justfile`                                | Quality gates with pinned tool versions, including the SDK README checker in `just check`.                                                                                                                           |
+| `justfile`                                | Quality gates with pinned tool versions, including the SDK README checker in `just check` and the package/install recipes.                                                                                           |
 | `.github/workflows/ci.yml`                | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                               |
 
 ## Architecture
@@ -631,19 +749,24 @@ for this surface is documented under
 
 ## Release checklist (0.1.0)
 
-1. Ship a single harness artifact with a version and an install/launch
-   contract; do not ship the plugin packaging path or claim `plugin-api`
+1. Confirm `VERSION` is `0.1.0`, then run `just check`, `just package`, and
+   `just verify-package` on the release revision. Record the archive digest,
+   sidecar, and manifest; do not publish a plugin package or claim `plugin-api`
    compatibility.
 2. Complete the controls in [SECURITY-MODEL.md](SECURITY-MODEL.md) for the
    approved ceiling, pass both evidence gates, and obtain independent security
-   review.
-3. Replace this README's status note once the harness artifact is functional,
-   tested against a real host fixture, and the evidence is recorded; keep the
-   six user sections and the developer sections synchronized with that release.
-4. Remove or retire the transitional `bitty-plugin.toml` and its SDK lint gate
+   review of the authority and install paths.
+3. Tag `v0.1.0` and publish the single harness artifact, its SHA-256 sidecar,
+   and its manifest only after review and green CI. This task defines the
+   artifact and validates the local path; it does not create the tag or release.
+4. Replace this README's status note once the artifact is published and the
+   evidence is recorded; keep the six user sections and the developer sections
+   synchronized with that release.
+5. Remove or retire the transitional `bitty-plugin.toml` and its SDK lint gate
    in a scoped follow-up; do not widen the manifest in the meantime.
-5. Keep the repository free of secrets and of install scripts with ambient
-   authority.
+6. Keep the repository free of secrets and of install scripts with ambient
+   authority. The 0.1.0 installer is offline, digest-verified, and does not
+   evaluate artifact content.
 
 ## Security
 

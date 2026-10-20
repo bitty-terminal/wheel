@@ -13,6 +13,9 @@
 --     creates the ephemeral base with real shell commands and re-executes the
 --     child with a private environment. The parent performs no harness
 --     operation and is not part of the measured boundary.
+--   * WHEEL_ROOT selects an installed artifact tree instead of the
+--     development checkout; WHEEL_EVIDENCE_PATH keeps evidence out of that
+--     tree. Both are test-controlled paths, not harness inputs.
 --
 -- Measurements:
 --   * cold = first activation in this process.
@@ -30,14 +33,38 @@
 --   * no OS sandbox or Bitty panel/terminal presentation run.
 --   * single host and one interpreter per run; CPU frequency is not pinned.
 
-package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
+-- WHEEL_ROOT points the fixture at an installed artifact tree instead of the
+-- development checkout. It must be absolute, and the fixture verifies that the
+-- loaded modules actually resolved from it. WHEEL_EVIDENCE_PATH redirects the
+-- evidence write so an installed-tree run does not touch the repository.
+local WHEEL_ROOT = os.getenv("WHEEL_ROOT")
+if WHEEL_ROOT == "" then
+  WHEEL_ROOT = nil
+end
+if WHEEL_ROOT then
+  if WHEEL_ROOT:sub(1, 1) ~= "/" then
+    io.stderr:write("real-host fixture: WHEEL_ROOT must be absolute\n")
+    os.exit(1)
+  end
+  if WHEEL_ROOT:sub(-1) == "/" then
+    WHEEL_ROOT = WHEEL_ROOT:sub(1, -2)
+  end
+  package.path = WHEEL_ROOT .. "/lua/?.lua;" .. WHEEL_ROOT
+    .. "/lua/?/init.lua;" .. package.path
+else
+  package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
+end
 
 local RC1_INSTRUCTION_BUDGET = 10000000
 local RC1_CPU_BUDGET_SECONDS = 0.050
 local RC1_WARNING_SECONDS = 0.008
 local WARM_ACTIVATIONS = 5
 local INSTRUMENTED_ACTIVATIONS = 5
-local EVIDENCE_PATH = "recording/real-host-2026-10-21.md"
+local EVIDENCE_PATH = os.getenv("WHEEL_EVIDENCE_PATH")
+if EVIDENCE_PATH == "" then
+  EVIDENCE_PATH = nil
+end
+EVIDENCE_PATH = EVIDENCE_PATH or "recording/real-host-2026-10-21.md"
 
 local EXPECTED_COMMAND_IDS = {
   "hello",
@@ -126,6 +153,8 @@ local function bootstrap_child()
     "env",
     "WHEEL_REAL_HOST_BASE=" .. shell_quote(base),
     "WHEEL_REAL_HOST_OWNED=1",
+    "WHEEL_ROOT=" .. shell_quote(WHEEL_ROOT or ""),
+    "WHEEL_EVIDENCE_PATH=" .. shell_quote(EVIDENCE_PATH),
     "XDG_RUNTIME_DIR=" .. shell_quote(base .. "/runtime"),
     "XDG_CONFIG_HOME=" .. shell_quote(base .. "/config"),
     "XDG_STATE_HOME=" .. shell_quote(base .. "/state"),
@@ -546,7 +575,8 @@ local function write_evidence(status, failure)
   if not WheelHost then
     return false, "WheelHost is not loaded"
   end
-  WheelHost.fs.mkdir_p("recording")
+  local evidence_dir = EVIDENCE_PATH:match("^(.*)/[^/]+$") or "."
+  WheelHost.fs.mkdir_p(evidence_dir)
   return WheelHost.fs.write_file(EVIDENCE_PATH, build_evidence(status, failure))
 end
 
@@ -600,6 +630,18 @@ local function main()
     "activation: cold require registered exactly 14 commands in catalog order"
   state.coverage[#state.coverage + 1] =
     "activation: eager errors/schema/commands/kernel/ui loaded; the eight lazy modules stayed unloaded"
+
+  if WHEEL_ROOT then
+    check(cold_wheel.command_runtime ~= nil and
+      type(cold_wheel.command_runtime.register) == "function",
+      "the entry module must expose the command runtime")
+    local source = debug.getinfo(cold_wheel.command_runtime.register, "S").source
+    check(source:sub(1, 1) == "@", "the command runtime must come from a file")
+    check(source:sub(2, #WHEEL_ROOT + 1) == WHEEL_ROOT,
+      "an installed-tree run must load modules from WHEEL_ROOT: " .. tostring(source))
+    state.coverage[#state.coverage + 1] =
+      "installed tree: wheel modules resolved from WHEEL_ROOT"
+  end
 
   local hello = cold_capture.registrations["hello"]
   local hello_ok, hello_result = pcall(hello.run, {})

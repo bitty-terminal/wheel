@@ -1,6 +1,6 @@
 {
   "name": "wheel",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "description": "Wheel — the agent harness for the Bitty terminal (mascot: Bittie the hamster).",
