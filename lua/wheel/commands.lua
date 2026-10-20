@@ -13,13 +13,22 @@ local function load_sibling(name)
   local ok, mod = pcall(require, rooted)
   if ok then return mod end
   local cause = mod
+  if type(cause) ~= "string"
+    or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+    error(string.format("wheel.commands: cannot load sibling '%s': %s",
+      rooted, tostring(cause)), 0)
+  end
 
   local alternate = "lua.wheel." .. name
   ok, mod = pcall(require, alternate)
   if ok then return mod end
+  if type(mod) == "string"
+    and mod:find("module '" .. alternate .. "' not found", 1, true) then
+    mod = cause
+  end
 
   error(string.format("wheel.commands: cannot load sibling '%s': %s",
-    rooted, tostring(mod or cause)), 0)
+    rooted, tostring(mod)), 0)
 end
 
 local WheelErrors = load_sibling("errors")

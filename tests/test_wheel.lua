@@ -1638,6 +1638,56 @@ local function read_eager_activation_bytes()
   return total
 end
 
+-- Real package.path fixtures for loader tests. These write only under the
+-- repository's ephemeral scratch root and never stub the global `require`.
+local MODULE_LOAD_FIXTURE_ROOT = "/tmp/bitty/test_wheel_module_loaders"
+local REPO_PACKAGE_PATH = "./lua/?.lua;./lua/?/init.lua"
+
+local function reset_module_fixture_root()
+  os.execute("rm -rf " .. MODULE_LOAD_FIXTURE_ROOT
+    .. " && mkdir -p " .. MODULE_LOAD_FIXTURE_ROOT)
+end
+
+local function write_fixture_file(relative, content)
+  local path = MODULE_LOAD_FIXTURE_ROOT .. "/" .. relative
+  local dir = path:match("^(.*)/[^/]+$")
+  if dir then
+    os.execute("mkdir -p " .. dir)
+  end
+  local fh = assert(io.open(path, "wb"), "cannot write fixture: " .. path)
+  fh:write(content)
+  fh:close()
+end
+
+local function read_repo_source(relative)
+  local fh = assert(io.open(relative, "rb"))
+  local src = fh:read("*a")
+  fh:close()
+  return src
+end
+
+local function detach_wheel_modules()
+  local saved = {}
+  for name, mod in pairs(package.loaded) do
+    if is_wheel_module(name) then
+      saved[name] = mod
+      package.loaded[name] = nil
+    end
+  end
+  return saved
+end
+
+local function restore_wheel_modules(saved)
+  for name in pairs(package.loaded) do
+    if is_wheel_module(name) then
+      package.loaded[name] = nil
+    end
+  end
+  for name, mod in pairs(saved) do
+    package.loaded[name] = mod
+  end
+end
+
 run_test("Wheel Init: required modules eager, optional modules lazy", function()
   local eager_bytes = read_eager_activation_bytes()
   assert(eager_bytes <= ACTIVATION_EAGER_SOURCE_BUDGET_BYTES,
@@ -1689,6 +1739,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   local fh = assert(io.open(entry_path, "rb"))
   local entry_src = fh:read("*a")
   fh:close()
+  local saved_path = package.path
 
   run_in_host_sandbox(function()
     local real_require = require
@@ -1732,9 +1783,127 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
     assert(err.message:find("\n", 1, true) == nil,
       "activation failure must stay on one line")
   end)
+
+  -- Real package.path: a present-but-broken required module keeps the syntax
+  -- cause rather than falling through to an absent alternate root.
+  local saved_modules = detach_wheel_modules()
+  reset_module_fixture_root()
+  write_fixture_file("wheel/ui.lua", "this is not lua\n")
+  package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
+  local broken_ok, broken_err = pcall(require, "wheel.init")
+  package.path = saved_path
+  restore_wheel_modules(saved_modules)
+
+  assert(not broken_ok, "activation must fail when a required module is broken")
+  assert(type(broken_err) == "table", "broken activation failure must be a typed table")
+  assert(broken_err.class == "resolution" and broken_err.code == "E_MODULE_LOAD_FAILED",
+    "broken activation failure must keep the typed resolution code")
+  assert(broken_err.message:find("wheel.ui", 1, true) ~= nil,
+    "broken activation failure must name the rooted module")
+  assert(broken_err.message:find("ui.lua", 1, true) ~= nil,
+    "broken activation failure must preserve the source location")
+  assert(broken_err.message:find("expected", 1, true) ~= nil,
+    "broken activation failure must preserve the syntax cause")
+  assert(broken_err.message:find("lua.wheel.ui", 1, true) == nil,
+    "broken activation failure must not report the alternate root")
+  assert(broken_err.message:find("not found", 1, true) == nil,
+    "broken activation failure must not be reported as missing")
+
+  -- Real package.path: the sibling loaders must preserve a rooted
+  -- present-but-broken dependency, without trying the alternate root first.
+  local sibling_cases = {
+    {
+      parent = "wheel.team",
+      dep = "agent",
+      label = "wheel.team: cannot load submodule 'wheel.agent'",
+      broken = "this is not lua\n",
+      marker = "expected",
+    },
+    {
+      parent = "wheel.context",
+      dep = "config",
+      label = "wheel.context: cannot load submodule 'wheel.config'",
+      broken = "error('config exploded', 0)\n",
+      marker = "config exploded",
+    },
+    {
+      parent = "wheel.commands",
+      dep = "errors",
+      label = "wheel.commands: cannot load sibling 'wheel.errors'",
+      broken = "this is not lua\n",
+      marker = "expected",
+    },
+  }
+
+  for _, case in ipairs(sibling_cases) do
+    local case_modules = detach_wheel_modules()
+    reset_module_fixture_root()
+    write_fixture_file("wheel/" .. case.dep .. ".lua", case.broken)
+    package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
+    local case_ok, case_err = pcall(require, case.parent)
+    package.path = saved_path
+    restore_wheel_modules(case_modules)
+
+    assert(not case_ok, case.parent .. " must fail when " .. case.dep .. " is broken")
+    assert(type(case_err) == "string", case.parent .. " failure must be a string")
+    assert(case_err:find(case.label, 1, true) ~= nil,
+      case.parent .. " must attribute the rooted module: " .. case_err)
+    assert(case_err:find(case.marker, 1, true) ~= nil,
+      case.parent .. " must preserve the original cause: " .. case_err)
+    assert(case_err:find("lua.wheel." .. case.dep, 1, true) == nil,
+      case.parent .. " must not report the alternate root: " .. case_err)
+    assert(case_err:find("not found", 1, true) == nil,
+      case.parent .. " must not report a broken module as missing: " .. case_err)
+  end
+
+  -- Real package.path: a rooted name that is genuinely absent falls through to
+  -- the alternate root. The temporary tree contains only lua/wheel/<dep>.lua,
+  -- so every rooted `wheel.<dep>` lookup is a real not-found result.
+  local alternate_cases = {
+    { parent = "team", deps = { "agent", "context", "tool", "ui", "host" } },
+    { parent = "context", deps = { "config", "host" } },
+    { parent = "commands", deps = { "errors", "schema" } },
+  }
+
+  for _, case in ipairs(alternate_cases) do
+    local case_modules = detach_wheel_modules()
+    reset_module_fixture_root()
+    for _, dep in ipairs(case.deps) do
+      write_fixture_file("lua/wheel/" .. dep .. ".lua", "return {}\n")
+    end
+
+    local source = read_repo_source("lua/wheel/" .. case.parent .. ".lua")
+    package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;"
+      .. MODULE_LOAD_FIXTURE_ROOT .. "/?/init.lua"
+    local case_ok, case_mod = pcall(function()
+      return assert((loadstring or load)(source, "@lua/wheel/" .. case.parent .. ".lua"))()
+    end)
+    package.path = saved_path
+    restore_wheel_modules(case_modules)
+
+    assert(case_ok, case.parent .. " alternate-root fallback failed: " .. tostring(case_mod))
+    assert(type(case_mod) == "table", case.parent .. " alternate root must return a module")
+  end
+
+  -- Non-ASCII path segments must be removed together with ASCII ones.
+  local unicode_segment = "\195\169" -- UTF-8 e-acute, deliberately non-ASCII.
+  local unicode_cause = WheelErrors.module_load_failed(
+    "wheel.agent", "cannot open /tmp/" .. unicode_segment .. "/secret.txt")
+  assert(unicode_cause.message:find(unicode_segment, 1, true) == nil,
+    "module failure must not retain a non-ASCII path segment")
+  assert(unicode_cause.message:find("<path>", 1, true) ~= nil,
+    "module failure must replace the path with the bounded placeholder")
+  assert(#unicode_cause.message <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "module failure must stay within the bounded message length")
+
+  os.execute("rm -rf " .. MODULE_LOAD_FIXTURE_ROOT)
 end)
 
 run_test("Wheel Init: missing lazy module is attributed on first use", function()
+  reset_module_fixture_root()
+  os.execute("mkdir -p " .. MODULE_LOAD_FIXTURE_ROOT .. "/empty")
+  write_fixture_file("broken/wheel/tool.lua", "error('tool exploded', 0)\n")
+
   run_in_host_sandbox(function()
     local capture = new_command_capture()
     _G.bitty = {
@@ -1746,18 +1915,12 @@ run_test("Wheel Init: missing lazy module is attributed on first use", function(
     assert_command_catalog(capture)
     assert(package.loaded["wheel.tool"] == nil, "tool must start lazy")
 
-    local real_require = require
-    _G.require = function(name)
-      if name == "wheel.tool" then
-        error("module 'wheel.tool' not found: no file '/host/private/lua/wheel/tool.lua'", 0)
-      elseif name == "lua.wheel.tool" then
-        error("module 'lua.wheel.tool' not found: no file '/host/private/lua/lua/wheel/tool.lua'", 0)
-      end
-      return real_require(name)
-    end
-
+    -- Real package.path: both rooted and alternate tool names are absent.
+    local saved_path = package.path
+    package.path = MODULE_LOAD_FIXTURE_ROOT .. "/empty/?.lua;"
+      .. MODULE_LOAD_FIXTURE_ROOT .. "/empty/?/init.lua"
     local ok, err = pcall(capture.defs["tools"].run)
-    _G.require = real_require
+    package.path = saved_path
 
     assert(not ok, "a missing lazy module must fail its first use")
     assert(type(err) == "table", "lazy activation failure must be a typed table")
@@ -1765,10 +1928,31 @@ run_test("Wheel Init: missing lazy module is attributed on first use", function(
       "lazy activation failure must keep the typed resolution code")
     assert(err.message:find("wheel.tool", 1, true) ~= nil,
       "lazy activation failure must name the rooted module")
-    assert(err.message:find("/host/private", 1, true) == nil,
-      "lazy activation failure must not leak a host path")
+    assert(err.message:find("not found", 1, true) ~= nil,
+      "lazy activation failure must preserve the not-found cause")
+
+    -- Real package.path: a present-but-broken optional module keeps its cause
+    -- instead of being reported as a missing alternate-root module.
+    package.path = MODULE_LOAD_FIXTURE_ROOT .. "/broken/?.lua;" .. REPO_PACKAGE_PATH
+    local broken_ok, broken_err = pcall(capture.defs["tools"].run)
+    package.path = saved_path
+
+    assert(not broken_ok, "a broken lazy module must fail its first use")
+    assert(type(broken_err) == "table", "broken lazy failure must be a typed table")
+    assert(broken_err.class == "resolution" and broken_err.code == "E_MODULE_LOAD_FAILED",
+      "broken lazy failure must keep the typed resolution code")
+    assert(broken_err.message:find("wheel.tool", 1, true) ~= nil,
+      "broken lazy failure must name the rooted module")
+    assert(broken_err.message:find("tool exploded", 1, true) ~= nil,
+      "broken lazy failure must preserve the runtime cause")
+    assert(broken_err.message:find("lua.wheel.tool", 1, true) == nil,
+      "broken lazy failure must not report the alternate root")
+    assert(broken_err.message:find("not found", 1, true) == nil,
+      "broken lazy failure must not be reported as missing")
     assert(wheel ~= nil, "activation must have succeeded before the lazy failure")
   end)
+
+  os.execute("rm -rf " .. MODULE_LOAD_FIXTURE_ROOT)
 end)
 
 -- ===========================================================================

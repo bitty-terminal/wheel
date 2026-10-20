@@ -195,8 +195,8 @@ local function sanitize_module_cause(cause)
     return not_found
   end
 
-  text = text:gsub("[%w%._%-/]+/([%w%._%-]+%.lua:%d+):", "%1:")
-  text = text:gsub("[%w%._%-]*/[%w%._%-/]+", "<path>")
+  text = text:gsub("[^%s:]*/([%w%._%-]+%.lua:%d+):", "%1:")
+  text = text:gsub("[^%s]*/[^%s]*", "<path>")
   text = text:gsub("%s+", " ")
   text = text:gsub("^%s*(.-)%s*$", "%1")
   if #text > MODULE_CAUSE_MAX_LENGTH then
