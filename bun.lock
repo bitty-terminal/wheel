@@ -7,7 +7,7 @@
       "devDependencies": {
         "@commitlint/cli": "21.2.2",
         "@commitlint/config-conventional": "21.2.2",
-        "bitty-plugin-sdk": "github:bitty-terminal/bitty-plugin-sdk#c3fa9b0574c684eebb38b01dddfdf504d183cc20",
+        "bitty-plugin-sdk": "github:bitty-terminal/bitty-plugin-sdk#5a679421cfa2e7639a1d745d439c5db389f47d36",
         "lefthook": "2.1.12",
         "luaparse": "0.3.1",
         "markdownlint-cli2": "0.23.2",
@@ -130,7 +130,7 @@
 
     "argue-cli": ["argue-cli@3.2.0", "", {}, "sha512-VipTB0gXgGIFO2Rg9yEVN5wLt2AurJcZqDbgmYSwPwsykhLrQhs240/bfceev4w68lI8JshoOJIk9uW7tFzROw=="],
 
-    "bitty-plugin-sdk": ["bitty-plugin-sdk@github:bitty-terminal/bitty-plugin-sdk#c3fa9b0", { "dependencies": { "smol-toml": "1.8.0" }, "bin": { "bitty-plugin-lint": "./src/cli.ts" } }, "bitty-terminal-bitty-plugin-sdk-c3fa9b0", "sha512-6QPn1pXRK1WbVveyjE+JiIKuGvThRbRsqXjwVxa+1wKht5l3MjP4+SSFvFjtIviEOoCR/22hSIKV8DY52W/4DQ=="],
+    "bitty-plugin-sdk": ["bitty-plugin-sdk@github:bitty-terminal/bitty-plugin-sdk#5a67942", { "dependencies": { "smol-toml": "1.8.0" }, "bin": { "bitty-plugin-lint": "./src/cli.ts", "bitty-plugin-docs-check": "./src/docs-cli.ts" } }, "bitty-terminal-bitty-plugin-sdk-5a67942", "sha512-5UNylUYQTPA+/sYRHI6SXsGI0kLij+z77eKlfrW+QPFwsd90q+J27Z1AQ/JU4NM2Y8Zug8gWqsLu/xiv22NyBw=="],
 
     "braces": ["braces@3.0.3", "", { "dependencies": { "fill-range": "^7.1.1" } }, "sha512-yQbXgO/OSZVD2IsiLlro+7Hf6Q18EJrKSEsdoMzKePKXct3gvD8oLcOQdIzGupr5Fj+EDe8gO/lxc1BzfMpxvA=="],
 

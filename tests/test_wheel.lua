@@ -2426,6 +2426,330 @@ run_test("WheelTeam: organizational status telemetry", function()
 end)
 
 -- ===========================================================================
+-- 9. README User-Documentation Contract (CTX-0012)
+-- ===========================================================================
+
+local README_PATH = "README.md"
+local README_REQUIRED_SECTIONS = {
+  "Overview",
+  "Install",
+  "Commands",
+  "Configuration",
+  "Keybindings",
+  "Troubleshooting",
+}
+
+local function read_repository_file(path)
+  local handle, err = io.open(path, "r")
+  assert(handle ~= nil, "cannot read " .. path .. ": " .. tostring(err))
+  local content = handle:read("*a")
+  handle:close()
+  return content
+end
+
+local function split_source_lines(content)
+  local lines = {}
+  for line in (content .. "\n"):gmatch("([^\n]*)\n") do
+    lines[#lines + 1] = (line:gsub("\r$", ""))
+  end
+  return lines
+end
+
+--- Return the body lines of the first H2 section with `name`.
+local function readme_section(lines, name)
+  local start = nil
+  for index, line in ipairs(lines) do
+    if line == "## " .. name then
+      start = index
+      break
+    end
+  end
+  assert(start ~= nil, "README is missing the " .. name .. " H2 section")
+  local body = {}
+  for index = start + 1, #lines do
+    if lines[index]:match("^## .+$") then
+      break
+    end
+    body[#body + 1] = lines[index]
+  end
+  return body
+end
+
+--- Split one GFM table row into trimmed cells; nil when the line is not a row.
+local function parse_markdown_row(line)
+  local trimmed = line:match("^%s*(.-)%s*$")
+  if not trimmed:match("^|.*|$") then
+    return nil
+  end
+  local cells = {}
+  local body = trimmed:sub(2, #trimmed - 1)
+  for cell in (body .. "|"):gmatch("(.-)|") do
+    cells[#cells + 1] = cell:match("^%s*(.-)%s*$")
+  end
+  return cells
+end
+
+local function strip_code_cell(cell)
+  return cell:match("^`(.-)`$") or cell
+end
+
+local README_LINES = split_source_lines(read_repository_file(README_PATH))
+
+run_test("README: six required H2 sections lead in order without duplicates", function()
+  local headings = {}
+  local fence_open = false
+  for _, line in ipairs(README_LINES) do
+    if line:match("^```") then
+      fence_open = not fence_open
+    elseif not fence_open then
+      local level, text = line:match("^(#+)%s+(.+)$")
+      if level then
+        headings[#headings + 1] = { level = #level, text = text }
+      end
+    end
+  end
+
+  local h2 = {}
+  for _, heading in ipairs(headings) do
+    if heading.level == 2 then
+      h2[#h2 + 1] = heading.text
+    end
+  end
+
+  for index, required in ipairs(README_REQUIRED_SECTIONS) do
+    assert(h2[index] == required,
+      string.format("README H2 position %d must be %s, got %s", index, required, tostring(h2[index])))
+  end
+
+  local counts = {}
+  for _, name in ipairs(h2) do
+    counts[name] = (counts[name] or 0) + 1
+  end
+  for _, required in ipairs(README_REQUIRED_SECTIONS) do
+    assert(counts[required] == 1, "README must carry exactly one " .. required .. " H2 section")
+  end
+end)
+
+run_test("README: command table matches M.command_catalog names and schemas", function()
+  local saved_bitty = _G.bitty
+  local saved_init = package.loaded["wheel.init"]
+  _G.bitty = nil
+  package.loaded["wheel.init"] = nil
+  local ok, wheel = pcall(require, "wheel.init")
+  package.loaded["wheel.init"] = saved_init
+  _G.bitty = saved_bitty
+  assert(ok and type(wheel) == "table", "cannot load M.command_catalog: " .. tostring(wheel))
+
+  local catalog = wheel.command_catalog
+  assert(type(catalog) == "table" and #catalog == 14,
+    "M.command_catalog must expose all 14 commands")
+
+  local section = readme_section(README_LINES, "Commands")
+  local header_index = nil
+  for index, line in ipairs(section) do
+    local cells = parse_markdown_row(line)
+    if cells and #cells == 4 and cells[1] == "Command" then
+      header_index = index
+      break
+    end
+  end
+  assert(header_index ~= nil, "README Commands section must carry the command table")
+
+  local header = parse_markdown_row(section[header_index])
+  assert(header[2] == "Invocation", "command table must document invocation names")
+  assert(header[3] == "Arguments schema", "command table must document argument schemas")
+  assert(header[4] == "Result contract", "command table must document result contracts")
+
+  local separator = parse_markdown_row(section[header_index + 1])
+  assert(separator ~= nil and #separator == 4, "command table needs a separator row")
+  for column = 1, 4 do
+    assert(separator[column]:match("^:?%-%-%-+:?$") ~= nil,
+      "command table separator column " .. column .. " must be a GFM delimiter")
+  end
+
+  local rows = {}
+  local row_index = header_index + 2
+  while section[row_index] ~= nil do
+    local cells = parse_markdown_row(section[row_index])
+    if cells == nil then
+      break
+    end
+    rows[#rows + 1] = cells
+    row_index = row_index + 1
+  end
+  assert(#rows == #catalog,
+    string.format("README command table must document %d commands, got %d", #catalog, #rows))
+
+  for index, def in ipairs(catalog) do
+    local cells = rows[index]
+    assert(#cells == 4, "command row " .. def.id .. " must have four columns")
+    assert(strip_code_cell(cells[1]) == def.id,
+      "README command row " .. index .. " must name " .. def.id)
+
+    local invocation = "bitty-terminal.wheel:" .. def.id
+    assert(strip_code_cell(cells[2]) == invocation,
+      "README must document invocation " .. invocation)
+
+    local args_cell = cells[3]:lower()
+    assert(args_cell:find("no arguments", 1, true) ~= nil,
+      "README must document the empty arguments schema for " .. def.id)
+    assert(args_cell:find("no properties", 1, true) ~= nil,
+      "README must document the closed object with no properties for " .. def.id)
+
+    assert(def.args_schema.type == "object" and def.args_schema.additionalProperties == false
+      and def.args_schema.properties == nil,
+      "command " .. def.id .. " must keep its closed, property-free arguments schema")
+
+    local result_cell = cells[4]
+    local property_count = 0
+    for key in pairs(def.result_schema.properties) do
+      property_count = property_count + 1
+      assert(result_cell:find(key, 1, true) ~= nil,
+        "README result contract must document schema key " .. key .. " for " .. def.id)
+    end
+    assert(property_count == 2,
+      "command " .. def.id .. " must declare the title/body result projection")
+    assert(result_cell:find("title", 1, true) ~= nil and result_cell:find("body", 1, true) ~= nil,
+      "README must document the title/body result contract for " .. def.id)
+  end
+end)
+
+run_test("README: configuration documents XDG layers, eight classes, and trust gate", function()
+  local section = readme_section(README_LINES, "Configuration")
+  local text = table.concat(section, "\n")
+
+  assert(text:find("This plugin declares no settings.", 1, true) ~= nil,
+    "Configuration must carry the SDK no-settings sentence")
+  assert(text:find("| Setting | Type | Default | Description |", 1, true) == nil,
+    "Configuration must not fake a settings table while the manifest declares none")
+  assert(text:find("$XDG_CONFIG_HOME/wheel/init.lua", 1, true) ~= nil,
+    "Configuration must document the global XDG layer")
+  assert(text:find("$XDG_STATE_HOME/wheel/trusted_projects.json", 1, true) ~= nil,
+    "Configuration must document the XDG trust store")
+  assert(text:find(".wheel/init.lua", 1, true) ~= nil,
+    "Configuration must document the project entry")
+  assert(text:lower():find("trust gate", 1, true) ~= nil,
+    "Configuration must document the executable project-config trust gate")
+
+  local documented = {}
+  local documented_count = 0
+  local in_harness_section = false
+  for _, line in ipairs(section) do
+    if line:match("^### ") then
+      in_harness_section = line == "### Wheel harness configuration"
+    elseif in_harness_section then
+      local indent, name = line:match("^(%s+)%- `([%a_]+)`")
+      if name and #indent >= 2 then
+        documented[#documented + 1] = name
+        documented_count = documented_count + 1
+      end
+    end
+  end
+
+  local expected = {}
+  local expected_count = 0
+  for key in pairs(WheelConfig.DEFAULTS) do
+    expected[key] = true
+    expected_count = expected_count + 1
+  end
+  assert(expected_count == 8, "lua/wheel/config.lua must define exactly eight function classes")
+  assert(documented_count == expected_count,
+    string.format("README must document %d function classes, got %d", expected_count, documented_count))
+
+  local seen = {}
+  for _, name in ipairs(documented) do
+    assert(expected[name], "README documents an unknown configuration class: " .. name)
+    assert(not seen[name], "README repeats configuration class: " .. name)
+    seen[name] = true
+  end
+  for name in pairs(expected) do
+    assert(seen[name], "README is missing configuration class: " .. name)
+  end
+end)
+
+run_test("README: keybindings section is commands-only and host-owned", function()
+  local text = table.concat(readme_section(README_LINES, "Keybindings"), "\n")
+  assert(text:find("commands, not keybindings", 1, true) ~= nil,
+    "Keybindings must state that Wheel exposes commands, not keybindings")
+  assert(text:find("The Bitty host owns keybinding", 1, true) ~= nil,
+    "Keybindings must state that the Bitty host owns keybindings")
+  assert(text:find("registers no default keybindings", 1, true) ~= nil,
+    "Keybindings must state that Wheel has no defaults")
+end)
+
+run_test("README: troubleshooting matches error codes and named config failures", function()
+  local section = readme_section(README_LINES, "Troubleshooting")
+  local text = table.concat(section, "\n")
+
+  local expected_codes = {
+    WheelErrors.E_CAPABILITY_DENIED,
+    WheelErrors.E_INTERNAL,
+    WheelErrors.E_ARGS_INVALID,
+    WheelErrors.E_SCHEMA_INVALID,
+    WheelErrors.E_RESULT_INVALID,
+  }
+  local expected_code_set = {}
+  for _, code in ipairs(expected_codes) do
+    expected_code_set[code] = true
+  end
+
+  local documented_codes = {}
+  local documented_code_count = 0
+  for code in text:gmatch("`(E_[A-Z0-9_]+)`") do
+    if not documented_codes[code] then
+      documented_code_count = documented_code_count + 1
+    end
+    documented_codes[code] = true
+  end
+  assert(documented_code_count == #expected_codes,
+    string.format("README must document %d error codes, got %d", #expected_codes, documented_code_count))
+  for _, code in ipairs(expected_codes) do
+    assert(documented_codes[code] ~= nil, "README Troubleshooting must document " .. code)
+  end
+  for code in pairs(documented_codes) do
+    assert(expected_code_set[code], "README documents an unknown error code: " .. code)
+  end
+
+  local failure_line = nil
+  for line in text:gmatch("[^\n]+") do
+    if line:find("Named configuration failures", 1, true) then
+      failure_line = line
+      break
+    end
+  end
+  assert(failure_line ~= nil, "Troubleshooting must name the configuration failures")
+
+  local documented_failures = {}
+  local documented_failure_count = 0
+  for name in failure_line:gmatch("`([%a_]+)`") do
+    if not documented_failures[name] then
+      documented_failure_count = documented_failure_count + 1
+    end
+    documented_failures[name] = true
+  end
+
+  local config_source = read_repository_file("lua/wheel/config.lua")
+  local expected_failures = {}
+  local expected_failure_count = 0
+  for name in config_source:gmatch('error%s*=%s*"([%a_]+)"') do
+    if not expected_failures[name] then
+      expected_failure_count = expected_failure_count + 1
+    end
+    expected_failures[name] = true
+  end
+  assert(expected_failure_count > 0, "config.lua must declare named configuration failures")
+  assert(documented_failure_count == expected_failure_count,
+    string.format("README must document %d configuration failures, got %d",
+      expected_failure_count, documented_failure_count))
+  for name in pairs(expected_failures) do
+    assert(documented_failures[name] ~= nil, "README Troubleshooting must document " .. name)
+  end
+  for name in pairs(documented_failures) do
+    assert(expected_failures[name], "README documents an unknown configuration failure: " .. name)
+  end
+end)
+
+-- ===========================================================================
 -- 10. WheelContext Tests (Shared Context, Slots, CAS, 3-Way Merge, Prefix Cache)
 -- ===========================================================================
 

@@ -22,7 +22,9 @@ packaging is not part of the 0.1.0 deliverable.
 > retained unchanged by the position record as a transitional artifact and is
 > not a supported distribution path.
 
-## Product position
+## Overview
+
+### Product position
 
 - **Independent harness process (Option B).** Wheel runs as its own OS process
   with the user's authority, constrained by Wheel's policy layer. It does not
@@ -42,7 +44,7 @@ packaging is not part of the 0.1.0 deliverable.
   widens without an independent security review plus mock/unit and real host
   fixture evidence (owner D7).
 
-## Scope
+### Scope
 
 Wheel is the agent harness for the Bitty terminal, scoped to software
 engineering only: its task domain is always software development. It
@@ -67,10 +69,268 @@ Wheel is not intended to be:
 
 Wheel is focused on software engineering workflows.
 
+## Install
+
+Wheel has no released artifact. The 0.1.0 harness artifact, its version, and its
+install/launch contract do not exist yet, so there is nothing to download and no
+released-host integration to claim. The supported path today is a source
+checkout for development and validation.
+
+Standalone harness development does not require a Bitty host. Prerequisites:
+
+- [Bun](https://bun.sh/) 1.4.2, the version pinned by `package.json`
+  (`packageManager`) and used by CI.
+- [just](https://github.com/casey/just) for the repository recipes.
+- Lua 5.1 or LuaJIT for the test and end-to-end recipes; a `lua` binary also
+  satisfies the recipe when neither is installed.
+- A POSIX host with standard shell utilities. Windows support is not claimed.
+
+From a checkout of the repository:
+
+```sh
+just install   # bun install --frozen-lockfile; the only network step
+just check     # lint, format check, manifest, docs, Lua parse, and tests
+```
+
+`just test` runs the unit suite and `just e2e` runs the optional cross-process
+drill against the separate `wheel_stdio_host` binary. The drill skips cleanly
+when no Lua interpreter is available; it reports a failure when the host binary
+is absent.
+
+The in-tree `bitty-plugin.toml` is a transitional v1 plugin manifest, not an
+installation path. Installing Wheel through a Bitty plugin manager, or claiming
+`plugin-api` compatibility from that file, is outside the 0.1.0 deliverable. A
+thin plugin facade may return only if a host-brokered execution service is
+accepted (owner D6).
+
+## Commands
+
+Wheel exposes 14 commands. The `bitty-terminal.wheel:` qualification and the
+host command registry belong to the transitional plugin surface; they are not
+the 0.1.0 distribution path. The harness catalog is the single declaration in
+`lua/wheel/init.lua` (`M.command_catalog`), and every command is registered
+from it with the same argument and result contract.
+
+| Command       | Invocation                         | Arguments schema                            | Result contract   |
+| ------------- | ---------------------------------- | ------------------------------------------- | ----------------- |
+| `hello`       | `bitty-terminal.wheel:hello`       | No arguments; closed object, no properties. | `{ title, body }` |
+| `status`      | `bitty-terminal.wheel:status`      | No arguments; closed object, no properties. | `{ title, body }` |
+| `graph`       | `bitty-terminal.wheel:graph`       | No arguments; closed object, no properties. | `{ title, body }` |
+| `plan`        | `bitty-terminal.wheel:plan`        | No arguments; closed object, no properties. | `{ title, body }` |
+| `run`         | `bitty-terminal.wheel:run`         | No arguments; closed object, no properties. | `{ title, body }` |
+| `trust`       | `bitty-terminal.wheel:trust`       | No arguments; closed object, no properties. | `{ title, body }` |
+| `team`        | `bitty-terminal.wheel:team`        | No arguments; closed object, no properties. | `{ title, body }` |
+| `context`     | `bitty-terminal.wheel:context`     | No arguments; closed object, no properties. | `{ title, body }` |
+| `tools`       | `bitty-terminal.wheel:tools`       | No arguments; closed object, no properties. | `{ title, body }` |
+| `orchestrate` | `bitty-terminal.wheel:orchestrate` | No arguments; closed object, no properties. | `{ title, body }` |
+| `models`      | `bitty-terminal.wheel:models`      | No arguments; closed object, no properties. | `{ title, body }` |
+| `branch`      | `bitty-terminal.wheel:branch`      | No arguments; closed object, no properties. | `{ title, body }` |
+| `checkpoint`  | `bitty-terminal.wheel:checkpoint`  | No arguments; closed object, no properties. | `{ title, body }` |
+| `reflog`      | `bitty-terminal.wheel:reflog`      | No arguments; closed object, no properties. | `{ title, body }` |
+
+What the commands display:
+
+- `hello`: a greeting from Wheel (Bittie the hamster 🐹).
+- `status`: kernel status, active task, checkpoint count, and telemetry.
+- `graph`: an ASCII visualization of the Task DAG grouped into topological
+  execution waves.
+- `plan`: initialize or decompose software engineering tasks into the Task DAG
+  (Commander role).
+- `run`: execute ready tasks in the DAG using WheelAgent (Worker role).
+- `trust`: inspect and approve project configuration (`.wheel/init.lua`) with
+  hash pinning.
+- `team`: the multi-agent peer colleague roster, roles, models, and live states.
+- `context`: active semantic slots, Merkle root hash, and prefix-cache status.
+- `tools`: registered Wheel agent tools, intent categories, and schema
+  descriptions.
+- `orchestrate`: the autonomous multi-agent wave orchestration loop over the
+  Task DAG.
+- `models`: configured model profiles, providers, and capabilities.
+- `branch`: context branches, or the active branch and HEAD commit.
+- `checkpoint`: recent context checkpoints (commit ancestry log).
+- `reflog`: recent context reflog transitions and audit journal.
+
+All 14 commands accept no arguments: `args_schema` is a closed object with no
+declared properties, so any supplied field is rejected with `E_ARGS_INVALID`
+(class `validation`) before the handler runs. Each command returns the
+notification projection it displays, `{ title, body }`, so CLI, palette, IPC,
+and agent consumers can type the result without scraping presentation text. The
+title is bounded at 64 bytes and the body at 8000 bytes: the current host bridge
+marshals a command result through `DEFAULT_MAX_VALUE_BYTES` (8 KiB), and the
+body bound reserves a 128-byte marshalling margin above the title. A larger
+body is truncated at a UTF-8 boundary before the notification is shown, so the
+visible and returned text stay schema-valid and host-compatible.
+
+A malformed or unbounded schema fails registration with `E_SCHEMA_INVALID`, and
+a handler result that drifts from its schema fails with `E_RESULT_INVALID`; both
+are `validation` errors. The schema vocabulary is finite: `string`, `integer`,
+`number`, `boolean`, `array`, and `object` types with `properties`, `required`,
+`additionalProperties` (always `false` for objects), `items`, `enum`,
+`minimum`/`maximum`, `minLength`/`maxLength`, and `minItems`/`maxItems`.
+Unsupported keywords, unbounded strings, arrays, or numbers, cycles, and
+over-deep schemas are rejected rather than ignored. The full failure contract is
+in [Troubleshooting](#troubleshooting).
+
+## Configuration
+
+This plugin declares no settings.
+
+### Wheel harness configuration
+
+Wheel does not read plugin settings from `bitty-plugin.toml`: the transitional
+manifest has no `[settings]` table and is intentionally unchanged. Configuration
+is resolved by `lua/wheel/config.lua` across three layers and grouped into eight
+function classes.
+
+- **XDG layers.**
+  - **Layer 0 — built-in defaults.** Compiled into `WheelConfig.DEFAULTS` in
+    `lua/wheel/config.lua`.
+  - **Layer 1 — user-wide file.** `$XDG_CONFIG_HOME/wheel/init.lua`, falling
+    back to `$HOME/.config/wheel/init.lua`.
+  - **Layer 2 — project file.** `.wheel/init.lua` under the project root;
+    highest precedence and evaluated only after the trust gate approves it.
+  - **Trust store.** `$XDG_STATE_HOME/wheel/trusted_projects.json`, falling back
+    to `$HOME/.local/state/wheel/trusted_projects.json`. A missing, corrupt, or
+    unreadable store fails closed and is never recreated with existing
+    approvals.
+- **Function classes.** `lua/wheel/config.lua` groups the schema into exactly
+  eight classes:
+  - `roles` — role definitions and model references (Commander, Coding, Debug,
+    Research, Reviewer).
+  - `directives` — structured prompt directives applied to every role.
+  - `tools` — tool allow and deny lists plus custom tool declarations.
+  - `skills` — session skill filters discovered from `.agents/`.
+  - `verification` — change-gated verification declarations and the test
+    command.
+  - `context` — context budgets: 64 KiB total, 16 KiB Zone 1, 32 KiB Zone 2,
+    16 KiB Zone 3, and the 4 KiB spillover threshold.
+  - `panel` — the Headless Panel working-container policy.
+  - `hooks` — lifecycle hooks.
+- **Executable `.wheel/init.lua` trust gate.** Project configuration is code,
+  and cloning or entering a project never executes it silently:
+  - First contact is inert. Discovery, scan, help, and status do not evaluate the
+    entry; only a command that needs project configuration reaches the gate.
+  - Approval is explicit and per project. The user sees the canonical project
+    root, the full entry, its SHA-256 content hash, and the configuration
+    effects it can request. There is no trust-on-first-use, no inherited trust,
+    and no `--yes` default.
+  - The trust record binds the canonical root and the entry hash in
+    `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
+    whitespace, invalidates trust and forces re-approval.
+  - Revocation and store deletion remove trust. A missing, corrupt, or unreadable
+    store fails closed; it is never recreated with existing approvals.
+  - Evaluation runs in a restricted environment with no filesystem, process,
+    network, environment, or module-loading access. The current instruction hook
+    is catchable and the wall-clock and memory budgets are not implemented; the
+    result is validated as data only after those gates exist (see
+    [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
+  - Project configuration may narrow behavior inside the approved ceiling. It
+    may not add a workspace root, network destination, secret name, or authority
+    for a role, and it may not disable audit, redaction, the deny-list, the path
+    sandbox, or the trust gate.
+- **Future plugin facade.** If a later facade declares `[settings]` in
+  `bitty-plugin.toml`, the SDK-rendered `Setting`/`Type`/`Default`/`Description`
+  table replaces the no-settings sentence above and is generated from the
+  manifest. The harness layers in this list remain the runtime configuration
+  surface.
+
+The security model restricts project-layer effects to narrowing within the
+approved ceiling; project configuration may not add a root, destination, secret
+name, or authority for a role. Current loader behavior is not evidence of that
+restriction until the evidence gates in
+[SECURITY-MODEL.md](SECURITY-MODEL.md) pass.
+
+Keeping the executable entry is a deliberate departure from OQ-068. It is
+recorded as a Wheel-local divergence in
+[SECURITY-MODEL.md](SECURITY-MODEL.md#oq-068-divergence-record); it does not
+change OQ-068 or grant any other consumer permission to execute project code.
+
+## Keybindings
+
+Wheel exposes commands, not keybindings. The Bitty host owns keybinding
+registration and dispatch: it decides which keys invoke which commands, so Wheel
+registers no default keybindings and claims no key conflicts. The transitional
+`bitty-plugin.toml` declares no keybindings either. Consumers invoke commands by
+name or bind them in their own host configuration.
+
+## Troubleshooting
+
+### Command error contract
+
+Every command handler crosses the typed failure boundary in
+`lua/wheel/errors.lua`. A public failure is a catchable Lua error table with
+exactly three fields, matching the accepted bridge error shape
+(`bitty-plugins-docs/sdk/reference/overview.md`): `class`, `code`, and
+`message`. Match on `code`, never on message text.
+
+The boundary enforces that shape. A typed table that matches it passes through
+unchanged; a recognized nil-global message becomes `E_CAPABILITY_DENIED`; a
+table with extra fields, non-string fields, or a message longer than the
+160-character Wheel bound is normalized to `E_INTERNAL`, as is every other
+non-capability failure. A malformed table is never presented as a capability
+denial. Schema and argument validation errors use the same three-field shape
+with class `validation`. One internal exception exists: the dispatch-budget
+sentinel is marked with a module-local token (`WheelErrors.passthrough`) and
+keeps its identity so the budget failure is not misreported. The token is not
+reachable from a handler and cannot be forged with a table field; it is not part
+of the public error contract.
+
+| `code`                | `class`      | Meaning                                                                                                            |
+| --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `E_CAPABILITY_DENIED` | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                     |
+| `E_INTERNAL`          | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
+| `E_ARGS_INVALID`      | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                               |
+| `E_SCHEMA_INVALID`    | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                           |
+| `E_RESULT_INVALID`    | `validation` | A handler result did not match its closed `result_schema`.                                                         |
+
+Capability denials use host wording, for example
+`capability 'env.read' is not granted`, and name the capability family
+(`env.read`, `fs.read`, `fs.write`, or `process.spawn`) the host would have to
+grant. Temporary-file creation maps to `fs.write`; there is no separate temp
+capability. These denials apply only to the transitional host command surface;
+the manifest and its granted capability set are unchanged, and harness
+authority is governed by [SECURITY-MODEL.md](SECURITY-MODEL.md).
+
+`E_INTERNAL` has no accepted host code yet. It is deliberately Wheel-local
+until the host vocabulary defines a generic internal or runtime failure code;
+replace it when that code lands. Messages are bounded to one line and never
+include tracebacks, host paths, secrets, or raw interpreter wording.
+
+### Configuration failures
+
+Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config` and `project_config_eval_error`.
+
+- `untrusted_project_config` — the project entry exists but its content hash is
+  not approved in the trust store. The loader returns the safe defaults plus
+  the global layer, marks `layers.project = false`, and does not evaluate the
+  entry. Approve it with the `trust` command or remove it.
+- `project_config_eval_error` — the trusted entry failed to evaluate or did not
+  return a table. The loader falls back to the safe defaults plus the global
+  layer, reports the bounded evaluation message, and never applies a partial
+  project overlay.
+
+### Common failures
+
+- `dependencies are not installed` — run `just install`.
+- `No lua interpreter found` — install Lua 5.1 or LuaJIT; the test and e2e
+  recipes skip execution rather than silently claiming success.
+- `bitty-plugin-lint` or `bitty-plugin-docs-check` reports the tool is not
+  installed — run `just install`; both binaries come from the pinned
+  `bitty-plugin-sdk` commit.
+- `just docs-check` reports `readme.section.missing`, `readme.section.order`, or
+  `readme.settings.none` — restore the six required H2 sections, their order,
+  or the no-settings sentence in `## Configuration`.
+- `just e2e` cannot find `wheel_stdio_host` — the cross-process drill needs the
+  separate Rust host binary; unit tests do not.
+- `just manifest` rejects `bitty-plugin.toml` — the transitional manifest is
+  unchanged by the harness position; fix the manifest or the SDK pin rather than
+  widening it.
+
 ## Layout
 
 | Path                          | Purpose                                                                                                                                                                                                             |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`                   | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                    |
 | `bitty-plugin.toml`           | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                         |
 | `lua/wheel/init.lua`          | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
 | `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                     |
@@ -86,65 +346,18 @@ Wheel is focused on software engineering workflows.
 | `lua/wheel/provider.lua`      | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                      |
 | `lua/wheel/runner.lua`        | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                |
 | `lua/wheel/ui.lua`            | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                         |
-| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, and trust gates.                                                                                         |
+| `tests/test_wheel.lua`        | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                 |
 | `tests/e2e_cross_process.lua` | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                               |
-| `package.json`                | Pinned dev dependencies: the transitional `bitty-plugin-lint` (by commit) and `luaparse`.                                                                                                                           |
+| `package.json`                | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                    |
 | `bun.lock`                    | Locked dependency graph installed by `just install`.                                                                                                                                                                |
-| `justfile`                    | Quality gates with pinned tool versions.                                                                                                                                                                            |
+| `justfile`                    | Quality gates with pinned tool versions, including the SDK README checker in `just check`.                                                                                                                          |
 | `.github/workflows/ci.yml`    | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                              |
 
-## Configuration and Architecture
+## Architecture
 
 ### Headless Panel Working Container Invariant
 
 Under Bitty Core Rule R1, `ExecutionContext` is primary: panels describe presentation and view projections, not execution authority (`PanelId != ViewId != TerminalId`). Every Wheel agent defaults to running in an isolated **Headless Panel working container** (`panel_id = "headless:panel:<agent_name>"`, `headless = true`), binding its execution environment without requiring desktop screen rendering. Presentation UI panels are optional observation projections.
-
-### Hierarchical Configuration Layering
-
-Wheel configuration is resolved across three hierarchical layers with fail-closed security:
-
-1. **Defaults (Layer 0)**: Built-in baseline defining roles, directives, context budgets, and headless container policies.
-2. **Global (Layer 1)**: User-wide defaults located at `~/.config/wheel/init.lua` (`$XDG_CONFIG_HOME/wheel/init.lua`).
-3. **Project (Layer 2)**: Project-specific overrides located at `.wheel/init.lua` in the repository root (highest precedence).
-
-The security model restricts project-layer effects to narrowing within the
-approved ceiling; project configuration may not add a root, destination, secret
-name, or authority for a role. Current loader behavior is not evidence of that
-restriction until the evidence gates in
-[SECURITY-MODEL.md](SECURITY-MODEL.md) pass.
-
-### Executable Project Configuration Trust Gate
-
-Project configuration (`.wheel/init.lua`) is executable code, and cloning or
-entering a repository never executes it silently. The full policy is in
-[SECURITY-MODEL.md](SECURITY-MODEL.md); the gates are:
-
-- First contact is inert. Discovery, scan, help, and status do not evaluate the
-  entry; only a command that needs project configuration reaches the gate.
-- Approval is explicit and per project. The user sees the canonical project
-  root, the full entry, its SHA-256 content hash, and the configuration effects
-  it can request. There is no trust-on-first-use, no inherited trust, and no
-  `--yes` default.
-- The trust record binds the canonical root and the entry hash in
-  `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
-  whitespace, invalidates trust and forces re-approval.
-- Revocation and store deletion remove trust. A missing, corrupt, or unreadable
-  store fails closed; it is never recreated with existing approvals.
-- Evaluation must run in a restricted environment with no filesystem, process,
-  network, environment, or module-loading access, under instruction,
-  wall-clock, and memory budgets. The current instruction hook is catchable and
-  the wall-clock and memory budgets are not implemented; the result is validated
-  as data only after those gates exist (see
-  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
-- Project configuration may narrow behavior inside the approved ceiling. It may
-  not add a workspace root, network destination, secret name, or authority for a
-  role, and it may not disable audit, redaction, the deny-list, the path
-  sandbox, or the trust gate.
-
-Keeping the executable entry is a deliberate departure from OQ-068. It is
-recorded as a Wheel-local divergence in
-[SECURITY-MODEL.md](SECURITY-MODEL.md#oq-068-divergence-record); it does not
-change OQ-068 or grant any other consumer permission to execute project code.
 
 ### Shared Context Memory & Prefix-Cache Optimization
 
@@ -202,49 +415,6 @@ Wheel models agent context as an immutable, content-addressed versioned DAG insp
 - **Cherry-Pick**: Imports specific findings, artifacts, or decisions from foreign branches (`cherry_pick`) without pulling along entire branch histories or transcripts ("parents absorb conclusions, never transcripts").
 - **Task-Isolated Workflows**: Multi-agent wave orchestration supports running worker tasks in dedicated task branches (`task/<id>`), merging deliverables into `main` upon reviewer acceptance.
 
-## Commands
-
-The harness currently defines the following commands. The
-`bitty-terminal.wheel:` qualification and the host command registry belong to
-the transitional plugin surface; they are not the 0.1.0 distribution path.
-
-- `bitty-terminal.wheel:hello`: Print a greeting from Wheel (Bittie the hamster 🐹).
-- `bitty-terminal.wheel:status`: Display kernel status, active task, checkpoint count, and telemetry.
-- `bitty-terminal.wheel:graph`: Render an ASCII visualization of the Task DAG grouped into topological execution waves.
-- `bitty-terminal.wheel:plan`: Initialize or decompose software engineering tasks into the Task DAG (Commander role).
-- `bitty-terminal.wheel:run`: Execute ready tasks in the DAG using WheelAgent (Worker role).
-- `bitty-terminal.wheel:trust`: Inspect and approve project configuration (`.wheel/init.lua`) with hash pinning.
-- `bitty-terminal.wheel:team`: Display multi-agent peer colleague roster, roles, models, and live states.
-- `bitty-terminal.wheel:context`: Inspect active semantic slots, Merkle root hash, and prefix-cache status.
-- `bitty-terminal.wheel:tools`: List registered Wheel agent tools, intent categories, and schema descriptions.
-- `bitty-terminal.wheel:orchestrate`: Run autonomous multi-agent wave orchestration loop over Task DAG.
-- `bitty-terminal.wheel:models`: Display configured model profiles, providers, and capabilities.
-- `bitty-terminal.wheel:branch`: List context branches or display active branch and HEAD commit.
-- `bitty-terminal.wheel:checkpoint`: Display recent context checkpoints (commit ancestry log).
-- `bitty-terminal.wheel:reflog`: Display recent context reflog transitions and audit journal.
-
-Every command is declared once in the lazy command table in `lua/wheel/init.lua`
-with an explicit `args_schema` and `result_schema`. All 14 commands currently
-accept no arguments: their argument schema is a closed object with no declared
-properties, so any supplied field is rejected with `E_ARGS_INVALID` (class
-`validation`) before the handler runs. Each command returns the notification
-projection it displays, `{ title, body }`, so CLI, palette, IPC, and agent
-consumers can type the result without scraping presentation text. The title is
-bounded at 64 bytes and the body at 8000 bytes: the current host bridge
-marshals a command result through `DEFAULT_MAX_VALUE_BYTES` (8 KiB), and the
-body bound reserves a 128-byte marshalling margin (the two keys plus headroom)
-above the title. A
-larger body is truncated at a UTF-8 boundary before the notification is shown,
-so the visible and returned text stay schema-valid and host-compatible. A
-malformed or unbounded schema fails registration with `E_SCHEMA_INVALID`, and a
-handler result that drifts from its schema fails with `E_RESULT_INVALID`; both
-are `validation` errors. The schema vocabulary is finite: `string`, `integer`,
-`number`, `boolean`, `array`, and `object` types with `properties`, `required`,
-`additionalProperties` (always `false` for objects), `items`, `enum`,
-`minimum`/`maximum`, `minLength`/`maxLength`, and `minItems`/`maxItems`.
-Unsupported keywords, unbounded strings, arrays, or numbers, cycles, and
-over-deep schemas are rejected rather than ignored.
-
 ## Development
 
 Install the pinned dependencies once, then run the same gate CI runs:
@@ -254,18 +424,34 @@ just install   # bun install --frozen-lockfile; the only network step
 just check
 ```
 
-`just install` materializes `bitty-plugin-lint` (bitty-plugin-sdk, pinned by
-commit in `package.json` and `bun.lock`) and `luaparse`; every gate then runs
-offline. `just manifest` validates the transitional `bitty-plugin.toml` with the
-authoritative SDK linter against the accepted contract in bitty-docs
-`docs/specifications/plugin-platform-rfc.md` (file name, identity,
-compatibility, capability closed set, lazy triggers, hard limits). `just lua`
-runs the pinned `luaparse` 0.3.1 CLI over every Lua source under `lua/` and
-`tests/`; `just lua-control`
-feeds the same parser an invalid snippet and requires rejection, so a recipe
-that stopped reading the entry point cannot pass silently. `just check` runs
-all three. The manifest gate keeps the transitional artifact honest until a
-follow-up removes it; it is not evidence of plugin compatibility.
+`just install` materializes the pinned `bitty-plugin-sdk` (commit-pinned in
+`package.json` and `bun.lock`) and `luaparse`; every gate then runs offline. The
+SDK supplies both `bitty-plugin-lint` and `bitty-plugin-docs-check`. The pin has
+exactly one location pair; update `package.json` and refresh `bun.lock` with
+`bun install`, never a second pin in the justfile.
+
+- `just manifest` validates the transitional `bitty-plugin.toml` with the
+  authoritative SDK linter against the accepted contract in bitty-docs
+  `docs/specifications/plugin-platform-rfc.md` (file name, identity,
+  compatibility, capability closed set, lazy triggers, hard limits).
+- `just docs-check` validates `README.md` against the SDK user-documentation
+  contract: the six required H2 sections lead in order, and `## Configuration`
+  matches the manifest `[settings]`. Wheel declares no settings, so the section
+  carries the required no-settings sentence and the harness configuration
+  bullet list.
+- `just lua` runs the pinned `luaparse` 0.3.1 CLI over every Lua source under
+  `lua/` and `tests/`; `just lua-control` feeds the same parser an invalid
+  snippet and requires rejection, so a recipe that stopped reading the entry
+  point cannot pass silently.
+- `just lint` and `just fmt-check` run markdownlint-cli2 and Prettier over the
+  repository.
+- `just test` runs the unit suite across `lua5.1`, `luajit`, or `lua`.
+- `just check` runs lint, format check, manifest, docs check, Lua parse, the
+  parser control, and the test suite. It fails closed when dependencies are
+  missing instead of fetching.
+
+The manifest gate keeps the transitional artifact honest until a follow-up
+removes it; it is not evidence of plugin compatibility.
 
 `bitty-plugin-lint` also validates table-form `[lazy].commands` schemas when a
 manifest carries them, but the transitional manifest is intentionally unchanged
@@ -283,6 +469,10 @@ Run the unit test suite and the cross-process end-to-end integration drill:
 just test      # runs unit tests across lua5.1, luajit, or lua
 just e2e       # runs the 11-step cross-process drill with wheel_stdio_host over Unix FIFOs
 ```
+
+The unit suite also parses `README.md` and asserts that the documented command
+catalog, the eight configuration classes, the troubleshooting error codes, and
+the named configuration failures match the Lua sources.
 
 ## Authority
 
@@ -316,49 +506,9 @@ The `bitty` namespace used by `init.lua` is the accepted Plugin API v1 surface.
 The authoritative Lua bindings and type definitions are generated by the SDK
 (`bitty.d.lua`, R-SDK-1). This surface is retained only while the transitional
 manifest remains in tree; the 0.1.0 harness does not depend on plugin
-activation, and no plugin compatibility is claimed.
-
-### Command error contract
-
-Every command handler crosses the typed failure boundary in
-`lua/wheel/errors.lua`. A public failure is a catchable Lua error table with
-exactly three fields, matching the accepted bridge error shape
-(`bitty-plugins-docs/sdk/reference/overview.md`): `class`, `code`, and
-`message`. Match on `code`, never on message text.
-
-The boundary enforces that shape. A typed table that matches it passes
-through unchanged; a recognized nil-global message becomes
-`E_CAPABILITY_DENIED`; a table with extra fields, non-string fields, or a
-message longer than the 160-character Wheel bound is normalized to
-`E_INTERNAL`, as is every other non-capability failure. A malformed table is
-never presented as a capability denial. Schema and argument validation errors
-use the same three-field shape with class `validation`. One internal exception
-exists: the
-dispatch-budget sentinel is marked with a module-local token
-(`WheelErrors.passthrough`) and keeps its identity so the budget failure is
-not misreported. The token is not reachable from a handler and cannot be
-forged with a table field; it is not part of the public error contract.
-
-| `code`                | `class`      | Meaning                                                                                                            |
-| --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `E_CAPABILITY_DENIED` | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                     |
-| `E_INTERNAL`          | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
-| `E_ARGS_INVALID`      | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                               |
-| `E_SCHEMA_INVALID`    | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                           |
-| `E_RESULT_INVALID`    | `validation` | A handler result did not match its closed `result_schema`.                                                         |
-
-Capability denials use host wording, for example
-`capability 'env.read' is not granted`, and name the capability family
-(`env.read`, `fs.read`, `fs.write`, or `process.spawn`) the host would have to
-grant. Temporary-file creation maps to `fs.write`; there is no separate temp
-capability. These denials apply only to the transitional host command surface;
-the manifest and its granted capability set are unchanged, and harness
-authority is governed by [SECURITY-MODEL.md](SECURITY-MODEL.md).
-
-`E_INTERNAL` has no accepted host code yet. It is deliberately Wheel-local
-until the host vocabulary defines a generic internal or runtime failure code;
-replace it when that code lands. Messages are bounded to one line and never
-include tracebacks, host paths, secrets, or raw interpreter wording.
+activation, and no plugin compatibility is claimed. The typed failure contract
+for this surface is documented under
+[Troubleshooting](#command-error-contract).
 
 ## Release checklist (0.1.0)
 
@@ -369,7 +519,8 @@ include tracebacks, host paths, secrets, or raw interpreter wording.
    approved ceiling, pass both evidence gates, and obtain independent security
    review.
 3. Replace this README's status note once the harness artifact is functional,
-   tested against a real host fixture, and the evidence is recorded.
+   tested against a real host fixture, and the evidence is recorded; keep the
+   six user sections and the developer sections synchronized with that release.
 4. Remove or retire the transitional `bitty-plugin.toml` and its SDK lint gate
    in a scoped follow-up; do not widen the manifest in the meantime.
 5. Keep the repository free of secrets and of install scripts with ambient

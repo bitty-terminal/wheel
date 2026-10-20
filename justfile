@@ -3,8 +3,9 @@
 # Dependencies live in package.json and are locked in bun.lock; `just install`
 # materializes them. Installed tools are invoked with `bun run <bin>` so every
 # gate resolves from node_modules and runs offline once install has completed.
-# The manifest gate runs the authoritative SDK linter (bitty-plugin-lint,
-# commit-pinned in package.json + bun.lock), not a vendored re-implementation.
+# The manifest and README gates run the authoritative SDK tools
+# (bitty-plugin-lint and bitty-plugin-docs-check, commit-pinned in package.json
+# + bun.lock), not vendored re-implementations.
 # A gate with missing dependencies fails closed (`just deps`) instead of
 # fetching. Never use npm, npx, or yarn in this repository.
 
@@ -69,6 +70,14 @@ manifest: deps
     @test -x node_modules/.bin/bitty-plugin-lint || { echo "bitty-plugin-lint is not installed; run 'just install'" >&2; exit 1; }
     bun run bitty-plugin-lint bitty-plugin.toml
 
+# Validate README.md with the authoritative SDK user-documentation checker,
+# pinned by commit in package.json and bun.lock. The six required H2 sections
+# must lead in order and the Configuration section must match the manifest
+# [settings]; this repository declares none.
+docs-check: deps
+    @test -x node_modules/.bin/bitty-plugin-docs-check || { echo "bitty-plugin-docs-check is not installed; run 'just install'" >&2; exit 1; }
+    bun run bitty-plugin-docs-check .
+
 # Parse all Lua sources with the pinned Lua 5.1 grammar parser (luaparse,
 # version pinned in package.json + bun.lock).
 lua: deps
@@ -121,7 +130,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest lua test lua-control
+check: lint fmt-check manifest docs-check lua test lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml
