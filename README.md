@@ -232,22 +232,22 @@ the 0.1.0 distribution path. The harness catalog is the single declaration in
 `lua/wheel/init.lua` (`M.command_catalog`), and every command is registered
 from it with the same argument and result contract.
 
-| Command       | Invocation                         | Arguments schema                            | Result contract   |
-| ------------- | ---------------------------------- | ------------------------------------------- | ----------------- |
-| `hello`       | `bitty-terminal.wheel:hello`       | No arguments; closed object, no properties. | `{ title, body }` |
-| `status`      | `bitty-terminal.wheel:status`      | No arguments; closed object, no properties. | `{ title, body }` |
-| `graph`       | `bitty-terminal.wheel:graph`       | No arguments; closed object, no properties. | `{ title, body }` |
-| `plan`        | `bitty-terminal.wheel:plan`        | No arguments; closed object, no properties. | `{ title, body }` |
-| `run`         | `bitty-terminal.wheel:run`         | No arguments; closed object, no properties. | `{ title, body }` |
-| `trust`       | `bitty-terminal.wheel:trust`       | No arguments; closed object, no properties. | `{ title, body }` |
-| `team`        | `bitty-terminal.wheel:team`        | No arguments; closed object, no properties. | `{ title, body }` |
-| `context`     | `bitty-terminal.wheel:context`     | No arguments; closed object, no properties. | `{ title, body }` |
-| `tools`       | `bitty-terminal.wheel:tools`       | No arguments; closed object, no properties. | `{ title, body }` |
-| `orchestrate` | `bitty-terminal.wheel:orchestrate` | No arguments; closed object, no properties. | `{ title, body }` |
-| `models`      | `bitty-terminal.wheel:models`      | No arguments; closed object, no properties. | `{ title, body }` |
-| `branch`      | `bitty-terminal.wheel:branch`      | No arguments; closed object, no properties. | `{ title, body }` |
-| `checkpoint`  | `bitty-terminal.wheel:checkpoint`  | No arguments; closed object, no properties. | `{ title, body }` |
-| `reflog`      | `bitty-terminal.wheel:reflog`      | No arguments; closed object, no properties. | `{ title, body }` |
+| Command       | Invocation                         | Arguments schema                                                       | Result contract   |
+| ------------- | ---------------------------------- | ---------------------------------------------------------------------- | ----------------- |
+| `hello`       | `bitty-terminal.wheel:hello`       | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `status`      | `bitty-terminal.wheel:status`      | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `graph`       | `bitty-terminal.wheel:graph`       | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `plan`        | `bitty-terminal.wheel:plan`        | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `run`         | `bitty-terminal.wheel:run`         | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `trust`       | `bitty-terminal.wheel:trust`       | Optional object: `action` (`show`/`confirm`/`revoke`), `hash`, `path`. | `{ title, body }` |
+| `team`        | `bitty-terminal.wheel:team`        | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `context`     | `bitty-terminal.wheel:context`     | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `tools`       | `bitty-terminal.wheel:tools`       | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `orchestrate` | `bitty-terminal.wheel:orchestrate` | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `models`      | `bitty-terminal.wheel:models`      | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `branch`      | `bitty-terminal.wheel:branch`      | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `checkpoint`  | `bitty-terminal.wheel:checkpoint`  | No arguments; closed object, no properties.                            | `{ title, body }` |
+| `reflog`      | `bitty-terminal.wheel:reflog`      | No arguments; closed object, no properties.                            | `{ title, body }` |
 
 What the commands display:
 
@@ -258,8 +258,12 @@ What the commands display:
 - `plan`: initialize or decompose software engineering tasks into the Task DAG
   (Commander role).
 - `run`: execute ready tasks in the DAG using WheelAgent (Worker role).
-- `trust`: inspect and approve project configuration (`.wheel/init.lua`) with
-  hash pinning.
+- `trust`: inspect, approve, or revoke project configuration
+  (`.wheel/init.lua`) with canonical-root and content-hash pinning. `trust`
+  (or `trust show`) displays the bounded full entry, the diff against the
+  previously trusted bytes, the full 64-hex SHA-256, and the canonical root;
+  `trust confirm <sha256>` requires that exact current hash; `trust revoke`
+  removes the record. No command argument is a `--yes` approval.
 - `team`: the multi-agent peer colleague roster, roles, models, and live states.
 - `context`: active semantic slots, Merkle root hash, and prefix-cache status.
 - `tools`: registered Wheel agent tools, intent categories, and schema
@@ -271,11 +275,13 @@ What the commands display:
 - `checkpoint`: recent context checkpoints (commit ancestry log).
 - `reflog`: recent context reflog transitions and audit journal.
 
-All 14 commands accept no arguments: `args_schema` is a closed object with no
+Thirteen commands accept no arguments: `args_schema` is a closed object with no
 declared properties, so any supplied field is rejected with `E_ARGS_INVALID`
-(class `validation`) before the handler runs. Each command returns the
-notification projection it displays, `{ title, body }`, so CLI, palette, IPC,
-and agent consumers can type the result without scraping presentation text. The
+(class `validation`) before the handler runs. `trust` is the one optional
+argument object (`action`, `hash`, `path`); unknown fields are still rejected.
+Each command returns the notification projection it displays, `{ title, body }`,
+so CLI, palette, IPC, and agent consumers can type the result without scraping
+presentation text. The
 title is bounded at 64 bytes and the body at 8000 bytes: the current host bridge
 marshals a command result through `DEFAULT_MAX_VALUE_BYTES` (8 KiB), and the
 body bound reserves a 128-byte marshalling margin above the title. A larger
@@ -311,9 +317,15 @@ function classes.
   - **Layer 2 — project file.** `.wheel/init.lua` under the project root;
     highest precedence and evaluated only after the trust gate approves it.
   - **Trust store.** `$XDG_STATE_HOME/wheel/trusted_projects.json`, falling back
-    to `$HOME/.local/state/wheel/trusted_projects.json`. A missing, corrupt, or
-    unreadable store fails closed and is never recreated with existing
-    approvals.
+    to `$HOME/.local/state/wheel/trusted_projects.json`; there is no `/tmp` or
+    other predictable fallback. When neither variable is set, trust operations
+    fail closed. The directory is created `0700` and the file `0600`, written
+    with a same-directory temporary file plus atomic rename. A symlinked,
+    non-regular, foreign-owned, group/world-writable, oversized, corrupt, or
+    foreign-version store fails closed and surfaces a warning; it is never
+    silently read as an empty approving store. Schema version 1 records
+    `{hash, content, approved_at}` per canonical root; legacy flat string
+    hashes are accepted as hash-only and migrated on the next approval.
 - **Function classes.** `lua/wheel/config.lua` groups the schema into exactly
   eight classes:
   - `roles` — role definitions and model references (Commander, Coding, Debug,
@@ -335,34 +347,49 @@ function classes.
   [SECURITY-MODEL.md](SECURITY-MODEL.md#executable-project-configuration-trust-gate):
   - First contact is inert. Discovery, scan, help, and status do not evaluate the
     entry; only a command that needs project configuration reaches the gate.
-  - Approval is an explicit interactive action. The consent view must show the
-    canonical project root (symlinks resolved), the full entry, its SHA-256
-    content hash, the change diff on re-approval, and the configuration effects
-    the entry can request; a truncated preview is not sufficient consent. There
-    is no trust-on-first-use, no inherited trust, and no `--yes` default.
+  - Approval is an explicit interactive action. `trust` (or `trust show`)
+    resolves the canonical project root through the host (`realpath`,
+    `readlink -f`, or `cd -P ... && pwd -P`), rejects a symlinked, non-regular,
+    or larger-than-32-KiB entry before hashing, and displays the bounded full
+    entry, the diff against the previously trusted content, the full 64-hex
+    SHA-256, and the canonical root. A truncated preview is not sufficient
+    consent. `trust confirm <sha256>` re-reads the entry and writes the record
+    only when the supplied hash equals the exact current bytes. There is no
+    trust-on-first-use, no inherited trust, and no `--yes` default.
+  - A concrete effects list cannot be produced without evaluating the entry.
+    The consent view says so explicitly and does not evaluate the entry before
+    confirmation; effects are applied only when a later configuration load
+    reads the approved record under the restricted evaluator.
   - The trust record binds the canonical project root and the entry hash in
     `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
-    whitespace, invalidates trust and forces re-approval.
-  - Revocation and store deletion remove trust. A missing, corrupt, or unreadable
-    store fails closed; it is never recreated with existing approvals.
+    whitespace, invalidates trust and forces re-approval with a diff.
+  - `trust revoke [path]` removes the canonical record and any alias or legacy
+    keys that resolve to the same root, without requiring entry files.
+    Revocation and store deletion remove trust. A missing, corrupt, or
+    unreadable store fails closed; it is never recreated with existing
+    approvals.
   - Evaluation runs in a restricted environment with no filesystem, process,
-    network, environment, or module-loading access. The current instruction hook
-    is catchable and the wall-clock and memory budgets are not implemented; the
-    result is validated as data only after those gates exist (see
+    network, environment, or module-loading access. `pcall`/`xpcall` are
+    removed so the instruction-hook error is not catchable; `string.rep` and
+    `table.concat` carry per-call and cumulative byte caps. These are
+    best-effort bounds, not a wall-clock or heap sandbox, and a killable
+    evaluation subprocess remains future work (see
     [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
   - Project configuration may narrow behavior inside the approved ceiling. It
     may not add a workspace root, network destination, secret name, or authority
     for a role, and it may not disable audit, redaction, the deny-list, the path
     sandbox, or the trust gate.
-- **Current trust-gate gaps.** The present `trust` command is not the consent
-  flow above. It approves the current working directory and keys the record by
-  a lexical path normalization (separator, `.` segment, and trailing-slash
-  cleanup; no `..` or symlink resolution), shows a 120-character preview and a
-  16-hex hash prefix, lists no configuration effects, and records trust without
-  an interactive confirmation. Hash pinning and fail-closed untrusted handling
-  exist, but the full-content consent view, the change diff, field validation,
-  narrowing-only enforcement, and the evaluation budgets are still gaps. See
-  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
+- **Current trust-gate gaps.** Canonical-root pinning, full-content consent,
+  diff-on-change, exact-hash confirmation, user-facing revocation, bounded
+  reads, native hashing, atomic `0700`/`0600` store writes, and the removed
+  `pcall`/`xpcall` path are implemented and covered by unit plus real-host
+  tests. Field validation and narrowing-only enforcement of the merged
+  configuration are still absent: a trusted config can set fields the policy
+  expects the loader to reject. Evaluation remains in-process with best-effort
+  instruction and string/table bounds; patterns, `string.format`, concatenation,
+  and library internals are not metered, and there is no wall-clock kill or
+  memory cgroup. The store is not tamper-proof against same-user processes.
+  See [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
   inventory is not a claim of compliance.
 - **Future plugin facade.** If a later facade declares `[settings]` in
   `bitty-plugin.toml`, the SDK-rendered `Setting`/`Type`/`Default`/`Description`
@@ -445,12 +472,18 @@ include tracebacks, host paths, secrets, or raw interpreter wording.
 
 ### Configuration failures
 
-Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config` and `project_config_eval_error`.
+Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config`, `project_config_rejected`, and `project_config_eval_error`.
 
 - `untrusted_project_config` — the project entry exists but its content hash is
-  not approved in the trust store. The loader returns the safe defaults plus
-  the global layer, marks `layers.project = false`, and does not evaluate the
-  entry. Approve it with the `trust` command or remove it.
+  not approved in the trust store, or the store is corrupt/insecure. The loader
+  returns the safe defaults plus the global layer, marks `layers.project =
+false`, and does not evaluate the entry. Inspect it with `trust`, then
+  `trust confirm <sha256>` or `trust revoke`.
+- `project_config_rejected` — the entry could not be inspected safely: the
+  project root is unresolvable, the entry is a symlink or non-regular file, it
+  exceeds the 32 KiB cap, or no SHA-256 implementation is available. The entry
+  is never evaluated. The `code` field carries the specific
+  `E_PROJECT_CONFIG_*` reason.
 - `project_config_eval_error` — the trusted entry failed to evaluate or did not
   return a table. The loader falls back to the safe defaults plus the global
   layer, reports the evaluation message, and never applies a partial project

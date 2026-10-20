@@ -13,9 +13,13 @@
 --   WheelHost.fs.mkdir_p(path)              create a directory tree
 --   WheelHost.fs.list_dir(path)             list directory entries
 --   WheelHost.fs.read_file(path)            read a whole file
+--   WheelHost.fs.read_file_bounded(path, n) read at most n bytes
 --   WheelHost.fs.write_file(path, content)  write a whole file
+--   WheelHost.fs.chmod(path, mode)          set a file mode
+--   WheelHost.fs.rename(from, to)           atomically rename within a filesystem
 --   WheelHost.fs.remove_file(path)          remove a file
 --   WheelHost.fs.exists(path)               test for a readable file
+--   WheelHost.fs.stat(path)                 lstat-style metadata and type probes
 --   WheelHost.proc.run_command(shell_string, env?)  run a shell command line
 --   WheelHost.proc.run_program(program, args)       run argv with each element
 --                                                   single-quoted for the
@@ -322,6 +326,27 @@ function standalone.new(opts)
     return content
   end
 
+  --- Read at most <max_bytes> bytes from <path>.
+  -- The caller receives at most `max_bytes` bytes; reading one byte beyond an
+  -- application cap is how a bounded reader proves the cap was exceeded. The
+  -- file is not read whole first.
+  -- @param path string
+  -- @param max_bytes number
+  -- @return string? content, string? err
+  function backend.read_file_bounded(path, max_bytes)
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.read")
+    if type(max_bytes) ~= "number" or max_bytes < 0 or max_bytes % 1 ~= 0 then
+      return nil, "invalid byte bound"
+    end
+    local f, err = io.open(path, "rb")
+    if not f then
+      return nil, tostring(err)
+    end
+    local content = f:read(max_bytes)
+    f:close()
+    return content or ""
+  end
+
   --- Write <content> to the file at <path>, replacing existing content.
   -- @param path string
   -- @param content string
@@ -360,6 +385,103 @@ function standalone.new(opts)
     end
     f:close()
     return true
+  end
+
+  --- Return lstat-style metadata for <path>.
+  -- `test` probes type and link status; `stat` supplies owner and mode when
+  -- the platform provides it. A missing path returns exists = false without an
+  -- error. A probe that cannot run fails closed with the typed denial, so an
+  -- unavailable `test` is never read as "not a symlink" or "not a file".
+  -- @param path string
+  -- @return table { exists, symlink, regular, directory, uid?, mode? }
+  function backend.stat(path)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.read")
+
+    local target = path
+    if target:sub(1, 1) ~= "/" and target:sub(1, 1) ~= "." then
+      target = "./" .. target
+    end
+
+    local function probe(flag)
+      local ok, _, code = os.execute("test " .. flag .. " " .. shell_quote(target))
+      local status
+      if ok == true then
+        status = 0
+      elseif type(ok) == "number" then
+        status = (ok >= 256) and math.floor(ok / 256) or ok
+      else
+        status = code
+      end
+      if status == 0 then
+        return true
+      end
+      if status == 1 then
+        return false
+      end
+      error(WheelErrors.capability_denied("fs.read"), 0)
+    end
+
+    local symlink = probe("-L")
+    local regular = probe("-f")
+    local directory = probe("-d")
+    local exists = regular or directory or symlink or probe("-e")
+
+    local uid, mode
+    local formats = {
+      { "-c", "%u %a" },
+      { "-f", "%u %Lp" },
+    }
+    for _, format in ipairs(formats) do
+      local res = backend.run_program("stat", { format[1], format[2], "--", target },
+        { discard_stderr = true })
+      if res.ok and res.code == 0 then
+        local owner, permissions = (res.stdout or ""):match("^%s*(%d+)%s+([0-7]+)")
+        if owner and permissions then
+          uid = tonumber(owner)
+          mode = tonumber(permissions, 8)
+          break
+        end
+      end
+    end
+
+    return {
+      exists = exists,
+      symlink = symlink,
+      regular = regular,
+      directory = directory,
+      uid = uid,
+      mode = mode,
+    }
+  end
+
+  --- Set the mode of <path> (octal string or number, for example "600").
+  -- @param path string
+  -- @param mode string|number
+  -- @return boolean ok, string? err
+  function backend.chmod(path, mode)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    local text = tostring(mode)
+    if not text:match("^[0-7]+$") then
+      return false, "invalid mode"
+    end
+    local ok, _, code = os.execute("chmod " .. text .. " -- " .. shell_quote(path))
+    if ok == true or ok == 0 or code == 0 then
+      return true
+    end
+    return false, "chmod failed"
+  end
+
+  --- Atomically rename <from> to <to> on the same filesystem.
+  -- @param from string
+  -- @param to string
+  -- @return boolean ok, string? err
+  function backend.rename(from, to)
+    require_surface(type(os) == "table" and type(os.rename) == "function", "fs.write")
+    local ok, err = os.rename(from, to)
+    if ok then
+      return true
+    end
+    return false, tostring(err)
   end
 
   --- Execute a shell command line with popen semantics (stdout captured,
@@ -590,12 +712,36 @@ function WheelHost.fs.read_file(path)
   return invoke("fs.read", "read_file", path)
 end
 
+--- Read at most `max_bytes` bytes from a file.
+-- @param path string
+-- @param max_bytes number
+-- @return string? content, string? err
+function WheelHost.fs.read_file_bounded(path, max_bytes)
+  return invoke("fs.read", "read_file_bounded", path, max_bytes)
+end
+
 --- Write a whole file.
 -- @param path string
 -- @param content string
 -- @return boolean ok, string? err
 function WheelHost.fs.write_file(path, content)
   return invoke("fs.write", "write_file", path, content)
+end
+
+--- Set a file mode.
+-- @param path string
+-- @param mode string|number
+-- @return boolean ok, string? err
+function WheelHost.fs.chmod(path, mode)
+  return invoke("fs.write", "chmod", path, mode)
+end
+
+--- Atomically rename a path on one filesystem.
+-- @param from string
+-- @param to string
+-- @return boolean ok, string? err
+function WheelHost.fs.rename(from, to)
+  return invoke("fs.write", "rename", from, to)
 end
 
 --- Remove a file.
@@ -610,6 +756,13 @@ end
 -- @return boolean
 function WheelHost.fs.exists(path)
   return invoke("fs.read", "exists", path)
+end
+
+--- Return lstat-style metadata and type probes for a path.
+-- @param path string
+-- @return table { exists, symlink, regular, directory, uid?, mode? }
+function WheelHost.fs.stat(path)
+  return invoke("fs.read", "stat", path)
 end
 
 --- Process primitives.

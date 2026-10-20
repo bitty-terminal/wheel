@@ -274,9 +274,18 @@ local function assert_catalog(capture, label)
     check(def ~= nil, label .. ": missing registration " .. expected_id)
     check(type(def.run) == "function", label .. ": handler is missing for " .. expected_id)
     check(type(def.args_schema) == "table", label .. ": args_schema is missing for " .. expected_id)
-    check(def.args_schema.type == "object" and def.args_schema.additionalProperties == false
-      and def.args_schema.properties == nil,
-      label .. ": args_schema must stay closed and property-free for " .. expected_id)
+    check(def.args_schema.type == "object" and def.args_schema.additionalProperties == false,
+      label .. ": args_schema must stay closed for " .. expected_id)
+    if expected_id == "trust" then
+      check(type(def.args_schema.properties) == "table"
+        and def.args_schema.properties.action ~= nil
+        and def.args_schema.properties.hash ~= nil
+        and def.args_schema.properties.path ~= nil,
+        label .. ": trust must declare optional action/hash/path fields")
+    else
+      check(def.args_schema.properties == nil,
+        label .. ": args_schema must stay property-free for " .. expected_id)
+    end
     check(type(def.result_schema) == "table"
       and type(def.result_schema.properties) == "table"
       and type(def.result_schema.properties.title) == "table"
@@ -892,7 +901,170 @@ local function main()
   state.coverage[#state.coverage + 1] =
     "denial: unknown backend and non-POSIX platform return typed E_CAPABILITY_DENIED"
 
-  -- 9. Evidence and cleanup.
+  -- 9. Project-configuration trust gate: bounded full-content consent, diff,
+  -- exact-hash confirmation, persistence across a module restart, and
+  -- user-facing revocation. The store is the fixture's private XDG state.
+  local trust_project = BASE .. "/trust-project"
+  check(WheelHost.fs.mkdir_p(trust_project .. "/.wheel"),
+    "cannot create the trust fixture project")
+  local trust_entry = trust_project .. "/.wheel/init.lua"
+  local trust_v1 = 'return { verification = { test_command = "make trust-v1" } }\n'
+  local trust_v2 = 'return { verification = { test_command = "make trust-v2" } }\n'
+  check(WheelHost.fs.write_file(trust_entry, trust_v1),
+    "cannot write the trust fixture entry")
+
+  local trust_wheel, trust_capture = activate_uninstrumented("trust-flow")
+  check(type(trust_wheel) == "table", "trust activation must return the entry module")
+  local trust_def = trust_capture.registrations["trust"]
+  check(trust_def ~= nil, "the trust command must be registered")
+
+  local function run_trust(args)
+    trust_capture.notifications = {}
+    local ok, result = pcall(trust_def.run, args)
+    check(ok, "trust command failed: " .. tostring(result))
+    check(type(trust_capture.notifications) == "table"
+      and #trust_capture.notifications >= 1,
+      "trust command emitted no notification")
+    local bodies = {}
+    for _, notification in ipairs(trust_capture.notifications) do
+      check(type(notification.body) == "string" and #notification.body > 0,
+        "trust notification body must be non-empty")
+      bodies[#bodies + 1] = notification.body
+    end
+    return table.concat(bodies, "\n"), result, #trust_capture.notifications
+  end
+
+  local show_text = run_trust({ path = trust_project })
+  local shown_hash = show_text:match("SHA%-256: (%x+)")
+  check(shown_hash ~= nil and #shown_hash == 64,
+    "the consent view must contain the full 64-hex hash")
+  check(show_text:find(trust_v1, 1, true) ~= nil,
+    "the consent view must contain the full entry content")
+  check(show_text:find("Canonical project root: " .. trust_project, 1, true) ~= nil,
+    "the consent view must show the canonical project root")
+  check(show_text:find("BEGIN PROJECT CONFIGURATION CONTENT", 1, true) ~= nil,
+    "the consent view must delimit the full content")
+  check(show_text:find("DIFF AGAINST PREVIOUSLY TRUSTED CONTENT", 1, true) ~= nil,
+    "the consent view must carry the diff section")
+  check(show_text:find("does not evaluate untrusted project code", 1, true) ~= nil,
+    "the consent view must state the pre-consent effects limitation")
+  check(WheelHost.fs.read_file(trust_entry) == trust_v1,
+    "showing consent must not modify the entry")
+  state.coverage[#state.coverage + 1] =
+    "trust: consent showed canonical root, full entry, full SHA-256, diff section, and no pre-consent evaluation"
+
+  local refused = run_trust({ action = "confirm", path = trust_project,
+    hash = string.rep("0", 64) })
+  check(refused:find("Trust gate refused", 1, true) ~= nil,
+    "a mismatched confirmation hash must be refused")
+  check(refused:find("E_TRUST_HASH_MISMATCH", 1, true) ~= nil,
+    "a mismatched confirmation must name the typed hash failure")
+
+  local approved = run_trust({ action = "confirm", path = trust_project, hash = shown_hash })
+  check(approved:find("approved", 1, true) ~= nil,
+    "an exact confirmation hash must approve the entry: " .. tostring(approved))
+  check(approved:find(shown_hash, 1, true) ~= nil,
+    "the approval result must echo the full hash")
+
+  local store_path = os.getenv("XDG_STATE_HOME") .. "/wheel/trusted_projects.json"
+  local store_raw = WheelHost.fs.read_file(store_path)
+  check(type(store_raw) == "string" and store_raw ~= "",
+    "the trust store must be written")
+  check(store_raw:find('"version":1', 1, true) ~= nil,
+    "the trust store must use schema version 1")
+  check(store_raw:find('"content"', 1, true) ~= nil,
+    "the trust store must retain full content for diffs")
+  check(store_raw:find('"approved_at"', 1, true) ~= nil,
+    "the trust store must retain the approval timestamp")
+  local store_mode = WheelHost.proc.run_program("stat", { "-c", "%a", store_path })
+  check(store_mode.ok and trim(store_mode.stdout) == "600",
+    "the trust store must be mode 0600: " .. tostring(store_mode.stdout))
+  local store_dir_mode = WheelHost.proc.run_program(
+    "stat", { "-c", "%a", os.getenv("XDG_STATE_HOME") .. "/wheel" })
+  check(store_dir_mode.ok and trim(store_dir_mode.stdout) == "700",
+    "the trust store directory must be mode 0700: " .. tostring(store_dir_mode.stdout))
+
+  local WheelConfig = require("wheel.config")
+  local trusted_load = WheelConfig.load({ project_root = trust_project })
+  check(trusted_load.ok == true and trusted_load.trusted == true,
+    "the approved project must load: " .. tostring(trusted_load.error))
+  check(trusted_load.config.verification.test_command == "make trust-v1",
+    "the approved project configuration must apply")
+
+  -- Content change invalidates the record and shows a diff on re-approval.
+  check(WheelHost.fs.write_file(trust_entry, trust_v2), "cannot change the trust fixture entry")
+  local changed_load = WheelConfig.load({ project_root = trust_project })
+  check(changed_load.ok == false and changed_load.error == "untrusted_project_config",
+    "changed content must invalidate trust before re-approval")
+  local changed_text = run_trust({ path = trust_project })
+  check(changed_text:find("changed since the last approval", 1, true) ~= nil,
+    "the consent view must report changed content")
+  check(changed_text:find("-" .. trust_v1:gsub("\n$", ""), 1, true) ~= nil,
+    "the diff must show the previously trusted line")
+  check(changed_text:find("+" .. trust_v2:gsub("\n$", ""), 1, true) ~= nil,
+    "the diff must show the current line")
+  local shown_v2 = changed_text:match("SHA%-256: (%x+)")
+  check(shown_v2 ~= nil and shown_v2 ~= shown_hash,
+    "the changed entry must have a different full hash")
+
+  local stale = run_trust({ action = "confirm", path = trust_project, hash = shown_hash })
+  check(stale:find("E_TRUST_HASH_MISMATCH", 1, true) ~= nil,
+    "the previous hash must not approve changed content")
+  local reapproved = run_trust({ action = "confirm", path = trust_project, hash = shown_v2 })
+  check(reapproved:find("approved", 1, true) ~= nil,
+    "the new hash must approve the changed content")
+
+  -- A consent view that exceeds one notification is chunked, not truncated:
+  -- every byte of a 20 KiB entry must reach the notification series.
+  local large_project = BASE .. "/trust-large"
+  check(WheelHost.fs.mkdir_p(large_project .. "/.wheel"),
+    "cannot create the large consent fixture")
+  local padding = string.rep("-- consent padding line 0123456789\n", 600)
+  local large_entry = padding .. 'return { verification = { test_command = "make large" } }\n'
+  check(WheelHost.fs.write_file(large_project .. "/.wheel/init.lua", large_entry),
+    "cannot write the large consent entry")
+  local large_text, _, large_count = run_trust({ path = large_project })
+  check(large_count >= 3,
+    "a large consent view must span multiple notifications, got " .. tostring(large_count))
+  check(large_text:find("-- consent padding line 0123456789", 1, true) ~= nil,
+    "the chunked consent view must include the entry body")
+  check(large_text:find('verification = { test_command = "make large" }', 1, true) ~= nil,
+    "the chunked consent view must include the final entry line")
+
+  -- Restart: clear module state and read the persisted store again.
+  clear_wheel_modules()
+  local WheelConfigRestart = require("wheel.config")
+  local restarted = WheelConfigRestart.load({ project_root = trust_project })
+  check(restarted.ok == true and restarted.trusted == true,
+    "approval must persist across a module restart")
+  check(restarted.config.verification.test_command == "make trust-v2",
+    "the re-approved configuration must apply after restart")
+  state.coverage[#state.coverage + 1] =
+    "trust: approval, content change, re-approval, and persisted trust survived a module restart"
+
+  -- Revocation is user-facing and removes the canonical record.
+  local _, revoke_capture = activate_uninstrumented("trust-revoke")
+  local revoke_def = revoke_capture.registrations["trust"]
+  revoke_capture.notifications = {}
+  local revoke_ok, revoke_result = pcall(revoke_def.run, { action = "revoke", path = trust_project })
+  check(revoke_ok, "trust revoke failed: " .. tostring(revoke_result))
+  local revoke_text = table.concat((function()
+    local bodies = {}
+    for _, notification in ipairs(revoke_capture.notifications) do
+      bodies[#bodies + 1] = notification.body
+    end
+    return bodies
+  end)(), "\n")
+  check(revoke_text:find("Trust records removed: 1", 1, true) ~= nil,
+    "trust revoke must report one removed record: " .. tostring(revoke_text))
+  local revoked_load = require("wheel.config").load({ project_root = trust_project })
+  check(revoked_load.ok == false and revoked_load.error == "untrusted_project_config",
+    "revocation must invalidate the next configuration load")
+  state.coverage[#state.coverage + 1] =
+    "trust: user-facing revocation removed the record and invalidated the next load"
+
+  -- 10. Evidence and cleanup.
+
   local cpu_cold = stats_for("cpu", "cold")
   local cpu_warm = stats_for("cpu", "warm")
   local instr_cold = stats_for("instructions", "cold")

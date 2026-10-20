@@ -300,9 +300,13 @@ authority.
   configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
   outside model-visible workspace authority. No state path is hardcoded to a
   developer checkout.
-- The trust store and audit log must be written atomically and with restrictive
-  permissions. The current trust store has a non-XDG fallback and no atomic
-  replace; this is a known gap.
+- The trust store is written atomically with restrictive permissions: the
+  harness-owned directory is `0700`, the file `0600`, and a same-directory
+  temporary file is renamed over the target. The store has no `/tmp` or other
+  predictable fallback, and a symlinked, non-regular, foreign-owned,
+  group/world-writable, oversized, corrupt, or foreign-version store fails
+  closed with a surfaced warning. No execution audit log exists yet; see
+  [Relationship to current code](#relationship-to-current-code).
 
 ## Path sandbox and role gates
 
@@ -396,13 +400,21 @@ code, and cloning or entering a repository must never execute it silently.
   directory, listing commands, `--help`, or a status query must not read and
   evaluate the project entry.
 - On the first command that needs project configuration, the harness shows the
-  canonical project root, the full entry content, its SHA-256 content hash, and
-  the configuration effects it can request. A truncated preview is not
-  sufficient consent.
-- Approval is an explicit interactive action by the user. There is no
-  `--yes`-style default, no environment variable that pre-approves a project,
-  and no trust inherited from a parent directory, a previous checkout path, or
-  another machine.
+  canonical project root, the full entry content within the accepted size cap,
+  its full 64-hex SHA-256 content hash, and the diff against the previously
+  trusted bytes on re-approval. A truncated preview is not sufficient consent.
+  The entry is refused, never truncated, when it exceeds the cap or is a
+  symlink or other non-regular file.
+- A concrete list of the configuration effects the entry can request cannot be
+  produced without evaluating it. The consent view states that limitation
+  explicitly and does not evaluate untrusted code; effects are applied only
+  after confirmation, by the restricted evaluator on a later load. The policy
+  does not require pre-consent evaluation to produce that list.
+- Approval is an explicit interactive action by the user. The confirmation
+  requires the full current SHA-256; a stale, partial, or mismatched hash writes
+  no record. There is no `--yes`-style default, no environment variable that
+  pre-approves a project, and no trust inherited from a parent directory, a
+  previous checkout path, or another machine.
 - The trust record binds the canonical project root and the SHA-256 hash of the
   entry bytes. Any content change, including a whitespace-only change,
   invalidates the record and forces re-approval.
@@ -410,10 +422,12 @@ code, and cloning or entering a repository must never execute it silently.
   before re-approval.
 - The trust store lives at `$XDG_STATE_HOME/wheel/trusted_projects.json`, is
   user-owned with restrictive permissions, and contains no secrets beyond the
-  project path and hash metadata.
-- A missing, corrupt, foreign-version, or unreadable trust store fails closed:
-  every project is untrusted until explicitly approved again. It is never
-  silently recreated with existing approvals.
+  project path, hash, approved content, and approval timestamp. It is created
+  `0700`/`0600` and replaced atomically; there is no `/tmp` fallback.
+- A missing, symlinked, non-regular, foreign-owned, group/world-writable,
+  corrupt, foreign-version, oversized, or unreadable trust store fails closed:
+  every project is untrusted and the warning is surfaced. It is never silently
+  read as an empty approving store or recreated with existing approvals.
 - CI and unattended runs have no implicit trust. They must either use a fixture
   that is explicitly approved out of band or fail closed.
 - A symlinked project root resolves to its canonical path. Moving or copying a
@@ -422,8 +436,10 @@ code, and cloning or entering a repository must never execute it silently.
 
 ### Revocation
 
-- The user can revoke one project or all projects. Revocation removes the
-  record; it does not require deleting files.
+- The user can revoke one project or all projects. `trust revoke [path]` removes
+  the canonical record and every alias or legacy key that resolves to the same
+  root; it does not require the entry file to exist and does not require
+  deleting files.
 - Deleting the trust store is equivalent to revoking all projects.
 - Revocation takes effect for the next configuration load. An already running
   session may continue with the configuration it loaded; the harness must
@@ -449,6 +465,8 @@ with no ambient authority:
 
 - no `io`, `os`, `require`, `package`, `debug`, `load`, `loadstring`, `dofile`,
   `getfenv`, `setfenv`, or module loader;
+- no `pcall` or `xpcall`, so the instruction-budget error cannot be caught by
+  the entry;
 - no filesystem, process, network, environment, clock, or random-device access;
 - no access to the harness's global environment, trust store, audit log, or
   secret material;
@@ -459,8 +477,18 @@ with no ambient authority:
 - errors are captured and reported as a configuration failure, never as an
   execution path.
 
-The evaluation result is data. The harness validates every field against its
-schema and ignores unknown fields rather than passing them through.
+The evaluation result is data. Full field validation and narrowing-only
+enforcement are not implemented yet: the loader currently merges the returned
+table without validating every field, which is a known gap below. The trust
+gate itself never evaluates the entry before consent.
+
+Current implementation status for the budget bullet: the evaluator installs an
+instruction-count hook and removes `pcall`/`xpcall` so the hook error is not
+catchable, and it caps `string.rep`/`table.concat` per call and cumulatively.
+It does not yet enforce a wall-clock kill or a true heap limit, and long-running
+C library calls (patterns, formatting, compression) are not preempted. These
+bounds are best-effort; a killable evaluation subprocess remains the durable
+fix.
 
 ### Project configuration cannot widen authority
 
@@ -710,6 +738,13 @@ network boundary, covering at minimum:
 - the terminal presentation path where the harness runs in a Bitty panel,
   recorded with the host version and tool versions.
 
+The current `tests/real_host_fixture.lua` covers activation, command smoke, real
+filesystem/process/temporary-file behavior, path and destructive-command
+denials, and the trust approval/content-change/re-approval/revocation-across-
+restart flow against a private XDG state directory. It does not cover process
+timeout/cancellation, a provider stub, audit output, or a Bitty panel
+presentation, so Gate 2 remains open and this is not a security approval.
+
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
 evidence for this model.
@@ -742,8 +777,12 @@ that the policy relies on, and they remain unverified until the gates pass:
 - role gates for the read-only roles and Commander Modify, plus a partial
   custom-tool check;
 - a dangerous-command scanner covering a subset of the policy categories;
-- a project-configuration loader with a content hash, an explicit trust action,
-  a revocation action, and a restricted evaluation environment;
+- a project-configuration trust gate with a bounded 32 KiB reader, regular-file
+  and symlink refusal, host canonical-root resolution, native SHA-256 over the
+  exact bytes, full-content/diff consent, exact-hash confirmation, canonical
+  plus alias revocation, a versioned `0700`/`0600` atomically replaced store,
+  and a restricted evaluation environment with no `pcall`/`xpcall` and
+  per-call/aggregate string and table caps;
 - a provider adapter boundary that reads named environment variables;
 - a `WheelHost` seam that concentrates filesystem, process, temporary-file,
   wall-clock, and CPU-time calls. The production backend is the standalone
@@ -790,10 +829,24 @@ Known gaps relative to this policy (not claims of compliance):
 - The process backend does not enforce the accepted timeout, bounded output,
   interactive stdin/TTY-off default, detached-execution denial, or an owned
   process group; cancellation by recorded PID/process group is policy only.
-- The project-configuration instruction hook is catchable through the exposed
-  `pcall`; there is no wall-clock or memory budget, and the full-content
-  consent view/change diff is absent. The trust store has a non-XDG fallback
-  and no explicit restrictive permissions or atomic replace.
+- The project-configuration trust gate now refuses symlinks/non-regular and
+  oversized entries before hashing, resolves the canonical root through the
+  host, shows bounded full content plus a change diff, requires the exact
+  full hash to confirm, supports user-facing canonical/alias revocation, and
+  writes a `0700`/`0600` versioned store atomically. `pcall`/`xpcall` are no
+  longer exposed and `string.rep`/`table.concat` have per-call and cumulative
+  caps. Remaining gaps: evaluation is still in-process, so the instruction hook
+  counts VM instructions but cannot preempt a long-running C library call, and
+  there is no wall-clock kill or real memory limit; patterns, `string.format`,
+  concatenation, and other allocations are not metered. The bounded caps are
+  best-effort, not an OS sandbox. A killable evaluation subprocess is the
+  durable fix. The loader still exposes internal `opts.trusted` and
+  `trust_mode = "permissive"` test seams; no command or environment variable
+  reaches them in production paths, but they are not a policy boundary.
+- The trust store is a same-user file, so a same-user process can still rewrite
+  it; ownership and permission checks narrow accidental or cross-user misuse,
+  not a compromised account. The atomic rename orders the replacement but the
+  store is not fsynced, and the format has no signature or hash chain.
 - There is no append-only execution audit stream with pre-spawn records and
   fail-closed behavior, and no exact-value secret redaction across every sink.
 - Project configuration is merged as an unvalidated table; field validation and

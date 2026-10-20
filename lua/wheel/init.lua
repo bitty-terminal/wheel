@@ -171,6 +171,70 @@ local function notify(title, body)
   return WheelCommands.notify(bitty, title, body)
 end
 
+--- Cut text at a UTF-8 boundary no later than `limit` bytes.
+local function utf8_cut(text, limit)
+  if #text <= limit then
+    return text
+  end
+  local cut = limit
+  while cut > 0 do
+    local byte = text:byte(cut + 1)
+    if byte == nil or byte < 0x80 or byte > 0xBF then
+      break
+    end
+    cut = cut - 1
+  end
+  if cut == 0 then
+    cut = limit
+  end
+  return text:sub(1, cut)
+end
+
+--- Split a consent report into notification-sized chunks.
+-- The trust consent view is intentionally not truncated: an entry within the
+-- 32 KiB cap must be shown in full even though one host notification is capped
+-- at 8000 body bytes. Chunks split on line boundaries where possible and never
+-- split a UTF-8 sequence.
+local function chunk_report(text, limit)
+  local chunks = {}
+  local remaining = text
+  while #remaining > limit do
+    local slice = remaining:sub(1, limit)
+    local newline = slice:match(".*()\n")
+    local cut
+    if newline and newline > 1 then
+      cut = newline
+    else
+      cut = #utf8_cut(remaining, limit)
+    end
+    if cut == 0 then
+      cut = limit
+    end
+    chunks[#chunks + 1] = remaining:sub(1, cut)
+    remaining = remaining:sub(cut + 1)
+  end
+  if remaining ~= "" then
+    chunks[#chunks + 1] = remaining
+  end
+  if #chunks == 0 then
+    chunks[1] = ""
+  end
+  return chunks
+end
+
+--- Show a report across one or more bounded notifications.
+local function notify_report(prefix, text)
+  local chunks = chunk_report(text, WheelCommands.RESULT_BODY_MAX_LENGTH)
+  if #chunks == 1 then
+    return notify(prefix, chunks[1])
+  end
+  local result
+  for index, chunk in ipairs(chunks) do
+    result = notify(string.format("%s (%d/%d)", prefix, index, #chunks), chunk)
+  end
+  return result
+end
+
 -- Lazy command table: metadata, argument schema, result schema, and handler
 -- live in one declaration per command. Registration is a pure projection over
 -- this table; no handler runs until the host dispatches it.
@@ -300,29 +364,68 @@ local WHEEL_COMMANDS = {
   {
     id = "trust",
     title = "Wheel: trust",
-    description = "Inspect and approve project configuration (.wheel/init.lua).",
-    args_schema = WheelCommands.no_args_schema(),
+    description = "Inspect, approve, or revoke project configuration trust.",
+    args_schema = {
+      type = "object",
+      properties = {
+        action = {
+          type = "string",
+          enum = { "show", "confirm", "revoke" },
+          maxLength = 16,
+        },
+        hash = {
+          type = "string",
+          minLength = 64,
+          maxLength = 64,
+        },
+        path = {
+          type = "string",
+          minLength = 1,
+          maxLength = 4096,
+        },
+      },
+      additionalProperties = false,
+    },
     result_schema = WheelCommands.notification_result_schema(),
-    run = function()
-      local project_root = "."
-      local proj_path = M.config.get_project_config_path(project_root)
-      local content = M.host.fs.read_file(proj_path)
-      if not content then
-        return notify("Wheel Trust", "No project configuration found at " .. proj_path)
+    run = function(args)
+      args = args or {}
+      local action = args.action or "show"
+      local project_root = args.path or "."
+      local config = M.config
+
+      if action == "show" then
+        local plan = config.trust_status(project_root)
+        if not plan.ok then
+          if plan.code == "E_PROJECT_CONFIG_MISSING" then
+            return notify("Wheel Trust", string.format(
+              "No project configuration found at %s\nCanonical project root: %s\nNothing was trusted.",
+              tostring(plan.path), tostring(plan.root or "unresolved")))
+          end
+          return notify("Wheel Trust Error", config.format_trust_error(plan))
+        end
+        return notify_report("Wheel Trust", config.format_trust_show(plan))
       end
 
-      local preview = content:sub(1, 120)
-      if #content > 120 then
-        preview = preview .. "..."
+      if action == "confirm" then
+        if not args.hash then
+          return notify("Wheel Trust Error",
+            "Confirmation requires the full 64-hex SHA-256 shown by `trust`.")
+        end
+        local ok, err, hash, status = config.confirm_trust(project_root, args.hash)
+        if not ok then
+          return notify("Wheel Trust Refused", config.format_trust_error(err))
+        end
+        return notify("Wheel Trust Approved", config.format_trust_confirm(status))
       end
 
-      local ok, err, hash = M.config.trust(project_root, content)
-      if ok then
-        return notify("Wheel Trust Approved",
-          string.format("Approved %s (hash: %s):\n%s", proj_path, hash:sub(1, 16), preview))
+      if action == "revoke" then
+        local ok, removed, root = config.revoke(project_root)
+        if not ok then
+          return notify("Wheel Trust Revoke Failed", config.format_trust_error(removed))
+        end
+        return notify("Wheel Trust Revoked",
+          config.format_trust_revoke(root or project_root, removed))
       end
-
-      return notify("Wheel Trust Error", "Failed to record trust: " .. tostring(err))
     end,
   },
 

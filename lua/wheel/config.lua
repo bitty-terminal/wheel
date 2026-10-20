@@ -191,6 +191,67 @@ end
 WheelConfig.deep_merge = deep_merge
 WheelConfig.deep_copy = deep_copy
 
+-- ---------------------------------------------------------------------------
+-- Security bounds for executable project configuration
+-- ---------------------------------------------------------------------------
+
+-- Maximum accepted `.wheel/init.lua` size. The consent view reads at most
+-- `MAX_PROJECT_CONFIG_BYTES + 1` bytes so a larger entry is refused without
+-- loading it whole. A 32 KiB entry is far above a practical configuration and
+-- small enough that a native hash is effectively instantaneous.
+WheelConfig.MAX_PROJECT_CONFIG_BYTES = 32 * 1024
+
+-- Maximum accepted trust-store file size. The store contains the approved
+-- entry content for the change diff, so it is larger than one entry but still
+-- bounded; a store above this size is corrupt for this harness.
+WheelConfig.MAX_TRUST_STORE_BYTES = 1024 * 1024
+
+-- Maximum number of projects recorded in one trust store.
+WheelConfig.MAX_TRUST_STORE_PROJECTS = 256
+
+-- Best-effort evaluation memory bounds. These are per-call and cumulative caps
+-- for the two allocation-prone library functions exposed to a project entry
+-- (`string.rep` and `table.concat`). They are not a general Lua heap limit:
+-- concatenation, formatting, pattern captures, and table growth outside these
+-- wrappers remain bounded only by the instruction hook. A killable evaluation
+-- subprocess is the durable fix and remains open.
+WheelConfig.MAX_EVAL_STRING_BYTES = 1024 * 1024
+WheelConfig.MAX_EVAL_TOTAL_STRING_BYTES = 4 * 1024 * 1024
+
+local HASH_HEX_PATTERN = "^%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x"
+  .. "%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x"
+  .. "%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x"
+  .. "%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x%x$"
+
+local SHA256_MATCH_PATTERN = "(%x" .. string.rep("%x", 63) .. ")"
+
+local function is_sha256_hex(value)
+  return type(value) == "string" and value:match(HASH_HEX_PATTERN) ~= nil
+end
+
+local function trim_output(value)
+  if type(value) ~= "string" then
+    return ""
+  end
+  return (value:gsub("%s+$", ""))
+end
+
+local function has_control_chars(value)
+  return type(value) == "string" and value:find("[%z\1-\31\127]") ~= nil
+end
+
+--- Return true when a POSIX mode grants group or world write permission.
+-- Mode values are the decimal form of the octal permission bits. Bit 4 of the
+-- group digit is 0o020 (16) and bit 1 of the world digit is 0o002 (2).
+-- @param mode number?
+-- @return boolean
+local function mode_is_group_or_world_writable(mode)
+  if type(mode) ~= "number" then
+    return true
+  end
+  return math.floor(mode / 16) % 2 == 1 or math.floor(mode / 2) % 2 == 1
+end
+
 local function sha256_pure(msg)
   local bit = nil
   if type(bit32) == "table" then
@@ -390,6 +451,202 @@ local function file_exists(filepath)
   return require_host("fs.read").fs.exists(filepath)
 end
 
+local function trust_error(code, message)
+  return { code = code, message = message }
+end
+
+local function empty_trust_store()
+  return { version = 1, projects = {} }
+end
+
+--- Hash exact bytes with a native SHA-256 utility when one is available.
+-- The content is written to a private temporary file so the utility hashes the
+-- exact bytes that will be evaluated; the caller's project entry is never read
+-- a second time. The temporary file lives in the harness-owned 0700 runtime
+-- directory, is chmodded 0600 when the host supports it, and is removed before
+-- returning. Returns nil when no native implementation can produce a digest.
+-- @param content string
+-- @return string? lowercase 64-hex digest
+local function native_sha256(content)
+  local host = require_host("fs.read")
+  local ok_tmp, temp = pcall(function()
+    return host.tmp.name()
+  end)
+  if not ok_tmp or type(temp) ~= "string" or temp == "" then
+    return nil
+  end
+
+  local wrote = pcall(function()
+    return host.fs.write_file(temp, content)
+  end)
+  if not wrote then
+    pcall(function() host.fs.remove_file(temp) end)
+    return nil
+  end
+  pcall(function() host.fs.chmod(temp, "600") end)
+
+  local digest = nil
+  local candidates = {
+    { "sha256sum", { "--", temp } },
+    { "shasum", { "-a", "256", "--", temp } },
+    { "openssl", { "dgst", "-sha256", temp } },
+  }
+  for _, candidate in ipairs(candidates) do
+    local res = host.proc.run_program(candidate[1], candidate[2], { discard_stderr = true })
+    if res.ok and res.code == 0 then
+      local found = (res.stdout or ""):match(SHA256_MATCH_PATTERN)
+      if found then
+        digest = found:lower()
+        break
+      end
+    end
+  end
+
+  pcall(function() host.fs.remove_file(temp) end)
+  return digest
+end
+
+--- Hash project configuration bytes.
+-- Native SHA-256 is the normal path. The pure-Lua implementation is the
+-- documented fallback when no `sha256sum`, `shasum`, or `openssl` is available;
+-- it can take seconds at the 32 KiB cap on PUC Lua 5.1, so the bounded reader
+-- above is what keeps that fallback from ever hashing an unbounded entry.
+-- @param content string
+-- @return string? lowercase 64-hex digest
+function WheelConfig.compute_content_hash(content)
+  if type(content) ~= "string" then content = tostring(content or "") end
+  local native = native_sha256(content)
+  if native then
+    return native
+  end
+  if #content <= WheelConfig.MAX_PROJECT_CONFIG_BYTES then
+    return sha256_pure(content)
+  end
+  return nil
+end
+
+--- Resolve a path to the current process's uid for store ownership checks.
+local function current_uid()
+  local res = require_host("process.spawn").proc.run_program(
+    "id", { "-u" }, { discard_stderr = true })
+  if res.ok and res.code == 0 then
+    return tonumber(trim_output(res.stdout))
+  end
+  return nil
+end
+
+--- Verify that an existing store file or directory is user-owned and not
+-- group- or world-writable.
+-- @param info table `WheelHost.fs.stat` result
+-- @param label string
+-- @return boolean ok, table? err
+local function check_store_owner(info, label, skip_mode_check)
+  if type(info.uid) ~= "number" then
+    return false, trust_error("E_TRUST_STORE_OWNER_UNVERIFIABLE",
+      "cannot determine ownership for " .. label)
+  end
+  local uid = current_uid()
+  if not uid then
+    return false, trust_error("E_TRUST_STORE_OWNER_UNVERIFIABLE",
+      "cannot determine the current uid for " .. label)
+  end
+  if info.uid ~= uid then
+    return false, trust_error("E_TRUST_STORE_FOREIGN_OWNED",
+      label .. " is not owned by the current user")
+  end
+  if not skip_mode_check then
+    if type(info.mode) ~= "number" then
+      return false, trust_error("E_TRUST_STORE_OWNER_UNVERIFIABLE",
+        "cannot determine permissions for " .. label)
+    end
+    if mode_is_group_or_world_writable(info.mode) then
+      return false, trust_error("E_TRUST_STORE_PERMISSIONS",
+        label .. " is group- or world-writable")
+    end
+  end
+  return true, nil
+end
+
+--- Normalize a decoded trust store to schema version 1.
+-- A legacy flat store (`{root = "hash"}`) is accepted as hash-only metadata.
+-- Unknown or malformed entries make the whole store corrupt so it cannot be
+-- silently treated as empty.
+-- @param data table
+-- @return table? store, table? err
+local function normalize_trust_store(data)
+  if type(data) ~= "table" then
+    return nil, trust_error("E_TRUST_STORE_CORRUPT", "trust store root is not an object")
+  end
+
+  local projects
+  if data.version ~= nil then
+    if data.version ~= 1 then
+      return nil, trust_error("E_TRUST_STORE_VERSION",
+        "unsupported trust store schema version " .. tostring(data.version))
+    end
+    if type(data.projects) ~= "table" then
+      return nil, trust_error("E_TRUST_STORE_CORRUPT", "trust store projects is not an object")
+    end
+    projects = data.projects
+  else
+    -- Legacy flat map. An empty file/no entries is an empty store.
+    projects = {}
+    for key, value in pairs(data) do
+      projects[key] = value
+    end
+  end
+
+  local store = empty_trust_store()
+  local count = 0
+  for key, value in pairs(projects) do
+    if type(key) ~= "string" or key == "" or key:sub(1, 1) ~= "/" or has_control_chars(key) then
+      return nil, trust_error("E_TRUST_STORE_CORRUPT",
+        "trust store contains a project key that is not a canonical absolute path")
+    end
+
+    local entry
+    if type(value) == "string" then
+      entry = { hash = value }
+    elseif type(value) == "table" then
+      entry = {
+        hash = value.hash,
+        content = value.content,
+        approved_at = value.approved_at,
+      }
+      if entry.content ~= nil and type(entry.content) ~= "string" then
+        return nil, trust_error("E_TRUST_STORE_CORRUPT",
+          "trust store entry for a project has non-string content")
+      end
+      if entry.content ~= nil and #entry.content > WheelConfig.MAX_PROJECT_CONFIG_BYTES then
+        return nil, trust_error("E_TRUST_STORE_CORRUPT",
+          "trust store entry content exceeds the project configuration cap")
+      end
+      if entry.approved_at ~= nil
+        and type(entry.approved_at) ~= "string"
+        and type(entry.approved_at) ~= "number" then
+        return nil, trust_error("E_TRUST_STORE_CORRUPT",
+          "trust store entry has an invalid approval timestamp")
+      end
+    else
+      return nil, trust_error("E_TRUST_STORE_CORRUPT",
+        "trust store entry for a project is not an object")
+    end
+
+    if not is_sha256_hex(entry.hash) then
+      return nil, trust_error("E_TRUST_STORE_CORRUPT",
+        "trust store entry does not contain a full 64-hex SHA-256 hash")
+    end
+    count = count + 1
+    if count > WheelConfig.MAX_TRUST_STORE_PROJECTS then
+      return nil, trust_error("E_TRUST_STORE_CORRUPT",
+        "trust store contains more than " .. WheelConfig.MAX_TRUST_STORE_PROJECTS .. " projects")
+    end
+    store.projects[key] = entry
+  end
+
+  return store, nil
+end
+
 --- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
 function WheelConfig.get_global_config_path()
   local xdg_config = getenv("XDG_CONFIG_HOME")
@@ -412,134 +669,923 @@ function WheelConfig.get_project_config_path(project_root)
 end
 
 --- Resolve trust store path ($XDG_STATE_HOME/wheel/trusted_projects.json).
-function WheelConfig.get_trust_store_path()
-  local xdg_state = getenv("XDG_STATE_HOME")
-  if xdg_state and xdg_state ~= "" then
+-- There is deliberately no `/tmp` or other predictable fallback: when neither
+-- XDG_STATE_HOME nor HOME is set the trust gate fails closed. The optional
+-- `env` table exists for deterministic tests; production callers omit it.
+-- @param env table? environment overrides for tests
+-- @return string? path
+function WheelConfig.get_trust_store_path(env)
+  local function value(name)
+    if type(env) == "table" then
+      return env[name]
+    end
+    return getenv(name)
+  end
+
+  local xdg_state = value("XDG_STATE_HOME")
+  if type(xdg_state) == "string" and xdg_state ~= "" then
     return xdg_state .. "/wheel/trusted_projects.json"
   end
-  local home = getenv("HOME") or ""
-  if home ~= "" then
+  local home = value("HOME")
+  if type(home) == "string" and home ~= "" then
     return home .. "/.local/state/wheel/trusted_projects.json"
   end
-  return "/tmp/bitty/wheel_trusted_projects.json"
+  return nil
 end
 
---- Read trust store JSON table.
---- @param path_override string? Optional custom trust store file path
---- @return table
-function WheelConfig.read_trust_store(path_override)
-  local path = path_override or WheelConfig.get_trust_store_path()
-  local raw = read_file(path)
-  if not raw or raw == "" then
-    return {}
+--- Resolve the trust-store path and reject relative or control-bearing values.
+-- @param path_override string?
+-- @param env table?
+-- @return string? path, table? err
+local function resolve_trust_store_path(path_override, env)
+  local path = path_override or WheelConfig.get_trust_store_path(env)
+  if not path or path == "" then
+    return nil, trust_error("E_TRUST_STORE_UNAVAILABLE",
+      "neither XDG_STATE_HOME nor HOME is set; the trust store has no non-XDG fallback")
   end
+  if path:sub(1, 1) ~= "/" then
+    return nil, trust_error("E_TRUST_STORE_UNAVAILABLE", "trust store path must be absolute")
+  end
+  if path:sub(-1) == "/" then
+    return nil, trust_error("E_TRUST_STORE_UNAVAILABLE",
+      "trust store path must name a file, not a directory")
+  end
+  local parent = path:match("^(.*)/[^/]+$")
+  if not parent or parent == "" or parent == "/" then
+    return nil, trust_error("E_TRUST_STORE_UNAVAILABLE",
+      "trust store path must live in a non-root directory")
+  end
+  if has_control_chars(path) then
+    return nil, trust_error("E_TRUST_STORE_UNAVAILABLE", "trust store path contains control bytes")
+  end
+  return path, nil
+end
+
+--- Read and validate the trust store.
+-- A missing store is an empty store. A corrupt, unreadable, symlinked,
+-- non-regular, foreign-owned, or group/world-writable store returns an empty
+-- store plus a structured warning; every project stays untrusted. The warning
+-- is never silently discarded.
+-- @param path_override string?
+-- @param env table? environment overrides for tests
+-- @return table store, table? warning
+function WheelConfig.read_trust_store(path_override, env)
+  local path, path_err = resolve_trust_store_path(path_override, env)
+  if not path then
+    return empty_trust_store(), path_err
+  end
+
+  local host = require_host("fs.read")
+  local parent = path:match("^(.*)/[^/]+$") or "/"
+  local parent_info = host.fs.stat(parent)
+  if parent_info.exists then
+    if parent_info.symlink then
+      return empty_trust_store(), trust_error("E_TRUST_STORE_SYMLINK",
+        "trust store directory is a symbolic link")
+    end
+    if not parent_info.directory then
+      return empty_trust_store(), trust_error("E_TRUST_STORE_NOT_REGULAR",
+        "trust store parent path is not a directory")
+    end
+    local parent_ok, parent_err = check_store_owner(parent_info, "trust store directory")
+    if not parent_ok then
+      return empty_trust_store(), parent_err
+    end
+  end
+
+  local info = host.fs.stat(path)
+  if not info.exists then
+    return empty_trust_store(), nil
+  end
+  if info.symlink then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_SYMLINK",
+      "trust store is a symbolic link")
+  end
+  if not info.regular then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_NOT_REGULAR",
+      "trust store is not a regular file")
+  end
+
+  local owner_ok, owner_err = check_store_owner(info, "trust store")
+  if not owner_ok then
+    return empty_trust_store(), owner_err
+  end
+
+  local raw, read_err = host.fs.read_file_bounded(path, WheelConfig.MAX_TRUST_STORE_BYTES + 1)
+  if not raw then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_UNREADABLE",
+      "trust store cannot be read: " .. tostring(read_err))
+  end
+  if #raw > WheelConfig.MAX_TRUST_STORE_BYTES then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_TOO_LARGE",
+      "trust store exceeds the " .. WheelConfig.MAX_TRUST_STORE_BYTES .. "-byte cap")
+  end
+  if raw == "" then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_CORRUPT",
+      "trust store is empty instead of a JSON object")
+  end
+
   local K = get_kernel()
-  local ok, data = pcall(function() return K.JSON.decode(raw) end)
-  if ok and type(data) == "table" then
-    return data
+  local decoded_ok, data = pcall(function() return K.JSON.decode(raw) end)
+  if not decoded_ok or type(data) ~= "table" then
+    return empty_trust_store(), trust_error("E_TRUST_STORE_CORRUPT",
+      "trust store JSON is corrupt")
   end
-  return {}
+  local store, normalize_err = normalize_trust_store(data)
+  if not store then
+    return empty_trust_store(), normalize_err
+  end
+  return store, nil
 end
 
---- Save trust store JSON table.
---- @param store table
---- @param path_override string? Optional custom trust store file path
---- @return boolean success
+--- Return the trust store with every resolvable project key canonicalized.
+-- Unresolvable keys cannot name an existing project root and are dropped, so a
+-- successful write never preserves a legacy lexical/alias key.
+-- @param store table
+-- @return table
+local function canonicalize_store(store)
+  local cleaned = empty_trust_store()
+  if type(store) ~= "table" or type(store.projects) ~= "table" then
+    return cleaned
+  end
+  for key, entry in pairs(store.projects) do
+    local canonical = nil
+    if type(key) == "string" and key:sub(1, 1) == "/" then
+      local ok, resolved = pcall(WheelConfig.canonical_root, key)
+      if ok and resolved then
+        canonical = resolved
+      end
+    end
+    if canonical then
+      cleaned.projects[canonical] = entry
+    end
+  end
+  return cleaned
+end
+
+--- Write the trust store atomically as a private file.
+-- The parent directory is created (or repaired) with mode 0700, the file is
+-- written to a same-directory `mktemp` file, chmodded 0600, then renamed over
+-- the target. An insecure, foreign-owned, symlinked, or non-regular target is
+-- rejected instead of replaced.
+-- @param store table
+-- @param path_override string?
+-- @return boolean success, table? err
 function WheelConfig.write_trust_store(store, path_override)
-  local path = path_override or WheelConfig.get_trust_store_path()
+  local path, path_err = resolve_trust_store_path(path_override)
+  if not path then
+    return false, path_err
+  end
+
+  local host = require_host("fs.write")
+  local parent = path:match("^(.*)/[^/]+$") or "/"
+
+  local made = host.fs.mkdir_p(parent)
+  if not made then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "cannot create the trust store directory")
+  end
+
+  local parent_info = host.fs.stat(parent)
+  if not parent_info.exists then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "the trust store directory is unavailable after creation")
+  end
+  if parent_info.symlink then
+    return false, trust_error("E_TRUST_STORE_SYMLINK",
+      "trust store directory is a symbolic link")
+  end
+  if not parent_info.directory then
+    return false, trust_error("E_TRUST_STORE_NOT_REGULAR",
+      "trust store parent path is not a directory")
+  end
+  local parent_ok, parent_owner_err = check_store_owner(
+    parent_info, "trust store directory", true)
+  if not parent_ok then
+    return false, parent_owner_err
+  end
+  local chmod_dir = host.fs.chmod(parent, "700")
+  if chmod_dir ~= true then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "cannot set the trust store directory to mode 0700")
+  end
+  parent_info = host.fs.stat(parent)
+  parent_ok, parent_owner_err = check_store_owner(parent_info, "trust store directory")
+  if not parent_ok then
+    return false, parent_owner_err
+  end
+
+  local info = host.fs.stat(path)
+  if info.exists then
+    if info.symlink then
+      return false, trust_error("E_TRUST_STORE_SYMLINK", "refusing to replace a symlinked trust store")
+    end
+    if not info.regular then
+      return false, trust_error("E_TRUST_STORE_NOT_REGULAR", "refusing to replace a non-regular trust store")
+    end
+    local file_ok, file_owner_err = check_store_owner(info, "trust store")
+    if not file_ok then
+      return false, file_owner_err
+    end
+  end
+
   local K = get_kernel()
-  local json_str = K.JSON.encode(store or {})
-  -- Ensure parent directory exists safely without shell injection
-  local parent_dir = string.match(path, "^(.*)/[^/]+$")
-  if parent_dir and parent_dir ~= "" then
-    require_host("fs.write").fs.mkdir_p(parent_dir)
+  local json_str = K.JSON.encode(canonicalize_store(store))
+
+  local temp_result = host.proc.run_program(
+    "mktemp", { path .. ".tmp.XXXXXX" }, { discard_stderr = true })
+  if not (temp_result.ok and temp_result.code == 0) then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "cannot create a private temporary trust store")
   end
-  return write_file(path, json_str)
+  local temp = trim_output(temp_result.stdout)
+  if temp:sub(1, 1) ~= "/" then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "temporary trust store path is not absolute")
+  end
+
+  local wrote = host.fs.write_file(temp, json_str)
+  if not wrote then
+    host.fs.remove_file(temp)
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED", "cannot write the temporary trust store")
+  end
+  local chmod_file = host.fs.chmod(temp, "600")
+  if chmod_file ~= true then
+    host.fs.remove_file(temp)
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED", "cannot set the trust store to mode 0600")
+  end
+  local renamed = host.fs.rename(temp, path)
+  if not renamed then
+    host.fs.remove_file(temp)
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED", "atomic trust store rename failed")
+  end
+
+  local final_info = host.fs.stat(path)
+  if final_info.symlink or not final_info.regular then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "trust store is not a regular file after the atomic rename")
+  end
+  local final_ok, final_err = check_store_owner(final_info, "trust store")
+  if not final_ok then
+    return false, final_err
+  end
+  return true, nil
 end
 
---- Normalize a path string to an absolute canonical path for trust store matching.
-local function normalize_path(path)
-  if not path or path == "" or path == "." then
-    local pwd = getenv("PWD")
-    if pwd and pwd ~= "" then
-      path = pwd
-    else
-      path = "."
+--- Resolve a path through the host to a canonical absolute directory.
+-- Uses `realpath -e`, then `readlink -f`, then `cd -P ... && pwd -P`. The
+-- process `PWD` is never consulted. Control bytes and unresolvable paths fail
+-- closed.
+-- @param path string?
+-- @return string? canonical_root, table? err
+function WheelConfig.canonical_root(path)
+  if path == nil or path == "" then
+    path = "."
+  end
+  if type(path) ~= "string" or has_control_chars(path) then
+    return nil, trust_error("E_PROJECT_ROOT_UNRESOLVED",
+      "project root must be a control-free path string")
+  end
+
+  local host = require_host("fs.read")
+  local info = host.fs.stat(path)
+  if not info.exists or not info.directory then
+    return nil, trust_error("E_PROJECT_ROOT_UNRESOLVED",
+      "project root is not an existing directory")
+  end
+
+  local function accept(candidate)
+    if type(candidate) ~= "string" then
+      return nil
     end
-  elseif string.sub(path, 1, 1) ~= "/" then
-    local pwd = getenv("PWD")
-    if pwd and pwd ~= "" then
-      path = pwd .. "/" .. path
+    local value = candidate:gsub("[\r\n]+$", "")
+    if value == "" or value:sub(1, 1) ~= "/" or has_control_chars(value) then
+      return nil
+    end
+    local resolved = host.fs.stat(value)
+    if not resolved.exists or not resolved.directory then
+      return nil
+    end
+    return value
+  end
+
+  local attempts = {
+    { "realpath", { "-e", "--", path } },
+    { "readlink", { "-f", "--", path } },
+  }
+  for _, attempt in ipairs(attempts) do
+    local res = host.proc.run_program(attempt[1], attempt[2], { discard_stderr = true })
+    if res.ok and res.code == 0 then
+      local accepted = accept(res.stdout)
+      if accepted then
+        return accepted, nil
+      end
     end
   end
-  local p = string.gsub(path, "\\", "/")
-  p = string.gsub(p, "/%./", "/")
-  p = string.gsub(p, "/+", "/")
-  p = string.gsub(p, "/+$", "")
-  if p == "" then return "/" end
-  return p
+
+  local quoted = host.proc.shell_quote(path)
+  local cd_result = host.proc.run_command("cd -P -- " .. quoted .. " && pwd -P")
+  if cd_result.ok and cd_result.code == 0 then
+    local accepted = accept(cd_result.stdout)
+    if accepted then
+      return accepted, nil
+    end
+  end
+
+  return nil, trust_error("E_PROJECT_ROOT_UNRESOLVED",
+    "project root cannot be resolved to a canonical directory")
 end
 
---- Check if a project configuration is trusted.
---- @param project_root string
---- @param content string? Optional config content; if omitted, reads file
---- @param trust_file string? Optional trust store path override
---- @return boolean is_trusted, string current_hash, string? trusted_hash
-function WheelConfig.is_trusted(project_root, content, trust_file)
-  local path = WheelConfig.get_project_config_path(project_root)
-  if not content then
-    content = read_file(path)
+--- Resolve an existing file or directory path without requiring a directory.
+-- @param path string
+-- @return string? canonical_path
+local function canonical_existing_path(path)
+  if type(path) ~= "string" or has_control_chars(path) then
+    return nil
   end
-  if not content then
-    return false, "", nil
+  local host = require_host("fs.read")
+  local attempts = {
+    { "realpath", { "-e", "--", path } },
+    { "readlink", { "-f", "--", path } },
+  }
+  for _, attempt in ipairs(attempts) do
+    local res = host.proc.run_program(attempt[1], attempt[2], { discard_stderr = true })
+    if res.ok and res.code == 0 then
+      local value = (res.stdout or ""):gsub("[\r\n]+$", "")
+      if value ~= "" and value:sub(1, 1) == "/" and not has_control_chars(value) then
+        local info = host.fs.stat(value)
+        if info.exists then
+          return value
+        end
+      end
+    end
   end
-  local current_hash = WheelConfig.compute_hash(content)
-  local store = WheelConfig.read_trust_store(trust_file)
-  local key = normalize_path(project_root)
-  local trusted_hash = store[key]
-  if trusted_hash and trusted_hash == current_hash then
-    return true, current_hash, trusted_hash
-  end
-  return false, current_hash, trusted_hash
+  return nil
 end
 
---- Mark a project configuration as trusted (direnv-style explicit trust action).
---- @param project_root string
---- @param content string? Optional config content; if omitted, reads file
---- @param trust_file string? Optional trust store path override
---- @return boolean success, string? error, string? hash
-function WheelConfig.trust(project_root, content, trust_file)
-  local path = WheelConfig.get_project_config_path(project_root)
-  if not content then
-    content = read_file(path)
+--- Inspect the project entry with the bounded reader and the trust rules.
+-- The entry must be a regular, non-symlinked file no larger than
+-- `MAX_PROJECT_CONFIG_BYTES`. The `.wheel` directory must not be a symlink and
+-- the entry's canonical path must equal the path inside the canonical root, so
+-- a repository cannot redirect the gate through a link. Nothing is evaluated.
+-- @param project_root string?
+-- @return table { ok, root?, path?, content?, hash?, bytes?, code?, message? }
+function WheelConfig.inspect_project_config(project_root)
+  local root, root_err = WheelConfig.canonical_root(project_root)
+  if not root then
+    return { ok = false, code = root_err.code, message = root_err.message }
   end
-  if not content then
-    return false, "project config file not found: " .. path, nil
+
+  local host = require_host("fs.read")
+  local config_dir = root .. "/.wheel"
+  local dir_info = host.fs.stat(config_dir)
+  if dir_info.exists then
+    if dir_info.symlink then
+      return {
+        ok = false,
+        root = root,
+        path = config_dir .. "/init.lua",
+        code = "E_PROJECT_CONFIG_SYMLINK",
+        message = "project configuration directory is a symbolic link",
+      }
+    end
+    if not dir_info.directory then
+      return {
+        ok = false,
+        root = root,
+        path = config_dir,
+        code = "E_PROJECT_CONFIG_NOT_REGULAR",
+        message = "project configuration directory path is not a directory",
+      }
+    end
   end
-  local hash = WheelConfig.compute_hash(content)
-  local store = WheelConfig.read_trust_store(trust_file)
-  local key = normalize_path(project_root)
-  store[key] = hash
-  local ok = WheelConfig.write_trust_store(store, trust_file)
-  if ok then
-    return true, nil, hash
+
+  local path = WheelConfig.get_project_config_path(root)
+  local info = host.fs.stat(path)
+  if not info.exists then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_MISSING",
+      message = "no project configuration at " .. path,
+    }
+  end
+  if info.symlink then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_SYMLINK",
+      message = "project configuration is a symbolic link",
+    }
+  end
+  if not info.regular then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_NOT_REGULAR",
+      message = "project configuration is not a regular file",
+    }
+  end
+
+  local canonical = canonical_existing_path(path)
+  if not canonical or canonical ~= path then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_SYMLINK",
+      message = "project configuration resolves outside its canonical path",
+    }
+  end
+
+  local content, read_err = host.fs.read_file_bounded(
+    path, WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1)
+  if not content then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_UNREADABLE",
+      message = "project configuration cannot be read: " .. tostring(read_err),
+    }
+  end
+  if #content > WheelConfig.MAX_PROJECT_CONFIG_BYTES then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_TOO_LARGE",
+      message = "project configuration exceeds the "
+        .. WheelConfig.MAX_PROJECT_CONFIG_BYTES .. "-byte cap",
+    }
+  end
+
+  local hash = WheelConfig.compute_content_hash(content)
+  if not hash then
+    return {
+      ok = false,
+      root = root,
+      path = path,
+      code = "E_PROJECT_CONFIG_HASH_UNAVAILABLE",
+      message = "no SHA-256 implementation is available for the project configuration",
+    }
+  end
+
+  return {
+    ok = true,
+    root = root,
+    path = path,
+    content = content,
+    hash = hash,
+    bytes = #content,
+  }
+end
+
+--- Find a trust record by canonical root, including legacy/alias keys.
+-- @param store table
+-- @param root string canonical root
+-- @return table? record, string? key, boolean alias
+local function find_trust_record(store, root)
+  if type(store) ~= "table" or type(store.projects) ~= "table" then
+    return nil, nil, false
+  end
+  local direct = store.projects[root]
+  if direct then
+    return direct, root, false
+  end
+  for key, value in pairs(store.projects) do
+    if type(key) == "string" and key:sub(1, 1) == "/" then
+      local ok, canonical = pcall(WheelConfig.canonical_root, key)
+      if ok and canonical == root then
+        return value, key, true
+      end
+    end
+  end
+  return nil, nil, false
+end
+
+--- Build the full consent/inspection view without evaluating the entry.
+-- @param project_root string?
+-- @param trust_file string?
+-- @return table
+function WheelConfig.trust_status(project_root, trust_file)
+  local entry = WheelConfig.inspect_project_config(project_root)
+  if not entry.ok then
+    return entry
+  end
+
+  local store, store_warning = WheelConfig.read_trust_store(trust_file)
+  local record, record_key, alias = find_trust_record(store, entry.root)
+
+  local trusted = false
+  local status
+  if not record then
+    status = "not trusted (no record for this canonical root)"
+  elseif record.hash == entry.hash then
+    trusted = true
+    status = "trusted (current hash matches the approved hash)"
   else
-    return false, "failed to persist trust store", nil
+    status = "changed since the last approval"
   end
+
+  local diff
+  local diff_note
+  if record and type(record.content) == "string" then
+    diff = WheelConfig.compute_diff(record.content, entry.content)
+  elseif record then
+    diff_note = "unavailable: the previous record is a legacy hash-only entry; "
+      .. "the next successful approval stores full content for future diffs"
+  else
+    diff_note = "none: there is no previously trusted content for this root"
+  end
+
+  local store_path = trust_file or WheelConfig.get_trust_store_path()
+
+  return {
+    ok = true,
+    root = entry.root,
+    path = entry.path,
+    content = entry.content,
+    hash = entry.hash,
+    bytes = entry.bytes,
+    store = store,
+    store_warning = store_warning,
+    store_path = store_path,
+    record = record,
+    record_key = record_key,
+    alias = alias,
+    trusted = trusted,
+    status = status,
+    diff = diff,
+    diff_note = diff_note,
+  }
 end
 
---- Revoke trust for a project configuration.
---- @param project_root string
---- @param trust_file string? Optional trust store path override
---- @return boolean success
-function WheelConfig.untrust(project_root, trust_file)
-  local store = WheelConfig.read_trust_store(trust_file)
-  local key = normalize_path(project_root)
-  store[key] = nil
-  return WheelConfig.write_trust_store(store, trust_file)
+--- Check a precomputed hash against the trust store.
+-- @param root string canonical project root
+-- @param current_hash string
+-- @param trust_file string?
+-- @return boolean trusted, string? trusted_hash, table? warning
+function WheelConfig.is_hash_trusted(root, current_hash, trust_file)
+  local store, store_warning = WheelConfig.read_trust_store(trust_file)
+  local record = find_trust_record(store, root)
+  local trusted_hash = record and record.hash or nil
+  if store_warning then
+    return false, trusted_hash, store_warning
+  end
+  return trusted_hash ~= nil and trusted_hash == current_hash, trusted_hash, nil
 end
+
+--- Check whether a project configuration is trusted.
+-- A corrupt or insecure store makes every project untrusted and is returned as
+-- the fourth value so a caller can surface it. No content is evaluated.
+-- @param project_root string
+-- @param content string? Optional exact entry content; if omitted, reads it
+-- @param trust_file string? Optional trust store path override
+-- @return boolean trusted, string current_hash, string? trusted_hash, table? warning
+function WheelConfig.is_trusted(project_root, content, trust_file)
+  local root, root_err = WheelConfig.canonical_root(project_root)
+  if not root then
+    return false, "", nil, root_err
+  end
+
+  local current_hash
+  if content ~= nil then
+    current_hash = WheelConfig.compute_content_hash(content)
+  else
+    local entry = WheelConfig.inspect_project_config(root)
+    if not entry.ok then
+      return false, "", nil, trust_error(entry.code, entry.message)
+    end
+    current_hash = entry.hash
+  end
+
+  local trusted, trusted_hash, warning = WheelConfig.is_hash_trusted(
+    root, current_hash or "", trust_file)
+  return trusted, current_hash or "", trusted_hash, warning
+end
+
+--- Approve the current entry only when the supplied hash is exact.
+-- The supplied hash must be the full 64-hex SHA-256 of the current bytes. The
+-- store is re-read inside this call so a confirmation cannot approve content
+-- that changed after the consent view.
+-- @param project_root string
+-- @param expected_hash string
+-- @param trust_file string?
+-- @return boolean success, table? err, string? hash, table? status
+function WheelConfig.confirm_trust(project_root, expected_hash, trust_file)
+  if not is_sha256_hex(expected_hash) then
+    return false, trust_error("E_TRUST_HASH_INVALID",
+      "confirmation requires the full 64-hex SHA-256 hash"), nil
+  end
+
+  local status = WheelConfig.trust_status(project_root, trust_file)
+  if not status.ok then
+    return false, { code = status.code, message = status.message }, nil
+  end
+  if status.store_warning then
+    return false, status.store_warning, nil
+  end
+  if status.hash ~= expected_hash then
+    return false, trust_error("E_TRUST_HASH_MISMATCH",
+      "supplied hash does not match the current entry bytes; run `trust` again"), nil
+  end
+
+  local store = status.store or empty_trust_store()
+  store.version = 1
+  store.projects = store.projects or {}
+
+  -- Migrate alias and legacy keys that resolve to this canonical root.
+  for key in pairs(store.projects) do
+    local remove = key == status.root
+    if not remove and type(key) == "string" and key:sub(1, 1) == "/" then
+      local canonical_ok, canonical = pcall(WheelConfig.canonical_root, key)
+      remove = canonical_ok and canonical == status.root
+    end
+    if remove then
+      store.projects[key] = nil
+    end
+  end
+
+  local approved_at = require_host("time.now").time.now()
+  store.projects[status.root] = {
+    hash = status.hash,
+    content = status.content,
+    approved_at = approved_at,
+  }
+
+  local ok, write_err = WheelConfig.write_trust_store(store, trust_file)
+  if not ok then
+    return false, write_err or trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "failed to persist the trust store"), nil
+  end
+  return true, nil, status.hash, status
+end
+
+--- Backward-compatible approval entry point; it now requires the exact hash.
+-- @param project_root string
+-- @param expected_hash string
+-- @param trust_file string?
+-- @return boolean success, table? err, string? hash, table? status
+function WheelConfig.trust(project_root, expected_hash, trust_file)
+  return WheelConfig.confirm_trust(project_root, expected_hash, trust_file)
+end
+
+--- Revoke one canonical project root, including alias and legacy keys.
+-- Revocation is independent of entry readability: the path must resolve, but
+-- the project configuration file may already be gone.
+-- @param project_root string
+-- @param trust_file string?
+-- @return boolean success, number|table removed_or_error
+function WheelConfig.revoke(project_root, trust_file)
+  local root, root_err = WheelConfig.canonical_root(project_root)
+  if not root then
+    return false, root_err
+  end
+
+  local store, store_warning = WheelConfig.read_trust_store(trust_file)
+  if store_warning then
+    return false, store_warning
+  end
+
+  local removed = 0
+  for key in pairs(store.projects) do
+    local remove = key == root or key == project_root
+    if not remove and type(key) == "string" and key:sub(1, 1) == "/" then
+      local canonical_ok, canonical = pcall(WheelConfig.canonical_root, key)
+      remove = canonical_ok and canonical == root
+    end
+    if remove then
+      store.projects[key] = nil
+      removed = removed + 1
+    end
+  end
+
+  if removed == 0 then
+    return true, 0, root
+  end
+
+  store.version = 1
+  local ok, write_err = WheelConfig.write_trust_store(store, trust_file)
+  if not ok then
+    return false, write_err or trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "failed to persist the revocation")
+  end
+  return true, removed, root
+end
+
+--- Revoke trust for a project configuration (legacy name).
+-- @param project_root string
+-- @param trust_file string?
+-- @return boolean success, number|table removed_or_error
+function WheelConfig.untrust(project_root, trust_file)
+  return WheelConfig.revoke(project_root, trust_file)
+end
+
+--- Split text into lines while preserving content exactly.
+local function split_lines(value)
+  local lines = {}
+  if value == "" then
+    return lines
+  end
+  local start = 1
+  while true do
+    local newline = value:find("\n", start, true)
+    if not newline then
+      lines[#lines + 1] = value:sub(start)
+      break
+    end
+    lines[#lines + 1] = value:sub(start, newline - 1)
+    start = newline + 1
+  end
+  return lines
+end
+
+--- Produce a fallback replacement diff when no `diff` utility is available.
+local function fallback_diff(previous, current)
+  local lines = { "--- trusted", "+++ current" }
+  for _, line in ipairs(split_lines(previous)) do
+    lines[#lines + 1] = "-" .. line
+  end
+  for _, line in ipairs(split_lines(current)) do
+    lines[#lines + 1] = "+" .. line
+  end
+  return table.concat(lines, "\n")
+end
+
+--- Compute a unified diff between previously trusted and current content.
+-- Uses the host temporary-file primitive and argv execution. Labels keep the
+-- temporary paths out of the output. Falls back to a labelled replacement
+-- diff when `diff` is unavailable.
+-- @param previous string
+-- @param current string
+-- @return string
+function WheelConfig.compute_diff(previous, current)
+  if previous == current then
+    return "(no changes)"
+  end
+  if type(previous) ~= "string" or type(current) ~= "string" then
+    return fallback_diff(tostring(previous or ""), tostring(current or ""))
+  end
+
+  local host = require_host("fs.read")
+  local ok_old, old_path = pcall(function() return host.tmp.name() end)
+  local ok_new, new_path = pcall(function() return host.tmp.name() end)
+  if not ok_old or not ok_new then
+    return fallback_diff(previous, current)
+  end
+
+  local wrote_old = pcall(function() return host.fs.write_file(old_path, previous) end)
+  local wrote_new = pcall(function() return host.fs.write_file(new_path, current) end)
+  if not wrote_old or not wrote_new then
+    pcall(function() host.fs.remove_file(old_path) end)
+    pcall(function() host.fs.remove_file(new_path) end)
+    return fallback_diff(previous, current)
+  end
+  pcall(function() host.fs.chmod(old_path, "600") end)
+  pcall(function() host.fs.chmod(new_path, "600") end)
+
+  local res = host.proc.run_program("diff", {
+    "-u", "--label", "trusted", "--label", "current", "--", old_path, new_path,
+  }, { discard_stderr = true })
+
+  pcall(function() host.fs.remove_file(old_path) end)
+  pcall(function() host.fs.remove_file(new_path) end)
+
+  if res.ok and (res.code == 0 or res.code == 1) then
+    local output = trim_output(res.stdout)
+    if output ~= "" then
+      return output
+    end
+    if res.code == 0 then
+      return "(no changes)"
+    end
+  end
+  return fallback_diff(previous, current)
+end
+
+local function single_line(value)
+  local text = type(value) == "string" and value or tostring(value or "")
+  return (text:gsub("[\r\n]", " "))
+end
+
+--- Render the full consent view. Content is not truncated here; the command
+-- layer chunks it across bounded notifications.
+-- @param plan table `trust_status` result
+-- @return string
+function WheelConfig.format_trust_show(plan)
+  local lines = {
+    "Wheel executable project configuration",
+    "",
+    "Canonical project root: " .. single_line(plan.root),
+    "Entry: " .. single_line(plan.path),
+    string.format("Entry size: %d bytes (cap %d bytes)", plan.bytes,
+      WheelConfig.MAX_PROJECT_CONFIG_BYTES),
+    "SHA-256: " .. plan.hash,
+    "Trust status: " .. single_line(plan.status),
+    "Trust store: " .. single_line(plan.store_path or "unavailable"),
+  }
+
+  if plan.record then
+    lines[#lines + 1] = "Approved hash: " .. tostring(plan.record.hash)
+    lines[#lines + 1] = "Approved at: " .. tostring(plan.record.approved_at or "unknown")
+    if plan.alias and plan.record_key then
+      lines[#lines + 1] = "Record key: " .. single_line(plan.record_key)
+        .. " (legacy/alias; the next approval migrates it to the canonical root)"
+    end
+  else
+    lines[#lines + 1] = "Approved hash: none"
+  end
+
+  if plan.store_warning then
+    lines[#lines + 1] = "Trust store warning: " .. single_line(plan.store_warning.code)
+      .. " - " .. single_line(plan.store_warning.message)
+    lines[#lines + 1] = "Every project is treated as untrusted until the store is repaired."
+  end
+
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Effects are evaluated only after confirmation. A concrete effects"
+  lines[#lines + 1] = "list cannot be produced without evaluating the entry, and this gate"
+  lines[#lines + 1] = "does not evaluate untrusted project code before `trust confirm`."
+  lines[#lines + 1] = "After confirmation the restricted loader evaluates it with no filesystem,"
+  lines[#lines + 1] = "process, network, secret, environment, or module-load authority, under"
+  lines[#lines + 1] = "an instruction hook and best-effort string/table memory bounds."
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "--- BEGIN PROJECT CONFIGURATION CONTENT ---"
+  lines[#lines + 1] = plan.content
+  lines[#lines + 1] = "--- END PROJECT CONFIGURATION CONTENT ---"
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT ---"
+  if plan.diff then
+    lines[#lines + 1] = plan.diff
+  else
+    lines[#lines + 1] = plan.diff_note or "unavailable"
+  end
+  lines[#lines + 1] = "--- END DIFF ---"
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Approve exactly these bytes only after reviewing them:"
+  lines[#lines + 1] = "  trust confirm " .. plan.hash
+  lines[#lines + 1] = "Revoke this project:"
+  lines[#lines + 1] = "  trust revoke"
+  return table.concat(lines, "\n")
+end
+
+--- Render the approval result.
+-- @param status table
+-- @return string
+function WheelConfig.format_trust_confirm(status)
+  return table.concat({
+    "Wheel project configuration approved",
+    "",
+    "Canonical project root: " .. single_line(status.root),
+    "Entry: " .. single_line(status.path),
+    string.format("Entry size: %d bytes", status.bytes),
+    "SHA-256: " .. status.hash,
+    "Trust store: " .. single_line(status.store_path or "unavailable"),
+    "",
+    "The supplied hash matched the exact current entry bytes. No configuration",
+    "was evaluated by the trust command; effects are applied only when a later",
+    "configuration load reads this record under the restricted evaluator.",
+  }, "\n")
+end
+
+--- Render the revocation result.
+-- @param root string
+-- @param removed number
+-- @return string
+function WheelConfig.format_trust_revoke(root, removed)
+  return table.concat({
+    "Wheel project trust revoked",
+    "",
+    "Canonical project root: " .. single_line(root),
+    string.format("Trust records removed: %d (canonical root plus aliases/legacy keys)", removed),
+    "",
+    "Revocation applies to the next configuration load. An already running",
+    "session may keep the configuration it loaded until it is restarted.",
+  }, "\n")
+end
+
+--- Render a structured trust-gate refusal.
+-- @param err table { code, message }
+-- @return string
+function WheelConfig.format_trust_error(err)
+  local code = type(err) == "table" and err.code or "E_TRUST_ERROR"
+  local message = type(err) == "table" and err.message or tostring(err)
+  return "Trust gate refused (" .. single_line(code) .. "): " .. single_line(message)
+end
+
+-- File helpers that are not part of the trust gate remain local to the
+-- loader; no extra public trust surface is added.
 
 --- Safely evaluate a Lua configuration string in a sandboxed environment.
+-- The environment intentionally omits `pcall` and `xpcall`: the instruction
+-- hook raises an error the chunk must not be able to catch. String and table
+-- concatenation are wrapped with per-call and cumulative byte caps. These are
+-- best-effort bounds, not an OS or heap sandbox; a killable subprocess remains
+-- the durable fix.
 local function eval_config_chunk(content, chunk_name)
   local function copy_library(lib)
     local c = {}
@@ -549,16 +1595,77 @@ local function eval_config_chunk(content, chunk_name)
     return c
   end
 
+  local total_allocated = 0
+
+  local function account_bytes(size, label)
+    if size > WheelConfig.MAX_EVAL_STRING_BYTES then
+      error(label .. " exceeds the safety bound of "
+        .. WheelConfig.MAX_EVAL_STRING_BYTES .. " bytes per call", 0)
+    end
+    total_allocated = total_allocated + size
+    if total_allocated > WheelConfig.MAX_EVAL_TOTAL_STRING_BYTES then
+      error(label .. " exceeds the cumulative safety bound of "
+        .. WheelConfig.MAX_EVAL_TOTAL_STRING_BYTES .. " bytes", 0)
+    end
+  end
+
   local string_copy = copy_library(string)
   local orig_rep = string_copy.rep
   string_copy.rep = function(s, n, sep)
-    if type(n) == "number" and n > 65536 then
-      error("string.rep count exceeds safety bound (max 65536)", 2)
+    if type(n) ~= "number" or n ~= n or n % 1 ~= 0 or n < 0 then
+      error("string.rep count must be a non-negative integer number", 0)
     end
-    return orig_rep(s, n, sep)
+    if sep ~= nil and type(sep) ~= "string" then
+      error("string.rep separator must be a string", 0)
+    end
+    local text = type(s) == "string" and s or tostring(s)
+    local separator = sep or ""
+    local size = #text * n
+    if n > 0 then
+      size = size + #separator * (n - 1)
+    end
+    account_bytes(size, "string.rep result")
+    return orig_rep(text, n, separator)
   end
 
-  -- Sandbox environment restricting ambient authority and isolating standard libraries
+  local table_copy = copy_library(table)
+  local orig_concat = table_copy.concat
+  table_copy.concat = function(t, sep, i, j)
+    if type(t) ~= "table" then
+      error("table.concat first argument must be a table", 0)
+    end
+    if sep ~= nil and type(sep) ~= "string" then
+      error("table.concat separator must be a string", 0)
+    end
+    if i ~= nil and (type(i) ~= "number" or i % 1 ~= 0) then
+      error("table.concat start index must be an integer number", 0)
+    end
+    if j ~= nil and (type(j) ~= "number" or j % 1 ~= 0) then
+      error("table.concat end index must be an integer number", 0)
+    end
+    local first = i or 1
+    local last = j or #t
+    local size = 0
+    for index = first, last do
+      local value = t[index]
+      if type(value) == "string" then
+        size = size + #value
+      elseif type(value) == "number" then
+        size = size + #tostring(value)
+      else
+        error("table.concat entry " .. tostring(index) .. " is not a string or number", 0)
+      end
+    end
+    if last >= first and sep then
+      size = size + #sep * (last - first)
+    end
+    account_bytes(size, "table.concat result")
+    return orig_concat(t, sep, i, j)
+  end
+
+  -- Sandbox environment restricting ambient authority and isolating standard libraries.
+  -- `pcall` and `xpcall` are deliberately absent so the instruction-hook error is
+  -- not catchable by the evaluated chunk.
   local env = {
     ipairs = ipairs,
     pairs = pairs,
@@ -566,10 +1673,8 @@ local function eval_config_chunk(content, chunk_name)
     tostring = tostring,
     tonumber = tonumber,
     string = string_copy,
-    table = copy_library(table),
+    table = table_copy,
     math = copy_library(math),
-    pcall = pcall,
-    xpcall = xpcall,
     select = select,
     unpack = unpack or table.unpack,
   }
@@ -592,7 +1697,7 @@ local function eval_config_chunk(content, chunk_name)
   local hook_installed = false
   if debug and debug.sethook then
     debug.sethook(function()
-      error("configuration execution exceeded instruction limit", 2)
+      error("configuration execution exceeded instruction limit", 0)
     end, "", 100000)
     hook_installed = true
   end
@@ -706,31 +1811,65 @@ function WheelConfig.load(opts)
   end
 
   -- 2. Layer 2: Project configuration (<project_root>/.wheel/init.lua)
-  local project_path = WheelConfig.get_project_config_path(project_root)
-  local project_content = read_file(project_path)
+  -- The entry is read once through the bounded reader, hashed from the exact
+  -- bytes read, and never evaluated before the trust record matches.
+  local entry = WheelConfig.inspect_project_config(project_root)
+  local project_content = nil
+  local project_path = nil
   local project_trusted = false
+  local trust_store_warning = nil
+
+  if not entry.ok and entry.code ~= "E_PROJECT_CONFIG_MISSING" then
+    return {
+      ok = false,
+      error = "project_config_rejected",
+      code = entry.code,
+      message = entry.message,
+      path = entry.path,
+      config = active_config,
+      layers = layers_loaded,
+      trusted = false,
+    }
+  end
+
+  if entry.ok then
+    project_content = entry.content
+    project_path = entry.path
+  end
 
   if project_content and project_content ~= "" then
-    local current_hash = WheelConfig.compute_hash(project_content)
     if opts.trusted then
       project_trusted = true
     elseif trust_mode == "permissive" then
       project_trusted = true
     else
-      local trusted, _, _ = WheelConfig.is_trusted(project_root, project_content, opts.trust_file)
+      local trusted, _, trust_warning = WheelConfig.is_hash_trusted(
+        entry.root, entry.hash, opts.trust_file)
       project_trusted = trusted
+      trust_store_warning = trust_warning
     end
 
     if not project_trusted then
+      local message = "Project configuration at " .. project_path
+        .. " is untrusted. Run `wheel trust` to inspect the full entry, its"
+        .. " SHA-256 hash, and the change diff before confirming."
+      if trust_store_warning then
+        message = message .. " Trust store warning: "
+          .. tostring(trust_store_warning.code) .. " - "
+          .. tostring(trust_store_warning.message)
+      end
       return {
         ok = false,
         error = "untrusted_project_config",
-        message = "Project configuration at " .. project_path .. " is untrusted. Run `wheel trust` or inspect before loading.",
+        message = message,
+        code = trust_store_warning and trust_store_warning.code or "E_PROJECT_CONFIG_UNTRUSTED",
         path = project_path,
-        hash = current_hash,
+        root = entry.root,
+        hash = entry.hash,
         config = active_config, -- Fallback to safe defaults + global
         layers = layers_loaded,
         trusted = false,
+        trust_store_warning = trust_store_warning,
       }
     end
 
@@ -742,6 +1881,7 @@ function WheelConfig.load(opts)
         error = "project_config_eval_error",
         message = tostring(project_tbl),
         path = project_path,
+        root = entry.root,
         config = active_config,
         layers = layers_loaded,
         trusted = true,
@@ -763,6 +1903,7 @@ function WheelConfig.load(opts)
     layers = layers_loaded,
     trusted = project_trusted or false,
     project_path = project_content and project_path or nil,
+    root = entry.root,
   }
 end
 
