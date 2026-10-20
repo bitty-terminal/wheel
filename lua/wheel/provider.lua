@@ -758,11 +758,6 @@ local function getenv(name)
   return os.getenv(name)
 end
 
---- Remove a temporary file through the host seam.
-local function remove_file(path)
-  return WheelHost.fs.remove_file(path)
-end
-
 --- Create a new Anthropic provider adapter (Claude 3.5 Sonnet, Claude 3 Opus).
 -- @param opts table:
 --   opts.api_key string?
@@ -1114,9 +1109,120 @@ WheelProvider.AnthropicAdapter = AnthropicAdapter
 local StdioAdapter = {}
 StdioAdapter.__index = StdioAdapter
 
+--- Shell syntax that is rejected in a stdio command string. Expansion,
+-- substitution, globbing, redirection, pipelines, and command separators have
+-- no place in an argv primitive; a caller that needs them must pass an explicit
+-- argv table instead.
+local STDIO_SHELL_SYNTAX = "[|&;<>()$`\\*?%[%]{}~!]"
+
+--- Split a stdio command string into an argv table without shell evaluation.
+-- Quotes group words that contain spaces; no expansion or substitution is
+-- performed. A table command is validated and copied.
+-- @param command string|string[]
+-- @return string[]? argv, string? err
+local function stdio_command_argv(command)
+  if type(command) == "table" then
+    local argv = {}
+    for index, word in ipairs(command) do
+      if type(word) ~= "string" or word == "" or word:find("[%z\n\r]") then
+        return nil, "stdio command argv element " .. tostring(index) .. " is invalid"
+      end
+      argv[#argv + 1] = word
+    end
+    if #argv == 0 then
+      return nil, "stdio command argv must not be empty"
+    end
+    if #argv > 64 then
+      return nil, "stdio command argv is too long"
+    end
+    return argv
+  end
+
+  if type(command) ~= "string" or command:match("^%s*$") ~= nil then
+    return nil, "stdio command must be a non-empty string or argv table"
+  end
+  if command:find("[%z\n\r]") then
+    return nil, "stdio command must not contain control bytes"
+  end
+
+  local argv, index = {}, 1
+  while index <= #command do
+    local char = command:sub(index, index)
+    if char:match("%s") then
+      index = index + 1
+    else
+      local word = {}
+      while index <= #command do
+        char = command:sub(index, index)
+        if char:match("%s") then
+          break
+        end
+        if char == "'" then
+          local close = command:find("'", index + 1, true)
+          if not close then
+            return nil, "unterminated single quote in stdio command"
+          end
+          word[#word + 1] = command:sub(index + 1, close - 1)
+          index = close + 1
+        elseif char == '"' then
+          local close = index + 1
+          local closed = false
+          while close <= #command do
+            local inner = command:sub(close, close)
+            if inner == "\\" then
+              local escaped = command:sub(close + 1, close + 1)
+              if escaped == '"' or escaped == "\\" then
+                word[#word + 1] = escaped
+                close = close + 2
+              else
+                word[#word + 1] = inner
+                close = close + 1
+              end
+            elseif inner == '"' then
+              closed = true
+              close = close + 1
+              break
+            else
+              word[#word + 1] = inner
+              close = close + 1
+            end
+          end
+          if not closed then
+            return nil, "unterminated double quote in stdio command"
+          end
+          index = close
+        else
+          if char:match(STDIO_SHELL_SYNTAX) then
+            return nil, "stdio command contains shell syntax; pass an argv table instead"
+          end
+          word[#word + 1] = char
+          index = index + 1
+        end
+      end
+      if #word == 0 then
+        return nil, "empty stdio command word"
+      end
+      argv[#argv + 1] = table.concat(word)
+      if #argv > 64 then
+        return nil, "stdio command argv is too long"
+      end
+    end
+  end
+
+  if #argv == 0 then
+    return nil, "stdio command must not be empty"
+  end
+  return argv
+end
+
 --- Create a new Stdio Subprocess Adapter for running local model CLI tools.
+-- The prompt is delivered on the child's stdin through the argv process
+-- primitive; no shell string and no prompt temp file are used. `command` is an
+-- argv source: a whitespace-separated string with optional quotes, or an
+-- explicit argv table for anything that would need shell syntax.
 -- @param opts table?:
---   opts.command string|table: CLI command line or argv table (e.g. "ollama run qwen2.5-coder")
+--   opts.command string|table: CLI command (default "ollama run qwen2.5-coder")
+--   opts.timeout_ms number?: process timeout override (host-bounded)
 --   opts.runner function?: injectable runner for test isolation
 -- @return table StdioAdapter instance
 function StdioAdapter.new(opts)
@@ -1124,6 +1230,7 @@ function StdioAdapter.new(opts)
   local self = setmetatable({}, StdioAdapter)
   self.name = "stdio"
   self.command = opts.command or "ollama run qwen2.5-coder"
+  self.timeout_ms = opts.timeout_ms
   self.runner = opts.runner
   return self
 end
@@ -1152,29 +1259,31 @@ function StdioAdapter:complete(request, opts)
     }, nil
   end
 
-  -- Secure command execution via redirected temporary file
-  local tmp_file = WheelHost.tmp.name()
-  local wrote_prompt = WheelHost.fs.write_file(tmp_file, prompt)
-  if not wrote_prompt then
-    return nil, "Failed to open temporary file for stdio prompt: " .. tostring(tmp_file)
+  local argv, argv_err = stdio_command_argv(self.command)
+  if not argv then
+    return nil, argv_err
   end
+  local program = table.remove(argv, 1)
 
-  -- The standalone process primitive has no stdin channel, so the provider
-  -- command (not a model tool) keeps the explicit shell-string form; the
-  -- temporary path is single-quoted and lives in the private runtime dir.
-  local safe_cmd = string.format("%s < %s 2>&1", self.command, WheelHost.proc.shell_quote(tmp_file))
-  local res = WheelHost.proc.run_command(safe_cmd)
+  local res = WheelHost.proc.run_program(program, argv, {
+    stdin = prompt,
+    timeout_ms = self.timeout_ms,
+  })
   if not res.ok then
-    remove_file(tmp_file)
-    return nil, "Failed to spawn stdio model process: " .. tostring(self.command)
+    return nil, "Failed to spawn stdio model process: " .. program
+      .. " (" .. tostring(res.stderr or res.outcome) .. ")"
+  end
+  if res.timed_out then
+    return nil, "stdio model process timed out: " .. program
+  end
+  if res.truncated then
+    return nil, "stdio model output exceeded the capture bound: " .. program
   end
 
   local out = res.stdout or ""
-  remove_file(tmp_file)
-
   if res.code ~= 0 then
     local code = res.code or 1
-    return nil, string.format("Command '%s' failed (exit code %s): %s", self.command, tostring(code), out:sub(1, 512))
+    return nil, string.format("Command '%s' failed (exit code %s): %s", program, tostring(code), out:sub(1, 512))
   end
 
   return {
@@ -1267,18 +1376,19 @@ function WheelProvider.create(profile, opts)
     })
   elseif p_type == "stdio" or p_type == "local" or p_type == "ollama" then
     local cmd = opts.command
-    if cmd ~= nil and type(cmd) ~= "string" then
-      return nil, "opts.command must be a string"
+    if cmd ~= nil and type(cmd) ~= "string" and type(cmd) ~= "table" then
+      return nil, "opts.command must be a string or argv table"
     end
     if not cmd then
       local m = profile.model or opts.model or "qwen2.5-coder"
       if type(m) ~= "string" or not m:match("^[%w%._%-:]+$") then
         return nil, "Invalid model name for local/ollama provider: " .. tostring(m)
       end
-      cmd = "ollama run " .. m
+      cmd = { "ollama", "run", m }
     end
     return StdioAdapter.new({
       command = cmd,
+      timeout_ms = opts.timeout_ms,
       runner = opts.runner,
     })
   else

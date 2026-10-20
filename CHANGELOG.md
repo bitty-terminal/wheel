@@ -54,8 +54,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   instructions, 50 ms CPU, 8 ms warning) with the series, interpreter, CPU, OS,
   and revision recorded in gitignored `recording/real-host-2026-10-21.md`.
   This is implementation evidence only, not a release claim or full Gate 2
-  evidence; process timeout, cancellation, process-group, and scrubbed
-  environment bounds remain CTX-0016 work.
+  evidence; CTX-0016 later added the process timeout, process-group, and
+  scrubbed-environment bounds, while asynchronous cancellation remains open.
 - Versioned 0.1.0 harness artifact (CTX-0018 / wheel#58): the root `VERSION`
   file is the single version source, and `just package` builds the deterministic
   `dist/wheel-0.1.0.tar.gz` with a SHA-256 sidecar and a manifest record. The
@@ -80,9 +80,32 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `WHEEL_EVIDENCE_PATH` to keep evidence out of the repository. It asserts
   that loaded modules resolved from `WHEEL_ROOT`; the real-host boundary and
   measurements are unchanged.
+- Bounded process primitive (CTX-0016 / wheel#74): `WheelHost.proc.run_program`
+  and `WheelHost.proc.run_command` run under GNU `timeout` (or `gtimeout`) with
+  a timeout-owned process group and bounded SIGTERM-to-SIGKILL escalation, a
+  fixed 256 KiB capture cap per stream read back from exclusive `0600` files,
+  and an explicit stdin channel (`opts.stdin`; `/dev/null` by default). Results
+  carry `exit_code`, `timed_out`, `truncated`, per-stream truncation flags, and
+  a typed `outcome` (`exited`/`timeout`/`unavailable`/`failure`). The child
+  environment is rebuilt from a fixed allowlist (`PATH`, `HOME`, `LANG`,
+  `LC_ALL`, `TERM`, `TMPDIR`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`,
+  `XDG_CONFIG_HOME`) plus explicit declarations; `PATH` must contain absolute
+  entries and secret-shaped or injection names are refused. The new
+  `WheelHost.tmp.create` / `create_exclusive` primitives create files
+  exclusively with mode 0600 and refuse pre-existing paths and symlinks.
 
 ### Changed
 
+- `StdioAdapter` passes the formatted prompt on stdin through the argv process
+  primitive instead of writing a non-exclusive prompt temp file and invoking a
+  shell redirection. String commands are tokenized conservatively (quotes only)
+  and shell syntax is refused; callers that need shell syntax pass an argv
+  table. The provider factory default is now an argv table.
+- `search_code` captures at most 64 KiB of `grep` output before the 100-line
+  observation cap, `read_file` reads at most `max_bytes + 1` bytes in fixed-size
+  chunks instead of loading the whole file, and `run_command` forwards
+  `timeout_ms` and reports typed timeout/truncation fields. Native SHA-256
+  staging uses the exclusive temp primitive and fails closed if cleanup fails.
 - CI installs Lua 5.1 before the quality gates, so `just test` runs the Lua
   suite in CI, runs `just test-real-host` after `just check`, and then runs
   `just verify-package`. The `package.json` version follows the canonical
@@ -99,8 +122,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remains outside `lua/wheel/host.lua`. Temporary files use a private runtime
   directory with mode 0700, inspect-intent tools pass argv through
   `WheelHost.proc.run_program`, and cwd quoting uses a POSIX single-quote
-  helper. The manifest and authority ceiling are unchanged; process timeout,
-  process-group, and scrubbed-environment hardening remain a follow-up.
+  helper. The manifest and authority ceiling are unchanged; CTX-0016 later
+  completed the process timeout, process-group, and scrubbed-environment
+  hardening.
 - Repository README reorganized into the uniform SDK user-documentation
   contract: `Overview`, `Install`, `Commands`, `Configuration`, `Keybindings`,
   and `Troubleshooting` lead in order, with the existing developer and
@@ -131,6 +155,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0015 review findings for CTX-0016 / wheel#74: the stdio prompt path no
+  longer creates a non-exclusive file through `WheelHost.fs.write_file`, so it
+  cannot follow a pre-existing link or leave an ignored cleanup failure; the
+  prompt travels on stdin and every staged/capture file is created exclusively
+  with mode 0600 in the private 0700 directory and removed fail-closed.
+  `search_code` no longer captures unbounded `grep` output before keeping 100
+  lines, and `read_file` no longer loads the whole file before applying
+  `max_bytes`. Tests cover timeout, process-group cleanup with a grandchild,
+  environment scrubbing, stdin round-trip, output truncation, bounded file
+  reads, symlink/pre-existing-path refusal, and cleanup on success, error, and
+  timeout.
 - Executable project-configuration trust gate hardened for CTX-0019 /
   wheel#54 (CTX-0020, including PX-0112 fixes). `trust`/`trust show` resolves
   the canonical project root through the host, refuses symlinked, non-regular,
@@ -170,8 +205,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for clean builds, `null` for `--allow-dirty` test builds), and the verifier
   asserts both the ignored-file exclusion and the recorded revision.
 - CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
-  substitutes a `"0"` stamp (uniqueness is process-local; cross-process
-  exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators,
+  substitutes a `"0"` stamp (uniqueness is process-local; exclusive creation
+  was completed by CTX-0016), and `tmp_dir` normalizes trailing separators,
   rejects the filesystem root and any all-dots segment (`.`, `..`, `...`, ...),
   and rejects a symlinked harness-owned temporary directory before `chmod` can
   follow it. A non-string `tmp_root` fails with the same typed denial.
@@ -180,8 +215,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   config/tool/provider host loaders, and a repeated lazy host access keeps the
   original cause instead of the Lua 5.1 failed-require sentinel. Full-output
   capture before the 100-line bound, whole-file reads before `max_bytes`, and
-  exclusive `0600` temporary-file creation remain tracked in CTX-0016 /
-  wheel#74.
+  exclusive `0600` temporary-file creation were fixed in CTX-0016 / wheel#74.
 - Entry-point activation now loads only the required registration and status
   surface (typed errors, command schemas, command layer, kernel, and UI).
   `agent`, `config`, `team`, `context`, `tool`, `provider`, `runner`, and `host`

@@ -81,6 +81,17 @@ WheelTool.DEFAULT_SPILLOVER_THRESHOLD = 4096
 --- Maximum bytes to read for file operations by default.
 WheelTool.DEFAULT_MAX_READ_BYTES = 65536
 
+--- Maximum caller-selectable file read bound (1 MiB).
+WheelTool.MAX_READ_BYTES = 1024 * 1024
+
+--- Maximum bytes captured from one `grep` before the 100-line bound applies.
+-- The process primitive also caps at `WheelHost.LIMITS.MAX_CAPTURE_BYTES`;
+-- this smaller application bound keeps a single search cheap.
+WheelTool.SEARCH_MAX_BYTES = 65536
+
+--- Maximum number of search result lines returned to the model.
+WheelTool.SEARCH_MAX_LINES = 100
+
 --- Split file content into lines with `file:lines()` semantics.
 -- A trailing newline does not produce a trailing empty entry, an empty input
 -- produces no entries, and interior empty lines are preserved.
@@ -346,6 +357,9 @@ function ActionOutcome:to_table()
     spillover_hash = self.spillover_hash,
     spillover_bytes = self.spillover_bytes,
     preview = self.preview,
+    outcome = self.outcome,
+    timed_out = self.timed_out,
+    truncated = self.truncated,
   }
 end
 
@@ -374,6 +388,9 @@ function WheelTool.process_spillover(raw, opts)
   self.duration_ms = raw.duration_ms or 0
   self.stdout = stdout
   self.stderr = stderr
+  self.outcome = raw.outcome
+  self.timed_out = raw.timed_out == true
+  self.truncated = raw.truncated == true
 
   if total_bytes > threshold then
     local full_payload = stdout
@@ -462,12 +479,24 @@ local tool_read_file = {
       return { success = false, exit_code = 1, stderr = err }
     end
 
-    local file_content, open_err = WheelHost.fs.read_file(clean_path)
+    local max_b = args.max_bytes or WheelTool.DEFAULT_MAX_READ_BYTES
+    if type(max_b) ~= "number" or max_b ~= math.floor(max_b)
+      or max_b < 1 or max_b > WheelTool.MAX_READ_BYTES then
+      return {
+        success = false,
+        exit_code = 1,
+        stderr = string.format("max_bytes must be an integer between 1 and %d",
+          WheelTool.MAX_READ_BYTES),
+      }
+    end
+
+    -- Read at most one byte beyond the cap so the bound is enforced while
+    -- reading; the whole file is never loaded just to truncate it afterwards.
+    local file_content, open_err = WheelHost.fs.read_file_bounded(clean_path, max_b + 1)
     if file_content == nil then
       return { success = false, exit_code = 1, stderr = "File not found: " .. tostring(path) .. " (" .. tostring(open_err) .. ")" }
     end
 
-    local max_b = args.max_bytes or WheelTool.DEFAULT_MAX_READ_BYTES
     local start_l = args.start_line
     local end_l = args.end_line
 
@@ -682,9 +711,28 @@ local tool_run_command = {
     end
 
     local full_cmd = string.format("cd %s && (%s) 2>&1", WheelHost.proc.shell_quote(cwd), cmd)
-    local res = WheelHost.proc.run_command(full_cmd, env)
+    local res = WheelHost.proc.run_command(full_cmd, env, { timeout_ms = args.timeout_ms })
     if not res.ok then
-      return { success = false, exit_code = 1, stderr = res.stderr or "Failed to spawn shell process" }
+      return {
+        success = false,
+        exit_code = 1,
+        stderr = res.stderr or "Failed to spawn shell process",
+        outcome = res.outcome,
+        timed_out = res.timed_out == true,
+      }
+    end
+
+    if res.timed_out then
+      return {
+        success = false,
+        exit_code = res.code,
+        stdout = res.stdout,
+        stderr = string.format("Command timed out after %d ms",
+          args.timeout_ms or WheelHost.LIMITS.DEFAULT_PROCESS_TIMEOUT_MS),
+        outcome = res.outcome,
+        timed_out = true,
+        truncated = res.truncated == true,
+      }
     end
 
     return {
@@ -692,6 +740,9 @@ local tool_run_command = {
       exit_code = res.code,
       stdout = res.stdout,
       stderr = res.stderr,
+      outcome = res.outcome,
+      timed_out = false,
+      truncated = res.truncated == true,
     }
   end,
 }
@@ -776,18 +827,33 @@ local tool_search_code = {
     table.insert(argv, "--")
     table.insert(argv, query)
     table.insert(argv, clean_path)
-    local res = WheelHost.proc.run_program("grep", argv, { discard_stderr = true })
+    local res = WheelHost.proc.run_program("grep", argv, {
+      discard_stderr = true,
+      max_output_bytes = WheelTool.SEARCH_MAX_BYTES,
+    })
     if not res.ok then
-      return { success = false, exit_code = 1, stderr = "Failed to execute search" }
+      return {
+        success = false,
+        exit_code = 1,
+        stderr = "Failed to execute search",
+        outcome = res.outcome,
+      }
+    end
+    if res.timed_out then
+      return {
+        success = false,
+        exit_code = res.code,
+        stderr = "Search timed out",
+        outcome = res.outcome,
+        timed_out = true,
+      }
     end
 
-    -- Bound the observation to the first 100 lines without a shell pipeline.
-    -- The previous `head` pipeline emitted a newline for every kept line;
-    -- preserve that shape while the full-output capture stays tracked in
-    -- CTX-0016 (bounded output).
+    -- The process primitive already capped the captured bytes; apply the
+    -- 100-line observation bound to that bounded buffer (no unbounded capture).
     local lines = split_content_lines(res.stdout or "")
     local bounded = {}
-    for index = 1, math.min(#lines, 100) do
+    for index = 1, math.min(#lines, WheelTool.SEARCH_MAX_LINES) do
       table.insert(bounded, lines[index])
     end
     local output = table.concat(bounded, "\n")
@@ -800,6 +866,7 @@ local tool_search_code = {
       exit_code = 0,
       stdout = output,
       stderr = "",
+      truncated = (res.truncated == true) or (#lines > WheelTool.SEARCH_MAX_LINES),
     }
   end,
 }
@@ -1013,6 +1080,9 @@ function WheelToolRegistry:dispatch(name, args, env)
       stdout = res.stdout or "",
       stderr = res.stderr or "",
       duration_ms = res.duration_ms or elapsed_ms,
+      outcome = res.outcome,
+      timed_out = res.timed_out == true,
+      truncated = res.truncated == true,
     }
   end
 

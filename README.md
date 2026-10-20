@@ -194,7 +194,10 @@ Standalone harness development does not require a Bitty host. Prerequisites:
 - [just](https://github.com/casey/just) for the repository recipes.
 - Lua 5.1 or LuaJIT for the test and end-to-end recipes; a `lua` binary also
   satisfies the recipe when neither is installed.
-- A POSIX host with standard shell utilities. Windows support is not claimed.
+- A POSIX host with standard shell utilities. Process execution additionally
+  requires `env` plus GNU `timeout` (or Homebrew `gtimeout`) on `PATH`; without
+  them the process primitive fails closed as `unavailable` instead of running
+  unbounded. Windows support is not claimed.
 
 From a checkout of the repository:
 
@@ -537,6 +540,11 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   negative, fractional, non-numeric, or above `MAX_COMPLETION_TOKENS` (32768).
   Use a positive integer within the bound or omit the override for the named
   default.
+- `timed out` or `unavailable` from `run_command`/`search_code` — the process
+  primitive maps GNU timeout expiry to exit code 124 and fails closed with
+  `unavailable` when `env`, `timeout`/`gtimeout`, or `sh` is missing from
+  `PATH`. Install GNU coreutils (or Homebrew coreutils for `gtimeout`); the
+  harness never falls back to unbounded execution or an inherited environment.
 - `just manifest` rejects `bitty-plugin.toml` — the transitional manifest is
   unchanged by the harness position; fix the manifest or the SDK pin rather than
   widening it.
@@ -601,7 +609,7 @@ context budgets:
 - **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
 - **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
-- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (with line slicing), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (process execution with metrics), `list_directory`, `search_code`, and `read_blob`.
+- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (bounded chunked reads with line slicing), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (bounded process execution with a timeout, timeout-owned process group, scrubbed environment, typed timeout/unavailable outcomes, and metrics), `list_directory`, `search_code` (bounded `grep` capture before the 100-line observation cap), and `read_blob`.
 
 ### Autonomous Wave Orchestration & Task Execution Loop
 
@@ -622,7 +630,7 @@ Wheel integrates heterogeneous large language models and autonomous ReAct execut
   - `MockProvider`: In-memory deterministic completion and chunk streaming simulation for offline tests and CI.
   - `OpenAIAdapter`: OpenAI-compatible `/v1/chat/completions` REST and SSE streaming (supporting OpenAI GPT-4o, DeepSeek Reasoner, Ollama `/v1`, vLLM, OpenRouter).
   - `AnthropicAdapter`: Anthropic Messages API (`/v1/messages`) supporting Claude 3.5 Sonnet, `thinking` token blocks, and `tool_use` blocks.
-  - `StdioAdapter`: Subprocess CLI streaming runner (pipes to `ollama run`, `llm`, or local model binaries).
+  - `StdioAdapter`: Subprocess CLI runner for `ollama run`, `llm`, or local model binaries. The command is parsed into argv (or supplied as an argv table), shell syntax is refused, and the prompt is delivered on stdin through the bounded `WheelHost.proc.run_program` primitive; no shell redirection or prompt temp file is used.
 - **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
 - **Bounded Completion Budget**: Every OpenAI-compatible and Anthropic HTTP provider request carries an explicit completion `max_tokens` from `WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS` (4096) or a validated `max_completion_tokens` override, bounded at 32768. The stdio adapter has no completion-token field and is outside this boundary. The context window remains a separate `context_budget`; zero, negative, non-integer, non-numeric, and oversized overrides fail with a typed `E_COMPLETION_BUDGET_INVALID` error before an HTTP request is sent.
 - **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, path-sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
@@ -724,20 +732,25 @@ exercises real filesystem, process, temporary-file, and tool paths
 (`read_file`, `write_file`, `edit_file`, `list_directory`, `search_code`,
 `run_command`). It also checks typed denials for `..` and absolute
 outside-workspace paths, the destructive-command deny-list, the read-only role
-gate, and unsupported backends. Activation is measured cold and warm with
-`os.clock()` and a `debug.sethook` instruction count against RC-1 (10^7
-instructions, 50 ms CPU, 8 ms warning); the series, interpreter, CPU, OS, and
-revision are written to `recording/real-host-2026-10-21.md`, which is
+gate, and unsupported backends. Process evidence covers a real timeout with a
+child-plus-grandchild process-group check, a scrubbed-environment probe
+(harness and secret-shaped variables absent), stdin round-trip, and typed
+timeout results. Temporary-file evidence covers exclusive `0600` creation and
+refusal of a pre-existing file and symlink. Activation is measured cold and
+warm with `os.clock()` and a `debug.sethook` instruction count against RC-1
+(10^7 instructions, 50 ms CPU, 8 ms warning); the series, interpreter, CPU, OS,
+and revision are written to `recording/real-host-2026-10-21.md`, which is
 gitignored durable scratch rather than a committed artifact.
 
 Evidence limits: the fixture is offline and uses no credentials. It is
 implementation evidence, not a release claim and not full Gate 2 evidence. It
-does not cover process timeout, cancellation, process-group, or
-scrubbed-environment bounds (CTX-0016), OS sandboxing, or a Bitty
-panel/terminal presentation run. `os.clock()` measures process CPU time, not
-elapsed wall clock; CPU frequency is not pinned, and one host runs one
-interpreter per run. The record is not a canonical specification and does not
-satisfy SECURITY-MODEL.md Gate 2 on its own.
+does not cover asynchronous cancellation (not implemented), OS sandboxing, or a
+Bitty panel/terminal presentation run. A child that calls `setsid` escapes the
+timeout-owned process group; timeout enforcement is not a real-time guarantee;
+and disk capture during a run has no per-file quota. `os.clock()` measures
+process CPU time, not elapsed wall clock; CPU frequency is not pinned, and one
+host runs one interpreter per run. The record is not a canonical specification
+and does not satisfy SECURITY-MODEL.md Gate 2 on its own.
 
 ### Offline and live tests
 
@@ -787,9 +800,11 @@ owner-approved ceiling is:
 - shell command strings, a higher-risk class with session opt-in for unattended
   runs, deny-list screening, and mandatory audit;
 - network egress to configured provider endpoints, with no inbound service;
-- secret environment reads for named provider keys only. Child-process
-  non-inheritance is a required control and is not implemented yet; the current
-  process path inherits the parent environment (see
+- secret environment reads for named provider keys only. Host-spawned commands
+  receive a rebuilt allowlist environment (`PATH`, `HOME`, locale/terminal
+  variables, `TMPDIR`, and XDG directories) with secret-shaped names refused;
+  `HOME` still grants the child the user's ambient file access, which is a
+  residual risk rather than a sandbox claim (see
   [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
 
 [SECURITY-MODEL.md](SECURITY-MODEL.md) is the normative repository policy for
