@@ -49,8 +49,9 @@ if WHEEL_ROOT then
   if WHEEL_ROOT:sub(-1) == "/" then
     WHEEL_ROOT = WHEEL_ROOT:sub(1, -2)
   end
-  package.path = WHEEL_ROOT .. "/lua/?.lua;" .. WHEEL_ROOT
-    .. "/lua/?/init.lua;" .. package.path
+  -- Hermetic installed-tree mode: no inherited repository path may satisfy a
+  -- require. A missing installed module must fail instead of falling back.
+  package.path = WHEEL_ROOT .. "/lua/?.lua;" .. WHEEL_ROOT .. "/lua/?/init.lua"
 else
   package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 end

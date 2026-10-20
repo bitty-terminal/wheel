@@ -131,6 +131,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Packaging copies only Git-tracked files under `lua/`, so ignored or
+  untracked files (for example an ignored `lua/wheel/agent.luac`) cannot enter
+  the release archive. The manifest now records `source_revision` (full HEAD
+  for clean builds, `null` for `--allow-dirty` test builds), and the verifier
+  asserts both the ignored-file exclusion and the recorded revision.
 - CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
   substitutes a `"0"` stamp (uniqueness is process-local; cross-process
   exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators,

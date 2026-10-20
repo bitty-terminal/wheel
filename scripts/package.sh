@@ -11,9 +11,11 @@
 # archive is a library tree, not a Bitty plugin: it carries no manifest
 # capability grant and no plugin-api compatibility contract.
 #
-# The release build refuses a dirty worktree and an unsupported version. A
-# local test build may pass --allow-dirty (and a different --version) to
-# exercise the install/upgrade path without publishing anything.
+# The release build refuses a dirty worktree and an unsupported version. Only
+# tracked `lua/` files are copied, so ignored or untracked files cannot enter
+# the archive even when Git does not report them as dirty. A local test build
+# may pass --allow-dirty (and a different --version) to exercise the
+# install/upgrade path without publishing anything.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +112,42 @@ check_package_metadata() {
     die "package.json version '$package_version' must match VERSION '$expected'"
 }
 
+# Copy only Git-tracked regular files under lua/. Ignored and untracked files
+# are invisible to `git status`, so copying the working tree would let them
+# enter the release archive while the clean-source claim stayed true. Tracked
+# modes are checked here: symlinks and submodules are not package inputs.
+copy_tracked_lua() {
+  local listing="$stage/lua-files.list"
+  local entry info path mode file_mode
+  git -C "$REPO_ROOT" ls-files -s -z -- lua >"$listing" ||
+    die "cannot list tracked lua inputs"
+  [ -s "$listing" ] || die "no tracked files under lua/"
+
+  while IFS= read -r -d '' entry; do
+    info=${entry%%$'\t'*}
+    path=${entry#*$'\t'}
+    mode=${info%% *}
+    case "$mode" in
+    100644) file_mode=0644 ;;
+    100755) file_mode=0755 ;;
+    *)
+      die "unsupported tracked mode $mode for $path: only regular files are packaged"
+      ;;
+    esac
+    case "$path" in
+    lua/*) ;;
+    *) die "unexpected path from git ls-files: $path" ;;
+    esac
+    [ ! -L "$REPO_ROOT/$path" ] || die "tracked input is a symlink: $path"
+    [ -f "$REPO_ROOT/$path" ] || die "tracked input is not a regular file: $path"
+    mkdir -p -- "$package_root/$(dirname -- "$path")"
+    install -m "$file_mode" -- "$REPO_ROOT/$path" "$package_root/$path"
+  done <"$listing"
+
+  [ -f "$package_root/lua/wheel/init.lua" ] ||
+    die "tracked inputs are missing lua/wheel/init.lua"
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
   --version)
@@ -168,11 +206,6 @@ for input in "${ARTIFACT_INPUTS[@]}"; do
 done
 [ -f "$REPO_ROOT/lua/wheel/init.lua" ] || die "missing artifact entry point: lua/wheel/init.lua"
 
-symlink="$(find "$REPO_ROOT/lua" -type l -print -quit)"
-if [ -n "$symlink" ]; then
-  die "artifact input contains a symlink: ${symlink#"$REPO_ROOT/"}"
-fi
-
 if [ -e "$output_dir" ] && [ -L "$output_dir" ]; then
   die "output directory must not be a symlink: $output_dir"
 fi
@@ -188,10 +221,9 @@ for file in LICENSE README.md SECURITY-MODEL.md repo.toml; do
   install -m 0644 -- "$REPO_ROOT/$file" "$package_root/$file"
 done
 printf '%s\n' "$version" >"$package_root/VERSION"
-cp -R -- "$REPO_ROOT/lua/." "$package_root/lua/"
+copy_tracked_lua
 
 find "$package_root" -type d -exec chmod 0755 {} +
-find "$package_root" -type f -exec chmod 0644 {} +
 
 archive="$output_dir/$PACKAGE_NAME-$version.tar.gz"
 digest_file="$archive.sha256"
@@ -218,8 +250,13 @@ mv -f -- "$digest_tmp" "$digest_file"
 
 if [ "$allow_dirty" -eq 1 ]; then
   source_clean_verified=false
+  source_revision=null
 else
   source_clean_verified=true
+  source_revision="$(git -C "$REPO_ROOT" rev-parse HEAD)"
+  [[ $source_revision =~ ^[0-9a-f]{40}$ ]] ||
+    die "cannot record a full source revision: $source_revision"
+  source_revision="\"$source_revision\""
 fi
 
 manifest_tmp="$(mktemp "$output_dir/.wheel-manifest.XXXXXX")"
@@ -227,6 +264,7 @@ manifest_tmp="$(mktemp "$output_dir/.wheel-manifest.XXXXXX")"
   printf '{\n'
   printf '  "name": "%s",\n' "$PACKAGE_NAME"
   printf '  "version": "%s",\n' "$version"
+  printf '  "source_revision": %s,\n' "$source_revision"
   printf '  "archive": "%s",\n' "$(basename -- "$archive")"
   printf '  "archive_sha256": "%s",\n' "$digest"
   printf '  "source_clean_verified": %s,\n' "$source_clean_verified"

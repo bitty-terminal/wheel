@@ -519,10 +519,13 @@ runs with the user's authority.
   version outside `X.Y.Z`. The archive contains `lua/`, `LICENSE`, `README.md`,
   `SECURITY-MODEL.md`, `repo.toml`, and `VERSION`; it excludes tests,
   recording, dependency trees, Git metadata, CI, scripts, the justfile, and
-  `dist/`. It carries no plugin manifest and no plugin-api compatibility field.
+  `dist/`. Only `lua/` files tracked by Git are copied; ignored and untracked
+  files are never package inputs. It carries no plugin manifest and no
+  plugin-api compatibility field.
 - **Determinism and integrity.** The archive uses sorted members, fixed mtime
   and ownership, normalized modes, and timestamp-free gzip. A SHA-256 sidecar
-  and a manifest record the digest and contents. The installer verifies the
+  and a manifest record the digest, contents, and the full source revision for
+  a clean build (a null revision and clean flag false for a local test build). The installer verifies the
   sidecar before extraction. The digest is integrity only; 0.1.0 is unsigned,
   has no publisher authentication, and has no update channel. An attacker who
   can replace both the archive and its sidecar is outside this control.
