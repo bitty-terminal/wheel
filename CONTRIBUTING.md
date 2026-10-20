@@ -33,9 +33,9 @@ or linters by name):
   or `yarn` in any Bitty repository.
 - `markdownlint-cli2`, `prettier`, `commitlint`, `lefthook` — materialized by
   `just install` and invoked through the justfile.
-- `bitty-plugin-lint` (bitty-plugin-sdk, commit-pinned), `luaparse`, and
-  `lua5.4` — transitional manifest, Lua parse, and Lua 5.4 behavior/conformance
-  gates.
+- `bitty-plugin-lint` and `bitty-plugin-docs-check` (bitty-plugin-sdk,
+  commit-pinned) plus `luaparse` — transitional manifest, README contract, and
+  Lua parse gates; a Lua 5.1/LuaJIT interpreter runs the behavior suite.
 
 ## Development setup
 
@@ -44,8 +44,8 @@ or linters by name):
    (`bun install --frozen-lockfile`).
 3. Enable Git hooks (optional): `just hooks-install`.
 4. Run all quality gates: `just check` (Markdown lint, Prettier format check,
-   transitional manifest validation, Lua parse, Lua behavior suite, and LuaLS
-   conformance).
+   transitional manifest validation, README user-documentation check, Lua
+   parse, the parser control, and the Lua behavior suite).
    CI runs the same aggregate target, and `just check` runs offline once
    `just install` has completed.
 5. Record scoped work in CarryCtx (task, session, progress, checkpoint) and

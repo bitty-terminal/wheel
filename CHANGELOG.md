@@ -43,6 +43,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Repository README reorganized into the uniform SDK user-documentation
+  contract: `Overview`, `Install`, `Commands`, `Configuration`, `Keybindings`,
+  and `Troubleshooting` lead in order, with the existing developer and
+  architecture reference following. The `bitty-plugin-sdk` devDependency moves
+  to commit `5a67942` and `just check` now runs the SDK README checker
+  (`bitty-plugin-docs-check`) alongside the manifest linter. The transitional
+  `bitty-plugin.toml` and its `[settings]`-free surface are unchanged.
 - Product position recorded (owner decisions D1-D7, wheel#51, 2026-10-20):
   Wheel is an independent out-of-process harness that holds execution
   authority, ships a single artifact for 0.1.0, and drops plugin packaging and
