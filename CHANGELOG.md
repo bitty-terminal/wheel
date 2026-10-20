@@ -131,6 +131,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Packaging normalizes generated file modes independently of the caller's
+  umask (the artifact `VERSION` was previously 0644 under 022 and 0600 under
+  077, changing the digest). The verifier now rebuilds under both umasks and
+  compares the archive, sidecar, and manifest byte-for-byte.
 - Packaging copies only Git-tracked files under `lua/`, so ignored or
   untracked files (for example an ignored `lua/wheel/agent.luac`) cannot enter
   the release archive. The manifest now records `source_revision` (full HEAD

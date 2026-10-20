@@ -192,15 +192,32 @@ pass "ignored lua/wheel/agent.luac excluded; source revision recorded"
 rm -f -- "$probe"
 probe=""
 
-# 2. Rebuild determinism: same inputs and bytes, without the ignored probe.
-rebuild_args=(--output-dir "$work/rebuilt")
+# 2. Rebuild determinism across caller umasks and compare all three outputs.
+# The first artifact was built under the ambient umask; these rebuilds use
+# explicit 022 and 077. Modes and bytes must match in every case.
+rebuild_args=()
 if [ "${WHEEL_VERIFY_ALLOW_DIRTY:-0}" = "1" ]; then
   rebuild_args+=(--allow-dirty)
 fi
-bash "$REPO_ROOT/scripts/package.sh" "${rebuild_args[@]}" >/dev/null
-cmp -s "$archive" "$work/rebuilt/$PACKAGE_NAME-$VERSION.tar.gz" ||
-  fail "the artifact is not byte-for-byte deterministic"
-pass "deterministic rebuild"
+(
+  umask 022
+  bash "$REPO_ROOT/scripts/package.sh" "${rebuild_args[@]}" \
+    --output-dir "$work/rebuilt-022" >/dev/null
+)
+(
+  umask 077
+  bash "$REPO_ROOT/scripts/package.sh" "${rebuild_args[@]}" \
+    --output-dir "$work/rebuilt-077" >/dev/null
+)
+for rebuilt in "$work/rebuilt-022" "$work/rebuilt-077"; do
+  cmp -s "$archive" "$rebuilt/$PACKAGE_NAME-$VERSION.tar.gz" ||
+    fail "artifact bytes differ in $rebuilt"
+  cmp -s "$sidecar" "$rebuilt/$PACKAGE_NAME-$VERSION.tar.gz.sha256" ||
+    fail "digest sidecar differs in $rebuilt"
+  cmp -s "$manifest" "$rebuilt/$PACKAGE_NAME-$VERSION.manifest.json" ||
+    fail "manifest differs in $rebuilt"
+done
+pass "deterministic rebuild across umask 022 and 077 (archive, sidecar, manifest)"
 
 # 3. Install and validate the installed tree.
 bash "$REPO_ROOT/scripts/install-local.sh" "$prefix"

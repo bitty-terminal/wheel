@@ -17,6 +17,10 @@
 # may pass --allow-dirty (and a different --version) to exercise the
 # install/upgrade path without publishing anything.
 set -euo pipefail
+# The caller's umask must not leak into artifact modes or bytes. Generated
+# files are also chmod'ed explicitly below; tracked files keep their intended
+# Git mode (0644 or 0755).
+umask 022
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
@@ -221,9 +225,20 @@ for file in LICENSE README.md SECURITY-MODEL.md repo.toml; do
   install -m 0644 -- "$REPO_ROOT/$file" "$package_root/$file"
 done
 printf '%s\n' "$version" >"$package_root/VERSION"
+chmod 0644 -- "$package_root/VERSION"
 copy_tracked_lua
 
 find "$package_root" -type d -exec chmod 0755 {} +
+
+# Every artifact file must be one of the two normalized modes. Tracked Lua
+# files keep their Git mode (0644 or 0755); generated files are 0644.
+while IFS= read -r -d '' packaged_file; do
+  packaged_mode="$(stat -c '%a' -- "$packaged_file")"
+  case "$packaged_mode" in
+  644 | 755) ;;
+  *) die "unexpected artifact mode $packaged_mode: ${packaged_file#"$package_root/"}" ;;
+  esac
+done < <(find "$package_root" -type f -print0)
 
 archive="$output_dir/$PACKAGE_NAME-$version.tar.gz"
 digest_file="$archive.sha256"

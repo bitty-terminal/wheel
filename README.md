@@ -110,8 +110,9 @@ archive digest. Only `lua/` files tracked by Git are copied, so ignored or
 untracked files cannot enter the archive. It fails closed on a dirty worktree,
 a missing input, or an unsupported version. The archive is
 deterministic — sorted member order, fixed mtime and ownership, normalized
-modes, and gzip without a name or timestamp — so the same revision and
-packaging toolchain produce the same bytes and digest. The digest provides
+modes independent of the caller's umask, and gzip without a name or timestamp
+— so the same revision and packaging toolchain produce the same bytes and
+digest. The digest provides
 integrity checking only; 0.1.0 is unsigned and has no update channel.
 
 ### Install and launch

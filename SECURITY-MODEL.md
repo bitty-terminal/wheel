@@ -523,7 +523,8 @@ runs with the user's authority.
   files are never package inputs. It carries no plugin manifest and no
   plugin-api compatibility field.
 - **Determinism and integrity.** The archive uses sorted members, fixed mtime
-  and ownership, normalized modes, and timestamp-free gzip. A SHA-256 sidecar
+  and ownership, normalized modes regardless of the caller's umask, and
+  timestamp-free gzip. A SHA-256 sidecar
   and a manifest record the digest, contents, and the full source revision for
   a clean build (a null revision and clean flag false for a local test build). The installer verifies the
   sidecar before extraction. The digest is integrity only; 0.1.0 is unsigned,
