@@ -43,6 +43,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The harness now selects the standalone POSIX backend explicitly through
+  `WheelHost.select_backend("standalone")` and fails closed on non-POSIX
+  platforms or unknown backends with a typed `E_CAPABILITY_DENIED` error. Every
+  filesystem, process, temporary-file, wall-clock, and CPU-time primitive used
+  by `lua/wheel` routes through `WheelHost`; no direct `io.open`, `io.popen`,
+  `os.remove`, `os.execute`, `os.tmpname`, `os.time`, or `os.clock` call
+  remains outside `lua/wheel/host.lua`. Temporary files use a private runtime
+  directory with mode 0700, inspect-intent tools pass argv through
+  `WheelHost.proc.run_program`, and cwd quoting uses a POSIX single-quote
+  helper. The manifest and authority ceiling are unchanged; process timeout,
+  process-group, and scrubbed-environment hardening remain a follow-up.
 - Repository README reorganized into the uniform SDK user-documentation
   contract: `Overview`, `Install`, `Commands`, `Configuration`, `Keybindings`,
   and `Troubleshooting` lead in order, with the existing developer and
@@ -59,10 +70,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Process, tmp, and wall-clock time operations route through an injectable
   `WheelHost` seam (`lua/wheel/host.lua`); the standalone POSIX backend is the
   production backend for the 0.1.0 harness, and a host ABI adapter is not part
-  of the 0.1.0 path. Several file and configuration paths still call `io.open`
-  directly, and CPU time (`os.clock`) is still read directly; the seam does not
-  yet cover them (recorded in `SECURITY-MODEL.md`). No user-visible behavior
-  change.
+  of the 0.1.0 path. CTX-0015 completes the migration to filesystem, CPU-time,
+  and private temporary-file primitives.
 - Command handlers now cross the typed failure boundary: `plan`, `trust`, and
   `orchestrate` report missing `env.read`/`fs.read` authority instead of raw
   nil-member failures, and the `trust` command reads project configuration
@@ -75,6 +84,19 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
+  substitutes a `"0"` stamp (uniqueness is process-local; cross-process
+  exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators,
+  rejects the filesystem root and any all-dots segment (`.`, `..`, `...`, ...),
+  and rejects a symlinked harness-owned temporary directory before `chmod` can
+  follow it. A non-string `tmp_root` fails with the same typed denial.
+  `read_file` reports `total_lines` as the emitted line count and `search_code`
+  keeps the previous trailing newline. Typed platform denials now survive the
+  config/tool/provider host loaders, and a repeated lazy host access keeps the
+  original cause instead of the Lua 5.1 failed-require sentinel. Full-output
+  capture before the 100-line bound, whole-file reads before `max_bytes`, and
+  exclusive `0600` temporary-file creation remain tracked in CTX-0016 /
+  wheel#74.
 - Entry-point activation now loads only the required registration and status
   surface (typed errors, command schemas, command layer, kernel, and UI).
   `agent`, `config`, `team`, `context`, `tool`, `provider`, `runner`, and `host`

@@ -22,11 +22,40 @@ if not ok_kernel then
   WheelKernel = ok_kernel2 and WheelKernel2 or nil
 end
 
-local ok_host, WheelHost = pcall(require, "wheel.host")
-if not ok_host then
-  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
-  WheelHost = ok_host2 and WheelHost2 or nil
+--- Load the host seam strictly for the StdioAdapter temp-file and process path.
+-- Remote adapters do not touch the seam, but the module owns one loader so a
+-- broken installation fails at the seam rather than at a nil call site. A
+-- typed seam error (for example an unsupported platform) is re-raised
+-- unchanged so its class/code survive.
+local function load_host()
+  local rooted = "wheel.host"
+  local ok, mod = pcall(require, rooted)
+  if ok then return mod end
+  package.loaded[rooted] = nil
+  local cause = mod
+  if WheelErrors.is_typed(cause) then
+    error(cause, 0)
+  end
+  if type(cause) ~= "string"
+    or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+    error("wheel.provider: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
+  end
+
+  local alternate = "lua.wheel.host"
+  ok, mod = pcall(require, alternate)
+  if ok then return mod end
+  package.loaded[alternate] = nil
+  if WheelErrors.is_typed(mod) then
+    error(mod, 0)
+  end
+  if type(mod) == "string"
+    and mod:find("module '" .. alternate .. "' not found", 1, true) then
+    mod = cause
+  end
+  error("wheel.provider: cannot load submodule 'wheel.host': " .. tostring(mod), 0)
 end
+
+local WheelHost = load_host()
 
 local json = (WheelKernel and WheelKernel.JSON) or nil
 if not json then
@@ -729,12 +758,9 @@ local function getenv(name)
   return os.getenv(name)
 end
 
---- Remove a temporary file through the checked host surface.
+--- Remove a temporary file through the host seam.
 local function remove_file(path)
-  if type(os) ~= "table" or type(os.remove) ~= "function" then
-    error(WheelErrors.capability_denied("fs.write"), 0)
-  end
-  return os.remove(path)
+  return WheelHost.fs.remove_file(path)
 end
 
 --- Create a new Anthropic provider adapter (Claude 3.5 Sonnet, Claude 3 Opus).
@@ -1133,7 +1159,10 @@ function StdioAdapter:complete(request, opts)
     return nil, "Failed to open temporary file for stdio prompt: " .. tostring(tmp_file)
   end
 
-  local safe_cmd = string.format("%s < %q 2>&1", self.command, tmp_file)
+  -- The standalone process primitive has no stdin channel, so the provider
+  -- command (not a model tool) keeps the explicit shell-string form; the
+  -- temporary path is single-quoted and lives in the private runtime dir.
+  local safe_cmd = string.format("%s < %s 2>&1", self.command, WheelHost.proc.shell_quote(tmp_file))
   local res = WheelHost.proc.run_command(safe_cmd)
   if not res.ok then
     remove_file(tmp_file)

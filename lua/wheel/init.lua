@@ -62,6 +62,10 @@ local function load_module(name)
   local rooted = "wheel." .. name
   local ok, mod = pcall(require, rooted)
   if ok then return mod end
+  -- Lua 5.1 leaves a load sentinel after a failed require. Clear it so a
+  -- second lazy access reports the real cause instead of "loop or previous
+  -- error"; this changes only error quality, not the activation contract.
+  package.loaded[rooted] = nil
 
   local cause = mod
   if not is_not_found(rooted, cause) then
@@ -71,6 +75,7 @@ local function load_module(name)
   local alternate = "lua." .. rooted
   ok, mod = pcall(require, alternate)
   if ok then return mod end
+  package.loaded[alternate] = nil
 
   local alternate_cause = mod
   if not is_not_found(alternate, alternate_cause) then

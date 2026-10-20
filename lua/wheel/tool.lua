@@ -12,6 +12,7 @@
 -- 7. WheelToolRegistry for extensible tool registration and safe execution dispatch.
 
 local WheelTool = {}
+local WheelErrors = require("wheel.errors")
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end
@@ -19,11 +20,39 @@ if not ok_config then WheelConfig = nil end
 local ok_context, WheelContext = pcall(require, "wheel.context")
 if not ok_context then WheelContext = nil end
 
-local ok_host, WheelHost = pcall(require, "wheel.host")
-if not ok_host then
-  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
-  WheelHost = ok_host2 and WheelHost2 or nil
+--- Load the host seam strictly. Tool execution has no direct stdlib fallback:
+-- a missing seam is an installation defect, and an unavailable primitive is a
+-- typed denial from the seam itself. A typed seam error (for example an
+-- unsupported platform) is re-raised unchanged so its class/code survive.
+local function load_host()
+  local rooted = "wheel.host"
+  local ok, mod = pcall(require, rooted)
+  if ok then return mod end
+  package.loaded[rooted] = nil
+  local cause = mod
+  if WheelErrors.is_typed(cause) then
+    error(cause, 0)
+  end
+  if type(cause) ~= "string"
+    or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+    error("wheel.tool: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
+  end
+
+  local alternate = "lua.wheel.host"
+  ok, mod = pcall(require, alternate)
+  if ok then return mod end
+  package.loaded[alternate] = nil
+  if WheelErrors.is_typed(mod) then
+    error(mod, 0)
+  end
+  if type(mod) == "string"
+    and mod:find("module '" .. alternate .. "' not found", 1, true) then
+    mod = cause
+  end
+  error("wheel.tool: cannot load submodule 'wheel.host': " .. tostring(mod), 0)
 end
+
+local WheelHost = load_host()
 
 -- ---------------------------------------------------------------------------
 -- Constants & Enums
@@ -51,6 +80,31 @@ WheelTool.DEFAULT_SPILLOVER_THRESHOLD = 4096
 
 --- Maximum bytes to read for file operations by default.
 WheelTool.DEFAULT_MAX_READ_BYTES = 65536
+
+--- Split file content into lines with `file:lines()` semantics.
+-- A trailing newline does not produce a trailing empty entry, an empty input
+-- produces no entries, and interior empty lines are preserved.
+-- @param content string
+-- @return string[] lines
+local function split_content_lines(content)
+  local lines = {}
+  if type(content) ~= "string" or content == "" then
+    return lines
+  end
+  local pos = 1
+  while true do
+    local nl = content:find("\n", pos, true)
+    if not nl then
+      if pos <= #content then
+        table.insert(lines, content:sub(pos))
+      end
+      break
+    end
+    table.insert(lines, content:sub(pos, nl - 1))
+    pos = nl + 1
+  end
+  return lines
+end
 
 -- ---------------------------------------------------------------------------
 -- Deterministic Hash Computation
@@ -408,8 +462,8 @@ local tool_read_file = {
       return { success = false, exit_code = 1, stderr = err }
     end
 
-    local f, open_err = io.open(clean_path, "r")
-    if not f then
+    local file_content, open_err = WheelHost.fs.read_file(clean_path)
+    if file_content == nil then
       return { success = false, exit_code = 1, stderr = "File not found: " .. tostring(path) .. " (" .. tostring(open_err) .. ")" }
     end
 
@@ -422,7 +476,7 @@ local tool_read_file = {
     local bytes_accum = 0
     local truncated = false
 
-    for line in f:lines() do
+    for _, line in ipairs(split_content_lines(file_content)) do
       line_no = line_no + 1
       local in_range = true
       if start_l and line_no < start_l then
@@ -445,7 +499,6 @@ local tool_read_file = {
         break
       end
     end
-    f:close()
 
     local content = table.concat(lines, "\n")
     if truncated then
@@ -458,7 +511,7 @@ local tool_read_file = {
       stdout = content,
       stderr = "",
       lines_read = #lines,
-      total_lines = line_no,
+      total_lines = #lines,
     }
   end,
 }
@@ -486,9 +539,7 @@ local tool_write_file = {
     end
 
     -- Check if file already exists
-    local existing = io.open(clean_path, "r")
-    if existing then
-      existing:close()
+    if WheelHost.fs.exists(clean_path) then
       if not args.overwrite then
         return { success = false, exit_code = 1, stderr = "File already exists and overwrite is false: " .. tostring(path) }
       end
@@ -500,12 +551,10 @@ local tool_write_file = {
       WheelHost.fs.mkdir_p(parent)
     end
 
-    local f, write_err = io.open(clean_path, "w")
-    if not f then
+    local wrote, write_err = WheelHost.fs.write_file(clean_path, args.content or "")
+    if not wrote then
       return { success = false, exit_code = 1, stderr = "Failed to open file for writing: " .. tostring(write_err) }
     end
-    f:write(args.content or "")
-    f:close()
 
     return {
       success = true,
@@ -539,12 +588,11 @@ local tool_edit_file = {
       return { success = false, exit_code = 1, stderr = err }
     end
 
-    local f, open_err = io.open(clean_path, "r")
-    if not f then
+    local file_content, open_err = WheelHost.fs.read_file(clean_path)
+    if file_content == nil then
       return { success = false, exit_code = 1, stderr = "File not found: " .. tostring(path) .. " (" .. tostring(open_err) .. ")" }
     end
-    local content = f:read("*a")
-    f:close()
+    local content = file_content
 
     local target = args.target
     local replacement = args.replacement
@@ -579,12 +627,10 @@ local tool_edit_file = {
       new_content = new_content:sub(1, m.s - 1) .. replacement .. new_content:sub(m.e + 1)
     end
 
-    local out_f, write_err = io.open(clean_path, "w")
-    if not out_f then
+    local wrote, write_err = WheelHost.fs.write_file(clean_path, new_content)
+    if not wrote then
       return { success = false, exit_code = 1, stderr = "Failed to open file for writing: " .. tostring(write_err) }
     end
-    out_f:write(new_content)
-    out_f:close()
 
     return {
       success = true,
@@ -635,7 +681,7 @@ local tool_run_command = {
       cwd = clean_cwd
     end
 
-    local full_cmd = string.format("cd %q && (%s) 2>&1", cwd, cmd)
+    local full_cmd = string.format("cd %s && (%s) 2>&1", WheelHost.proc.shell_quote(cwd), cmd)
     local res = WheelHost.proc.run_command(full_cmd, env)
     if not res.ok then
       return { success = false, exit_code = 1, stderr = res.stderr or "Failed to spawn shell process" }
@@ -722,17 +768,37 @@ local tool_search_code = {
       return { success = false, exit_code = 1, stderr = err }
     end
 
-    local flag = (args.case_sensitive == false) and "-i" or ""
-    local cmd = string.format("grep -rn %s -F %q %q 2>/dev/null | head -n 100", flag, query, clean_path)
-    local res = WheelHost.proc.run_command(cmd)
+    local argv = { "-rn" }
+    if args.case_sensitive == false then
+      table.insert(argv, "-i")
+    end
+    table.insert(argv, "-F")
+    table.insert(argv, "--")
+    table.insert(argv, query)
+    table.insert(argv, clean_path)
+    local res = WheelHost.proc.run_program("grep", argv, { discard_stderr = true })
     if not res.ok then
       return { success = false, exit_code = 1, stderr = "Failed to execute search" }
+    end
+
+    -- Bound the observation to the first 100 lines without a shell pipeline.
+    -- The previous `head` pipeline emitted a newline for every kept line;
+    -- preserve that shape while the full-output capture stays tracked in
+    -- CTX-0016 (bounded output).
+    local lines = split_content_lines(res.stdout or "")
+    local bounded = {}
+    for index = 1, math.min(#lines, 100) do
+      table.insert(bounded, lines[index])
+    end
+    local output = table.concat(bounded, "\n")
+    if #bounded > 0 then
+      output = output .. "\n"
     end
 
     return {
       success = true,
       exit_code = 0,
-      stdout = res.stdout,
+      stdout = output,
       stderr = "",
     }
   end,
@@ -912,9 +978,9 @@ function WheelToolRegistry:dispatch(name, args, env)
   end
 
   -- 2. Execute tool inside pcall
-  local start_time = os.clock()
+  local start_time = WheelHost.time.clock()
   local ok, res = pcall(tool.execute, args, env)
-  local elapsed_ms = math.floor((os.clock() - start_time) * 1000)
+  local elapsed_ms = math.floor((WheelHost.time.clock() - start_time) * 1000)
 
   local raw_outcome
   if not ok then
