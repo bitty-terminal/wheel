@@ -691,8 +691,9 @@ that the policy relies on, and they remain unverified until the gates pass:
 - a project-configuration loader with a content hash, an explicit trust action,
   a revocation action, and a restricted evaluation environment;
 - a provider adapter boundary that reads named environment variables;
-- a `WheelHost` seam for process, temporary-file, and time calls; several file
-  and configuration paths still call `io.open` directly.
+- a `WheelHost` seam for process, temporary-file, and wall-clock time calls;
+  several file and configuration paths still call `io.open` directly, and CPU
+  time (`os.clock`) is still read directly.
 
 Known gaps relative to this policy (not claims of compliance):
 
@@ -705,9 +706,12 @@ Known gaps relative to this policy (not claims of compliance):
   deny-list, and `%q` is not a shell-safe argv boundary; a crafted path can
   execute shell substitution. These tools must move to argv or a reviewed
   quoting primitive.
-- `run_command` and several file tools call `io.popen`/`io.open` directly, so
-  the `WheelHost` seam does not yet concentrate all filesystem, process,
-  temporary-file, and time calls.
+- `run_command` and temporary-file creation do route through `WheelHost`, but
+  several file and configuration paths still call `io.open` directly, and
+  temporary files use the ambient `os.tmpname` location. The seam does not yet
+  concentrate all filesystem calls.
+- Wall-clock reads route through the seam, but CPU time (`os.clock`) is still
+  read directly in `tool.lua` and `team.lua`.
 - The child environment is inherited from the parent. `run_command` does not
   scrub allowlisted provider keys, so spawned processes can read them.
   Non-inheritance is required before release.

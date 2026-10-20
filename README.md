@@ -128,9 +128,12 @@ entering a repository never executes it silently. The full policy is in
   whitespace, invalidates trust and forces re-approval.
 - Revocation and store deletion remove trust. A missing, corrupt, or unreadable
   store fails closed; it is never recreated with existing approvals.
-- Evaluation runs in a restricted environment with no filesystem, process,
-  network, environment, or module-loading access, under instruction, time, and
-  memory budgets. The result is validated as data.
+- Evaluation must run in a restricted environment with no filesystem, process,
+  network, environment, or module-loading access, under instruction,
+  wall-clock, and memory budgets. The current instruction hook is catchable and
+  the wall-clock and memory budgets are not implemented; the result is validated
+  as data only after those gates exist (see
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
 - Project configuration may narrow behavior inside the approved ceiling. It may
   not add a workspace root, network destination, secret name, or authority for a
   role, and it may not disable audit, redaction, the deny-list, the path
