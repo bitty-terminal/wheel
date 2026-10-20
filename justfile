@@ -74,6 +74,8 @@ manifest: deps
 lua: deps
     bun run luaparse --quiet --file lua/wheel/init.lua
     bun run luaparse --quiet --file lua/wheel/errors.lua
+    bun run luaparse --quiet --file lua/wheel/schema.lua
+    bun run luaparse --quiet --file lua/wheel/commands.lua
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/config.lua
     bun run luaparse --quiet --file lua/wheel/host.lua
@@ -85,6 +87,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/provider.lua
     bun run luaparse --quiet --file lua/wheel/runner.lua
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
+    bun run luaparse --quiet --file tests/test_wheel.lua
 
 # Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
 test: deps

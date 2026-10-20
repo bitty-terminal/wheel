@@ -11,12 +11,20 @@
 -- and marks an unexpected handler failure so a real defect is never reported
 -- as a capability denial. Replace it when the host vocabulary defines a
 -- generic internal or runtime failure code.
+--
+-- Command schema and argument failures use the SDK mock-host validation
+-- vocabulary (`E_SCHEMA_INVALID`, `E_ARGS_INVALID`, `E_RESULT_INVALID`) with
+-- class `validation`, and the same three-field bridge shape.
 
 local WheelErrors = {}
 
 WheelErrors.CLASS_RUNTIME = "runtime"
+WheelErrors.CLASS_VALIDATION = "validation"
 WheelErrors.E_CAPABILITY_DENIED = "E_CAPABILITY_DENIED"
 WheelErrors.E_INTERNAL = "E_INTERNAL"
+WheelErrors.E_ARGS_INVALID = "E_ARGS_INVALID"
+WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
+WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.MESSAGE_MAX_LENGTH = 160
 
 local CLASSES = {
@@ -96,6 +104,56 @@ function WheelErrors.internal(command_id)
     WheelErrors.CLASS_RUNTIME,
     WheelErrors.E_INTERNAL,
     string.format("internal error in wheel command '%s'", id)
+  )
+end
+
+local function validation_detail(command_id, label, detail)
+  local id = valid_identifier(command_id) and command_id or "unknown"
+  local reason = type(detail) == "string" and detail or "invalid shape"
+  -- Argument field names are untrusted; keep the single-line diagnostic free
+  -- of control characters so a crafted key cannot forge log lines.
+  reason = reason:gsub("%c", "?")
+  return string.format("%s in wheel command '%s': %s", label, id, reason)
+end
+
+--- Build a typed invalid-arguments failure.
+-- The detail is a bounded schema path and reason; `typed` keeps the final
+-- message to one line within `MESSAGE_MAX_LENGTH`.
+-- @param command_id string
+-- @param detail string
+-- @return table
+function WheelErrors.args_invalid(command_id, detail)
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_ARGS_INVALID,
+    validation_detail(command_id, "invalid arguments", detail)
+  )
+end
+
+--- Build a typed invalid-schema failure.
+-- Raised at registration, before the handler is wrapped or captured.
+-- @param command_id string
+-- @param detail string
+-- @return table
+function WheelErrors.schema_invalid(command_id, detail)
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_SCHEMA_INVALID,
+    validation_detail(command_id, "invalid command schema", detail)
+  )
+end
+
+--- Build a typed invalid-result failure.
+-- Raised after a handler returns when its result no longer matches the
+-- registered `result_schema`.
+-- @param command_id string
+-- @param detail string
+-- @return table
+function WheelErrors.result_invalid(command_id, detail)
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_RESULT_INVALID,
+    validation_detail(command_id, "invalid command result", detail)
   )
 end
 

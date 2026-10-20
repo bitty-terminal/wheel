@@ -32,6 +32,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   residual risks, and the mock/unit plus real host fixture evidence gates.
 - Explicit OQ-068 divergence record for executable `.wheel/init.lua`, scoped to
   the Wheel harness and bounded by the trust gate.
+- Bounded command schemas (`lua/wheel/schema.lua`): all 14 commands declare a
+  closed `args_schema` and `result_schema` in one lazy command table.
+  Registration rejects unsupported or unbounded schemas with `E_SCHEMA_INVALID`,
+  invocation arguments are validated before dispatch with `E_ARGS_INVALID`, and
+  handlers return the bounded `{ title, body }` notification projection. The
+  result body (8000 bytes) and title (64 bytes) fit the host bridge's 8 KiB
+  `DEFAULT_MAX_VALUE_BYTES`, and oversized bodies are truncated at a UTF-8
+  boundary. The transitional manifest is unchanged.
 
 ### Changed
 

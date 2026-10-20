@@ -24,7 +24,8 @@ local WheelTool = load_submodule("tool")
 local WheelProvider = load_submodule("provider")
 local WheelRunner = load_submodule("runner")
 local WheelHost = load_submodule("host")
-local WheelErrors = load_submodule("errors")
+local WheelSchema = load_submodule("schema")
+local WheelCommands = load_submodule("commands")
 
 local M = {
   kernel = WheelKernel.new(),
@@ -36,6 +37,8 @@ local M = {
   tool = WheelTool,
   provider = WheelProvider,
   runner = WheelRunner,
+  schema = WheelSchema,
+  command_runtime = WheelCommands,
   WheelKernel = WheelKernel,
   WheelAgent = WheelAgent,
   WheelUI = WheelUI,
@@ -45,72 +48,73 @@ local M = {
   WheelTool = WheelTool,
   WheelProvider = WheelProvider,
   WheelRunner = WheelRunner,
+  WheelSchema = WheelSchema,
+  WheelCommands = WheelCommands,
   tools = WheelTool and WheelTool.get_default_registry(),
 }
 
--- Register plugin commands if running inside Bitty host environment.
-if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands.register then
-  -- Every handler crosses the same typed failure boundary, so a missing host
-  -- surface becomes a stable capability denial while real defects stay
-  -- distinguishable as internal errors. Registration metadata is untouched.
-  local function register_command(def)
-    def.run = WheelErrors.wrap(def.id, def.run)
-    bitty.commands.register(def)
-  end
+-- Show a notification through the shared command layer, which owns the
+-- host-compatible result bounds and the UTF-8-safe truncation.
+-- @param title string
+-- @param body string
+-- @return table { title: string, body: string }
+local function notify(title, body)
+  return WheelCommands.notify(bitty, title, body)
+end
 
+-- Lazy command table: metadata, argument schema, result schema, and handler
+-- live in one declaration per command. Registration is a pure projection over
+-- this table; no handler runs until the host dispatches it.
+local WHEEL_COMMANDS = {
   -- 1. hello
-  register_command({
+  {
     id = "hello",
     title = "Wheel: hello",
     description = "Print a greeting from Wheel.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
-      bitty.notify.show({
-        title = "Wheel",
-        body = "Hello from bitty-terminal.wheel (Bittie 🐹).",
-      })
+      return notify("Wheel", "Hello from bitty-terminal.wheel (Bittie 🐹).")
     end,
-  })
+  },
 
   -- 2. status
-  register_command({
+  {
     id = "status",
     title = "Wheel: status",
     description = "Display Wheel kernel status and telemetry summary.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local text = WheelUI.format_status(M.kernel)
-      bitty.notify.show({
-        title = "Wheel Status",
-        body = text,
-      })
+      return notify("Wheel Status", text)
     end,
-  })
+  },
 
   -- 3. graph
-  register_command({
+  {
     id = "graph",
     title = "Wheel: graph",
     description = "Render ASCII Task DAG and topological execution waves.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local text = WheelUI.format_graph(M.kernel)
-      bitty.notify.show({
-        title = "Wheel Task DAG",
-        body = text,
-      })
+      return notify("Wheel Task DAG", text)
     end,
-  })
+  },
 
   -- 4. plan
-  register_command({
+  {
     id = "plan",
     title = "Wheel: plan",
     description = "Initialize or decompose a software engineering plan in the Task DAG.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local conf_res = WheelConfig.load({ project_root = "." })
       if not conf_res.ok and conf_res.message then
-        bitty.notify.show({
-          title = "Wheel Config Notice",
-          body = conf_res.message,
-        })
+        notify("Wheel Config Notice", conf_res.message)
       end
 
       local commander = WheelAgent.new({
@@ -124,18 +128,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         { id = "CTX-0002", title = "Implement kernel client and roles", priority = 0, dependencies = { "CTX-0001" } },
         { id = "CTX-0003", title = "Verify and test quality gates", priority = 1, dependencies = { "CTX-0002" } },
       })
-      bitty.notify.show({
-        title = "Wheel Plan",
-        body = "Initialized software engineering plan with 3 tasks in DAG.",
-      })
+      return notify("Wheel Plan", "Initialized software engineering plan with 3 tasks in DAG.")
     end,
-  })
+  },
 
   -- 5. run
-  register_command({
+  {
     id = "run",
     title = "Wheel: run",
     description = "Execute the next ready task in the DAG using WheelAgent.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local tasks = M.kernel:list_tasks()
       local ready_task = nil
@@ -147,19 +150,12 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       end
 
       if not ready_task then
-        bitty.notify.show({
-          title = "Wheel Run",
-          body = "No ready tasks available to execute.",
-        })
-        return
+        return notify("Wheel Run", "No ready tasks available to execute.")
       end
 
       local conf_res = WheelConfig.load({ project_root = "." })
       if not conf_res.ok and conf_res.message then
-        bitty.notify.show({
-          title = "Wheel Config Notice",
-          body = conf_res.message,
-        })
+        notify("Wheel Config Notice", conf_res.message)
       end
 
       local worker = WheelAgent.new({
@@ -187,28 +183,23 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         msg = string.format("Task %s failed: %s", ready_task.id, tostring(outcome.error))
       end
 
-      bitty.notify.show({
-        title = "Wheel Run",
-        body = msg,
-      })
+      return notify("Wheel Run", msg)
     end,
-  })
+  },
 
   -- 6. trust
-  register_command({
+  {
     id = "trust",
     title = "Wheel: trust",
     description = "Inspect and approve project configuration (.wheel/init.lua).",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local project_root = "."
       local proj_path = WheelConfig.get_project_config_path(project_root)
       local content = WheelHost.fs.read_file(proj_path)
       if not content then
-        bitty.notify.show({
-          title = "Wheel Trust",
-          body = "No project configuration found at " .. proj_path,
-        })
-        return
+        return notify("Wheel Trust", "No project configuration found at " .. proj_path)
       end
 
       local preview = content:sub(1, 120)
@@ -218,24 +209,21 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
 
       local ok, err, hash = WheelConfig.trust(project_root, content)
       if ok then
-        bitty.notify.show({
-          title = "Wheel Trust Approved",
-          body = string.format("Approved %s (hash: %s):\n%s", proj_path, hash:sub(1, 16), preview),
-        })
-      else
-        bitty.notify.show({
-          title = "Wheel Trust Error",
-          body = "Failed to record trust: " .. tostring(err),
-        })
+        return notify("Wheel Trust Approved",
+          string.format("Approved %s (hash: %s):\n%s", proj_path, hash:sub(1, 16), preview))
       end
+
+      return notify("Wheel Trust Error", "Failed to record trust: " .. tostring(err))
     end,
-  })
+  },
 
   -- 7. team
-  register_command({
+  {
     id = "team",
     title = "Wheel: team status",
     description = "Display Wheel multi-agent peer colleague roster and live states.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -250,18 +238,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         table.insert(lines, string.format("  [%s] %s (%s) | %s | %s",
           a.state == "busy" and "RUN" or "IDLE", a.name, a.role, model_info, a.panel_id))
       end
-      bitty.notify.show({
-        title = "Wheel Team Roster",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Team Roster", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 8. context
-  register_command({
+  {
     id = "context",
     title = "Wheel: context",
     description = "Inspect active semantic slots, Merkle root, and prefix-cache status.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -275,18 +262,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       for _, s in ipairs(slots) do
         table.insert(lines, string.format("  [%s] %s (v%d, %d B)", s.kind:upper(), s.name, s.version, s.size_bytes))
       end
-      bitty.notify.show({
-        title = "Wheel Context State",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Context State", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 9. tools
-  register_command({
+  {
     id = "tools",
     title = "Wheel: tools",
     description = "List registered Wheel agent tools and intent schemas.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local reg = WheelTool.get_default_registry()
       local list = reg:list_tools()
@@ -296,18 +282,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
       for _, t in ipairs(list) do
         table.insert(lines, string.format("  [%s] %s - %s", t.intent:upper(), t.name, t.description))
       end
-      bitty.notify.show({
-        title = "Wheel Tools Registry",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Tools Registry", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 10. orchestrate
-  register_command({
+  {
     id = "orchestrate",
     title = "Wheel: orchestrate",
     description = "Run autonomous multi-agent wave orchestration loop over Task DAG.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -338,18 +323,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
           report.blocked_reason or "unknown blockage", #report.completed_tasks, #report.failed_tasks, report.waves_executed)
       end
 
-      bitty.notify.show({
-        title = "Wheel Orchestration",
-        body = msg,
-      })
+      return notify("Wheel Orchestration", msg)
     end,
-  })
+  },
 
   -- 11. models
-  register_command({
+  {
     id = "models",
     title = "Wheel: models",
     description = "Display configured model profiles, providers, and parameters.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local roles = {
         WheelAgent.Role.COMMANDER,
@@ -376,18 +360,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         table.insert(lines, string.format("• %-10s : %s / %s (temp: %.1f)%s", r, prof.provider, prof.model, prof.temperature, thinking_str))
       end
 
-      bitty.notify.show({
-        title = "Wheel Models",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Models", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 12. branch
-  register_command({
+  {
     id = "branch",
     title = "Wheel: branch",
     description = "List context branches or display active branch and HEAD commit.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -400,18 +383,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
         local hash_str = b.hash and b.hash:sub(1, 8) or "(empty)"
         table.insert(lines, string.format("%s%-16s -> %s", marker, b.name, hash_str))
       end
-      bitty.notify.show({
-        title = "Wheel Context Branches",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Context Branches", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 13. checkpoint
-  register_command({
+  {
     id = "checkpoint",
     title = "Wheel: checkpoint",
     description = "Display recent context checkpoints (commit ancestry log).",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -427,18 +409,17 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
             c.hash:sub(1, 8), c.message, c.author or "unknown"))
         end
       end
-      bitty.notify.show({
-        title = "Wheel Checkpoints",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Checkpoints", table.concat(lines, "\n"))
     end,
-  })
+  },
 
   -- 14. reflog
-  register_command({
+  {
     id = "reflog",
     title = "Wheel: reflog",
     description = "Display recent context reflog transitions and audit journal.",
+    args_schema = WheelCommands.no_args_schema(),
+    result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
         M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
@@ -454,12 +435,21 @@ if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands
             r.from_hash:sub(1, 7), r.to_hash:sub(1, 7), r.action, r.message))
         end
       end
-      bitty.notify.show({
-        title = "Wheel Reflog",
-        body = table.concat(lines, "\n"),
-      })
+      return notify("Wheel Reflog", table.concat(lines, "\n"))
     end,
-  })
+  },
+}
+
+M.command_catalog = WHEEL_COMMANDS
+
+-- Register plugin commands if running inside Bitty host environment. The
+-- command layer validates both schemas before the host captures a definition,
+-- validates arguments before a handler runs, and validates the result before
+-- returning it.
+if type(bitty) == "table" and type(bitty.commands) == "table" and bitty.commands.register then
+  for _, def in ipairs(WHEEL_COMMANDS) do
+    WheelCommands.register(def, bitty)
+  end
 end
 
 return M
