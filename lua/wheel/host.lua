@@ -188,6 +188,18 @@ local function owned_parent_path(dir)
   return nil
 end
 
+--- Return true when any normalized path segment is `..`.
+-- @param path string
+-- @return boolean
+local function has_parent_segment(path)
+  for segment in path:gmatch("[^/]+") do
+    if segment == ".." then
+      return true
+    end
+  end
+  return false
+end
+
 --- Normalize a temporary-directory path for the symlink guard and filesystem
 -- calls. Trailing separators and `/.` segments are stripped so `test -L` sees
 -- the harness-owned directory itself rather than a path that follows a link.
@@ -406,6 +418,7 @@ function standalone.new(opts)
 
   --- Resolve, create, and repair the private temporary directory.
   -- The path is normalized (trailing `/`, `/.` stripped) before inspection. The
+  -- filesystem root and any `..` segment are rejected before mkdir/chmod. The
   -- harness-owned directory (and the `wheel` component of the state fallback)
   -- must not be a symbolic link: `chmod` must never follow a pre-existing link.
   -- Legitimate parent links such as `/tmp` are allowed because only the
@@ -434,6 +447,11 @@ function standalone.new(opts)
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
     dir = normalize_tmp_dir(dir)
+    -- The harness-owned temp directory must not be the filesystem root or
+    -- escape through parent traversal; reject before any mkdir/chmod.
+    if dir == "/" or has_parent_segment(dir) then
+      error(WheelErrors.capability_denied("fs.write"), 0)
+    end
 
     local parent = owned_parent_path(dir)
     require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")

@@ -5702,6 +5702,54 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelHost: temp roots reject root and parent traversal", function()
+  local function root_mode()
+    local listing = WheelHost.proc.run_command("ls -ld /")
+    return listing.stdout:match("^(%S+)")
+  end
+
+  local mode_before = root_mode()
+  local saved_execute = os.execute
+  local mutating = {}
+  os.execute = function(command)
+    if string.find(command, "mkdir", 1, true) or string.find(command, "chmod", 1, true) then
+      table.insert(mutating, command)
+      return 1
+    end
+    return saved_execute(command)
+  end
+
+  local forms = { "/", "//", "/.", "/./", "/tmp/..", "/tmp/../..", ".." }
+  local results = {}
+  for _, form in ipairs(forms) do
+    local backend = WheelHost.create_backend("standalone", { tmp_root = form })
+    local ok, err = pcall(backend.tmp_dir)
+    results[#results + 1] = { form = form, ok = ok, err = err }
+  end
+  os.execute = saved_execute
+
+  assert(#mutating == 0,
+    "root/traversal guard must reject before mkdir/chmod: " .. table.concat(mutating, "; "))
+  for _, result in ipairs(results) do
+    assert(not result.ok, "unsafe tmp_root must be rejected: '" .. result.form .. "'")
+    local denial = assert_typed_error(result.err, "E_CAPABILITY_DENIED")
+    assert(denial.message == "capability 'fs.write' is not granted",
+      "unsafe tmp_root must report the typed fs.write denial: '" .. result.form .. "'")
+  end
+  assert(root_mode() == mode_before, "the filesystem root mode must not change")
+
+  -- Legitimate relative roots still normalize (trailing separator and `/.`).
+  local relative = "ctx0015_relative_tmp_dir"
+  os.execute("rm -rf " .. relative)
+  local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
+  local slash_dir, slash_err = with_slash.tmp_dir()
+  assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
+  local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
+  local dot_dir, dot_err = with_dot.tmp_dir()
+  assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
+  os.execute("rm -rf " .. relative)
+end)
+
 run_test("WheelHost: default temp directory still resolves", function()
   local backend = WheelHost.create_backend("standalone")
   local runtime = os.getenv("XDG_RUNTIME_DIR")

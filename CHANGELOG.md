@@ -86,15 +86,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
   substitutes a `"0"` stamp (uniqueness is process-local; cross-process
-  exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators
-  and rejects a symlinked harness-owned temporary directory before `chmod` can
-  follow it. `read_file` reports `total_lines` as the emitted line count and
-  `search_code` keeps the previous trailing newline. Typed platform denials now
-  survive the config/tool/provider host loaders, and a repeated lazy host access
-  keeps the original cause instead of the Lua 5.1 failed-require sentinel.
-  Full-output capture before the 100-line bound, whole-file reads before
-  `max_bytes`, and exclusive `0600` temporary-file creation remain tracked in
-  CTX-0016 / wheel#74.
+  exclusivity remains CTX-0016), and `tmp_dir` normalizes trailing separators,
+  rejects the filesystem root and any `..` segment, and rejects a symlinked
+  harness-owned temporary directory before `chmod` can follow it. `read_file`
+  reports `total_lines` as the emitted line count and `search_code` keeps the
+  previous trailing newline. Typed platform denials now survive the
+  config/tool/provider host loaders, and a repeated lazy host access keeps the
+  original cause instead of the Lua 5.1 failed-require sentinel. Full-output
+  capture before the 100-line bound, whole-file reads before `max_bytes`, and
+  exclusive `0600` temporary-file creation remain tracked in CTX-0016 /
+  wheel#74.
 - Entry-point activation now loads only the required registration and status
   surface (typed errors, command schemas, command layer, kernel, and UI).
   `agent`, `config`, `team`, `context`, `tool`, `provider`, `runner`, and `host`
