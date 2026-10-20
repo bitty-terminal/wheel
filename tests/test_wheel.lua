@@ -2681,17 +2681,17 @@ run_test("README: troubleshooting matches error codes and named config failures"
   local section = readme_section(README_LINES, "Troubleshooting")
   local text = table.concat(section, "\n")
 
-  local expected_codes = {
-    WheelErrors.E_CAPABILITY_DENIED,
-    WheelErrors.E_INTERNAL,
-    WheelErrors.E_ARGS_INVALID,
-    WheelErrors.E_SCHEMA_INVALID,
-    WheelErrors.E_RESULT_INVALID,
-  }
+  -- Derive the public code set from the module exports so a new
+  -- WheelErrors.E_* export fails this test until the README documents it.
   local expected_code_set = {}
-  for _, code in ipairs(expected_codes) do
-    expected_code_set[code] = true
+  local expected_code_count = 0
+  for name in pairs(WheelErrors) do
+    if name:match("^E_[A-Z0-9_]+$") then
+      expected_code_set[name] = true
+      expected_code_count = expected_code_count + 1
+    end
   end
+  assert(expected_code_count > 0, "errors.lua must export at least one public E_* code")
 
   local documented_codes = {}
   local documented_code_count = 0
@@ -2701,9 +2701,9 @@ run_test("README: troubleshooting matches error codes and named config failures"
     end
     documented_codes[code] = true
   end
-  assert(documented_code_count == #expected_codes,
-    string.format("README must document %d error codes, got %d", #expected_codes, documented_code_count))
-  for _, code in ipairs(expected_codes) do
+  assert(documented_code_count == expected_code_count,
+    string.format("README must document %d error codes, got %d", expected_code_count, documented_code_count))
+  for code in pairs(expected_code_set) do
     assert(documented_codes[code] ~= nil, "README Troubleshooting must document " .. code)
   end
   for code in pairs(documented_codes) do

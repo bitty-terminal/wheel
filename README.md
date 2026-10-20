@@ -207,14 +207,17 @@ function classes.
   - `panel` — the Headless Panel working-container policy.
   - `hooks` — lifecycle hooks.
 - **Executable `.wheel/init.lua` trust gate.** Project configuration is code,
-  and cloning or entering a project never executes it silently:
+  and cloning or entering a project never executes it silently. The policy
+  target is defined in
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#executable-project-configuration-trust-gate):
   - First contact is inert. Discovery, scan, help, and status do not evaluate the
     entry; only a command that needs project configuration reaches the gate.
-  - Approval is explicit and per project. The user sees the canonical project
-    root, the full entry, its SHA-256 content hash, and the configuration
-    effects it can request. There is no trust-on-first-use, no inherited trust,
-    and no `--yes` default.
-  - The trust record binds the canonical root and the entry hash in
+  - Approval is an explicit interactive action. The consent view must show the
+    canonical project root (symlinks resolved), the full entry, its SHA-256
+    content hash, the change diff on re-approval, and the configuration effects
+    the entry can request; a truncated preview is not sufficient consent. There
+    is no trust-on-first-use, no inherited trust, and no `--yes` default.
+  - The trust record binds the canonical project root and the entry hash in
     `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
     whitespace, invalidates trust and forces re-approval.
   - Revocation and store deletion remove trust. A missing, corrupt, or unreadable
@@ -228,6 +231,16 @@ function classes.
     may not add a workspace root, network destination, secret name, or authority
     for a role, and it may not disable audit, redaction, the deny-list, the path
     sandbox, or the trust gate.
+- **Current trust-gate gaps.** The present `trust` command is not the consent
+  flow above. It approves the current working directory and keys the record by
+  a lexical path normalization (separator, `.` segment, and trailing-slash
+  cleanup; no `..` or symlink resolution), shows a 120-character preview and a
+  16-hex hash prefix, lists no configuration effects, and records trust without
+  an interactive confirmation. Hash pinning and fail-closed untrusted handling
+  exist, but the full-content consent view, the change diff, field validation,
+  narrowing-only enforcement, and the evaluation budgets are still gaps. See
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
+  inventory is not a claim of compliance.
 - **Future plugin facade.** If a later facade declares `[settings]` in
   `bitty-plugin.toml`, the SDK-rendered `Setting`/`Type`/`Default`/`Description`
   table replaces the no-settings sentence above and is generated from the
@@ -306,8 +319,8 @@ Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_proj
   entry. Approve it with the `trust` command or remove it.
 - `project_config_eval_error` — the trusted entry failed to evaluate or did not
   return a table. The loader falls back to the safe defaults plus the global
-  layer, reports the bounded evaluation message, and never applies a partial
-  project overlay.
+  layer, reports the evaluation message, and never applies a partial project
+  overlay.
 
 ### Common failures
 
