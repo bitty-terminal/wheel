@@ -195,6 +195,7 @@ local function sanitize_module_cause(cause)
     return not_found
   end
 
+  text = text:gsub("error loading module '[^']+' from file '[^']*':%s*", "")
   text = text:gsub("[^%s:]*/([%w%._%-]+%.lua:%d+):", "%1:")
   text = text:gsub("[^%s]*/[^%s]*", "<path>")
   text = text:gsub("%s+", " ")

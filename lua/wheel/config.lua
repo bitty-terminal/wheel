@@ -5,6 +5,7 @@
 
 local WheelKernel = nil
 local WheelErrors = require("wheel.errors")
+local WheelHost
 
 local ok_host, host_or_err = pcall(require, "wheel.host")
 if ok_host then

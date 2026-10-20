@@ -1802,7 +1802,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
     "broken activation failure must name the rooted module")
   assert(broken_err.message:find("ui.lua", 1, true) ~= nil,
     "broken activation failure must preserve the source location")
-  assert(broken_err.message:find("expected", 1, true) ~= nil,
+  assert(broken_err.message:find("near", 1, true) ~= nil,
     "broken activation failure must preserve the syntax cause")
   assert(broken_err.message:find("lua.wheel.ui", 1, true) == nil,
     "broken activation failure must not report the alternate root")
@@ -1817,7 +1817,8 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       dep = "agent",
       label = "wheel.team: cannot load submodule 'wheel.agent'",
       broken = "this is not lua\n",
-      marker = "expected",
+      marker = "near",
+      location = "agent.lua",
     },
     {
       parent = "wheel.context",
@@ -1831,7 +1832,8 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       dep = "errors",
       label = "wheel.commands: cannot load sibling 'wheel.errors'",
       broken = "this is not lua\n",
-      marker = "expected",
+      marker = "near",
+      location = "errors.lua",
     },
   }
 
@@ -1850,11 +1852,59 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       case.parent .. " must attribute the rooted module: " .. case_err)
     assert(case_err:find(case.marker, 1, true) ~= nil,
       case.parent .. " must preserve the original cause: " .. case_err)
+    if case.location then
+      assert(case_err:find(case.location, 1, true) ~= nil,
+        case.parent .. " must preserve the source location: " .. case_err)
+    end
     assert(case_err:find("lua.wheel." .. case.dep, 1, true) == nil,
       case.parent .. " must not report the alternate root: " .. case_err)
     assert(case_err:find("not found", 1, true) == nil,
       case.parent .. " must not report a broken module as missing: " .. case_err)
   end
+
+  -- The typed message built by init must keep the nested cause when a broken
+  -- sibling fails through lazy dispatch, not just the raw require string.
+  local dispatch_modules = detach_wheel_modules()
+  reset_module_fixture_root()
+  write_fixture_file("wheel/agent.lua", "this is not lua\n")
+  package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
+  local dispatch_ok, dispatch_wheel = pcall(require, "wheel.init")
+  package.path = saved_path
+  restore_wheel_modules(dispatch_modules)
+
+  assert(dispatch_ok, "activation must succeed while the optional agent stays lazy: "
+    .. tostring(dispatch_wheel))
+  local team_def
+  for _, def in ipairs(dispatch_wheel.command_catalog) do
+    if def.id == "team" then
+      team_def = def
+      break
+    end
+  end
+  assert(team_def ~= nil, "the team command must be registered")
+
+  -- The broken-agent fixture is still in place; dispatch through the lazy
+  -- accessor so init builds the typed message.
+  local lazy_modules = detach_wheel_modules()
+  package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
+  local team_ok, team_err = pcall(team_def.run)
+  package.path = saved_path
+  restore_wheel_modules(lazy_modules)
+
+  assert(not team_ok, "a broken lazy sibling must fail the team command")
+  assert(type(team_err) == "table", "lazy sibling failure must be a typed table")
+  assert(team_err.code == "E_MODULE_LOAD_FAILED",
+    "lazy sibling failure must keep the typed resolution code")
+  assert(team_err.message:find("wheel.team", 1, true) ~= nil,
+    "lazy sibling failure must attribute the rooted module")
+  assert(team_err.message:find("agent.lua", 1, true) ~= nil,
+    "lazy sibling failure must preserve the source location: " .. team_err.message)
+  assert(team_err.message:find("near", 1, true) ~= nil,
+    "lazy sibling failure must preserve the nested syntax cause: " .. team_err.message)
+  assert(team_err.message:find("lua.wheel.agent", 1, true) == nil,
+    "lazy sibling failure must not report the alternate root")
+  assert(#team_err.message <= WheelErrors.MESSAGE_MAX_LENGTH,
+    "lazy sibling failure must stay within the bounded message length")
 
   -- Real package.path: a rooted name that is genuinely absent falls through to
   -- the alternate root. The temporary tree contains only lua/wheel/<dep>.lua,
@@ -2194,6 +2244,7 @@ end)
 -- ===========================================================================
 
 run_test("WheelConfig: 8 function classes schema and default values", function()
+  assert(_G.WheelHost == nil, "requiring wheel.config must not leak WheelHost into _G")
   assert(type(WheelConfig.DEFAULTS) == "table", "DEFAULTS must be a table")
   local d = WheelConfig.DEFAULTS
 

@@ -83,7 +83,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   raises the typed `resolution` / `E_MODULE_LOAD_FAILED` table naming the rooted
   module and a bounded, path-free cause instead of falling through to a bare
   `require`. Under the CTX-0008 workload the eager payload drops from 269,708
-  bytes / 3.19 ms to 95,300 bytes / 1.34 ms (lua5.1 warm median); the
+  bytes / 3.19 ms to 95,377 bytes / 1.34 ms (lua5.1 warm median); the
   instruction count remains far below RC-1 (see
   `recording/activation-budget.md`).
 - Provider requests now carry an explicit completion `max_tokens` bound
