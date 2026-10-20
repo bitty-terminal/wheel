@@ -20,12 +20,14 @@ local WheelErrors = {}
 
 WheelErrors.CLASS_RUNTIME = "runtime"
 WheelErrors.CLASS_VALIDATION = "validation"
+WheelErrors.CLASS_RESOLUTION = "resolution"
 WheelErrors.E_CAPABILITY_DENIED = "E_CAPABILITY_DENIED"
 WheelErrors.E_INTERNAL = "E_INTERNAL"
 WheelErrors.E_ARGS_INVALID = "E_ARGS_INVALID"
 WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
 WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
+WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
 WheelErrors.MESSAGE_MAX_LENGTH = 160
 
 local CLASSES = {
@@ -170,6 +172,52 @@ function WheelErrors.completion_budget_invalid(detail)
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_COMPLETION_BUDGET_INVALID,
     "invalid completion budget: " .. reason
+  )
+end
+
+-- Loader diagnostics can carry the interpreter's package search path, which
+-- may embed a host checkout or system directory. Keep the cause bounded and
+-- path-free: a not-found result is fully described by its rooted module name,
+-- and parser/runtime failures keep only the source basename and line.
+local MODULE_CAUSE_MAX_LENGTH = 96
+
+local function sanitize_module_cause(cause)
+  if type(cause) == "table" and type(cause.message) == "string" then
+    cause = cause.message
+  end
+  if type(cause) ~= "string" or cause == "" then
+    return "unknown cause"
+  end
+  local text = cause:gsub("%c", " "):gsub("\\", "/")
+
+  local not_found = text:match("module%s+'[^']+'%s+not%s+found")
+  if not_found then
+    return not_found
+  end
+
+  text = text:gsub("error loading module '[^']+' from file '[^']*':%s*", "")
+  text = text:gsub("[^%s:]*/([%w%._%-]+%.lua:%d+):", "%1:")
+  text = text:gsub("[^%s]*/[^%s]*", "<path>")
+  text = text:gsub("%s+", " ")
+  text = text:gsub("^%s*(.-)%s*$", "%1")
+  if #text > MODULE_CAUSE_MAX_LENGTH then
+    text = text:sub(1, MODULE_CAUSE_MAX_LENGTH - 3) .. "..."
+  end
+  return text
+end
+
+--- Build a typed activation failure for a module that could not be loaded.
+-- The message names the rooted module and a bounded, path-free cause. A loader
+-- stack trace is never included.
+-- @param module_name string Rooted module name (`wheel.agent`).
+-- @param cause string? Underlying loader diagnostic.
+-- @return table
+function WheelErrors.module_load_failed(module_name, cause)
+  local name = valid_identifier(module_name) and module_name or "unknown"
+  return typed(
+    WheelErrors.CLASS_RESOLUTION,
+    WheelErrors.E_MODULE_LOAD_FAILED,
+    string.format("activation failed for module '%s': %s", name, sanitize_module_cause(cause))
   )
 end
 

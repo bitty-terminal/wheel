@@ -5,24 +5,54 @@
 
 local WheelKernel = nil
 local WheelErrors = require("wheel.errors")
+local WheelHost
 
-local ok_host, WheelHost = pcall(require, "wheel.host")
-if not ok_host then
-  local ok_host2, WheelHost2 = pcall(require, "lua.wheel.host")
-  WheelHost = ok_host2 and WheelHost2 or nil
+local ok_host, host_or_err = pcall(require, "wheel.host")
+if ok_host then
+  WheelHost = host_or_err
+else
+  local cause = host_or_err
+  if type(cause) ~= "string"
+    or not cause:find("module 'wheel.host' not found", 1, true) then
+    error("wheel.config: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
+  end
+
+  local ok_alt, alternate = pcall(require, "lua.wheel.host")
+  if ok_alt then
+    WheelHost = alternate
+  elseif type(alternate) == "string"
+    and alternate:find("module 'lua.wheel.host' not found", 1, true) then
+    -- Standalone config remains usable without the host seam; the caller
+    -- fails closed if it reaches a host-dependent operation.
+    WheelHost = nil
+  else
+    error("wheel.config: cannot load submodule 'wheel.host': " .. tostring(alternate), 0)
+  end
 end
 
 local function get_kernel()
   if not WheelKernel then
-    local ok, mod = pcall(require, "wheel.kernel")
+    local rooted = "wheel.kernel"
+    local ok, mod = pcall(require, rooted)
     if ok then
       WheelKernel = mod
     else
-      ok, mod = pcall(require, "lua.wheel.kernel")
+      local cause = mod
+      if type(cause) ~= "string"
+        or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+        error("wheel.config: cannot load submodule '" .. rooted .. "': " .. tostring(cause), 0)
+      end
+
+      local alternate = "lua.wheel.kernel"
+      ok, mod = pcall(require, alternate)
       if ok then
         WheelKernel = mod
       else
-        WheelKernel = require("kernel")
+        if type(mod) == "string"
+          and mod:find("module '" .. alternate .. "' not found", 1, true) then
+          mod = cause
+        end
+        error("wheel.config: cannot load submodule '" .. rooted .. "': " .. tostring(mod), 0)
       end
     end
   end
