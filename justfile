@@ -97,6 +97,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/runner.lua
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
     bun run luaparse --quiet --file tests/test_wheel.lua
+    bun run luaparse --quiet --file tests/test_live_openrouter.lua
 
 # Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
 test: deps
@@ -108,6 +109,33 @@ test: deps
         lua tests/test_wheel.lua; \
     else \
         echo "No lua interpreter found; skipping runtime test execution" >&2; \
+    fi
+
+# Opt-in live provider test against OpenRouter. Manual only; never part of
+# `just check` or CI. It always runs the key-free redirect-policy test first
+# and fails closed if that test fails. When OPENROUTER_API_KEY is absent, only
+# the live provider portion is skipped after the redirect test succeeds. The
+# test-only Python client reads the key from its own environment; the Lua
+# harness adapter never receives it.
+test-live:
+    @set -e; \
+    if ! command -v python3 >/dev/null 2>&1; then \
+        echo "test-live requires python3 for the test-only HTTP client" >&2; \
+        exit 1; \
+    fi; \
+    python3 tests/test_live_http_client_redirect.py; \
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then \
+        echo "test-live live portion skipped: OPENROUTER_API_KEY is not set (redirect policy test passed)"; \
+        exit 0; \
+    fi; \
+    if command -v lua5.1 >/dev/null 2>&1; then \
+        lua5.1 tests/test_live_openrouter.lua; \
+    elif command -v luajit >/dev/null 2>&1; then \
+        luajit tests/test_live_openrouter.lua; \
+    elif command -v lua >/dev/null 2>&1; then \
+        lua tests/test_live_openrouter.lua; \
+    else \
+        echo "No lua interpreter found; skipping live test execution" >&2; \
     fi
 
 # Run end-to-end cross-process host integration drill when binary is available.

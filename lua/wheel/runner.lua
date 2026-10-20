@@ -51,6 +51,7 @@ end
 -- @param opts table?:
 --   opts.provider table?: override provider adapter
 --   opts.max_turns number?: turn limit
+--   opts.max_completion_tokens number?: completion bound override
 --   opts.on_token function?: callback fn(delta, type)
 --   opts.on_turn_start function?: callback fn(turn, task)
 --   opts.on_tool_call function?: callback fn(tool_call)
@@ -61,12 +62,37 @@ end
 --   checkpoints = string[],
 --   iterations = number,
 --   error = string?,
+--   error_code = string?,
 --   usage = table,
 -- }
 function WheelRunner.run_task(agent, task, opts)
   opts = opts or {}
   if not agent or not task then
     return { success = false, error = "Invalid agent or task argument", iterations = 0 }
+  end
+
+  -- Resolve one bounded completion budget per run. The context window is a
+  -- separate budget on the model profile; this value caps completion tokens and
+  -- is always sent so no provider assumes the model maximum.
+  if not WheelProvider then
+    return {
+      success = false,
+      error = "WheelProvider is not available",
+      iterations = 0,
+    }
+  end
+  local requested_budget = opts.max_completion_tokens
+  if requested_budget == nil then
+    requested_budget = agent.model_profile and agent.model_profile.max_completion_tokens
+  end
+  local completion_budget, budget_err = WheelProvider.validate_max_completion_tokens(requested_budget)
+  if not completion_budget then
+    return {
+      success = false,
+      error = tostring(budget_err),
+      error_code = budget_err and budget_err.code,
+      iterations = 0,
+    }
   end
 
   local task_id = task.id or task.task_id
@@ -183,6 +209,7 @@ function WheelRunner.run_task(agent, task, opts)
       tools = tools,
       temperature = (agent.model_profile and agent.model_profile.temperature) or 0.0,
       thinking = agent.model_profile and agent.model_profile.thinking,
+      max_completion_tokens = completion_budget,
     }
 
     -- Call model stream

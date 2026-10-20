@@ -72,3 +72,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   from the official plugin set (bitty-plugins #98); descriptors, documentation,
   and the GitHub repository description aligned with the independence direction
   (wheel #45). No behavior changes.
+
+### Fixed
+
+- Provider requests now carry an explicit completion `max_tokens` bound
+  (`WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS`, 4096) on the OpenAI-compatible
+  and Anthropic HTTP `complete` and `stream` paths, including every runner
+  turn. A request or model-profile `max_completion_tokens` override is validated
+  as a positive integer no larger than `WheelProvider.MAX_COMPLETION_TOKENS`
+  (32768); invalid values fail with typed `E_COMPLETION_BUDGET_INVALID` before
+  an HTTP request is sent. The context-window budget remains separate. This
+  prevents providers such as OpenRouter from assuming a model's maximum
+  completion window for credit checks and returning HTTP 402 on a low-balance
+  key.
+- Added the opt-in `just test-live` target: a manual OpenRouter smoke test for
+  complete, tool call, SSE stream, and one runner ReAct turn. It is absent from
+  `just check` and CI, skips the live portion cleanly without
+  `OPENROUTER_API_KEY`, and uses a test-only stdlib helper that reads the key
+  from its inherited environment.
+- The live-test HTTP helper now refuses every redirect before a second hop, so
+  the authorization header is never forwarded to another host or downgraded to
+  plaintext HTTP. A key-free loopback test covers cross-host and scheme-change
+  302 responses and asserts that no target request or Authorization header is
+  sent.

@@ -25,6 +25,7 @@ WheelErrors.E_INTERNAL = "E_INTERNAL"
 WheelErrors.E_ARGS_INVALID = "E_ARGS_INVALID"
 WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
 WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
+WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.MESSAGE_MAX_LENGTH = 160
 
 local CLASSES = {
@@ -154,6 +155,21 @@ function WheelErrors.result_invalid(command_id, detail)
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_RESULT_INVALID,
     validation_detail(command_id, "invalid command result", detail)
+  )
+end
+
+--- Build a typed invalid completion-budget failure.
+-- Provider and agent overrides must be positive integers within the named
+-- bound; an invalid value is rejected before a request is sent.
+-- @param detail string
+-- @return table
+function WheelErrors.completion_budget_invalid(detail)
+  local reason = type(detail) == "string" and detail or "invalid bound"
+  reason = reason:gsub("%c", "?")
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_COMPLETION_BUDGET_INVALID,
+    "invalid completion budget: " .. reason
   )
 end
 

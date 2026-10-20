@@ -147,6 +147,13 @@ function WheelAgent.validate_model_profile(profile)
       end
     end
   end
+  if profile.max_completion_tokens ~= nil and WheelProvider then
+    local budget, budget_err = WheelProvider.validate_max_completion_tokens(profile.max_completion_tokens)
+    if not budget then
+      return false, "model_profile.max_completion_tokens: "
+        .. tostring(budget_err and budget_err.message or "invalid completion budget")
+    end
+  end
   return true, nil
 end
 
