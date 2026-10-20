@@ -326,7 +326,10 @@ function classes.
     with a same-directory temporary file plus atomic rename. A symlinked,
     non-regular, foreign-owned, group/world-writable, oversized, corrupt, or
     foreign-version store fails closed and surfaces a warning; it is never
-    silently read as an empty approving store. Schema version 1 records
+    silently read as an empty approving store. Confirmation may repair a
+    group/world-writable but user-owned real parent to `0700`, then re-reads the
+    store before writing; a foreign, symlinked, or non-directory parent remains
+    fatal and no write occurs. Schema version 1 records
     `{hash, content, approved_at}` per canonical root; legacy flat string
     hashes are accepted as hash-only and migrated on the next approval.
 - **Function classes.** `lua/wheel/config.lua` groups the schema into exactly

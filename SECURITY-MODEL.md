@@ -432,6 +432,10 @@ code, and cloning or entering a repository must never execute it silently.
   `0700`/`0600` and replaced atomically; there is no `/tmp` fallback. Write-side
   project-count and byte caps match the read-side caps (256 projects and 1 MiB),
   so a successful write cannot create a store that the next read rejects.
+  Confirmation repairs a group/world-writable but user-owned real parent to
+  `0700` and re-reads the store before writing; foreign, symlinked, and
+  non-directory parents remain fatal, and confirmation never writes from the
+  empty store returned with the permission warning.
 - A missing, symlinked, non-regular, foreign-owned, group/world-writable,
   corrupt, foreign-version, oversized, or unreadable trust store fails closed:
   every project is untrusted and the warning is surfaced. It is never silently

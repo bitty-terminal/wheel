@@ -1301,6 +1301,51 @@ function WheelConfig.is_trusted(project_root, content, trust_file)
   return trusted, current_hash or "", trusted_hash, warning
 end
 
+--- Repair a user-owned trust-store parent directory after a permission warning.
+-- Only the parent mode is changed: the store file itself is never rewritten
+-- here. Ownership, symlink, and directory type are re-checked before chmod, and
+-- the caller re-reads the store and refuses to continue if any warning remains.
+-- @param trust_file string?
+-- @return boolean repaired, table? err
+local function repair_trust_store_parent(trust_file)
+  local path, path_err = resolve_trust_store_path(trust_file)
+  if not path then
+    return false, path_err
+  end
+
+  local host = require_host("fs.write")
+  local parent = path:match("^(.*)/[^/]+$") or "/"
+  local info = host.fs.stat(parent)
+  if not info.exists then
+    return false, trust_error("E_TRUST_STORE_PERMISSIONS",
+      "trust store directory is missing")
+  end
+  if info.symlink then
+    return false, trust_error("E_TRUST_STORE_SYMLINK",
+      "trust store directory is a symbolic link")
+  end
+  if not info.directory then
+    return false, trust_error("E_TRUST_STORE_NOT_REGULAR",
+      "trust store parent path is not a directory")
+  end
+
+  local owner_ok, owner_err = check_store_owner(info, "trust store directory", true)
+  if not owner_ok then
+    return false, owner_err
+  end
+  local chmod_ok = host.fs.chmod(parent, "700")
+  if chmod_ok ~= true then
+    return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
+      "cannot repair the trust store directory to mode 0700")
+  end
+  local repaired = host.fs.stat(parent)
+  local mode_ok, mode_err = check_store_owner(repaired, "trust store directory")
+  if not mode_ok then
+    return false, mode_err
+  end
+  return true, nil
+end
+
 --- Approve the current entry only when the supplied hash is exact.
 -- The supplied hash must be the full 64-hex SHA-256 of the current bytes. The
 -- store is re-read inside this call so a confirmation cannot approve content
@@ -1320,7 +1365,22 @@ function WheelConfig.confirm_trust(project_root, expected_hash, trust_file)
     return false, { code = status.code, message = status.message }, nil
   end
   if status.store_warning then
-    return false, status.store_warning, nil
+    -- A group/world-writable parent is repairable only when it is a real,
+    -- user-owned directory. Re-read the store afterwards: every existing
+    -- project must be preserved, and every other warning remains fatal.
+    if status.store_warning.code ~= "E_TRUST_STORE_PERMISSIONS" then
+      return false, status.store_warning, nil
+    end
+    local repaired = repair_trust_store_parent(trust_file)
+    if not repaired then
+      return false, status.store_warning, nil
+    end
+    local repaired_store, repaired_warning = WheelConfig.read_trust_store(trust_file)
+    if repaired_warning then
+      return false, repaired_warning, nil
+    end
+    status.store = repaired_store
+    status.store_warning = nil
   end
   if status.hash ~= expected_hash then
     return false, trust_error("E_TRUST_HASH_MISMATCH",

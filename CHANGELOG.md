@@ -146,7 +146,10 @@ revoke [path]` is user-facing and removes the canonical record plus aliases.
   corruption instead of returning an empty store, enforces matching read/write
   caps, preserves temporarily unresolvable records, and uses schema version 1
   with hash, content, and approval time (legacy string hashes migrate on the
-  next approval). SHA-256 of the exact entry bytes uses
+  next approval). Confirmation repairs a user-owned group/world-writable
+  parent directory to `0700` and re-reads the store before writing, while
+  foreign, symlinked, and non-directory parents remain fatal. SHA-256 of the
+  exact entry bytes uses
   `sha256sum`/`shasum`/`openssl` with the pure-Lua fallback. The evaluator no
   longer exposes `pcall`/`xpcall`; direct and method-call forms of
   `string.rep`/`table.concat` carry per-call and cumulative caps by patching

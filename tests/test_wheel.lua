@@ -2428,6 +2428,13 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
     "the real string/table tables must be restored after every eval path")
   assert(("x"):rep(3) == "xxx", "string method syntax must work after restoration")
 
+  local ok_runtime, err_runtime = WheelConfig.eval_chunk(
+    "local value = string.rep('A', 10)\nreturn { bad = value + {} }", "restore_error_test")
+  assert(ok_runtime == false, "an ordinary runtime error must fail the chunk")
+  assert(string.rep == original_rep and table.concat == original_concat,
+    "the real string/table tables must be restored after a runtime error")
+  assert(string.find(tostring(err_runtime), "runtime error") ~= nil)
+
   -- The hook error is no longer catchable because pcall/xpcall are absent.
   local pcall_escape = "while true do pcall(function() for i=1,2000000 do end end) end return {}"
   local ok_escape, err_escape = WheelConfig.eval_chunk(pcall_escape, "pcall_escape_test")
@@ -3014,6 +3021,107 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
     "a store above the project count cap must be refused on write")
   assert(WheelHost.fs.exists(count_file) == false,
     "a refused count-cap store must not be created")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
+run_test("WheelConfig: confirmation repairs a user-owned store parent and preserves records", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_store_parent_repair"
+  local state_dir = tmp_dir .. "/state/wheel"
+  local trust_file = state_dir .. "/trusted_projects.json"
+  local proj_a = tmp_dir .. "/a"
+  local proj_b = tmp_dir .. "/b"
+  local proj_c = tmp_dir .. "/c"
+  os.execute("rm -rf " .. tmp_dir
+    .. " && mkdir -p " .. proj_a .. "/.wheel " .. proj_b .. "/.wheel "
+    .. proj_c .. "/.wheel " .. state_dir)
+  os.execute("chmod 700 " .. state_dir)
+
+  local function write_entry(dir, value)
+    local handle = io.open(dir .. "/.wheel/init.lua", "w")
+    handle:write('return { verification = { test_command = "' .. value .. '" } }\n')
+    handle:close()
+  end
+  write_entry(proj_a, "a")
+  write_entry(proj_b, "b")
+  write_entry(proj_c, "c")
+
+  local a_status = WheelConfig.trust_status(proj_a, trust_file)
+  assert(a_status.ok == true)
+  assert(WheelConfig.trust(proj_a, a_status.hash, trust_file) == true)
+
+  -- A 0755 parent is user-owned and not group/world-writable, but confirmation
+  -- still repairs it to 0700 and preserves the existing record.
+  os.execute("chmod 755 " .. state_dir)
+  local b_status = WheelConfig.trust_status(proj_b, trust_file)
+  assert(b_status.ok == true)
+  local b_ok, b_err = WheelConfig.trust(proj_b, b_status.hash, trust_file)
+  assert(b_ok == true, tostring(b_err and b_err.message))
+  local after_b = WheelConfig.read_trust_store(trust_file)
+  assert(after_b.projects[a_status.root] ~= nil, "the existing project must be preserved")
+  assert(after_b.projects[b_status.root] ~= nil, "the new project must be added")
+  local b_mode = WheelHost.fs.stat(state_dir)
+  assert(b_mode.mode == 448,
+    "confirmation must repair the parent to mode 0700, got " .. tostring(b_mode.mode))
+
+  -- A group/world-writable parent with an existing store exercises the
+  -- permission-warning repair path: chmod 0700, re-read, preserve, add.
+  os.execute("chmod 777 " .. state_dir)
+  local c_status = WheelConfig.trust_status(proj_c, trust_file)
+  assert(c_status.ok == true)
+  assert(c_status.store_warning ~= nil
+    and c_status.store_warning.code == "E_TRUST_STORE_PERMISSIONS",
+    "a 0777 parent must surface the permission warning")
+  local c_ok, c_err = WheelConfig.trust(proj_c, c_status.hash, trust_file)
+  assert(c_ok == true, tostring(c_err and c_err.message))
+  local after_c = WheelConfig.read_trust_store(trust_file)
+  assert(after_c.projects[a_status.root] ~= nil, "repair must preserve the first record")
+  assert(after_c.projects[b_status.root] ~= nil, "repair must preserve the second record")
+  assert(after_c.projects[c_status.root] ~= nil, "repair must add the third record")
+  local c_mode = WheelHost.fs.stat(state_dir)
+  assert(c_mode.mode == 448, "the repaired parent must be mode 0700")
+
+  -- A foreign-owned parent fails closed and must not write.
+  local before_raw = WheelHost.fs.read_file(trust_file)
+  local backend = WheelHost.backend
+  local original_stat = backend.stat
+  backend.stat = function(path)
+    local info = original_stat(path)
+    if path == state_dir and type(info.uid) == "number" then
+      info.uid = info.uid + 1
+    end
+    return info
+  end
+  local d_status = WheelConfig.trust_status(proj_a, trust_file)
+  local foreign_ok, foreign_err = WheelConfig.trust(proj_a, d_status.hash, trust_file)
+  backend.stat = original_stat
+  assert(foreign_ok == false and foreign_err ~= nil
+    and foreign_err.code == "E_TRUST_STORE_FOREIGN_OWNED",
+    "a foreign-owned parent must fail closed")
+  assert(WheelHost.fs.read_file(trust_file) == before_raw,
+    "a failed foreign-owner confirmation must not rewrite the store")
+
+  -- A non-directory parent fails closed.
+  local not_dir = tmp_dir .. "/not-a-directory"
+  local nd = io.open(not_dir, "w")
+  nd:write("x")
+  nd:close()
+  local nd_status = WheelConfig.trust_status(proj_a, not_dir .. "/trusted_projects.json")
+  local nd_ok, nd_err = WheelConfig.trust(proj_a, nd_status.hash,
+    not_dir .. "/trusted_projects.json")
+  assert(nd_ok == false and nd_err ~= nil
+    and nd_err.code == "E_TRUST_STORE_NOT_REGULAR",
+    "a non-directory parent must fail closed")
+
+  -- A symlinked parent fails closed.
+  local link_parent = tmp_dir .. "/state-link"
+  os.execute("ln -s " .. state_dir .. " " .. link_parent)
+  local link_status = WheelConfig.trust_status(proj_a, link_parent .. "/trusted_projects.json")
+  local link_ok, link_err = WheelConfig.trust(proj_a, link_status.hash,
+    link_parent .. "/trusted_projects.json")
+  assert(link_ok == false and link_err ~= nil
+    and link_err.code == "E_TRUST_STORE_SYMLINK",
+    "a symlinked parent must fail closed")
 
   os.execute("rm -rf " .. tmp_dir)
 end)
