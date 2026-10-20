@@ -59,23 +59,30 @@
 -- string passed to `proc.run_command` is the explicit shell-string primitive
 -- used by Execute-intent tools; inspect-intent call sites use `run_program`,
 -- which passes each argv element as a positional argument to a constant POSIX
--- shell wrapper (`exec "$@"` with stdin redirected from a positional path). No
--- call site builds an unquoted shell string.
+-- shell wrapper and then to `env -- "$@"` (stdin redirected from a positional
+-- path). No call site builds an unquoted shell string, and a program named
+-- `-S`/`-i` cannot become an env option.
 --
 -- Process bounds and environment:
--- Every child runs under GNU `timeout` (or `gtimeout`), which creates and owns
--- the child process group; on expiry it signals only that group, and a bounded
--- kill-after escalates to SIGKILL. stdout and stderr are redirected to private
--- 0600 files and read back through a fixed cap (`WheelHost.LIMITS.
--- MAX_CAPTURE_BYTES`, 256 KiB) so output cannot exhaust harness memory. The
--- child environment is rebuilt from the allowlist in `ENV_ALLOWLIST` (PATH,
--- HOME, LANG/LC_ALL, TERM, TMPDIR, XDG_RUNTIME_DIR/XDG_STATE_HOME/
--- XDG_CONFIG_HOME) plus explicit `opts.env` declarations; PATH must contain
--- absolute entries and is never inherited implicitly. Secret-shaped names are
--- refused even as explicit declarations, and the wrapper strips shell-added
--- `PWD`/`SHLVL` with `env -u` so an argv child sees only the allowlist. stdin
+-- A supervisor starts a `setsid -w` session leader that records its own
+-- PID/PGID, then executes the scrubbed command under GNU `timeout` (or
+-- `gtimeout`). On expiry timeout signals the command group and a bounded
+-- kill-after escalates to SIGKILL. After the direct command exits for any
+-- reason, the supervisor terminates any remaining members of the recorded PGID
+-- with TERM and a bounded KILL, then preserves the direct command's status; a
+-- child that calls `setsid` on its own can still escape. stdout and stderr are
+-- redirected to private 0600 files and read back through a fixed cap
+-- (`WheelHost.LIMITS.MAX_CAPTURE_BYTES`, 256 KiB) so output cannot exhaust
+-- harness memory. The child environment is rebuilt from the allowlist in
+-- `ENV_ALLOWLIST` (PATH, HOME, LANG/LC_ALL, TERM, TMPDIR,
+-- XDG_RUNTIME_DIR/XDG_STATE_HOME/XDG_CONFIG_HOME) plus explicit `opts.env`
+-- declarations; PATH is copied from the parent and sanitized to absolute
+-- entries rather than inherited implicitly. Secret-shaped names are refused
+-- even as explicit declarations, and the wrapper strips shell-added
+-- `PWD`/`SHLVL`/`_` with `env -u` so an argv child sees only the allowlist. stdin
 -- is `/dev/null` unless `opts.stdin` supplies bytes, which are staged in an
--- exclusive 0600 file.
+-- exclusive 0600 file. `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
+-- must be resolvable or the primitive fails closed as `unavailable`.
 -- `WheelHost.backend` is the documented swap point for tests; call sites never
 -- touch it directly.
 --
@@ -184,6 +191,9 @@ local MIN_TIMEOUT_MS = 50
 --- Grace period between SIGTERM and SIGKILL for the owned process group.
 local KILL_AFTER_MS = 2000
 
+--- Grace period for the post-exit group sweep (TERM, then KILL).
+local SWEEP_GRACE_MS = 250
+
 --- Maximum bytes accepted for one stdin payload (1 MiB).
 local MAX_STDIN_BYTES = 1024 * 1024
 
@@ -259,11 +269,23 @@ WheelHost.LIMITS = {
   DEFAULT_PROCESS_TIMEOUT_MS = DEFAULT_TIMEOUT_MS,
   MAX_PROCESS_TIMEOUT_MS = MAX_TIMEOUT_MS,
   MIN_PROCESS_TIMEOUT_MS = MIN_TIMEOUT_MS,
+  SWEEP_GRACE_MS = SWEEP_GRACE_MS,
   MAX_STDIN_BYTES = MAX_STDIN_BYTES,
   MAX_ENV_VALUE_BYTES = MAX_ENV_VALUE_BYTES,
   MAX_ENV_ENTRIES = MAX_ENV_ENTRIES,
   READ_CHUNK_BYTES = READ_CHUNK_BYTES,
 }
+
+--- Post-exit supervisor. It runs `setsid -w <leader>` (the leader is the
+--- session/PGID leader), preserves the command status, then terminates any
+--- remaining members of the recorded PGID with TERM and a bounded KILL. It never
+--- uses a name or pattern; `$pgid` is validated as a numeric PGID greater than 1.
+local SUPERVISOR_SCRIPT = 'pgid_file="$1"; grace="$2"; sleep_bin="$3"; shift 3; "$@"; status=$?; if [ -s "$pgid_file" ]; then read -r pgid < "$pgid_file" || pgid=""; case "$pgid" in ""|*[!0-9]*) : ;; *) if [ "$pgid" -gt 1 ]; then kill -TERM -"$pgid" 2>/dev/null || :; if kill -0 -"$pgid" 2>/dev/null; then "$sleep_bin" "$grace" 2>/dev/null || :; kill -KILL -"$pgid" 2>/dev/null || :; fi; fi ;; esac; fi; exit "$status"'
+
+--- Session leader. It records its own PID/PGID in the exclusive file created
+--- by the host, then replaces itself with the scrubbed command chain. No caller
+--- value is interpolated into this script.
+local LEADER_SCRIPT = 'pgid_file="$1"; shift; printf "%s\n" "$$" > "$pgid_file" || exit 125; exec "$@"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the exit
@@ -633,21 +655,23 @@ function standalone.new(opts)
 
   --- List a directory as raw `ls -la` lines.
   -- The argv is passed one argument at a time; the standalone primitive is a
-  -- POSIX shell, but no call site builds a shell string. stderr is merged so a
-  -- missing directory's diagnostic remains in the entry stream, matching the
-  -- pre-seam tool.
+  -- POSIX shell, but no call site builds a shell string. stderr is kept
+  -- separate, and a nonzero `ls` status or timeout is reported as failure so a
+  -- missing/broken `ls` never becomes directory content.
   -- @param path string
-  -- @return table { ok, code, stdout, stderr, entries, total }
+  -- @return table { ok, code, stdout, stderr, entries, total, timed_out, outcome }
   function backend.list_dir(path)
-    local res = backend.run_program("ls", { "-la", "--", path }, { merge_stderr = true })
+    local res = backend.run_program("ls", { "-la", "--", path })
     local entries = split_lines(res.stdout)
     return {
-      ok = res.ok,
+      ok = res.ok and res.code == 0 and not res.timed_out,
       code = res.code,
       stdout = res.stdout,
       stderr = res.stderr,
       entries = entries,
       total = #entries,
+      timed_out = res.timed_out,
+      outcome = res.outcome,
     }
   end
 
@@ -897,6 +921,13 @@ function standalone.new(opts)
     return string.format("%.3fs", ms / 1000)
   end
 
+  --- Format a millisecond grace as a sleep argument (no unit suffix).
+  -- @param ms number
+  -- @return string
+  local function format_sleep(ms)
+    return string.format("%.3f", ms / 1000)
+  end
+
   --- Execute one bounded child process and normalize its result.
   -- @param mode string "argv" or "shell"
   -- @param payload string program name or shell string
@@ -943,6 +974,9 @@ function standalone.new(opts)
       end
     end
 
+    -- cwd is caller-resolved and caller-contained: this seam validates only
+    -- shape, not workspace membership. Tool call sites must pass a path that
+    -- already passed the workspace resolver.
     local cwd = opts.cwd
     if cwd ~= nil then
       if type(cwd) ~= "string"
@@ -976,6 +1010,18 @@ function standalone.new(opts)
       return process_failure("the POSIX 'sh' is unavailable",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
+    local setsid_bin = resolve_tool("setsid")
+    if not setsid_bin then
+      return process_failure(
+        "the 'setsid' utility is unavailable; refusing to run without a recorded process group",
+        WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
+    end
+    local sleep_bin = resolve_tool("sleep")
+    if not sleep_bin then
+      return process_failure(
+        "the 'sleep' utility is unavailable; cannot bound the process-group sweep",
+        WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
+    end
 
     local created = {}
     local function fresh_temp()
@@ -1006,13 +1052,14 @@ function standalone.new(opts)
     local out_path = fresh_temp()
     local err_path = fresh_temp()
     local status_path = fresh_temp()
+    local pgid_path = fresh_temp()
     local stdin_path
-    if out_path and err_path and status_path then
+    if out_path and err_path and status_path and pgid_path then
       if stdin_data ~= nil then
         stdin_path = fresh_temp()
       end
     end
-    if (not out_path) or (not err_path) or (not status_path)
+    if (not out_path) or (not err_path) or (not status_path) or (not pgid_path)
       or (stdin_data ~= nil and not stdin_path) then
       local errors = cleanup()
       local message = "cannot create private process-capture files"
@@ -1036,17 +1083,20 @@ function standalone.new(opts)
       stdin_path = "/dev/null"
     end
 
-    -- A constant wrapper: `$0` is the stdin path and `$@` is either the argv
-    -- vector or `sh -c <shell string>`. No caller value is interpolated into
-    -- the script text.
+    -- A constant wrapper: `$0` is `wheel-exec`, `$1` is the stdin path, and the
+    -- remaining positional arguments are either the argv vector or
+    -- `sh -c <shell string>` after the shifts. No caller value is interpolated
+    -- into the script text. `--` stops env option parsing, and a program name
+    -- that starts with `-` or contains `=` is refused so env cannot treat it as
+    -- an option or environment assignment.
     local script
     local launch_args
     if mode == "argv" then
       if cwd then
-        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD "$@" < "$stdin"'
+        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
         launch_args = { stdin_path, env_bin, cwd, payload }
       else
-        script = 'stdin="$1"; envbin="$2"; shift 2; exec "$envbin" -u SHLVL -u PWD "$@" < "$stdin"'
+        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
         launch_args = { stdin_path, env_bin, payload }
       end
       for _, arg in ipairs(payload_args or {}) do
@@ -1054,16 +1104,26 @@ function standalone.new(opts)
       end
     else
       if cwd then
-        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD "$@" < "$stdin"'
+        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
         launch_args = { stdin_path, env_bin, cwd, sh_bin, "-c", payload }
       else
-        script = 'stdin="$1"; envbin="$2"; shift 2; exec "$envbin" -u SHLVL -u PWD "$@" < "$stdin"'
+        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
         launch_args = { stdin_path, env_bin, sh_bin, "-c", payload }
       end
     end
 
     local kill_after_ms = math.min(KILL_AFTER_MS, timeout_ms)
-    local pieces = { shell_quote(env_bin), "-i" }
+    local pieces = {
+      shell_quote(sh_bin), "-c", shell_quote(SUPERVISOR_SCRIPT),
+      shell_quote("wheel-supervisor"),
+      shell_quote(pgid_path), shell_quote(format_sleep(SWEEP_GRACE_MS)),
+      shell_quote(sleep_bin),
+      shell_quote(setsid_bin), "-w",
+      shell_quote(sh_bin), "-c", shell_quote(LEADER_SCRIPT),
+      shell_quote("wheel-leader"),
+      shell_quote(pgid_path),
+      shell_quote(env_bin), "-i",
+    }
     for _, assignment in ipairs(env_parts) do
       pieces[#pieces + 1] = shell_quote(assignment)
     end
@@ -1151,14 +1211,17 @@ function standalone.new(opts)
     }
   end
 
-
-  --
-  -- The command runs through GNU `timeout`, which creates and owns a process
-  -- group for the child and signals only that group on expiry. stdout and
-  -- stderr are redirected to private 0600 files and read back at most
-  -- `opts.max_output_bytes` (default 256 KiB) so a runaway child cannot exhaust
-  -- harness memory. The child environment is rebuilt from the allowlist; it is
-  -- never inherited. stdin is `/dev/null` unless `opts.stdin` supplies bytes.
+  --- Execute a shell command line inside the bounded, scrubbed process
+  -- primitive. This is the explicit shell-string surface for Execute-intent
+  -- tools; argv call sites use `run_program`.
+  -- The command runs in a `setsid`-recorded process group under GNU `timeout`.
+  -- Timeout expiry signals the group and a bounded kill-after escalates to
+  -- SIGKILL; after any direct-command exit the supervisor sweeps remaining
+  -- members of the recorded PGID with TERM/KILL and preserves the command
+  -- status. stdout and stderr are redirected to private 0600 files and read
+  -- back at most `opts.max_output_bytes` (default 256 KiB) so a runaway child
+  -- cannot exhaust harness memory. The child environment is rebuilt from the
+  -- allowlist; stdin is `/dev/null` unless `opts.stdin` supplies bytes.
   --
   -- Result: `ok` reports a launched process (a timeout is still launched),
   -- `code`/`exit_code` carry the shell status (124/137 map to timeout),
@@ -1177,9 +1240,12 @@ function standalone.new(opts)
 
   --- Execute a program with an explicit argument vector. The caller never
   -- builds a shell string: each element is passed as a positional argument to
-  -- a constant `sh -c 'stdin="$1"; shift; exec "$@" < "$stdin"'` wrapper, so no argv element is
-  -- parsed as shell syntax. The wrapper only exists to apply stdin redirection
-  -- and an optional cwd; `run_command` remains the shell-string primitive.
+  -- a constant `sh -c` wrapper and then to `env -- "$@"`, so no argv element is
+  -- parsed as shell syntax or as an env option (including `-S`/`-i`). A program
+  -- name that starts with `-` or contains `=` is refused before env runs. The
+  -- wrapper applies stdin redirection and an optional cwd; callers must resolve
+  -- and contain `opts.cwd` in the workspace themselves. `run_command` remains
+  -- the shell-string primitive.
   -- `opts.merge_stderr` merges the captured streams, `opts.discard_stderr`
   -- drops captured stderr, and `opts.stdin` supplies the child's stdin bytes.
   -- @param program string
@@ -1308,8 +1374,12 @@ function standalone.new(opts)
     end
     local wrote, write_err = write_private_file(path, content or "")
     if not wrote then
-      os.remove(path)
-      return false, write_err
+      local removed, remove_err = os.remove(path)
+      if not removed then
+        return false, tostring(write_err)
+          .. "; cleanup failed: " .. tostring(remove_err or path)
+      end
+      return false, tostring(write_err)
     end
     return true
   end
@@ -1520,8 +1590,9 @@ end
 -- tools; argv call sites use `run_program`.
 -- With `env.command_runner` set (the existing tool injection seam), the runner
 -- is invoked with { command = shell_string } and its tool-shaped result is
--- normalized; otherwise the backend runs the command under the timeout,
--- output cap, and environment allowlist.
+-- normalized; otherwise the backend runs the command under the setsid-recorded
+-- process group, timeout, post-exit group sweep, output cap, and environment
+-- allowlist.
 -- @param shell_string string
 -- @param env table? { command_runner = function? }
 -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, env }
@@ -1535,9 +1606,10 @@ end
 
 --- Execute a program with an explicit argument vector (no unquoted shell
 -- string at the call site). Every element crosses the seam as a positional
--- argument to a constant `exec "$@"` wrapper; nothing is interpolated into a
--- shell script. The command_runner override applies to shell-string execution
--- only, so it is not consulted here.
+-- argument to a constant `env -- "$@"` wrapper; nothing is interpolated into a
+-- shell script. `opts.cwd` is caller-resolved and must already be contained in
+-- the workspace; this seam validates only its shape. The command_runner
+-- override applies to shell-string execution only, so it is not consulted here.
 -- @param program string
 -- @param args string[]?
 -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,

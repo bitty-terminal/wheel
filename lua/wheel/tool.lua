@@ -320,11 +320,21 @@ ActionOutcome.__index = ActionOutcome
 -- @return string Formatted observation string
 function ActionOutcome:format_observation()
   local lines = {}
+  local flags = ""
+  if self.timed_out then
+    flags = flags .. ", timed_out"
+  end
+  if self.truncated then
+    flags = flags .. ", truncated"
+  end
+  if self.spilled then
+    flags = flags .. ", spilled=" .. tostring(self.spillover_hash):sub(1, 16) .. "..."
+  end
   local header = string.format("[Tool: %s (exit=%d, %dms%s)]",
     self.tool or "unknown",
     self.exit_code or 0,
     self.duration_ms or 0,
-    self.spilled and (", spilled=" .. tostring(self.spillover_hash):sub(1, 16) .. "...") or "")
+    flags)
   table.insert(lines, header)
 
   if self.preview and #self.preview > 0 then
@@ -468,7 +478,7 @@ local tool_read_file = {
       path = { type = "string", description = "Relative path to file in workspace" },
       start_line = { type = "integer", description = "Optional 1-indexed start line" },
       end_line = { type = "integer", description = "Optional 1-indexed end line" },
-      max_bytes = { type = "integer", description = "Max bytes to read (default 65536)" },
+      max_bytes = { type = "integer", description = "Max bytes to read from the start (default 65536; line ranges apply within this bounded prefix)" },
     },
     required = { "path" },
   },
@@ -504,9 +514,13 @@ local tool_read_file = {
     local line_no = 0
     local bytes_accum = 0
     local truncated = false
+    local reached_start = not start_l
 
     for _, line in ipairs(split_content_lines(file_content)) do
       line_no = line_no + 1
+      if start_l and line_no >= start_l then
+        reached_start = true
+      end
       local in_range = true
       if start_l and line_no < start_l then
         in_range = false
@@ -527,6 +541,19 @@ local tool_read_file = {
       if end_l and line_no >= end_l then
         break
       end
+    end
+
+    if start_l and not reached_start and #file_content > max_b then
+      return {
+        success = false,
+        exit_code = 1,
+        stderr = string.format(
+          "start_line %s is beyond the bounded read prefix (%d bytes); increase max_bytes",
+          tostring(start_l), max_b),
+        truncated = true,
+        lines_read = 0,
+        total_lines = 0,
+      }
     end
 
     local content = table.concat(lines, "\n")
@@ -770,7 +797,19 @@ local tool_list_directory = {
     local max_entries = args.max_entries or 100
     local listing = WheelHost.fs.list_dir(clean_path)
     if not listing.ok then
-      return { success = false, exit_code = 1, stderr = "Failed to list directory: " .. clean_path }
+      local detail = listing.stderr or ""
+      if listing.timed_out then
+        detail = "Directory listing timed out"
+      elseif detail == "" then
+        detail = "Failed to list directory: " .. clean_path
+      end
+      return {
+        success = false,
+        exit_code = listing.code or 1,
+        stderr = detail:sub(1, 512),
+        outcome = listing.outcome,
+        timed_out = listing.timed_out == true,
+      }
     end
 
     local entries = {}
@@ -828,7 +867,6 @@ local tool_search_code = {
     table.insert(argv, query)
     table.insert(argv, clean_path)
     local res = WheelHost.proc.run_program("grep", argv, {
-      discard_stderr = true,
       max_output_bytes = WheelTool.SEARCH_MAX_BYTES,
     })
     if not res.ok then
@@ -846,6 +884,19 @@ local tool_search_code = {
         stderr = "Search timed out",
         outcome = res.outcome,
         timed_out = true,
+      }
+    end
+    if res.code ~= 0 and res.code ~= 1 then
+      local detail = res.stderr or ""
+      if detail == "" then
+        detail = "grep failed with exit code " .. tostring(res.code)
+      end
+      return {
+        success = false,
+        exit_code = res.exit_code or 1,
+        stderr = detail:sub(1, 512),
+        outcome = res.outcome,
+        truncated = res.truncated == true,
       }
     end
 

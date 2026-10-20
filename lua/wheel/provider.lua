@@ -1268,6 +1268,7 @@ function StdioAdapter:complete(request, opts)
   local res = WheelHost.proc.run_program(program, argv, {
     stdin = prompt,
     timeout_ms = self.timeout_ms,
+    merge_stderr = true,
   })
   if not res.ok then
     return nil, "Failed to spawn stdio model process: " .. program
@@ -1283,7 +1284,12 @@ function StdioAdapter:complete(request, opts)
   local out = res.stdout or ""
   if res.code ~= 0 then
     local code = res.code or 1
-    return nil, string.format("Command '%s' failed (exit code %s): %s", program, tostring(code), out:sub(1, 512))
+    local detail = out
+    if detail == "" and res.stderr ~= "" then
+      detail = res.stderr
+    end
+    return nil, string.format("Command '%s' failed (exit code %s): %s",
+      program, tostring(code), detail:sub(1, 512))
   end
 
   return {

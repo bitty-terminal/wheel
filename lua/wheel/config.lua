@@ -499,6 +499,12 @@ local function native_sha256(content)
 
   local removed = host.fs.remove_file(temp)
   if removed ~= true then
+    -- Do not leave a 0600 copy of project configuration behind when the
+    -- unlink fails; blanking it is best-effort and the digest still fails
+    -- closed to the bounded pure-Lua path.
+    pcall(function()
+      host.fs.write_file(temp, "")
+    end)
     return nil
   end
   return digest

@@ -168,39 +168,46 @@ not receive it.
 - The child environment is rebuilt from a fixed allowlist rather than
   inherited: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`,
   `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `XDG_CONFIG_HOME`, plus explicit
-  caller declarations. `PATH` must contain absolute entries and is never
-  inherited implicitly. Secret-shaped names (`*_KEY`, `*_TOKEN`, `*_SECRET`,
+  caller declarations. `PATH` is copied from the parent and sanitized to
+  absolute entries; it is not inherited implicitly. Secret-shaped names (`*_KEY`, `*_TOKEN`, `*_SECRET`,
   `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIAL[S]`), `LD_*`/`DYLD_*`, and shell
   injection names (`IFS`, `ENV`, `BASH_ENV`, `CDPATH`, `GLOBIGNORE`,
   `SHELLOPTS`, `BASHOPTS`, `PS4`, `PROMPT_COMMAND`) are refused even when a
-  caller declares them. The wrapper also strips shell-added `PWD`/`SHLVL` with
+  caller declares them. The wrapper also strips shell-added `PWD`/`SHLVL`/`_` with
   `env -u` for argv children; an explicit shell-string child still starts a
-  shell, which may set its own `SHLVL` counter. `HOME` is passed only because
+  shell, which may set its own `SHLVL` or `_` variable. `HOME` is passed only because
   ordinary build tools require it; that still grants the child the user's
   ambient file access, which is a residual risk, not a sandbox claim.
-- The harness records the resolved executable path, argv, cwd, exit status, and
-  duration before the process is allowed to run.
+- The harness is required to record the resolved executable path, argv, cwd,
+  exit status, and duration before the process is allowed to run. No execution
+  audit stream exists yet, so this remains a known gap.
 - Each invocation has a finite timeout, bounded output, and a process group
-  owned by GNU `timeout` (or `gtimeout`). The timeout process creates the
-  group, signals only that group on expiry, and escalates to SIGKILL after a
-  bounded grace period. The harness never sends a name- or pattern-based kill.
+  recorded through a `setsid` session leader. GNU `timeout` (or `gtimeout`)
+  enforces expiry, signals the command group, and escalates to SIGKILL after a
+  bounded grace. After the direct command exits for any reason, a supervisor
+  sends TERM then KILL to the recorded PGID, preserving the command's exit
+  status; this removes background grandchildren that outlive normal completion.
+  The harness never sends a name- or pattern-based kill and never signals an
+  unrecorded group. `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
+  must be resolvable or the primitive fails closed as `unavailable`.
   stdout and stderr are captured to private `0600` files and read back through
   a fixed cap of 256 KiB per stream; the result carries `timed_out`,
   `truncated`, `exit_code`, and a typed `outcome`. GNU maps expiry to 124 and
   kill-after escalation to 137, so a child that itself exits 124/137 is
   indistinguishable and is reported as a timeout.
 - There is no asynchronous cancellation hook in the single-threaded Lua
-  runtime yet. Timeout expiry is the termination trigger; a caller cannot
-  interrupt an in-flight invocation. This is a known limitation, not a claim
-  that the policy's recorded-PID cancellation requirement is complete.
+  runtime yet. Timeout expiry and the post-exit group sweep are the termination
+  triggers; a caller cannot interrupt an in-flight invocation. This is a known
+  limitation, not a claim that the policy's recorded-PID cancellation
+  requirement is complete.
 - Interactive stdin and TTY allocation are off by default. stdin is
   `/dev/null` unless the caller supplies bytes, which are staged in an
   exclusive `0600` file inside the private runtime directory. No TTY is
   allocated for a child.
-- Detached execution, daemonization, and reparenting out of the owned process
-  tree are denied. A child that calls `setsid` or otherwise leaves the timeout
-  process group can escape group termination; that remains an orphan risk and
-  is recorded below.
+- Detached execution, daemonization, and reparenting out of the recorded process
+  tree are denied; the post-exit sweep terminates background members of the
+  recorded group. A child that calls `setsid` itself can still escape group
+  termination; that remains an orphan risk and is recorded below.
 - Executing setuid/setgid binaries and invoking privilege-transition tools
   (`sudo`, `su`, `doas`, `pkexec`) is denied.
 - Network access by spawned programs is not mediated by the harness. The argv
@@ -237,9 +244,10 @@ controls are mandatory:
    or interpreter is denied. The content must be fetched, inspected, and
    executed as a separate recorded step.
 10. **Bounded execution.** The same timeout, 256 KiB-per-stream capture bound,
-    and timeout-owned process-group termination as argv apply. Asynchronous
-    cancellation by recorded PID is not exposed by the current runtime; timeout
-    expiry is the only in-flight termination trigger.
+    setsid-recorded group, and post-exit TERM/KILL sweep as argv apply.
+    Asynchronous cancellation by recorded PID is not exposed by the current
+    runtime; timeout expiry and normal-exit group cleanup are the in-flight
+    termination triggers.
 
 Residual risk: a shell command can write outside the workspace root because the
 harness has no OS-level confinement in 0.1.0. The path sandbox governs
@@ -719,7 +727,7 @@ secret environment reads.
 | Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                     | Upstream compromise remains possible                                  |
 | Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                  | Same-user processes can rewrite it                                    |
 | Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                | Same-user processes can tamper with the log                           |
-| Orphaned or daemonized processes                  | Timeout-owned process group, bounded SIGKILL escalation, no detach, cleanup on close                         | A child that calls `setsid` can still escape the group                |
+| Orphaned or daemonized processes                  | setsid-recorded PGID, timeout plus post-exit TERM/KILL sweep, no detach                                      | A child that calls setsid can still escape the recorded group         |
 | Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration | Disk capture during a run has no file-size quota; CPU is not budgeted |
 | Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                   | A reader may still assume plugin semantics                            |
 | Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                               | Not designed or implemented in 0.1.0                                  |
@@ -791,8 +799,8 @@ network boundary, covering at minimum:
 The current `tests/real_host_fixture.lua` covers activation, command smoke, real
 filesystem/process/temporary-file behavior, path and destructive-command
 denials, a real process timeout with a child-plus-grandchild process-group
-check, a scrubbed-environment probe, stdin round-trip, exclusive `0600`
-temporary creation with a symlink refusal, and the trust
+check, a normal-exit background-child sweep, a scrubbed-environment probe, stdin
+round-trip, exclusive `0600` temporary creation with a symlink refusal, and the trust
 approval/content-change/re-approval/revocation-across-restart flow against a
 private XDG state directory. Cancellation (as distinct from timeout) is not
 implemented, and the fixture does not cover a provider stub, audit output, or a
@@ -842,11 +850,11 @@ that the policy relies on, and they remain unverified until the gates pass:
   wall-clock, and CPU-time calls. The production backend is the standalone
   POSIX surface, selected explicitly with `select_backend("standalone")`;
   unsupported platforms and unavailable primitives fail closed with typed
-  denials. The process primitive runs under GNU timeout with a timeout-owned
-  process group, a 256 KiB per-stream capture cap, a rebuilt allowlist
-  environment, and an explicit stdin channel. No direct `io.open`, `io.popen`,
-  `os.remove`, `os.execute`, `os.tmpname`, `os.time`, or `os.clock` call
-  remains outside `host.lua`.
+  denials. The process primitive runs under GNU timeout with a
+  `setsid`-recorded process group, a post-exit TERM/KILL sweep, a 256 KiB
+  per-stream capture cap, a rebuilt allowlist environment, and an explicit
+  stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
+  `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
 backend, the standalone POSIX surface, selected explicitly with
@@ -893,16 +901,17 @@ Known gaps relative to this policy (not claims of compliance):
   and Commander Custom-mutating and the full matrix are not enforced.
 - The process primitive enforces a finite timeout (default 120 s, maximum
   10 min), a 256 KiB capture cap per stream, `/dev/null` stdin unless bytes are
-  supplied, a timeout-owned process group with bounded SIGKILL escalation, and
-  exclusive `0600` capture-file cleanup on success, error, and timeout.
+  supplied, a `setsid`-recorded process group, timeout SIGKILL escalation, and
+  a post-exit TERM/KILL sweep (250 ms grace) on success, error, and timeout.
   Remaining gaps: there is no asynchronous cancellation hook, so timeout expiry
-  is the only in-flight termination trigger; GNU timeout maps expiry to 124 and
-  kill-after to 137, so a child that itself exits 124/137 is indistinguishable;
-  `env`, `timeout`/`gtimeout`, and `sh` must be resolvable or the primitive
-  fails closed as `unavailable`; timeout enforcement is not a real-time
-  guarantee; disk capture has no per-file quota, only the timeout bound; a
-  child that calls `setsid` escapes the group; and there is no rlimit, cgroup,
-  seccomp, or OS confinement for spawned programs.
+  and the post-exit sweep are the only termination triggers; GNU timeout maps
+  expiry to 124 and kill-after to 137, so a child that itself exits 124/137 is
+  indistinguishable; `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
+  must be resolvable or the primitive fails closed as `unavailable`; timeout
+  enforcement is not a real-time guarantee; disk capture has no per-file quota,
+  only the timeout bound; a child that calls `setsid` itself escapes the
+  recorded group; and there is no rlimit, cgroup, seccomp, or OS confinement for
+  spawned programs.
 - Temporary-file creation and the subsequent content write are separate
   operations. The directory is `0700`, so another OS user cannot substitute a
   path, but a same-user process could replace the freshly created path before
@@ -927,10 +936,10 @@ Known gaps relative to this policy (not claims of compliance):
   seams; no command or environment variable reaches them in production paths,
   but they are not a policy boundary.
 - Native hashing and host metadata resolve `sha256sum`/`shasum`/`openssl`,
-  `realpath`/`readlink`, `stat`, `test`, `id`, `mktemp`, `env`,
-  `timeout`/`gtimeout`, and `sh` through `PATH`. A same-user attacker who
-  controls the environment or `PATH` can influence those tools; the checks are
-  not a privilege boundary. Trust approval is a high-risk operation, and the
+  `realpath`/`readlink`, `stat`, `test`, `id`, `mktemp`, `env`, `setsid`,
+  `sleep`, `timeout`/`gtimeout`, and `sh` through `PATH`. A same-user attacker
+  who controls the environment or `PATH` can influence those tools; the checks
+  are not a privilege boundary. Trust approval is a high-risk operation, and the
   policy requires it to fail closed when audit cannot record it; no execution
   audit stream exists yet, so that control is not implemented.
 - The trust store is a same-user file, so a same-user process can still rewrite

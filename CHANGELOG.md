@@ -81,10 +81,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that loaded modules resolved from `WHEEL_ROOT`; the real-host boundary and
   measurements are unchanged.
 - Bounded process primitive (CTX-0016 / wheel#74): `WheelHost.proc.run_program`
-  and `WheelHost.proc.run_command` run under GNU `timeout` (or `gtimeout`) with
-  a timeout-owned process group and bounded SIGTERM-to-SIGKILL escalation, a
-  fixed 256 KiB capture cap per stream read back from exclusive `0600` files,
-  and an explicit stdin channel (`opts.stdin`; `/dev/null` by default). Results
+  and `WheelHost.proc.run_command` run under a `setsid -w` session leader and
+  GNU `timeout` (or `gtimeout`) with a recorded process group, bounded
+  SIGTERM-to-SIGKILL escalation, a post-exit TERM/KILL group sweep, a fixed
+  256 KiB capture cap per stream read back from exclusive `0600` files, and an
+  explicit stdin channel (`opts.stdin`; `/dev/null` by default). Results
   carry `exit_code`, `timed_out`, `truncated`, per-stream truncation flags, and
   a typed `outcome` (`exited`/`timeout`/`unavailable`/`failure`). The child
   environment is rebuilt from a fixed allowlist (`PATH`, `HOME`, `LANG`,
@@ -155,6 +156,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0016 second security pass: a `setsid`-recorded supervisor now sweeps the
+  process group with bounded TERM/KILL after normal completion, so a
+  backgrounded grandchild cannot outlive the tool call; `env --` prevents a
+  program named `-S`/`-i` from being parsed as an env option; `read_file` fails
+  loud when `start_line` is beyond the bounded prefix; `search_code` and
+  `list_directory` fail closed on nonzero `grep`/`ls`/timeout instead of
+  returning success with diagnostic text; `StdioAdapter` retains stderr
+  diagnostics; and temp write-cleanup failures are surfaced. Tests add the
+  normal-exit sweep, TERM-ignoring KILL, `env -S`/`-i`, read/list/search
+  failures, 1 MiB stdin, spawn-failure cleanup, capture-file 0600, and
+  cleanup-failure typing. Setsid/timeout/sleep unavailability is a typed
+  `unavailable` outcome. A grandchild that calls `setsid` itself still escapes.
 - CTX-0015 review findings for CTX-0016 / wheel#74: the stdio prompt path no
   longer creates a non-exclusive file through `WheelHost.fs.write_file`, so it
   cannot follow a pre-existing link or leave an ignored cleanup failure; the
@@ -162,10 +175,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with mode 0600 in the private 0700 directory and removed fail-closed.
   `search_code` no longer captures unbounded `grep` output before keeping 100
   lines, and `read_file` no longer loads the whole file before applying
-  `max_bytes`. Tests cover timeout, process-group cleanup with a grandchild,
-  environment scrubbing, stdin round-trip, output truncation, bounded file
-  reads, symlink/pre-existing-path refusal, and cleanup on success, error, and
-  timeout.
+  `max_bytes`. Tests cover timeout, timeout process-group cleanup with a
+  grandchild, normal-exit background-child cleanup, TERM-ignoring KILL
+  escalation, environment scrubbing, stdin round-trip, output truncation,
+  bounded file reads, symlink/pre-existing-path refusal, and cleanup on
+  success, error, and timeout.
 - Executable project-configuration trust gate hardened for CTX-0019 /
   wheel#54 (CTX-0020, including PX-0112 fixes). `trust`/`trust show` resolves
   the canonical project root through the host, refuses symlinked, non-regular,
