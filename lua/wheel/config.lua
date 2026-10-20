@@ -22,7 +22,7 @@ local function get_kernel()
       if ok then
         WheelKernel = mod
       else
-        WheelKernel = require("kernel")
+        error("wheel.config: cannot load submodule 'wheel.kernel': " .. tostring(mod), 0)
       end
     end
   end

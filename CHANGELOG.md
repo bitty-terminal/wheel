@@ -75,6 +75,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Entry-point activation now loads only the required registration and status
+  surface (typed errors, command schemas, command layer, kernel, and UI).
+  `agent`, `config`, `team`, `context`, `tool`, `provider`, `runner`, and `host`
+  load on first use through one lazy accessor, and `wheel.tools` shares the
+  default registry with the `tools` command. A submodule that cannot load now
+  raises the typed `resolution` / `E_MODULE_LOAD_FAILED` table naming the rooted
+  module and a bounded, path-free cause instead of falling through to a bare
+  `require`. Under the CTX-0008 workload the eager payload drops from 269,708
+  bytes / 3.19 ms to 94,983 bytes / 1.30 ms (lua5.1 warm median); the
+  instruction count remains far below RC-1 (see
+  `recording/activation-budget.md`).
 - Provider requests now carry an explicit completion `max_tokens` bound
   (`WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS`, 4096) on the OpenAI-compatible
   and Anthropic HTTP `complete` and `stream` paths, including every runner

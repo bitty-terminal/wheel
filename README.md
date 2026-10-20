@@ -298,10 +298,16 @@ of the public error contract.
 | `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                           |
 | `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                         |
 | `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.        |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.         |
 
 `E_COMPLETION_BUDGET_INVALID` is raised by the provider adapters and
 `WheelRunner` before a network request when a `max_completion_tokens` override
 fails validation; it is not a command argument failure.
+
+`E_MODULE_LOAD_FAILED` is raised at activation when a required Wheel submodule
+cannot be loaded, or on first use when an optional lazy submodule fails. The
+message names the rooted module (for example `wheel.agent`) and keeps only a
+bounded, path-free cause; no stack trace, host path, or secret is included.
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family

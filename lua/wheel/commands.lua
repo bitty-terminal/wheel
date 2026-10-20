@@ -9,11 +9,17 @@
 -- projection stays under that host cap.
 
 local function load_sibling(name)
-  local ok, mod = pcall(require, "wheel." .. name)
+  local rooted = "wheel." .. name
+  local ok, mod = pcall(require, rooted)
   if ok then return mod end
-  ok, mod = pcall(require, "lua.wheel." .. name)
+  local cause = mod
+
+  local alternate = "lua.wheel." .. name
+  ok, mod = pcall(require, alternate)
   if ok then return mod end
-  return require(name)
+
+  error(string.format("wheel.commands: cannot load sibling '%s': %s",
+    rooted, tostring(mod or cause)), 0)
 end
 
 local WheelErrors = load_sibling("errors")

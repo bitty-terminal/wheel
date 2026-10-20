@@ -5,53 +5,157 @@
 --
 -- Capabilities used here match `bitty-plugin.toml`: platform.notify.
 -- No other ambient authority is granted or assumed.
+--
+-- Activation loads only what command registration, `hello`, `status`, and the
+-- catalog/help surface need: the typed error vocabulary, command schemas, the
+-- command layer, the kernel instance, and the UI formatter. Agent, team,
+-- context, tool, provider, runner, config, and host load on first use through
+-- one lazy accessor. A missing module fails with a typed, bounded
+-- `E_MODULE_LOAD_FAILED` error naming the rooted module and its cause.
 
-local function load_submodule(subpath)
-  local ok, mod = pcall(require, "wheel." .. subpath)
-  if ok then return mod end
-  ok, mod = pcall(require, "lua.wheel." .. subpath)
-  if ok then return mod end
-  return require(subpath)
+local M = {}
+local WheelErrors
+
+--- Built only when `wheel.errors` itself cannot load, before the typed error
+-- vocabulary exists. The reason stays one of two fixed, path-free categories.
+local function bootstrap_activation_failure(module_name, cause)
+  if type(cause) == "table" and type(cause.message) == "string" then
+    cause = cause.message
+  end
+  local detail = "load error"
+  if type(cause) == "string" and cause:find("not found", 1, true) then
+    detail = "not found"
+  end
+  local err = {
+    class = "resolution",
+    code = "E_MODULE_LOAD_FAILED",
+    message = string.format("activation failed for module '%s': %s", module_name, detail),
+  }
+  return setmetatable(err, {
+    __tostring = function(self)
+      return string.format("%s: %s (%s)", self.class, self.message, self.code)
+    end,
+  })
 end
 
-local WheelKernel = load_submodule("kernel")
-local WheelAgent = load_submodule("agent")
-local WheelUI = load_submodule("ui")
-local WheelConfig = load_submodule("config")
-local WheelTeam = load_submodule("team")
-local WheelContext = load_submodule("context")
-local WheelTool = load_submodule("tool")
-local WheelProvider = load_submodule("provider")
-local WheelRunner = load_submodule("runner")
-local WheelHost = load_submodule("host")
-local WheelSchema = load_submodule("schema")
-local WheelCommands = load_submodule("commands")
+--- Build the typed activation failure through the error vocabulary when it is
+-- available. Never include a raw stack trace or an unbounded loader message.
+local function activation_failure(module_name, cause)
+  if WheelErrors and type(WheelErrors.module_load_failed) == "function" then
+    return WheelErrors.module_load_failed(module_name, cause)
+  end
+  return bootstrap_activation_failure(module_name, cause)
+end
 
-local M = {
-  kernel = WheelKernel.new(),
-  agent = WheelAgent,
-  ui = WheelUI,
-  config = WheelConfig,
-  team = WheelTeam,
-  context = WheelContext,
-  tool = WheelTool,
-  provider = WheelProvider,
-  runner = WheelRunner,
-  schema = WheelSchema,
-  command_runtime = WheelCommands,
-  WheelKernel = WheelKernel,
-  WheelAgent = WheelAgent,
-  WheelUI = WheelUI,
-  WheelConfig = WheelConfig,
-  WheelTeam = WheelTeam,
-  WheelContext = WheelContext,
-  WheelTool = WheelTool,
-  WheelProvider = WheelProvider,
-  WheelRunner = WheelRunner,
-  WheelSchema = WheelSchema,
-  WheelCommands = WheelCommands,
-  tools = WheelTool and WheelTool.get_default_registry(),
+--- Return true when `err` is the interpreter's "module not found" diagnostic.
+local function is_not_found(module_name, err)
+  return type(err) == "string"
+    and err:find("module '" .. module_name .. "' not found", 1, true) ~= nil
+end
+
+--- Require one Wheel submodule through a rooted package name.
+-- Both accepted module roots are tried (`wheel.<name>` and `lua.wheel.<name>`).
+-- There is deliberately no bare `require(name)` fallback: it would drop the
+-- rooted context and mask the original cause. Any failure raises a typed,
+-- attributed activation error instead.
+local function load_module(name)
+  local rooted = "wheel." .. name
+  local ok, mod = pcall(require, rooted)
+  if ok then return mod end
+
+  local cause = mod
+  if not is_not_found(rooted, cause) then
+    error(activation_failure(rooted, cause), 0)
+  end
+
+  local alternate = "lua." .. rooted
+  ok, mod = pcall(require, alternate)
+  if ok then return mod end
+
+  local alternate_cause = mod
+  if not is_not_found(alternate, alternate_cause) then
+    error(activation_failure(rooted, alternate_cause), 0)
+  end
+
+  -- Both roots report the module absent. Keep the canonical rooted name and
+  -- the first diagnostic so the message cannot drift to the alternate root.
+  error(activation_failure(rooted, cause), 0)
+end
+
+WheelErrors = load_module("errors")
+local WheelSchema = load_module("schema")
+local WheelCommands = load_module("commands")
+local WheelKernel = load_module("kernel")
+local WheelUI = load_module("ui")
+
+-- Required at activation: registration metadata, the kernel instance that
+-- `status` and every command closure use, and the status/graph formatter.
+M.kernel = WheelKernel.new()
+M.ui = WheelUI
+M.schema = WheelSchema
+M.command_runtime = WheelCommands
+M.WheelKernel = WheelKernel
+M.WheelUI = WheelUI
+M.WheelSchema = WheelSchema
+M.WheelCommands = WheelCommands
+
+-- Optional modules are absent from the activation path and load exactly once,
+-- on first field access or first command dispatch. Loaded values are cached in
+-- the module table (and in `lazy_cache`) so repeated access is cheap; a caller
+-- can still replace a field with an injected double.
+local LAZY_FIELDS = {
+  agent = "agent",
+  config = "config",
+  team = "team",
+  context = "context",
+  tool = "tool",
+  provider = "provider",
+  runner = "runner",
+  host = "host",
+  WheelAgent = "agent",
+  WheelConfig = "config",
+  WheelTeam = "team",
+  WheelContext = "context",
+  WheelTool = "tool",
+  WheelProvider = "provider",
+  WheelRunner = "runner",
+  WheelHost = "host",
+  tools = "tools",
 }
+
+local lazy_cache = {}
+
+local function lazy_module(name)
+  local mod = lazy_cache[name]
+  if mod == nil then
+    mod = load_module(name)
+    lazy_cache[name] = mod
+  end
+  return mod
+end
+
+--- Return the shared default tool registry, loading the tool module on first
+-- use. `wheel.tools` and the `tools` command share this one cache.
+local function lazy_tools()
+  local registry = lazy_cache.tools
+  if registry == nil then
+    registry = lazy_module("tool").get_default_registry()
+    lazy_cache.tools = registry
+  end
+  return registry
+end
+
+setmetatable(M, {
+  __index = function(target, key)
+    local name = LAZY_FIELDS[key]
+    if not name then
+      return nil
+    end
+    local value = name == "tools" and lazy_tools() or lazy_module(name)
+    rawset(target, key, value)
+    return value
+  end,
+})
 
 -- Show a notification through the shared command layer, which owns the
 -- host-compatible result bounds and the UTF-8-safe truncation.
@@ -112,14 +216,14 @@ local WHEEL_COMMANDS = {
     args_schema = WheelCommands.no_args_schema(),
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
-      local conf_res = WheelConfig.load({ project_root = "." })
+      local conf_res = M.config.load({ project_root = "." })
       if not conf_res.ok and conf_res.message then
         notify("Wheel Config Notice", conf_res.message)
       end
 
-      local commander = WheelAgent.new({
+      local commander = M.agent.new({
         name = "commander-01",
-        role = WheelAgent.Role.COMMANDER,
+        role = M.agent.Role.COMMANDER,
         kernel = M.kernel,
         config = conf_res.config,
       })
@@ -153,14 +257,14 @@ local WHEEL_COMMANDS = {
         return notify("Wheel Run", "No ready tasks available to execute.")
       end
 
-      local conf_res = WheelConfig.load({ project_root = "." })
+      local conf_res = M.config.load({ project_root = "." })
       if not conf_res.ok and conf_res.message then
         notify("Wheel Config Notice", conf_res.message)
       end
 
-      local worker = WheelAgent.new({
+      local worker = M.agent.new({
         name = "worker-coding-01",
-        role = WheelAgent.Role.CODING,
+        role = M.agent.Role.CODING,
         kernel = M.kernel,
         config = conf_res.config,
       })
@@ -196,8 +300,8 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       local project_root = "."
-      local proj_path = WheelConfig.get_project_config_path(project_root)
-      local content = WheelHost.fs.read_file(proj_path)
+      local proj_path = M.config.get_project_config_path(project_root)
+      local content = M.host.fs.read_file(proj_path)
       if not content then
         return notify("Wheel Trust", "No project configuration found at " .. proj_path)
       end
@@ -207,7 +311,7 @@ local WHEEL_COMMANDS = {
         preview = preview .. "..."
       end
 
-      local ok, err, hash = WheelConfig.trust(project_root, content)
+      local ok, err, hash = M.config.trust(project_root, content)
       if ok then
         return notify("Wheel Trust Approved",
           string.format("Approved %s (hash: %s):\n%s", proj_path, hash:sub(1, 16), preview))
@@ -226,7 +330,7 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
       local st = M._team:status()
       local lines = {
@@ -251,9 +355,9 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
-      local ctx = M._team.context or WheelContext.new({ kernel = M.kernel, config = M._last_config })
+      local ctx = M._team.context or M.context.new({ kernel = M.kernel, config = M._last_config })
       local slots = ctx:list_slots()
       local tree_h = ctx:tree_hash()
       local lines = {
@@ -274,7 +378,7 @@ local WHEEL_COMMANDS = {
     args_schema = WheelCommands.no_args_schema(),
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
-      local reg = WheelTool.get_default_registry()
+      local reg = M.tools
       local list = reg:list_tools()
       local lines = {
         string.format("Wheel Tools: %d registered core tools", #list),
@@ -295,22 +399,22 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
       local has_worker = false
       local has_reviewer = false
       for _, a in ipairs(M._team:list_agents()) do
-        if a.role == WheelAgent.Role.CODING then
+        if a.role == M.agent.Role.CODING then
           has_worker = true
-        elseif a.role == WheelAgent.Role.REVIEWER then
+        elseif a.role == M.agent.Role.REVIEWER then
           has_reviewer = true
         end
       end
       if not has_worker then
-        M._team:spawn_agent({ name = "worker-coding-01", role = WheelAgent.Role.CODING })
+        M._team:spawn_agent({ name = "worker-coding-01", role = M.agent.Role.CODING })
       end
       if not has_reviewer then
-        M._team:spawn_agent({ name = "reviewer-01", role = WheelAgent.Role.REVIEWER })
+        M._team:spawn_agent({ name = "reviewer-01", role = M.agent.Role.REVIEWER })
       end
 
       local report = M._team:run_orchestration_loop()
@@ -335,17 +439,18 @@ local WHEEL_COMMANDS = {
     args_schema = WheelCommands.no_args_schema(),
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
+      local agent = M.agent
       local roles = {
-        WheelAgent.Role.COMMANDER,
-        WheelAgent.Role.CODING,
-        WheelAgent.Role.DEBUG,
-        WheelAgent.Role.REVIEWER,
-        WheelAgent.Role.RESEARCH,
+        agent.Role.COMMANDER,
+        agent.Role.CODING,
+        agent.Role.DEBUG,
+        agent.Role.REVIEWER,
+        agent.Role.RESEARCH,
       }
       local cfg = M.config and type(M.config.get) == "function" and M.config.get()
       local lines = { "=== Wheel Heterogeneous Model Profiles ===" }
       for _, r in ipairs(roles) do
-        local prof = WheelAgent.get_default_model_profile(r)
+        local prof = agent.get_default_model_profile(r)
         if cfg and cfg.roles and cfg.roles[r] and cfg.roles[r].model_profile then
           local override = cfg.roles[r].model_profile
           local merged = {}
@@ -373,7 +478,7 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
       local ctx = M._team.context
       local branches = ctx:list_branches()
@@ -396,7 +501,7 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
       local ctx = M._team.context
       local commits = ctx:log(8)
@@ -422,7 +527,7 @@ local WHEEL_COMMANDS = {
     result_schema = WheelCommands.notification_result_schema(),
     run = function()
       if not M._team then
-        M._team = WheelTeam.new({ kernel = M.kernel, config = M._last_config })
+        M._team = M.team.new({ kernel = M.kernel, config = M._last_config })
       end
       local ctx = M._team.context
       local entries = ctx:reflog(8)

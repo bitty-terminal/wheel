@@ -3,11 +3,17 @@
 -- Rejects master-slave hierarchy: each agent is an autonomous peer worker in an engineering workspace.
 
 local function load_submodule(subpath)
-  local ok, mod = pcall(require, "wheel." .. subpath)
+  local rooted = "wheel." .. subpath
+  local ok, mod = pcall(require, rooted)
   if ok then return mod end
-  ok, mod = pcall(require, "lua.wheel." .. subpath)
+  local cause = mod
+
+  local alternate = "lua.wheel." .. subpath
+  ok, mod = pcall(require, alternate)
   if ok then return mod end
-  return require(subpath)
+
+  error(string.format("wheel.team: cannot load submodule '%s': %s",
+    rooted, tostring(mod or cause)), 0)
 end
 
 local WheelAgent = load_submodule("agent")

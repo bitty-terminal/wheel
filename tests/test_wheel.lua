@@ -1614,6 +1614,163 @@ run_test("Wheel Init: host sandbox activation and denial paths", function()
   end)
 end)
 
+-- CTX-0008 measured the eager activation payload at 269,708 source bytes across
+-- 11 files. CTX-0014 keeps only the required registration/status surface eager;
+-- the bound below is half that baseline and leaves room for bounded diagnostics.
+local ACTIVATION_EAGER_SOURCE_BUDGET_BYTES = 134854
+
+local EAGER_ACTIVATION_MODULES = {
+  "init", "errors", "schema", "commands", "kernel", "ui",
+}
+
+local LAZY_ACTIVATION_MODULES = {
+  "agent", "config", "team", "context", "tool", "provider", "runner", "host",
+}
+
+local function read_eager_activation_bytes()
+  local total = 0
+  for _, name in ipairs(EAGER_ACTIVATION_MODULES) do
+    local path = "lua/wheel/" .. name .. ".lua"
+    local fh = assert(io.open(path, "rb"))
+    total = total + #fh:read("*a")
+    fh:close()
+  end
+  return total
+end
+
+run_test("Wheel Init: required modules eager, optional modules lazy", function()
+  local eager_bytes = read_eager_activation_bytes()
+  assert(eager_bytes <= ACTIVATION_EAGER_SOURCE_BUDGET_BYTES,
+    string.format("activation eager source budget exceeded: %d > %d bytes",
+      eager_bytes, ACTIVATION_EAGER_SOURCE_BUDGET_BYTES))
+  print(string.format("[INFO] activation eager source: %d bytes", eager_bytes))
+
+  run_in_host_sandbox(function()
+    local capture = new_command_capture()
+    _G.bitty = {
+      commands = { register = capture.register },
+      notify = { show = function() return true end },
+    }
+
+    local wheel = require("wheel.init")
+    assert_command_catalog(capture)
+
+    for _, name in ipairs(EAGER_ACTIVATION_MODULES) do
+      assert(package.loaded["wheel." .. name] ~= nil,
+        "required module must load eagerly: wheel." .. name)
+    end
+    for _, name in ipairs(LAZY_ACTIVATION_MODULES) do
+      assert(package.loaded["wheel." .. name] == nil,
+        "optional module must not load eagerly: wheel." .. name)
+    end
+
+    -- hello and status answer without any optional submodule.
+    assert(capture.defs["hello"].run().title == "Wheel")
+    assert(capture.defs["status"].run().title == "Wheel Status")
+    for _, name in ipairs(LAZY_ACTIVATION_MODULES) do
+      assert(package.loaded["wheel." .. name] == nil,
+        "hello/status must not load optional module: wheel." .. name)
+    end
+
+    -- First dispatch of `tools` loads the tool module and its lazy accessor.
+    assert(capture.defs["tools"].run().title == "Wheel Tools Registry")
+    assert(package.loaded["wheel.tool"] ~= nil,
+      "the tools command must load wheel.tool on first use")
+    assert(package.loaded["wheel.agent"] == nil,
+      "a lazy first use must not load unrelated optional modules")
+    local loaded_tool = assert(package.loaded["wheel.tool"])
+    assert(wheel.tools == loaded_tool.get_default_registry(),
+      "wheel.tools must expose the shared default registry")
+  end)
+end)
+
+run_test("Wheel Init: missing required module is rooted and attributed", function()
+  local entry_path = "lua/wheel/init.lua"
+  local fh = assert(io.open(entry_path, "rb"))
+  local entry_src = fh:read("*a")
+  fh:close()
+
+  run_in_host_sandbox(function()
+    local real_require = require
+    _G.require = function(name)
+      if name == "wheel.ui" then
+        error("module 'wheel.ui' not found: no file '/host/private/lua/wheel/ui.lua'", 0)
+      elseif name == "lua.wheel.ui" then
+        error("module 'lua.wheel.ui' not found: no file '/host/private/lua/lua/wheel/ui.lua'", 0)
+      end
+      return real_require(name)
+    end
+
+    local ok, err = pcall(function()
+      assert((loadstring or load)(entry_src, "@" .. entry_path))()
+    end)
+    _G.require = real_require
+
+    assert(not ok, "activation must fail when a required module is missing")
+    assert(type(err) == "table", "activation failure must be a typed table, got " .. type(err))
+
+    local fields = 0
+    for key in pairs(err) do
+      assert(key == "class" or key == "code" or key == "message",
+        "unexpected activation error field: " .. tostring(key))
+      fields = fields + 1
+    end
+    assert(fields == 3, "activation failure must carry exactly class/code/message")
+    assert(err.class == "resolution", "activation failure class must be resolution")
+    assert(err.code == "E_MODULE_LOAD_FAILED",
+      "activation failure must use E_MODULE_LOAD_FAILED")
+    assert(type(err.message) == "string" and #err.message > 0,
+      "activation failure must carry a message")
+    assert(#err.message <= WheelErrors.MESSAGE_MAX_LENGTH,
+      "activation failure message must stay within the bounded message length")
+    assert(err.message:find("wheel.ui", 1, true) ~= nil,
+      "activation failure must name the rooted module")
+    assert(err.message:find("not found", 1, true) ~= nil,
+      "activation failure must include the underlying cause")
+    assert(err.message:find("/host/private", 1, true) == nil,
+      "activation failure must not leak a host path")
+    assert(err.message:find("\n", 1, true) == nil,
+      "activation failure must stay on one line")
+  end)
+end)
+
+run_test("Wheel Init: missing lazy module is attributed on first use", function()
+  run_in_host_sandbox(function()
+    local capture = new_command_capture()
+    _G.bitty = {
+      commands = { register = capture.register },
+      notify = { show = function() return true end },
+    }
+
+    local wheel = require("wheel.init")
+    assert_command_catalog(capture)
+    assert(package.loaded["wheel.tool"] == nil, "tool must start lazy")
+
+    local real_require = require
+    _G.require = function(name)
+      if name == "wheel.tool" then
+        error("module 'wheel.tool' not found: no file '/host/private/lua/wheel/tool.lua'", 0)
+      elseif name == "lua.wheel.tool" then
+        error("module 'lua.wheel.tool' not found: no file '/host/private/lua/lua/wheel/tool.lua'", 0)
+      end
+      return real_require(name)
+    end
+
+    local ok, err = pcall(capture.defs["tools"].run)
+    _G.require = real_require
+
+    assert(not ok, "a missing lazy module must fail its first use")
+    assert(type(err) == "table", "lazy activation failure must be a typed table")
+    assert(err.class == "resolution" and err.code == "E_MODULE_LOAD_FAILED",
+      "lazy activation failure must keep the typed resolution code")
+    assert(err.message:find("wheel.tool", 1, true) ~= nil,
+      "lazy activation failure must name the rooted module")
+    assert(err.message:find("/host/private", 1, true) == nil,
+      "lazy activation failure must not leak a host path")
+    assert(wheel ~= nil, "activation must have succeeded before the lazy failure")
+  end)
+end)
+
 -- ===========================================================================
 -- 5. Wire Normalization and Null Semantics Tests
 -- ===========================================================================
