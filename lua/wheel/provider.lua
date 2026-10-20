@@ -68,6 +68,63 @@ end
 WheelProvider.JSON = json
 
 -- ---------------------------------------------------------------------------
+-- Completion Budget
+-- ---------------------------------------------------------------------------
+
+--- Named default completion-token budget sent with every provider request.
+-- The context window is a separate budget (`context_budget` on model
+-- profiles); this limit caps generated completion tokens only. Sending it
+-- explicitly prevents a provider from assuming the model's maximum completion
+-- window for credit, latency, and cost checks.
+WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS = 4096
+
+--- Hard upper bound for a caller-supplied completion-token budget.
+WheelProvider.MAX_COMPLETION_TOKENS = 32768
+
+--- Validate a completion-token budget override.
+-- @param value number? Explicit bound; nil selects the named default.
+-- @return number? effective bound, table? typed validation error
+function WheelProvider.validate_max_completion_tokens(value)
+  if value == nil then
+    return WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS, nil
+  end
+  if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
+    return nil, WheelErrors.completion_budget_invalid("max_completion_tokens must be a finite integer")
+  end
+  if value % 1 ~= 0 then
+    return nil, WheelErrors.completion_budget_invalid("max_completion_tokens must be an integer")
+  end
+  if value <= 0 then
+    return nil, WheelErrors.completion_budget_invalid("max_completion_tokens must be greater than zero")
+  end
+  if value > WheelProvider.MAX_COMPLETION_TOKENS then
+    return nil, WheelErrors.completion_budget_invalid(string.format(
+      "max_completion_tokens must not exceed %d",
+      WheelProvider.MAX_COMPLETION_TOKENS
+    ))
+  end
+  return value, nil
+end
+
+--- Resolve the effective completion budget for a request.
+-- Precedence: request.max_completion_tokens, legacy request.max_tokens,
+-- adapter/config override, named default. Every path is validated.
+-- @param request table? Provider request.
+-- @param configured number? Adapter or model-profile override.
+-- @return number? effective bound, table? typed validation error
+function WheelProvider.resolve_max_completion_tokens(request, configured)
+  request = request or {}
+  local value = request.max_completion_tokens
+  if value == nil then
+    value = request.max_tokens
+  end
+  if value == nil then
+    value = configured
+  end
+  return WheelProvider.validate_max_completion_tokens(value)
+end
+
+-- ---------------------------------------------------------------------------
 -- Line-Buffered SSE Parser
 -- ---------------------------------------------------------------------------
 
@@ -236,6 +293,7 @@ function MockProvider.new(opts)
   self.responses = opts.responses or {}
   self.completion_fn = opts.completion_fn
   self.stream_chunk_size = opts.stream_chunk_size or 4
+  self.max_completion_tokens = opts.max_completion_tokens
   self.call_history = {}
   self._call_count = 0
   return self
@@ -348,6 +406,7 @@ OpenAIAdapter.__index = OpenAIAdapter
 --   opts.model string? (defaults to "gpt-4o")
 --   opts.temperature number?
 --   opts.thinking table?
+--   opts.max_completion_tokens number?: validated completion bound override
 --   opts.http_client function?: injectable client fn(req) -> { status, body, stream_fn }
 -- @return table OpenAIAdapter instance
 function OpenAIAdapter.new(opts)
@@ -359,6 +418,7 @@ function OpenAIAdapter.new(opts)
   self.model = opts.model or "gpt-4o"
   self.temperature = opts.temperature or 0.0
   self.thinking = opts.thinking
+  self.max_completion_tokens = opts.max_completion_tokens
   self.http_client = opts.http_client
   return self
 end
@@ -406,16 +466,18 @@ function OpenAIAdapter:_format_payload(request, stream)
     table.insert(messages, msg)
   end
 
+  local max_tokens, budget_err = WheelProvider.resolve_max_completion_tokens(request, self.max_completion_tokens)
+  if not max_tokens then
+    return nil, budget_err
+  end
+
   local payload = {
     model = request.model or self.model,
     messages = messages,
     temperature = request.temperature or self.temperature,
+    max_tokens = max_tokens,
     stream = stream and true or false,
   }
-
-  if request.max_tokens then
-    payload.max_tokens = request.max_tokens
-  end
 
   if request.tools and #request.tools > 0 then
     payload.tools = WheelProvider.format_tools_for_openai(request.tools)
@@ -428,7 +490,10 @@ end
 --- Execute complete request.
 function OpenAIAdapter:complete(request, opts)
   opts = opts or {}
-  local payload = self:_format_payload(request, false)
+  local payload, payload_err = self:_format_payload(request, false)
+  if not payload then
+    return nil, payload_err
+  end
   local body_str = json.encode(payload)
   local endpoint = self.base_url:gsub("/+$", "") .. "/chat/completions"
 
@@ -496,7 +561,10 @@ end
 --- Execute streaming completion.
 function OpenAIAdapter:stream(request, on_chunk, opts)
   opts = opts or {}
-  local payload = self:_format_payload(request, true)
+  local payload, payload_err = self:_format_payload(request, true)
+  if not payload then
+    return nil, payload_err
+  end
   local body_str = json.encode(payload)
   local endpoint = self.base_url:gsub("/+$", "") .. "/chat/completions"
 
@@ -676,6 +744,7 @@ end
 --   opts.model string? (defaults to "claude-3-5-sonnet-20241022")
 --   opts.version string? (defaults to "2023-06-01")
 --   opts.thinking table? { enabled = bool, budget_tokens = number }
+--   opts.max_completion_tokens number?: validated completion bound override
 --   opts.http_client function?: injectable client fn(req) -> { status, body, stream_fn }
 -- @return table AnthropicAdapter instance
 function AnthropicAdapter.new(opts)
@@ -687,6 +756,7 @@ function AnthropicAdapter.new(opts)
   self.model = opts.model or "claude-3-5-sonnet-20241022"
   self.version = opts.version or "2023-06-01"
   self.thinking = opts.thinking
+  self.max_completion_tokens = opts.max_completion_tokens
   self.http_client = opts.http_client
   return self
 end
@@ -759,10 +829,15 @@ function AnthropicAdapter:_format_payload(request, stream)
     end
   end
 
+  local max_tokens, budget_err = WheelProvider.resolve_max_completion_tokens(request, self.max_completion_tokens)
+  if not max_tokens then
+    return nil, budget_err
+  end
+
   local payload = {
     model = request.model or self.model,
     messages = messages,
-    max_tokens = request.max_tokens or 4096,
+    max_tokens = max_tokens,
     stream = stream and true or false,
   }
 
@@ -793,7 +868,10 @@ end
 --- Execute complete request.
 function AnthropicAdapter:complete(request, opts)
   opts = opts or {}
-  local payload = self:_format_payload(request, false)
+  local payload, payload_err = self:_format_payload(request, false)
+  if not payload then
+    return nil, payload_err
+  end
   local body_str = json.encode(payload)
   local endpoint = self.base_url:gsub("/+$", "") .. "/messages"
 
@@ -860,7 +938,10 @@ end
 --- Execute streaming completion.
 function AnthropicAdapter:stream(request, on_chunk, opts)
   opts = opts or {}
-  local payload = self:_format_payload(request, true)
+  local payload, payload_err = self:_format_payload(request, true)
+  if not payload then
+    return nil, payload_err
+  end
   local body_str = json.encode(payload)
   local endpoint = self.base_url:gsub("/+$", "") .. "/messages"
 
@@ -1106,12 +1187,22 @@ function WheelProvider.create(profile, opts)
   opts = opts or {}
   local p_type = string.lower(profile.provider or opts.provider or "mock")
 
+  local requested_budget = profile.max_completion_tokens
+  if requested_budget == nil then
+    requested_budget = opts.max_completion_tokens
+  end
+  local completion_budget, budget_err = WheelProvider.validate_max_completion_tokens(requested_budget)
+  if not completion_budget then
+    return nil, budget_err
+  end
+
   if p_type == "mock" then
     return MockProvider.new({
       model = profile.model or opts.model or "mock-model",
       responses = opts.responses,
       completion_fn = opts.completion_fn,
       stream_chunk_size = opts.stream_chunk_size,
+      max_completion_tokens = completion_budget,
     })
   elseif p_type == "openai" then
     local api_key = opts.api_key or getenv("OPENAI_API_KEY") or ""
@@ -1121,6 +1212,7 @@ function WheelProvider.create(profile, opts)
       model = profile.model or opts.model or "gpt-4o",
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
+      max_completion_tokens = completion_budget,
       http_client = opts.http_client,
     })
   elseif p_type == "deepseek" then
@@ -1131,6 +1223,7 @@ function WheelProvider.create(profile, opts)
       model = profile.model or opts.model or "deepseek-reasoner",
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
+      max_completion_tokens = completion_budget,
       http_client = opts.http_client,
     })
   elseif p_type == "anthropic" then
@@ -1140,6 +1233,7 @@ function WheelProvider.create(profile, opts)
       base_url = opts.base_url or "https://api.anthropic.com/v1",
       model = profile.model or opts.model or "claude-3-5-sonnet-20241022",
       thinking = profile.thinking or opts.thinking,
+      max_completion_tokens = completion_budget,
       http_client = opts.http_client,
     })
   elseif p_type == "stdio" or p_type == "local" or p_type == "ollama" then

@@ -4170,6 +4170,264 @@ run_test("WheelProvider.create: strict validation, injection rejection, and no m
   local p_cmd, err_cmd = WheelProvider.create({ provider = "local" }, { command = 12345 })
   assert(p_cmd == nil, "create must reject non-string command")
   assert(string.find(err_cmd, "must be a string", 1, true) ~= nil)
+
+  -- 4. Completion budget override is validated before adapter creation
+  local p_budget, err_budget = WheelProvider.create(
+    { provider = "openai", model = "gpt-4o", max_completion_tokens = 0 },
+    { api_key = "test-key" }
+  )
+  assert(p_budget == nil, "create must reject a zero completion budget")
+  assert(type(err_budget) == "table", "completion budget rejection must be typed")
+  assert(err_budget.code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+
+  -- 5. A valid config override reaches the adapter; an absent override uses the default
+  local configured_p = WheelProvider.create(
+    { provider = "openai", model = "gpt-4o", max_completion_tokens = 1024 },
+    { api_key = "test-key" }
+  )
+  assert(configured_p ~= nil)
+  assert(configured_p.max_completion_tokens == 1024)
+
+  local default_p = WheelProvider.create({ provider = "openai", model = "gpt-4o" }, { api_key = "test-key" })
+  assert(default_p ~= nil)
+  assert(default_p.max_completion_tokens == WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS)
+end)
+
+run_test("WheelProvider: completion-token budget default and typed validation", function()
+  local DEFAULT = WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS
+  local MAX = WheelProvider.MAX_COMPLETION_TOKENS
+
+  -- One named default, bounded and positive: never an unbounded provider default.
+  assert(DEFAULT == 4096, "named default completion budget must be 4096")
+  assert(MAX == 32768, "completion budget hard bound must be 32768")
+  assert(DEFAULT > 0 and DEFAULT <= MAX, "default must be a bounded positive budget")
+
+  local value, err = WheelProvider.validate_max_completion_tokens(nil)
+  assert(value == DEFAULT and err == nil, "nil must resolve to the named default")
+
+  for _, valid in ipairs({ 1, 256, 4096, MAX }) do
+    local v, e = WheelProvider.validate_max_completion_tokens(valid)
+    assert(v == valid and e == nil, "valid budget must pass: " .. tostring(valid))
+  end
+
+  local invalid_values = {
+    0,
+    -1,
+    -MAX,
+    1.5,
+    0 / 0,
+    math.huge,
+    -math.huge,
+    "256",
+    true,
+    {},
+    MAX + 1,
+  }
+  for _, invalid in ipairs(invalid_values) do
+    local v, e = WheelProvider.validate_max_completion_tokens(invalid)
+    assert(v == nil, "invalid budget must be rejected: " .. tostring(invalid))
+    assert(type(e) == "table", "invalid budget must return a typed error")
+    assert(e.class == "validation" and e.code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+    assert(WheelErrors.is_typed(e), "budget error must match the typed bridge shape")
+  end
+
+  -- Resolution precedence: request override, legacy request field, config, default.
+  local resolved = WheelProvider.resolve_max_completion_tokens({
+    max_completion_tokens = 128,
+    max_tokens = 64,
+  }, 1024)
+  assert(resolved == 128, "request override must win")
+
+  resolved = WheelProvider.resolve_max_completion_tokens({ max_tokens = 64 }, 1024)
+  assert(resolved == 64, "legacy request field must be accepted")
+
+  resolved = WheelProvider.resolve_max_completion_tokens({}, 1024)
+  assert(resolved == 1024, "config override must apply when the request is silent")
+
+  resolved = WheelProvider.resolve_max_completion_tokens({}, nil)
+  assert(resolved == DEFAULT, "named default must apply when no override exists")
+end)
+
+run_test("WheelProvider.OpenAIAdapter: bounded max_tokens on complete and stream", function()
+  local DEFAULT = WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS
+  local captured = {}
+
+  local function client(response_body)
+    return function(req)
+      table.insert(captured, WheelProvider.JSON.decode(req.body))
+      if req.stream and req.on_stream_chunk then
+        req.on_stream_chunk("data: [DONE]\n\n")
+      end
+      return { status = 200, body = response_body }
+    end
+  end
+
+  local completion_body = '{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":3}}'
+  local adapter = WheelProvider.OpenAIAdapter.new({
+    http_client = client(completion_body),
+  })
+
+  -- 1. Default applied to complete.
+  local res, err = adapter:complete({ messages = { { role = "user", content = "hi" } } })
+  assert(res ~= nil and err == nil, "complete must succeed: " .. tostring(err))
+  assert(captured[1].max_tokens == DEFAULT, "complete must carry the named default")
+
+  -- 2. Default applied to stream.
+  local sres, serr = adapter:stream({ messages = { { role = "user", content = "hi" } } }, function() end)
+  assert(sres ~= nil and serr == nil, "stream must succeed: " .. tostring(serr))
+  assert(captured[2].max_tokens == DEFAULT, "stream must carry the named default")
+
+  -- 3. Valid explicit request override.
+  res, err = adapter:complete({
+    messages = { { role = "user", content = "hi" } },
+    max_completion_tokens = 256,
+  })
+  assert(res ~= nil and err == nil)
+  assert(captured[3].max_tokens == 256, "explicit override must be serialized")
+
+  -- 4. Adapter-level config override, then request override wins.
+  local configured = WheelProvider.OpenAIAdapter.new({
+    max_completion_tokens = 1024,
+    http_client = client(completion_body),
+  })
+  local before = #captured
+  res = configured:complete({ messages = { { role = "user", content = "hi" } } })
+  assert(res ~= nil)
+  assert(captured[before + 1].max_tokens == 1024, "adapter override must be serialized")
+  res = configured:complete({
+    messages = { { role = "user", content = "hi" } },
+    max_completion_tokens = 512,
+  })
+  assert(res ~= nil)
+  assert(captured[before + 2].max_tokens == 512, "request override must beat adapter config")
+
+  -- 5. Invalid overrides are rejected before any HTTP request is sent.
+  local sent = #captured
+  for _, invalid in ipairs({ 0, -1, 1.5, "256", true, WheelProvider.MAX_COMPLETION_TOKENS + 1 }) do
+    local bad_res, bad_err = adapter:complete({
+      messages = { { role = "user", content = "hi" } },
+      max_completion_tokens = invalid,
+    })
+    assert(bad_res == nil, "invalid complete budget must fail")
+    assert(type(bad_err) == "table" and bad_err.code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+
+    local bad_sres, bad_serr = adapter:stream({
+      messages = { { role = "user", content = "hi" } },
+      max_completion_tokens = invalid,
+    }, function() end)
+    assert(bad_sres == nil, "invalid stream budget must fail")
+    assert(type(bad_serr) == "table" and bad_serr.code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+  end
+  assert(#captured == sent, "invalid overrides must not reach the HTTP client")
+end)
+
+run_test("WheelProvider.AnthropicAdapter: bounded max_tokens and typed rejection", function()
+  local DEFAULT = WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS
+  local captured = {}
+
+  local anthropic = WheelProvider.AnthropicAdapter.new({
+    api_key = "ant-token",
+    http_client = function(req)
+      table.insert(captured, WheelProvider.JSON.decode(req.body))
+      return {
+        status = 200,
+        body = '{"content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{}}',
+      }
+    end,
+  })
+
+  local res, err = anthropic:complete({ messages = { { role = "user", content = "hi" } } })
+  assert(res ~= nil and err == nil, "anthropic complete must succeed: " .. tostring(err))
+  assert(captured[1].max_tokens == DEFAULT, "anthropic requests must carry the named default")
+
+  res = anthropic:complete({
+    messages = { { role = "user", content = "hi" } },
+    max_completion_tokens = 256,
+  })
+  assert(res ~= nil)
+  assert(captured[2].max_tokens == 256, "anthropic request override must be serialized")
+
+  local bad_res, bad_err = anthropic:complete({
+    messages = { { role = "user", content = "hi" } },
+    max_completion_tokens = 0,
+  })
+  assert(bad_res == nil)
+  assert(type(bad_err) == "table" and bad_err.code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+end)
+
+run_test("WheelRunner: completion budget reaches complete, stream, and mock requests", function()
+  local DEFAULT = WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS
+  local kernel = WheelKernel.new_mock()
+
+  -- 1. MockProvider captures the bound on both request paths.
+  local direct_mock = WheelProvider.MockProvider.new({
+    responses = {
+      { content = "complete" },
+      { content = "stream" },
+    },
+  })
+  direct_mock:complete({ messages = {}, max_completion_tokens = 256 })
+  direct_mock:stream({ messages = {}, max_completion_tokens = 512 }, function() end)
+  assert(direct_mock.call_history[1].max_completion_tokens == 256)
+  assert(direct_mock.call_history[2].max_completion_tokens == 512)
+
+  -- 2. Runner uses the model-profile override.
+  local override_agent = WheelAgent.new({
+    name = "budget-override-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    model_profile = {
+      provider = "mock",
+      model = "mock-model",
+      temperature = 0.0,
+      max_completion_tokens = 1234,
+    },
+  })
+  local override_mock = WheelProvider.MockProvider.new({
+    responses = { { content = "done" } },
+  })
+  override_agent:set_provider(override_mock)
+  local task1 = kernel:create_task({ id = "T-BUDGET-01", title = "Budget override" })
+  local report1 = WheelRunner.run_task(override_agent, task1)
+  assert(report1.success == true, "runner must succeed: " .. tostring(report1.error))
+  assert(override_mock.call_history[1].max_completion_tokens == 1234)
+
+  -- 3. Runner uses the named default when no override exists.
+  local default_agent = WheelAgent.new({
+    name = "budget-default-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    model_profile = { provider = "mock", model = "mock-model", temperature = 0.0 },
+  })
+  local default_mock = WheelProvider.MockProvider.new({
+    responses = { { content = "done" } },
+  })
+  default_agent:set_provider(default_mock)
+  local task2 = kernel:create_task({ id = "T-BUDGET-02", title = "Budget default" })
+  local report2 = WheelRunner.run_task(default_agent, task2)
+  assert(report2.success == true, "runner must succeed: " .. tostring(report2.error))
+  assert(default_mock.call_history[1].max_completion_tokens == DEFAULT)
+
+  -- 4. Invalid run override fails closed with a typed error code and no provider call.
+  local calls_before = #default_mock.call_history
+  local task3 = kernel:create_task({ id = "T-BUDGET-03", title = "Budget invalid" })
+  local report3 = WheelRunner.run_task(default_agent, task3, { max_completion_tokens = 0 })
+  assert(report3.success == false)
+  assert(report3.error_code == WheelErrors.E_COMPLETION_BUDGET_INVALID)
+  assert(#default_mock.call_history == calls_before, "invalid override must not reach the provider")
+
+  -- 5. Agent model-profile validation rejects an invalid bound at construction.
+  local ok_agent = pcall(WheelAgent.new, {
+    name = "budget-invalid-worker",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    model_profile = {
+      provider = "mock",
+      model = "mock-model",
+      max_completion_tokens = WheelProvider.MAX_COMPLETION_TOKENS + 1,
+    },
+  })
+  assert(ok_agent == false, "agent construction must reject an oversized completion budget")
 end)
 
 run_test("WheelRunner & WheelAgent: protected dispatch, task finalization, and config override", function()

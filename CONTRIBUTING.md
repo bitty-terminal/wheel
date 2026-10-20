@@ -48,7 +48,11 @@ or linters by name):
    parse, the parser control, and the Lua behavior suite).
    CI runs the same aggregate target, and `just check` runs offline once
    `just install` has completed.
-5. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
+5. Run the opt-in live provider test only when needed: `just test-live` requires
+   `OPENROUTER_API_KEY` in the inherited environment, is never part of
+   `just check` or CI, and skips cleanly when the key is absent. See the
+   README's offline/live test section for the env-only key handling contract.
+6. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
    stop at review; independent review is required for acceptance.
 
 ## Delivery lifecycle
