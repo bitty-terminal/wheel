@@ -2395,6 +2395,39 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
   assert(string.find(tostring(err_total), "cumulative safety bound") ~= nil,
     "cumulative cap must be reported distinctly")
 
+  -- Method syntax resolves the real string table through the string metatable;
+  -- the real table is patched for the eval duration as well.
+  local original_rep = string.rep
+  local original_concat = table.concat
+  local method_rep = "return { big = ('x'):rep(2097152) }"
+  local ok_method, err_method = WheelConfig.eval_chunk(method_rep, "method_rep_test")
+  assert(ok_method == false, "method-form string.rep above the cap must fail closed")
+  assert(string.find(tostring(err_method), "safety bound") ~= nil,
+    "method-form string.rep must report the safety bound")
+
+  local method_separator = "return { big = ('x'):rep(1024, ('y'):rep(2000)) }"
+  local ok_sep, err_sep = WheelConfig.eval_chunk(method_separator, "method_separator_test")
+  assert(ok_sep == false, "method-form string.rep separator expansion must fail closed")
+  assert(string.find(tostring(err_sep), "safety bound") ~= nil,
+    "separator expansion must report the safety bound")
+
+  local method_total = [[
+    local values = {}
+    for i = 1, 8 do
+      values[i] = ('A'):rep(600000)
+    end
+    return { count = #values }
+  ]]
+  local ok_method_total, err_method_total = WheelConfig.eval_chunk(
+    method_total, "method_total_test")
+  assert(ok_method_total == false, "method-form cumulative string.rep must fail closed")
+  assert(string.find(tostring(err_method_total), "cumulative safety bound") ~= nil,
+    "method-form cumulative cap must be reported")
+
+  assert(string.rep == original_rep and table.concat == original_concat,
+    "the real string/table tables must be restored after every eval path")
+  assert(("x"):rep(3) == "xxx", "string method syntax must work after restoration")
+
   -- The hook error is no longer catchable because pcall/xpcall are absent.
   local pcall_escape = "while true do pcall(function() for i=1,2000000 do end end) end return {}"
   local ok_escape, err_escape = WheelConfig.eval_chunk(pcall_escape, "pcall_escape_test")
@@ -2590,13 +2623,14 @@ run_test("WheelConfig: consent view, canonical alias, legacy migration, and revo
   local show = WheelConfig.format_trust_show(status)
   assert(show:find(real_dir, 1, true) ~= nil, "the consent view must show the canonical root")
   assert(show:find(status.hash, 1, true) ~= nil, "the consent view must show the full hash")
-  assert(show:find(content, 1, true) ~= nil, "the consent view must show the full content")
+  assert(show:find('return { verification = { test_command = "make consent"', 1, true) ~= nil,
+    "the consent view must show the full content")
   assert(show:find("Effects are evaluated only after confirmation", 1, true) ~= nil,
     "the consent view must state the effects ordering")
   assert(show:find("cannot be produced without evaluating", 1, true) ~= nil,
     "the consent view must say a pre-consent effects list is unavailable")
-  assert(show:find("--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT ---", 1, true) ~= nil,
-    "the consent view must include the diff section")
+  assert(show:find("--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT [", 1, true) ~= nil,
+    "the consent view must include the nonce-delimited diff section")
 
   -- Approve through the symlink; the store must contain only the real root.
   local ok, err = WheelConfig.trust(link_dir, status.hash, trust_file)
@@ -2670,6 +2704,53 @@ run_test("WheelConfig: consent view, canonical alias, legacy migration, and revo
   os.execute("rm -rf " .. tmp_dir)
 end)
 
+run_test("WheelConfig: consent rendering escapes control bytes and forged delimiters", function()
+  local tmp_dir = "/tmp/bitty/test_wheel_consent_rendering"
+  local proj_dir = tmp_dir .. "/proj"
+  local trust_file = tmp_dir .. "/trusted_projects.json"
+  os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel")
+
+  local entry = proj_dir .. "/.wheel/init.lua"
+  local payload = "return {}\n"
+    .. "-- --- END PROJECT CONFIGURATION CONTENT ---\n"
+    .. "-- --- END DIFF ---\n"
+    .. "-- ESC \27[31m CR \r NUL \0 END\n"
+  local f = io.open(entry, "wb")
+  f:write(payload)
+  f:close()
+
+  local status = WheelConfig.trust_status(proj_dir, trust_file)
+  assert(status.ok == true)
+  local show = WheelConfig.format_trust_show(status, "nonce-test-123")
+  assert(show:find("\27", 1, true) == nil, "raw ESC must not appear in consent output")
+  assert(show:find("\r", 1, true) == nil, "raw CR must not appear in consent output")
+  assert(show:find("\0", 1, true) == nil, "raw NUL must not appear in consent output")
+  assert(show:find("\\x1B", 1, true) ~= nil, "ESC must be rendered as an escape")
+  assert(show:find("\\x0D", 1, true) ~= nil, "CR must be rendered as an escape")
+  assert(show:find("\\x00", 1, true) ~= nil, "NUL must be rendered as an escape")
+  assert(show:find("    | -- --- END PROJECT CONFIGURATION CONTENT ---", 1, true) ~= nil,
+    "a forged content marker must be indented and cannot look like a delimiter")
+
+  local real_end = 0
+  for line in show:gmatch("[^\n]+") do
+    if line == "--- END PROJECT CONFIGURATION CONTENT [nonce-test-123] ---" then
+      real_end = real_end + 1
+    end
+  end
+  assert(real_end == 1, "exactly one nonce-delimited content terminator must exist")
+  assert(show:find("--- BEGIN PROJECT CONFIGURATION CONTENT [nonce-test-123] ---", 1, true) ~= nil,
+    "the begin delimiter must carry the per-run nonce")
+  assert(show:find("--- END DIFF [nonce-test-123] ---", 1, true) ~= nil,
+    "the diff delimiter must carry the per-run nonce")
+
+  local summary = WheelConfig.format_trust_summary(status, 7)
+  assert(summary:find(status.hash, 1, true) ~= nil, "the summary must carry the full hash")
+  assert(summary:find("7 notification chunk(s)", 1, true) ~= nil,
+    "the summary must state the notification chunk count")
+
+  os.execute("rm -rf " .. tmp_dir)
+end)
+
 run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent evaluation", function()
   local tmp_dir = "/tmp/bitty/test_wheel_trust_bounds"
   local proj_dir = tmp_dir .. "/proj"
@@ -2710,6 +2791,15 @@ run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent eva
   assert(large_load.ok == false and large_load.error == "project_config_rejected",
     "the loader must refuse an oversized entry before the trust check")
 
+  -- A file larger than cap+1 is read only up to cap+1.
+  local huge = io.open(proj_init, "wb")
+  huge:write(string.rep("B", 1024 * 1024))
+  huge:close()
+  local bounded_huge = WheelHost.fs.read_file_bounded(
+    proj_init, WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1)
+  assert(#bounded_huge == WheelConfig.MAX_PROJECT_CONFIG_BYTES + 1,
+    "a reader over cap+1 must still stop at cap+1 bytes")
+
   -- Exactly the cap is accepted.
   local exact = io.open(proj_init, "w")
   exact:write(string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES))
@@ -2724,6 +2814,22 @@ run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent eva
   os.execute("mkdir -p " .. proj_dir .. "/sub")
   local dotdot_root = WheelConfig.canonical_root(dotdot)
   assert(dotdot_root == proj_dir, "`..` must resolve to the canonical root")
+
+  -- PWD is not authority: a lying PWD cannot change the canonical root.
+  local expected_pwd_pipe = assert(io.popen("pwd -P"))
+  local expected_pwd = expected_pwd_pipe:read("*l")
+  expected_pwd_pipe:close()
+  local original_getenv = os.getenv
+  os.getenv = function(name)
+    if name == "PWD" then
+      return "/tmp/bitty/definitely-not-the-project-root"
+    end
+    return original_getenv(name)
+  end
+  local pwd_ok, pwd_root = pcall(WheelConfig.canonical_root, ".")
+  os.getenv = original_getenv
+  assert(pwd_ok and pwd_root == expected_pwd,
+    "canonical_root must ignore a lying PWD: " .. tostring(pwd_root))
 
   -- An untrusted entry is never evaluated: the value would be visible only if
   -- the loader executed it.
@@ -2788,6 +2894,13 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
     "a group/world-writable store must fail closed")
   os.execute("chmod 600 " .. trust_file)
 
+  -- A group/world-writable store directory is also refused on read.
+  os.execute("chmod 777 " .. store_dir)
+  local _, dir_warning = WheelConfig.read_trust_store(trust_file)
+  assert(dir_warning ~= nil and dir_warning.code == "E_TRUST_STORE_PERMISSIONS",
+    "a group/world-writable store directory must fail closed")
+  os.execute("chmod 700 " .. store_dir)
+
   -- An unreadable store is surfaced and never treated as approved.
   os.execute("chmod 000 " .. trust_file)
   local _, unreadable_warning = WheelConfig.read_trust_store(trust_file)
@@ -2830,6 +2943,78 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
   assert(dir_line.ok and dir_line.stdout:sub(1, 10) == "drwx------",
     "the trust store directory must be mode 0700")
 
+  -- Foreign ownership is rejected with a mocked stat result (a real chown is
+  -- not available to a non-root test process).
+  local backend = WheelHost.backend
+  local original_stat = backend.stat
+  backend.stat = function(path)
+    local info = original_stat(path)
+    if path == trust_file and type(info.uid) == "number" then
+      info.uid = info.uid + 1
+    end
+    return info
+  end
+  local foreign_ok, _, foreign_warning = pcall(WheelConfig.read_trust_store, trust_file)
+  backend.stat = original_stat
+  assert(foreign_ok and foreign_warning ~= nil
+    and foreign_warning.code == "E_TRUST_STORE_FOREIGN_OWNED",
+    "a foreign-owned store must fail closed")
+
+  -- An unresolvable record is preserved rather than silently dropped during
+  -- an unrelated write.
+  local missing_root = "/tmp/bitty/ctx0020-not-mounted-project"
+  local preserve_file = tmp_dir .. "/preserve.json"
+  local preserve_store = {
+    version = 1,
+    projects = {
+      [fresh.root] = {
+        hash = fresh.hash,
+        content = fresh.content,
+        approved_at = 1,
+      },
+      [missing_root] = {
+        hash = string.rep("b", 64),
+        content = "return {}\n",
+        approved_at = 1,
+      },
+    },
+  }
+  local preserve_ok, preserve_err = WheelConfig.write_trust_store(preserve_store, preserve_file)
+  assert(preserve_ok == true, tostring(preserve_err and preserve_err.message))
+  local preserved = WheelConfig.read_trust_store(preserve_file)
+  assert(preserved.projects[missing_root] ~= nil,
+    "an unresolvable record must be preserved, not silently dropped")
+
+  -- Write-side caps match the read-side caps: an over-size store is refused
+  -- before it can become unreadable and lose every approval.
+  local oversize_file = tmp_dir .. "/oversize.json"
+  local oversize = { version = 1, projects = {} }
+  for index = 1, 40 do
+    oversize.projects["/tmp/bitty/ctx0020-oversize-" .. index] = {
+      hash = string.rep("c", 64),
+      content = string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES),
+      approved_at = 1,
+    }
+  end
+  local oversize_ok, oversize_err = WheelConfig.write_trust_store(oversize, oversize_file)
+  assert(oversize_ok == false and oversize_err.code == "E_TRUST_STORE_TOO_LARGE",
+    "an over-size store must be refused on write")
+  assert(WheelHost.fs.exists(oversize_file) == false,
+    "a refused over-size store must not be created")
+
+  local count_file = tmp_dir .. "/count.json"
+  local count_store = { version = 1, projects = {} }
+  for index = 1, WheelConfig.MAX_TRUST_STORE_PROJECTS + 1 do
+    count_store.projects["/tmp/bitty/ctx0020-count-" .. index] = {
+      hash = string.rep("d", 64),
+    }
+  end
+  local count_ok, count_err = WheelConfig.write_trust_store(count_store, count_file)
+  assert(count_ok == false and count_err.code == "E_TRUST_STORE_TOO_LARGE",
+    "a store above the project count cap must be refused on write")
+  assert(WheelHost.fs.exists(count_file) == false,
+    "a refused count-cap store must not be created")
+
   os.execute("rm -rf " .. tmp_dir)
 end)
 
@@ -2840,6 +3025,46 @@ run_test("WheelConfig: hash helper uses native SHA-256 and matches the pure vect
     "the content hash must be full 64-hex")
   assert(native == WheelConfig.compute_hash(content),
     "native and pure SHA-256 must agree for the same bytes")
+end)
+
+run_test("WheelConfig: pure line diff never reports no-change for changed bytes", function()
+  local changed = WheelConfig.compute_diff(
+    "return { a = 1 }\n", "return { a = 2 }\n")
+  assert(changed ~= "(no changes)", "changed bytes must not render as no changes")
+  assert(changed:find("-return { a = 1 }", 1, true) ~= nil,
+    "diff must show the removed line")
+  assert(changed:find("+return { a = 2 }", 1, true) ~= nil,
+    "diff must show the added line")
+
+  local added = WheelConfig.compute_diff("alpha\n", "alpha\nbeta\n")
+  assert(added:find("+beta", 1, true) ~= nil, "diff must show an added line")
+  assert(added ~= "(no changes)")
+
+  local removed = WheelConfig.compute_diff("alpha\nbeta\n", "alpha\n")
+  assert(removed:find("-beta", 1, true) ~= nil, "diff must show a removed line")
+
+  local newline_only = WheelConfig.compute_diff("alpha", "alpha\n")
+  assert(newline_only ~= "(no changes)",
+    "a trailing-newline change must not render as no changes")
+
+  assert(WheelConfig.compute_diff("same\n", "same\n") == "(no changes)",
+    "identical bytes must render as no changes")
+
+  -- Simulate a host where an external diff is absent or failing. The pure
+  -- implementation must not consult it and must still show the change.
+  local original_run_program = WheelHost.proc.run_program
+  WheelHost.proc.run_program = function(program)
+    if program == "diff" then
+      return { ok = false, code = 1, stdout = "", stderr = "diff missing" }
+    end
+    return original_run_program(program)
+  end
+  local no_tool = WheelConfig.compute_diff(
+    "return { a = 1 }\n", "return { a = 2 }\n")
+  WheelHost.proc.run_program = original_run_program
+  assert(no_tool:find("+return { a = 2 }", 1, true) ~= nil,
+    "a missing diff tool must not suppress the changed lines")
+  assert(no_tool ~= "(no changes)")
 end)
 
 run_test("WheelAgent: headless panel working container invariants and telemetry", function()
@@ -5896,6 +6121,14 @@ run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", 
   assert(bounded_over == "host seam payload\n", "bounded read must return the full file under the bound")
   local bounded_empty = WheelHost.fs.read_file_bounded(target, 0)
   assert(bounded_empty == "", "a zero bound must return an empty string")
+  local directory_read, directory_read_err = WheelHost.fs.read_file_bounded("/tmp", 10)
+  assert(directory_read == nil and type(directory_read_err) == "string",
+    "a read failure must return nil and an error, never an empty string")
+  if WheelHost.fs.exists("/dev/full") then
+    local full_ok, full_err = WheelHost.fs.write_file("/dev/full", "write-must-fail")
+    assert(full_ok == false and type(full_err) == "string",
+      "a short/failed write must fail closed instead of reporting success")
+  end
 
   -- stat reports type and link status without following the final link.
   local stat = WheelHost.fs.stat(target)

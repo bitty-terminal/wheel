@@ -132,22 +132,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Executable project-configuration trust gate hardened for CTX-0019 /
-  wheel#54 (CTX-0020). `trust`/`trust show` now resolves the canonical project
-  root through the host, refuses symlinked, non-regular, and larger-than-32-KiB
-  entries before hashing, and shows the bounded full entry, the diff against
-  the previously trusted bytes, the full 64-hex SHA-256, and a statement that
-  effects are evaluated only after confirmation. `trust confirm <sha256>`
-  requires the exact current hash; `trust revoke [path]` is user-facing and
-  removes the canonical record plus aliases. The trust store now has no `/tmp`
-  fallback, is created `0700`/`0600` with atomic temp-plus-rename, checks
-  ownership and group/world-writable modes, surfaces corruption instead of
-  returning an empty store, and uses schema version 1 with hash, content, and
-  approval time (legacy string hashes migrate on the next approval). SHA-256
-  of the exact entry bytes uses `sha256sum`/`shasum`/`openssl` with the
-  pure-Lua fallback. The evaluator no longer exposes `pcall`/`xpcall`, and
-  `string.rep`/`table.concat` carry per-call and cumulative caps. The 14
+  wheel#54 (CTX-0020, including PX-0112 fixes). `trust`/`trust show` resolves
+  the canonical project root through the host, refuses symlinked, non-regular,
+  and larger-than-32-KiB entries before hashing, and shows the full entry under
+  a per-run nonce delimiter with every line escaped and prefixed, a pure-Lua
+  line diff against the previously trusted bytes, the full 64-hex SHA-256, and
+  a statement that effects are evaluated only after confirmation. The returned
+  result is a bounded consent summary; the full view is the notification
+  series. `trust confirm <sha256>` requires the exact current hash; `trust
+revoke [path]` is user-facing and removes the canonical record plus aliases.
+  The trust store has no `/tmp` fallback, is created `0700`/`0600` with atomic
+  temp-plus-rename, checks ownership and group/world-writable modes, surfaces
+  corruption instead of returning an empty store, enforces matching read/write
+  caps, preserves temporarily unresolvable records, and uses schema version 1
+  with hash, content, and approval time (legacy string hashes migrate on the
+  next approval). SHA-256 of the exact entry bytes uses
+  `sha256sum`/`shasum`/`openssl` with the pure-Lua fallback. The evaluator no
+  longer exposes `pcall`/`xpcall`; direct and method-call forms of
+  `string.rep`/`table.concat` carry per-call and cumulative caps by patching
+  and restoring the real tables. Host file writes now check write/close errors
+  and bounded reads return an error instead of a false empty string. The 14
   command ids and the standalone authority boundary are unchanged; process
-  timeout, true wall-clock/heap limits, and field validation remain open.
+  timeout, true wall-clock/heap limits, audit fail-closed approval, and field
+  validation remain open.
 
 - Packaging normalizes generated file modes independently of the caller's
   umask (the artifact `VERSION` was previously 0644 under 022 and 0600 under

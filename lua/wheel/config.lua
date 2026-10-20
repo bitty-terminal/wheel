@@ -476,10 +476,10 @@ local function native_sha256(content)
     return nil
   end
 
-  local wrote = pcall(function()
+  local write_ok, write_result = pcall(function()
     return host.fs.write_file(temp, content)
   end)
-  if not wrote then
+  if not write_ok or write_result ~= true then
     pcall(function() host.fs.remove_file(temp) end)
     return nil
   end
@@ -492,8 +492,9 @@ local function native_sha256(content)
     { "openssl", { "dgst", "-sha256", temp } },
   }
   for _, candidate in ipairs(candidates) do
-    local res = host.proc.run_program(candidate[1], candidate[2], { discard_stderr = true })
-    if res.ok and res.code == 0 then
+    local call_ok, res = pcall(host.proc.run_program,
+      candidate[1], candidate[2], { discard_stderr = true })
+    if call_ok and res.ok and res.code == 0 then
       local found = (res.stdout or ""):match(SHA256_MATCH_PATTERN)
       if found then
         digest = found:lower()
@@ -816,9 +817,10 @@ local function canonicalize_store(store)
         canonical = resolved
       end
     end
-    if canonical then
-      cleaned.projects[canonical] = entry
-    end
+    -- Preserve an unresolvable record under its original key: a temporarily
+    -- unmounted project must not silently lose its approval during an
+    -- unrelated write. It remains untrusted until the path resolves again.
+    cleaned.projects[canonical or key] = entry
   end
   return cleaned
 end
@@ -844,6 +846,17 @@ function WheelConfig.write_trust_store(store, path_override)
   if not made then
     return false, trust_error("E_TRUST_STORE_WRITE_FAILED",
       "cannot create the trust store directory")
+  end
+
+  if type(store) ~= "table" or type(store.projects) ~= "table" then
+    return false, trust_error("E_TRUST_STORE_CORRUPT",
+      "trust store to write is not an object with projects")
+  end
+  for key in pairs(store.projects) do
+    if type(key) ~= "string" or key:sub(1, 1) ~= "/" or has_control_chars(key) then
+      return false, trust_error("E_TRUST_STORE_CORRUPT",
+        "refusing to write a non-absolute or control-bearing project key")
+    end
   end
 
   local parent_info = host.fs.stat(parent)
@@ -890,7 +903,22 @@ function WheelConfig.write_trust_store(store, path_override)
   end
 
   local K = get_kernel()
-  local json_str = K.JSON.encode(canonicalize_store(store))
+  local candidate = canonicalize_store(store)
+  local project_count = 0
+  for _ in pairs(candidate.projects) do
+    project_count = project_count + 1
+  end
+  if project_count > WheelConfig.MAX_TRUST_STORE_PROJECTS then
+    return false, trust_error("E_TRUST_STORE_TOO_LARGE",
+      "refusing to write more than " .. WheelConfig.MAX_TRUST_STORE_PROJECTS
+        .. " trust records")
+  end
+  local json_str = K.JSON.encode(candidate)
+  if #json_str > WheelConfig.MAX_TRUST_STORE_BYTES then
+    return false, trust_error("E_TRUST_STORE_TOO_LARGE",
+      "refusing to write a trust store above " .. WheelConfig.MAX_TRUST_STORE_BYTES
+        .. " bytes; the file would fail the read cap and lose approvals")
+  end
 
   local temp_result = host.proc.run_program(
     "mktemp", { path .. ".tmp.XXXXXX" }, { discard_stderr = true })
@@ -1254,6 +1282,11 @@ function WheelConfig.is_trusted(project_root, content, trust_file)
 
   local current_hash
   if content ~= nil then
+    if #content > WheelConfig.MAX_PROJECT_CONFIG_BYTES then
+      return false, "", nil, trust_error("E_PROJECT_CONFIG_TOO_LARGE",
+        "project configuration exceeds the " .. WheelConfig.MAX_PROJECT_CONFIG_BYTES
+          .. "-byte cap")
+    end
     current_hash = WheelConfig.compute_content_hash(content)
   else
     local entry = WheelConfig.inspect_project_config(root)
@@ -1385,7 +1418,9 @@ function WheelConfig.untrust(project_root, trust_file)
   return WheelConfig.revoke(project_root, trust_file)
 end
 
---- Split text into lines while preserving content exactly.
+--- Split text into lines while preserving trailing-newline distinction.
+-- `"a"` and `"a\n"` produce different line arrays (`{"a"}` vs `{"a", ""}`),
+-- so a whitespace-only final newline change still appears in the diff.
 local function split_lines(value)
   local lines = {}
   if value == "" then
@@ -1404,67 +1439,71 @@ local function split_lines(value)
   return lines
 end
 
---- Produce a fallback replacement diff when no `diff` utility is available.
-local function fallback_diff(previous, current)
-  local lines = { "--- trusted", "+++ current" }
-  for _, line in ipairs(split_lines(previous)) do
-    lines[#lines + 1] = "-" .. line
+--- Produce a bounded pure-Lua line diff.
+-- The prefix/suffix trim makes the common case linear and caps the emitted
+-- block at the changed lines; the 32 KiB entry cap bounds the total. Added,
+-- removed, and changed lines are all represented, and the caller never turns
+-- differing bytes into "(no changes)". This deliberately avoids an external
+-- `diff` process, whose Lua 5.1 popen status is unobservable.
+-- @param previous string
+-- @param current string
+-- @return string
+local function pure_line_diff(previous, current)
+  local old_lines = split_lines(previous)
+  local new_lines = split_lines(current)
+  local old_count = #old_lines
+  local new_count = #new_lines
+
+  local prefix = 0
+  while prefix < old_count and prefix < new_count
+    and old_lines[prefix + 1] == new_lines[prefix + 1] do
+    prefix = prefix + 1
   end
-  for _, line in ipairs(split_lines(current)) do
-    lines[#lines + 1] = "+" .. line
+
+  local suffix = 0
+  while suffix < old_count - prefix and suffix < new_count - prefix
+    and old_lines[old_count - suffix] == new_lines[new_count - suffix] do
+    suffix = suffix + 1
+  end
+
+  local lines = { "--- trusted", "+++ current" }
+  if prefix > 0 then
+    lines[#lines + 1] = " " .. old_lines[prefix]
+  end
+
+  local old_start = prefix + 1
+  local old_end = old_count - suffix
+  local new_start = prefix + 1
+  local new_end = new_count - suffix
+  lines[#lines + 1] = string.format("@@ -%d,%d +%d,%d @@",
+    old_start, old_end - old_start + 1, new_start, new_end - new_start + 1)
+  for index = old_start, old_end do
+    lines[#lines + 1] = "-" .. old_lines[index]
+  end
+  for index = new_start, new_end do
+    lines[#lines + 1] = "+" .. new_lines[index]
+  end
+  if suffix > 0 then
+    lines[#lines + 1] = " " .. old_lines[old_end + 1]
   end
   return table.concat(lines, "\n")
 end
 
---- Compute a unified diff between previously trusted and current content.
--- Uses the host temporary-file primitive and argv execution. Labels keep the
--- temporary paths out of the output. Falls back to a labelled replacement
--- diff when `diff` is unavailable.
+--- Compute a line diff between previously trusted and current content.
+-- Pure Lua and bounded by the entry cap; never reports "(no changes)" unless
+-- the byte strings are identical.
 -- @param previous string
 -- @param current string
 -- @return string
 function WheelConfig.compute_diff(previous, current)
+  if type(previous) ~= "string" or type(current) ~= "string" then
+    previous = tostring(previous or "")
+    current = tostring(current or "")
+  end
   if previous == current then
     return "(no changes)"
   end
-  if type(previous) ~= "string" or type(current) ~= "string" then
-    return fallback_diff(tostring(previous or ""), tostring(current or ""))
-  end
-
-  local host = require_host("fs.read")
-  local ok_old, old_path = pcall(function() return host.tmp.name() end)
-  local ok_new, new_path = pcall(function() return host.tmp.name() end)
-  if not ok_old or not ok_new then
-    return fallback_diff(previous, current)
-  end
-
-  local wrote_old = pcall(function() return host.fs.write_file(old_path, previous) end)
-  local wrote_new = pcall(function() return host.fs.write_file(new_path, current) end)
-  if not wrote_old or not wrote_new then
-    pcall(function() host.fs.remove_file(old_path) end)
-    pcall(function() host.fs.remove_file(new_path) end)
-    return fallback_diff(previous, current)
-  end
-  pcall(function() host.fs.chmod(old_path, "600") end)
-  pcall(function() host.fs.chmod(new_path, "600") end)
-
-  local res = host.proc.run_program("diff", {
-    "-u", "--label", "trusted", "--label", "current", "--", old_path, new_path,
-  }, { discard_stderr = true })
-
-  pcall(function() host.fs.remove_file(old_path) end)
-  pcall(function() host.fs.remove_file(new_path) end)
-
-  if res.ok and (res.code == 0 or res.code == 1) then
-    local output = trim_output(res.stdout)
-    if output ~= "" then
-      return output
-    end
-    if res.code == 0 then
-      return "(no changes)"
-    end
-  end
-  return fallback_diff(previous, current)
+  return pure_line_diff(previous, current)
 end
 
 local function single_line(value)
@@ -1472,11 +1511,71 @@ local function single_line(value)
   return (text:gsub("[\r\n]", " "))
 end
 
---- Render the full consent view. Content is not truncated here; the command
--- layer chunks it across bounded notifications.
--- @param plan table `trust_status` result
+--- Escape one line for consent display.
+-- Printable ASCII is preserved except backslash, which is doubled so `\xNN`
+-- escapes are unambiguous. Every other byte (ESC, CR, NUL, other control bytes,
+-- and non-ASCII bytes) is rendered as `\xNN`. The raw SHA-256 still covers the
+-- original bytes, never this escaped rendering.
+-- @param value string
 -- @return string
-function WheelConfig.format_trust_show(plan)
+local function escape_consent_text(value)
+  local out = {}
+  for index = 1, #value do
+    local byte = value:byte(index)
+    if byte == 92 then
+      out[#out + 1] = "\\\\"
+    elseif byte >= 32 and byte <= 126 then
+      out[#out + 1] = string.char(byte)
+    else
+      out[#out + 1] = string.format("\\x%02X", byte)
+    end
+  end
+  return table.concat(out)
+end
+
+--- Render one escaped, prefixed block so no content line can look like a
+-- delimiter.
+-- @param value string
+-- @param prefix string
+-- @return string[]
+local function render_consent_block(value, prefix)
+  local rendered = {}
+  local lines = split_lines(value)
+  if #lines == 0 then
+    rendered[1] = prefix
+    return rendered
+  end
+  for _, line in ipairs(lines) do
+    rendered[#rendered + 1] = prefix .. escape_consent_text(line)
+  end
+  return rendered
+end
+
+--- Build a per-run nonce for the consent delimiters.
+-- This is not a cryptographic token; it prevents a project entry from
+-- pre-embedding the exact delimiter line. Every content line is also prefixed
+-- and escaped, so guessing the nonce alone is not enough.
+-- @return string
+function WheelConfig.consent_nonce()
+  local address = tostring({}):match("0x(%x+)") or "0"
+  local now = "0"
+  local ok, value = pcall(function()
+    return require_host("time.now").time.now()
+  end)
+  if ok and type(value) == "number" then
+    now = string.format("%x", math.floor(value))
+  end
+  return address .. "-" .. now
+end
+
+--- Render the full consent view. Content is escaped, line-prefixed, and
+-- delimited by a per-run nonce. It is not truncated here; the command layer
+-- chunks it across bounded notifications and returns a bounded summary.
+-- @param plan table `trust_status` result
+-- @param nonce string? per-run delimiter nonce
+-- @return string
+function WheelConfig.format_trust_show(plan, nonce)
+  nonce = nonce or WheelConfig.consent_nonce()
   local lines = {
     "Wheel executable project configuration",
     "",
@@ -1491,7 +1590,8 @@ function WheelConfig.format_trust_show(plan)
 
   if plan.record then
     lines[#lines + 1] = "Approved hash: " .. tostring(plan.record.hash)
-    lines[#lines + 1] = "Approved at: " .. tostring(plan.record.approved_at or "unknown")
+    lines[#lines + 1] = "Approved at: "
+      .. escape_consent_text(tostring(plan.record.approved_at or "unknown"))
     if plan.alias and plan.record_key then
       lines[#lines + 1] = "Record key: " .. single_line(plan.record_key)
         .. " (legacy/alias; the next approval migrates it to the canonical root)"
@@ -1502,34 +1602,78 @@ function WheelConfig.format_trust_show(plan)
 
   if plan.store_warning then
     lines[#lines + 1] = "Trust store warning: " .. single_line(plan.store_warning.code)
-      .. " - " .. single_line(plan.store_warning.message)
+      .. " - " .. escape_consent_text(tostring(plan.store_warning.message))
     lines[#lines + 1] = "Every project is treated as untrusted until the store is repaired."
   end
 
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "Effects are evaluated only after confirmation. A concrete effects"
-  lines[#lines + 1] = "list cannot be produced without evaluating the entry, and this gate"
+  lines[#lines + 1] = "Effects class: project configuration may request role/model profiles,"
+  lines[#lines + 1] = "directives, tool allow/deny/custom declarations, skill filters,"
+  lines[#lines + 1] = "verification commands, context budgets, panel policy, and lifecycle hooks."
+  lines[#lines + 1] = "It may not add workspace roots, network destinations, secret names, or"
+  lines[#lines + 1] = "role authority. The loader does not yet validate every field, so a"
+  lines[#lines + 1] = "trusted entry remains code approved by the user, not a data-only contract."
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Effects are evaluated only after confirmation. A concrete entry-specific"
+  lines[#lines + 1] = "effects list cannot be produced without evaluating the entry, and this gate"
   lines[#lines + 1] = "does not evaluate untrusted project code before `trust confirm`."
   lines[#lines + 1] = "After confirmation the restricted loader evaluates it with no filesystem,"
   lines[#lines + 1] = "process, network, secret, environment, or module-load authority, under"
   lines[#lines + 1] = "an instruction hook and best-effort string/table memory bounds."
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "--- BEGIN PROJECT CONFIGURATION CONTENT ---"
-  lines[#lines + 1] = plan.content
-  lines[#lines + 1] = "--- END PROJECT CONFIGURATION CONTENT ---"
+  lines[#lines + 1] = "Content rendering: every line is prefixed and escaped. Backslash is"
+  lines[#lines + 1] = "shown as \\\\ and non-printable/non-ASCII bytes as \\xNN. The SHA-256"
+  lines[#lines + 1] = "covers the original bytes, not this escaped rendering."
   lines[#lines + 1] = ""
-  lines[#lines + 1] = "--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT ---"
-  if plan.diff then
-    lines[#lines + 1] = plan.diff
-  else
-    lines[#lines + 1] = plan.diff_note or "unavailable"
+  lines[#lines + 1] = "--- BEGIN PROJECT CONFIGURATION CONTENT [" .. nonce .. "] ---"
+  local content_lines = render_consent_block(plan.content, "    | ")
+  for _, line in ipairs(content_lines) do
+    lines[#lines + 1] = line
   end
-  lines[#lines + 1] = "--- END DIFF ---"
+  lines[#lines + 1] = "--- END PROJECT CONFIGURATION CONTENT [" .. nonce .. "] ---"
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "--- DIFF AGAINST PREVIOUSLY TRUSTED CONTENT [" .. nonce .. "] ---"
+  if plan.diff then
+    local diff_lines = render_consent_block(plan.diff, "    | ")
+    for _, line in ipairs(diff_lines) do
+      lines[#lines + 1] = line
+    end
+  else
+    lines[#lines + 1] = "    | " .. escape_consent_text(plan.diff_note or "unavailable")
+  end
+  lines[#lines + 1] = "--- END DIFF [" .. nonce .. "] ---"
   lines[#lines + 1] = ""
   lines[#lines + 1] = "Approve exactly these bytes only after reviewing them:"
   lines[#lines + 1] = "  trust confirm " .. plan.hash
   lines[#lines + 1] = "Revoke this project:"
   lines[#lines + 1] = "  trust revoke"
+  return table.concat(lines, "\n")
+end
+
+--- Render a bounded result summary for the trust show command.
+-- The full escaped consent view is delivered as a notification series; the
+-- command result cannot carry 32 KiB plus a diff inside the host body cap.
+-- @param plan table
+-- @param chunk_count number
+-- @return string
+function WheelConfig.format_trust_summary(plan, chunk_count)
+  local lines = {
+    "Wheel project trust consent summary",
+    "Canonical project root: " .. single_line(plan.root),
+    "Entry: " .. single_line(plan.path),
+    string.format("Entry size: %d bytes (cap %d)", plan.bytes,
+      WheelConfig.MAX_PROJECT_CONFIG_BYTES),
+    "SHA-256: " .. plan.hash,
+    "Trust status: " .. single_line(plan.status),
+    "Trust store: " .. single_line(plan.store_path or "unavailable"),
+    string.format("Consent view: %d notification chunk(s) shown before this summary.", chunk_count),
+  }
+  if plan.store_warning then
+    lines[#lines + 1] = "Trust store warning: " .. single_line(plan.store_warning.code)
+      .. " - " .. escape_consent_text(tostring(plan.store_warning.message))
+  end
+  lines[#lines + 1] = "This result body is a summary; review the notification series for the"
+  lines[#lines + 1] = "escaped full entry and the diff before confirming the hash."
   return table.concat(lines, "\n")
 end
 
@@ -1574,7 +1718,8 @@ end
 function WheelConfig.format_trust_error(err)
   local code = type(err) == "table" and err.code or "E_TRUST_ERROR"
   local message = type(err) == "table" and err.message or tostring(err)
-  return "Trust gate refused (" .. single_line(code) .. "): " .. single_line(message)
+  return "Trust gate refused (" .. single_line(code) .. "): "
+    .. escape_consent_text(single_line(message))
 end
 
 -- File helpers that are not part of the trust gate remain local to the
@@ -1610,8 +1755,9 @@ local function eval_config_chunk(content, chunk_name)
   end
 
   local string_copy = copy_library(string)
-  local orig_rep = string_copy.rep
-  string_copy.rep = function(s, n, sep)
+  local real_string_rep = string.rep
+  local orig_rep = real_string_rep
+  local capped_rep = function(s, n, sep)
     if type(n) ~= "number" or n ~= n or n % 1 ~= 0 or n < 0 then
       error("string.rep count must be a non-negative integer number", 0)
     end
@@ -1627,10 +1773,12 @@ local function eval_config_chunk(content, chunk_name)
     account_bytes(size, "string.rep result")
     return orig_rep(text, n, separator)
   end
+  string_copy.rep = capped_rep
 
   local table_copy = copy_library(table)
-  local orig_concat = table_copy.concat
-  table_copy.concat = function(t, sep, i, j)
+  local real_table_concat = table.concat
+  local orig_concat = real_table_concat
+  local capped_concat = function(t, sep, i, j)
     if type(t) ~= "table" then
       error("table.concat first argument must be a table", 0)
     end
@@ -1662,6 +1810,7 @@ local function eval_config_chunk(content, chunk_name)
     account_bytes(size, "table.concat result")
     return orig_concat(t, sep, i, j)
   end
+  table_copy.concat = capped_concat
 
   -- Sandbox environment restricting ambient authority and isolating standard libraries.
   -- `pcall` and `xpcall` are deliberately absent so the instruction-hook error is
@@ -1694,20 +1843,36 @@ local function eval_config_chunk(content, chunk_name)
     return false, "syntax error in " .. chunk_name .. ": " .. tostring(err)
   end
 
+  -- Method syntax such as `("x"):rep(n)` resolves the real string table through
+  -- the string metatable. Patch the real tables for the duration of the chunk,
+  -- not just the sandbox copies, and restore them on every path.
   local hook_installed = false
-  if debug and debug.sethook then
-    debug.sethook(function()
-      error("configuration execution exceeded instruction limit", 0)
-    end, "", 100000)
-    hook_installed = true
-  end
-
-  local ok, res = pcall(chunk)
+  local patched = false
+  local ok, res
+  local run_ok, run_err = pcall(function()
+    string.rep = capped_rep
+    table.concat = capped_concat
+    patched = true
+    if debug and debug.sethook then
+      debug.sethook(function()
+        error("configuration execution exceeded instruction limit", 0)
+      end, "", 100000)
+      hook_installed = true
+    end
+    ok, res = pcall(chunk)
+  end)
 
   if hook_installed and debug and debug.sethook then
-    debug.sethook()
+    pcall(function() debug.sethook() end)
+  end
+  if patched then
+    string.rep = real_string_rep
+    table.concat = real_table_concat
   end
 
+  if not run_ok then
+    return false, "runtime error in " .. chunk_name .. ": " .. tostring(run_err)
+  end
   if not ok then
     return false, "runtime error in " .. chunk_name .. ": " .. tostring(res)
   end

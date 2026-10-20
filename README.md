@@ -281,7 +281,10 @@ declared properties, so any supplied field is rejected with `E_ARGS_INVALID`
 argument object (`action`, `hash`, `path`); unknown fields are still rejected.
 Each command returns the notification projection it displays, `{ title, body }`,
 so CLI, palette, IPC, and agent consumers can type the result without scraping
-presentation text. The
+presentation text. `trust show` is the exception in content volume: its full
+escaped entry and diff are delivered as a notification series, and its returned
+`{ title, body }` is a bounded consent summary (canonical root, full hash,
+status, store state, and chunk count). The
 title is bounded at 64 bytes and the body at 8000 bytes: the current host bridge
 marshals a command result through `DEFAULT_MAX_VALUE_BYTES` (8 KiB), and the
 body bound reserves a 128-byte marshalling margin above the title. A larger
@@ -351,15 +354,19 @@ function classes.
     resolves the canonical project root through the host (`realpath`,
     `readlink -f`, or `cd -P ... && pwd -P`), rejects a symlinked, non-regular,
     or larger-than-32-KiB entry before hashing, and displays the bounded full
-    entry, the diff against the previously trusted content, the full 64-hex
-    SHA-256, and the canonical root. A truncated preview is not sufficient
-    consent. `trust confirm <sha256>` re-reads the entry and writes the record
-    only when the supplied hash equals the exact current bytes. There is no
+    entry, a pure-Lua line diff against the previously trusted content, the
+    full 64-hex SHA-256, and the canonical root. Every content and diff line is
+    escaped (non-printables as `\xNN`) and prefixed inside a per-run nonce
+    delimiter, so a forged marker or control byte cannot look like the real
+    boundary. A truncated preview is not sufficient consent.
+    `trust confirm <sha256>` re-reads the entry and writes the record only when
+    the supplied hash equals the exact current bytes. There is no
     trust-on-first-use, no inherited trust, and no `--yes` default.
-  - A concrete effects list cannot be produced without evaluating the entry.
-    The consent view says so explicitly and does not evaluate the entry before
-    confirmation; effects are applied only when a later configuration load
-    reads the approved record under the restricted evaluator.
+  - A concrete entry-specific effects list cannot be produced without evaluating
+    the entry. The consent view says so explicitly, states the class of effects
+    the configuration surface can request, and does not evaluate the entry
+    before confirmation; effects are applied only when a later configuration
+    load reads the approved record under the restricted evaluator.
   - The trust record binds the canonical project root and the entry hash in
     `$XDG_STATE_HOME/wheel/trusted_projects.json`. Any content change, including
     whitespace, invalidates trust and forces re-approval with a diff.
@@ -371,25 +378,39 @@ function classes.
   - Evaluation runs in a restricted environment with no filesystem, process,
     network, environment, or module-loading access. `pcall`/`xpcall` are
     removed so the instruction-hook error is not catchable; `string.rep` and
-    `table.concat` carry per-call and cumulative byte caps. These are
-    best-effort bounds, not a wall-clock or heap sandbox, and a killable
-    evaluation subprocess remains future work (see
+    `table.concat` carry per-call and cumulative byte caps for direct and
+    method-call forms by patching the real string/table tables for the eval
+    duration and restoring them on every path. These are best-effort bounds,
+    not a wall-clock or heap sandbox: `string.format`, pattern matching,
+    concatenation, sort comparators, and other C-library allocations are not
+    metered, and a killable evaluation subprocess remains future work (see
     [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code)).
   - Project configuration may narrow behavior inside the approved ceiling. It
     may not add a workspace root, network destination, secret name, or authority
     for a role, and it may not disable audit, redaction, the deny-list, the path
-    sandbox, or the trust gate.
-- **Current trust-gate gaps.** Canonical-root pinning, full-content consent,
-  diff-on-change, exact-hash confirmation, user-facing revocation, bounded
-  reads, native hashing, atomic `0700`/`0600` store writes, and the removed
+    sandbox, or the trust gate. The loader does not yet enforce every field or
+    narrowing rule; a trusted entry is user-approved code, not a validated data
+    contract.
+- **Current trust-gate gaps.** Canonical-root pinning, escaped full-content
+  consent, pure-Lua diff-on-change, exact-hash confirmation, user-facing
+  revocation, bounded reads, native hashing, atomic `0700`/`0600` store writes,
+  matched store read/write caps (256 projects and 1 MiB), and the removed
   `pcall`/`xpcall` path are implemented and covered by unit plus real-host
-  tests. Field validation and narrowing-only enforcement of the merged
-  configuration are still absent: a trusted config can set fields the policy
-  expects the loader to reject. Evaluation remains in-process with best-effort
-  instruction and string/table bounds; patterns, `string.format`, concatenation,
-  and library internals are not metered, and there is no wall-clock kill or
-  memory cgroup. The store is not tamper-proof against same-user processes.
-  See [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
+  tests. Field validation and
+  narrowing-only enforcement of the merged configuration are still absent: a
+  trusted config can set fields the policy expects the loader to reject.
+  Evaluation remains in-process with best-effort instruction and string/table
+  bounds; direct and method forms of `string.rep`/`table.concat` are capped,
+  but `string.format`, patterns, concatenation, sort comparators, and other
+  C-library allocations are not metered. There is no wall-clock kill, memory
+  cgroup, or append-only audit stream, so trust approval cannot yet fail closed
+  on an audit write. The store is not tamper-proof against same-user processes
+  and is not fsynced or signed. Native hashing and host primitives resolve
+  `sha256sum`/`shasum`/`openssl`, `realpath`/`readlink`, `stat`, `test`, `id`,
+  and `mktemp` through `PATH`, which is same-user authority. `trust_file` and
+  `global_path` are internal call-site/test overrides, not command or
+  environment inputs. See
+  [SECURITY-MODEL.md](SECURITY-MODEL.md#relationship-to-current-code); this
   inventory is not a claim of compliance.
 - **Future plugin facade.** If a later facade declares `[settings]` in
   `bitty-plugin.toml`, the SDK-rendered `Setting`/`Type`/`Default`/`Description`

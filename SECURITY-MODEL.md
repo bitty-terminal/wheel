@@ -401,15 +401,21 @@ code, and cloning or entering a repository must never execute it silently.
   evaluate the project entry.
 - On the first command that needs project configuration, the harness shows the
   canonical project root, the full entry content within the accepted size cap,
-  its full 64-hex SHA-256 content hash, and the diff against the previously
-  trusted bytes on re-approval. A truncated preview is not sufficient consent.
-  The entry is refused, never truncated, when it exceeds the cap or is a
-  symlink or other non-regular file.
-- A concrete list of the configuration effects the entry can request cannot be
-  produced without evaluating it. The consent view states that limitation
-  explicitly and does not evaluate untrusted code; effects are applied only
-  after confirmation, by the restricted evaluator on a later load. The policy
-  does not require pre-consent evaluation to produce that list.
+  its full 64-hex SHA-256 content hash, and a pure-Lua line diff against the
+  previously trusted bytes on re-approval. A truncated preview is not sufficient
+  consent. Every content and diff line is escaped (non-printables as `\xNN`) and
+  prefixed inside a per-run nonce delimiter, so a forged marker or control byte
+  cannot impersonate the boundary. The entry is refused, never truncated, when
+  it exceeds the cap or is a symlink or other non-regular file.
+- A concrete entry-specific list of the configuration effects cannot be
+  produced without evaluating it. The consent view states that limitation, the
+  class of effects the configuration surface can request (roles/models,
+  directives, tool lists, skill filters, verification, context, panel, hooks),
+  and does not evaluate untrusted code; effects are applied only after
+  confirmation, by the restricted evaluator on a later load. The policy does
+  not require pre-consent evaluation to produce an entry-specific list. The
+  class-level statement is a description of the existing configuration surface,
+  not a new owner decision or an entry-specific effects list.
 - Approval is an explicit interactive action by the user. The confirmation
   requires the full current SHA-256; a stale, partial, or mismatched hash writes
   no record. There is no `--yes`-style default, no environment variable that
@@ -423,7 +429,9 @@ code, and cloning or entering a repository must never execute it silently.
 - The trust store lives at `$XDG_STATE_HOME/wheel/trusted_projects.json`, is
   user-owned with restrictive permissions, and contains no secrets beyond the
   project path, hash, approved content, and approval timestamp. It is created
-  `0700`/`0600` and replaced atomically; there is no `/tmp` fallback.
+  `0700`/`0600` and replaced atomically; there is no `/tmp` fallback. Write-side
+  project-count and byte caps match the read-side caps (256 projects and 1 MiB),
+  so a successful write cannot create a store that the next read rejects.
 - A missing, symlinked, non-regular, foreign-owned, group/world-writable,
   corrupt, foreign-version, oversized, or unreadable trust store fails closed:
   every project is untrusted and the warning is surfaced. It is never silently
@@ -484,11 +492,13 @@ gate itself never evaluates the entry before consent.
 
 Current implementation status for the budget bullet: the evaluator installs an
 instruction-count hook and removes `pcall`/`xpcall` so the hook error is not
-catchable, and it caps `string.rep`/`table.concat` per call and cumulatively.
-It does not yet enforce a wall-clock kill or a true heap limit, and long-running
-C library calls (patterns, formatting, compression) are not preempted. These
-bounds are best-effort; a killable evaluation subprocess remains the durable
-fix.
+catchable. It caps direct and method-call forms of `string.rep`/`table.concat`
+per call and cumulatively by patching the real string/table tables for the eval
+duration and restoring them on every path. It does not yet enforce a wall-clock
+kill or a true heap limit, and long-running C library calls (patterns,
+formatting, sorting, compression) and other allocations are not preempted or
+metered. These bounds are best-effort; a killable evaluation subprocess remains
+the durable fix.
 
 ### Project configuration cannot widen authority
 
@@ -509,8 +519,12 @@ It may not:
 - read the harness's global configuration, trust store, audit log, or secrets;
 - execute processes, access the filesystem, or open sockets during evaluation.
 
-A project configuration that requests an effect outside these limits is
-rejected as a policy error, not silently clamped.
+A project configuration that requests an effect outside these limits is a
+policy violation and must be rejected as a policy error, not silently clamped.
+The current loader does not yet validate every field or enforce narrowing-only
+merging; it merges the returned table and is listed as a known gap below. A
+trusted entry therefore remains user-approved code, not a validated data
+contract.
 
 ### OQ-068 divergence record
 
@@ -831,22 +845,34 @@ Known gaps relative to this policy (not claims of compliance):
   process group; cancellation by recorded PID/process group is policy only.
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
-  host, shows bounded full content plus a change diff, requires the exact
-  full hash to confirm, supports user-facing canonical/alias revocation, and
-  writes a `0700`/`0600` versioned store atomically. `pcall`/`xpcall` are no
-  longer exposed and `string.rep`/`table.concat` have per-call and cumulative
-  caps. Remaining gaps: evaluation is still in-process, so the instruction hook
-  counts VM instructions but cannot preempt a long-running C library call, and
-  there is no wall-clock kill or real memory limit; patterns, `string.format`,
-  concatenation, and other allocations are not metered. The bounded caps are
-  best-effort, not an OS sandbox. A killable evaluation subprocess is the
-  durable fix. The loader still exposes internal `opts.trusted` and
-  `trust_mode = "permissive"` test seams; no command or environment variable
-  reaches them in production paths, but they are not a policy boundary.
+  host, shows escaped full content plus a pure-Lua change diff under a per-run
+  nonce delimiter, requires the exact full hash to confirm, supports
+  user-facing canonical/alias revocation, and writes a `0700`/`0600` versioned
+  store atomically with matching read/write caps. `pcall`/`xpcall` are no
+  longer exposed and direct and method-call forms of
+  `string.rep`/`table.concat` have per-call and cumulative caps. Remaining
+  gaps: evaluation is still in-process, so the instruction hook counts VM
+  instructions but cannot preempt a long-running C library call, and there is
+  no wall-clock kill or real memory limit; patterns, `string.format`,
+  concatenation, sort comparators, and other allocations are not metered. The
+  bounded caps are best-effort, not an OS sandbox. A killable evaluation
+  subprocess is the durable fix. The loader still exposes internal
+  `opts.trusted`, `trust_mode = "permissive"`, `trust_file`, and `global_path`
+  seams; no command or environment variable reaches them in production paths,
+  but they are not a policy boundary.
+- Native hashing and host metadata resolve `sha256sum`/`shasum`/`openssl`,
+  `realpath`/`readlink`, `stat`, `test`, `id`, and `mktemp` through `PATH`. A
+  same-user attacker who controls the environment or `PATH` can influence
+  those tools; the checks are not a privilege boundary. Trust approval is a
+  high-risk operation, and the policy requires it to fail closed when audit
+  cannot record it; no execution audit stream exists yet, so that control is
+  not implemented.
 - The trust store is a same-user file, so a same-user process can still rewrite
   it; ownership and permission checks narrow accidental or cross-user misuse,
   not a compromised account. The atomic rename orders the replacement but the
   store is not fsynced, and the format has no signature or hash chain.
+  Temporarily unresolvable project records are preserved by the write path
+  rather than dropped, but they remain untrusted until their root resolves.
 - There is no append-only execution audit stream with pre-spawn records and
   fail-closed behavior, and no exact-value secret redaction across every sink.
 - Project configuration is merged as an unvalidated table; field validation and

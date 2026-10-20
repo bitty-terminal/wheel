@@ -223,16 +223,18 @@ local function chunk_report(text, limit)
 end
 
 --- Show a report across one or more bounded notifications.
-local function notify_report(prefix, text)
+-- The result body is `summary` when supplied; the full report is the
+-- notification series. This keeps a result-only consumer from believing the
+-- final chunk is the whole consent view.
+local function notify_report(prefix, text, summary)
   local chunks = chunk_report(text, WheelCommands.RESULT_BODY_MAX_LENGTH)
-  if #chunks == 1 then
-    return notify(prefix, chunks[1])
-  end
-  local result
   for index, chunk in ipairs(chunks) do
-    result = notify(string.format("%s (%d/%d)", prefix, index, #chunks), chunk)
+    notify(string.format("%s (%d/%d)", prefix, index, #chunks), chunk)
   end
-  return result
+  if summary then
+    return notify(prefix .. " Summary", summary)
+  end
+  return nil
 end
 
 -- Lazy command table: metadata, argument schema, result schema, and handler
@@ -403,7 +405,11 @@ local WHEEL_COMMANDS = {
           end
           return notify("Wheel Trust Error", config.format_trust_error(plan))
         end
-        return notify_report("Wheel Trust", config.format_trust_show(plan))
+        local nonce = config.consent_nonce()
+        local report = config.format_trust_show(plan, nonce)
+        local chunk_count = #chunk_report(report, WheelCommands.RESULT_BODY_MAX_LENGTH)
+        local summary = config.format_trust_summary(plan, chunk_count)
+        return notify_report("Wheel Trust", report, summary)
       end
 
       if action == "confirm" then

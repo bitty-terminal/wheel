@@ -934,18 +934,27 @@ local function main()
     return table.concat(bodies, "\n"), result, #trust_capture.notifications
   end
 
-  local show_text = run_trust({ path = trust_project })
+  local show_text, show_result = run_trust({ path = trust_project })
   local shown_hash = show_text:match("SHA%-256: (%x+)")
   check(shown_hash ~= nil and #shown_hash == 64,
     "the consent view must contain the full 64-hex hash")
-  check(show_text:find(trust_v1, 1, true) ~= nil,
+  check(show_text:find('return { verification = { test_command = "make trust-v1" }', 1, true) ~= nil,
     "the consent view must contain the full entry content")
+  check(show_result ~= nil and type(show_result.body) == "string"
+    and show_result.body:find("Wheel project trust consent summary", 1, true) ~= nil,
+    "the command result must be a bounded consent summary")
+  check(show_result.body:find(shown_hash, 1, true) ~= nil,
+    "the command summary must carry the full hash")
+  check(#show_result.body <= 8000,
+    "the consent summary must fit the host result body cap")
   check(show_text:find("Canonical project root: " .. trust_project, 1, true) ~= nil,
     "the consent view must show the canonical project root")
-  check(show_text:find("BEGIN PROJECT CONFIGURATION CONTENT", 1, true) ~= nil,
-    "the consent view must delimit the full content")
-  check(show_text:find("DIFF AGAINST PREVIOUSLY TRUSTED CONTENT", 1, true) ~= nil,
-    "the consent view must carry the diff section")
+  check(show_text:find("BEGIN PROJECT CONFIGURATION CONTENT [", 1, true) ~= nil,
+    "the consent view must use a nonce-delimited content block")
+  check(show_text:find("    | ", 1, true) ~= nil,
+    "the consent view must prefix content lines")
+  check(show_text:find("DIFF AGAINST PREVIOUSLY TRUSTED CONTENT [", 1, true) ~= nil,
+    "the consent view must carry the nonce-delimited diff section")
   check(show_text:find("does not evaluate untrusted project code", 1, true) ~= nil,
     "the consent view must state the pre-consent effects limitation")
   check(WheelHost.fs.read_file(trust_entry) == trust_v1,
@@ -1013,6 +1022,32 @@ local function main()
   local reapproved = run_trust({ action = "confirm", path = trust_project, hash = shown_v2 })
   check(reapproved:find("approved", 1, true) ~= nil,
     "the new hash must approve the changed content")
+
+  -- True process restart: a separate Lua process reads the same store and loads
+  -- the project. The child prints a marker because Lua 5.1 popen status is not
+  -- observable reliably.
+  local restart_script = BASE .. "/trust-restart.lua"
+  local restart_source = string.format([[
+package.path = %q
+local C = require("wheel.config")
+local res = C.load({ project_root = %q })
+if res.ok and res.trusted
+  and res.config.verification.test_command == "make trust-v2" then
+  io.write("RESTART-TRUSTED\n")
+  os.exit(0)
+end
+io.write("RESTART-NOT-TRUSTED\n")
+os.exit(1)
+]], package.path, trust_project)
+  check(WheelHost.fs.write_file(restart_script, restart_source),
+    "cannot write the restart probe")
+  local interpreter = (arg and arg[-1]) or "lua5.1"
+  local restart = WheelHost.proc.run_program(interpreter, { restart_script })
+  check(restart.ok and (restart.stdout or ""):find("RESTART-TRUSTED", 1, true) ~= nil,
+    "a separate process must see the approved project as trusted: "
+      .. tostring(restart.stdout) .. tostring(restart.stderr))
+  state.coverage[#state.coverage + 1] =
+    "trust: a separate Lua process read the persisted approval and loaded the project"
 
   -- A consent view that exceeds one notification is chunked, not truncated:
   -- every byte of a 20 KiB entry must reach the notification series.

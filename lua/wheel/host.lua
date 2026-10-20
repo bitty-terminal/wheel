@@ -342,9 +342,15 @@ function standalone.new(opts)
     if not f then
       return nil, tostring(err)
     end
-    local content = f:read(max_bytes)
-    f:close()
-    return content or ""
+    local content, read_err = f:read(max_bytes)
+    local close_ok, close_err = f:close()
+    if content == nil then
+      return nil, tostring(read_err or close_err or "read failed")
+    end
+    if close_ok == nil then
+      return nil, tostring(close_err or "close failed")
+    end
+    return content
   end
 
   --- Write <content> to the file at <path>, replacing existing content.
@@ -357,8 +363,15 @@ function standalone.new(opts)
     if not f then
       return false, tostring(err)
     end
-    f:write(content or "")
-    f:close()
+    local wrote, write_err = f:write(content or "")
+    if not wrote then
+      f:close()
+      return false, tostring(write_err or "write failed")
+    end
+    local close_ok, close_err = f:close()
+    if not close_ok then
+      return false, tostring(close_err or "close failed")
+    end
     return true
   end
 
