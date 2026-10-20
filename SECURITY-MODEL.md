@@ -290,7 +290,10 @@ authority.
   authority negotiation item.
 - Temporary files are created inside the workspace or in a user-private runtime
   directory with restrictive permissions, and are removed when the job closes.
-  The ambient `os.tmpname` location is not used directly by tool code.
+  The standalone backend uses `$XDG_RUNTIME_DIR/wheel` when set, otherwise
+  `$XDG_STATE_HOME/wheel/tmp`, otherwise `$HOME/.local/state/wheel/tmp`; the
+  directory is created or repaired with mode 0700 before a path is returned.
+  The ambient `os.tmpname` location is not used.
 - Durable harness state lives under `$XDG_STATE_HOME/wheel/`; user
   configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
   outside model-visible workspace authority. No state path is hardcoded to a
@@ -691,9 +694,20 @@ that the policy relies on, and they remain unverified until the gates pass:
 - a project-configuration loader with a content hash, an explicit trust action,
   a revocation action, and a restricted evaluation environment;
 - a provider adapter boundary that reads named environment variables;
-- a `WheelHost` seam for process, temporary-file, and wall-clock time calls;
-  several file and configuration paths still call `io.open` directly, and CPU
-  time (`os.clock`) is still read directly.
+- a `WheelHost` seam that concentrates filesystem, process, temporary-file,
+  wall-clock, and CPU-time calls. The production backend is the standalone
+  POSIX surface, selected explicitly with `select_backend("standalone")`;
+  unsupported platforms and unavailable primitives fail closed with typed
+  denials. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
+  `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
+
+Backend-selection decision: the 0.1.0 harness has exactly one execution
+backend, the standalone POSIX surface, selected explicitly with
+`WheelHost.select_backend("standalone")`. There is no fallback to a plugin
+host, no `bitty.api_version` authority probe, and no implicit in-process
+adapter. A non-POSIX platform fails closed at seam construction. A future host
+IPC client is presentation-only; adding an execution adapter requires the
+widening process above.
 
 Known gaps relative to this policy (not claims of compliance):
 
@@ -701,17 +715,10 @@ Known gaps relative to this policy (not claims of compliance):
   absolute paths outside the root, but does not reject NUL/control bytes,
   resolve symlink targets, reject non-regular files, or re-validate at open
   time. Writes truncate in place; there is no atomic temp-file-plus-rename.
-- File tools build shell strings for `list_directory`, `search_code`, and cwd
-  selection with Lua `%q` interpolation. Those values are not screened by the
-  deny-list, and `%q` is not a shell-safe argv boundary; a crafted path can
-  execute shell substitution. These tools must move to argv or a reviewed
-  quoting primitive.
-- `run_command` and temporary-file creation do route through `WheelHost`, but
-  several file and configuration paths still call `io.open` directly, and
-  temporary files use the ambient `os.tmpname` location. The seam does not yet
-  concentrate all filesystem calls.
-- Wall-clock reads route through the seam, but CPU time (`os.clock`) is still
-  read directly in `tool.lua` and `team.lua`.
+- Inspect-intent tools now pass argv through `WheelHost.proc.run_program` and
+  quote cwd with a single-quote helper, but `run_command` remains the explicit
+  shell-string primitive: the command body is model-provided by design and is
+  screened only by the partial deny-list.
 - The child environment is inherited from the parent. `run_command` does not
   scrub allowlisted provider keys, so spawned processes can read them.
   Non-inheritance is required before release.

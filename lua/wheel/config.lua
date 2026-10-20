@@ -341,28 +341,28 @@ function WheelConfig.compute_hash(str)
   return sha256_pure(str)
 end
 
+--- Return the host seam, failing closed when it did not load.
+-- Configuration file access has no direct surface of its own: every read and
+-- write goes through WheelHost, so a missing seam is a typed denial.
+-- @param capability string
+-- @return table
+local function require_host(capability)
+  if not WheelHost then
+    error(WheelErrors.capability_denied(capability), 0)
+  end
+  return WheelHost
+end
+
 --- Read file content safely.
 local function read_file(filepath)
-  if type(io) ~= "table" or type(io.open) ~= "function" then
-    error(WheelErrors.capability_denied("fs.read"), 0)
-  end
-  local f = io.open(filepath, "r")
-  if not f then return nil end
-  local content = f:read("*a")
-  f:close()
+  local content = require_host("fs.read").fs.read_file(filepath)
   return content
 end
 
 --- Write file content safely.
 local function write_file(filepath, content)
-  if type(io) ~= "table" or type(io.open) ~= "function" then
-    error(WheelErrors.capability_denied("fs.write"), 0)
-  end
-  local f = io.open(filepath, "w")
-  if not f then return false end
-  f:write(content)
-  f:close()
-  return true
+  local ok = require_host("fs.write").fs.write_file(filepath, content)
+  return ok == true
 end
 
 --- Read an environment variable through the checked host surface.
@@ -373,17 +373,9 @@ local function getenv(name)
   return os.getenv(name)
 end
 
---- Cheap file-existence check (open/close, no content read).
+--- Cheap file-existence check through the host seam.
 local function file_exists(filepath)
-  if type(io) ~= "table" or type(io.open) ~= "function" then
-    error(WheelErrors.capability_denied("fs.read"), 0)
-  end
-  local f = io.open(filepath, "r")
-  if not f then
-    return false
-  end
-  f:close()
-  return true
+  return require_host("fs.read").fs.exists(filepath)
 end
 
 --- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
@@ -437,10 +429,6 @@ function WheelConfig.read_trust_store(path_override)
   return {}
 end
 
-local function shell_quote(value)
-  return "'" .. string.gsub(tostring(value or ""), "'", "'\\''") .. "'"
-end
-
 --- Save trust store JSON table.
 --- @param store table
 --- @param path_override string? Optional custom trust store file path
@@ -452,7 +440,7 @@ function WheelConfig.write_trust_store(store, path_override)
   -- Ensure parent directory exists safely without shell injection
   local parent_dir = string.match(path, "^(.*)/[^/]+$")
   if parent_dir and parent_dir ~= "" then
-    WheelHost.fs.mkdir_p(parent_dir)
+    require_host("fs.write").fs.mkdir_p(parent_dir)
   end
   return write_file(path, json_str)
 end
@@ -641,8 +629,13 @@ function WheelConfig.discover_agent_capabilities(workspace_root, filter)
   end
 
   local discovered = {}
-  -- Scan skills directory safely with shell_quote
-  local list_res = WheelHost.proc.run_command("ls -1 -- " .. shell_quote(skills_dir) .. " 2>/dev/null")
+  -- List the skills directory through the argv-oriented process primitive.
+  -- The existence probe keeps a missing directory from emitting stderr noise.
+  local host = require_host("fs.read")
+  if not host.fs.exists(skills_dir) then
+    return { skills = discovered, count = 0 }
+  end
+  local list_res = host.proc.run_program("ls", { "-1", "--", skills_dir }, { discard_stderr = true })
   if list_res.ok then
     for entry in (list_res.stdout or ""):gmatch("[^\n]+") do
       local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"

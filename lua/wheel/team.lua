@@ -501,7 +501,7 @@ function WheelTeam:run_orchestration_loop(opts)
   local max_waves = opts.max_waves or 50
   local auto_reviewer = (opts.auto_reviewer ~= false)
   local role_mapping = opts.role_mapping
-  local start_clock = os.clock()
+  local start_clock = WheelHost.time.clock()
 
   local wave_num = 0
   local completed_set = {}
@@ -754,7 +754,7 @@ function WheelTeam:run_orchestration_loop(opts)
     loop_success = true
   end
 
-  local duration_ms = math.max(1, math.floor((os.clock() - start_clock) * 1000))
+  local duration_ms = math.max(1, math.floor((WheelHost.time.clock() - start_clock) * 1000))
   local final_cp_log = self.kernel:log(100) or {}
   local total_checkpoints = math.max(0, #final_cp_log - initial_checkpoints)
 

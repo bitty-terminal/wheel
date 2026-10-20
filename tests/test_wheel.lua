@@ -5433,6 +5433,185 @@ run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", 
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelHost: the standalone backend is explicitly selected", function()
+  assert(WheelHost.BACKEND_STANDALONE == "standalone",
+    "the standalone backend id must be a named constant")
+  assert(WheelHost.backend_name == WheelHost.BACKEND_STANDALONE,
+    "the installed backend must be the standalone backend")
+  assert(type(WheelHost.backend) == "table" and WheelHost.backend.name == "standalone",
+    "the backend table must identify itself as standalone")
+  assert(WheelHost.backend.platform == "posix",
+    "the installed standalone backend must report the POSIX platform")
+
+  -- The factory is explicit and named; it builds a backend without installing it.
+  local fresh = WheelHost.create_backend(WheelHost.BACKEND_STANDALONE)
+  assert(type(fresh) == "table" and fresh.name == "standalone")
+  assert(fresh ~= WheelHost.backend, "create_backend must not install its result")
+
+  -- The selection path installs exactly the backend it built.
+  local selected = WheelHost.select_backend(WheelHost.BACKEND_STANDALONE)
+  assert(selected == WheelHost.backend, "select_backend must install the built backend")
+  assert(WheelHost.backend_name == WheelHost.BACKEND_STANDALONE)
+end)
+
+run_test("WheelHost: unsupported backends and platforms fail closed", function()
+  local installed = WheelHost.backend
+  local installed_name = WheelHost.backend_name
+
+  local ok_name, err_name = pcall(WheelHost.create_backend, "plugin-host")
+  assert(not ok_name, "an unknown backend must not be constructed")
+  local name_denial = assert_typed_error(err_name, "E_CAPABILITY_DENIED")
+  assert(name_denial.message == "capability 'host.backend' is not granted",
+    "unknown backend must fail with the typed host-backend denial")
+
+  local ok_platform, err_platform = pcall(WheelHost.create_backend, "standalone", { platform = "windows" })
+  assert(not ok_platform, "a non-POSIX platform must not construct the standalone backend")
+  local platform_denial = assert_typed_error(err_platform, "E_CAPABILITY_DENIED")
+  assert(platform_denial.message == "capability 'host.backend.standalone' is not granted",
+    "unsupported platform must fail with the typed standalone denial")
+
+  -- Real detection path: a Windows-style package.config separator is rejected.
+  local saved_config = package.config
+  package.config = "\\\n?\n!\n-\n"
+  local ok_detect, err_detect = pcall(WheelHost.create_backend, "standalone")
+  package.config = saved_config
+  assert(not ok_detect, "non-POSIX package.config must fail closed")
+  assert_typed_error(err_detect, "E_CAPABILITY_DENIED")
+
+  -- A failed construction never replaces the installed backend.
+  assert(WheelHost.backend == installed, "failed selection must not mutate the installed backend")
+  assert(WheelHost.backend_name == installed_name)
+end)
+
+run_test("WheelHost: unavailable primitives return typed denials", function()
+  local installed = WheelHost.backend
+  WheelHost.backend = {}
+
+  local cases = {
+    { label = "fs.mkdir_p", capability = "fs.write", call = function() return WheelHost.fs.mkdir_p("/tmp/x") end },
+    { label = "fs.list_dir", capability = "fs.read", call = function() return WheelHost.fs.list_dir("/tmp") end },
+    { label = "fs.read_file", capability = "fs.read", call = function() return WheelHost.fs.read_file("/tmp/x") end },
+    { label = "fs.write_file", capability = "fs.write", call = function() return WheelHost.fs.write_file("/tmp/x", "x") end },
+    { label = "fs.remove_file", capability = "fs.write", call = function() return WheelHost.fs.remove_file("/tmp/x") end },
+    { label = "fs.exists", capability = "fs.read", call = function() return WheelHost.fs.exists("/tmp/x") end },
+    { label = "proc.run_command", capability = "process.spawn", call = function() return WheelHost.proc.run_command("true") end },
+    { label = "proc.run_program", capability = "process.spawn", call = function() return WheelHost.proc.run_program("true") end },
+    { label = "proc.shell_quote", capability = "process.spawn", call = function() return WheelHost.proc.shell_quote("x") end },
+    { label = "tmp.dir", capability = "fs.write", call = function() return WheelHost.tmp.dir() end },
+    { label = "tmp.name", capability = "fs.write", call = function() return WheelHost.tmp.name() end },
+    { label = "time.now", capability = "time.now", call = function() return WheelHost.time.now() end },
+    { label = "time.clock", capability = "time.clock", call = function() return WheelHost.time.clock() end },
+  }
+
+  local results = {}
+  for _, case in ipairs(cases) do
+    local ok, err = pcall(case.call)
+    results[case.label] = { ok = ok, err = err, capability = case.capability }
+  end
+  WheelHost.backend = installed
+
+  for _, case in ipairs(cases) do
+    local result = results[case.label]
+    assert(not result.ok, case.label .. " must fail when the primitive is unavailable")
+    local denial = assert_typed_error(result.err, "E_CAPABILITY_DENIED")
+    assert(denial.message == "capability '" .. case.capability .. "' is not granted",
+      case.label .. " must report the typed " .. case.capability .. " denial")
+  end
+end)
+
+run_test("WheelHost: config file access fails closed through the seam", function()
+  local installed = WheelHost.backend
+  WheelHost.backend = {}
+  local read_ok, read_err = pcall(WheelConfig.read_trust_store, "/tmp/bitty/ctx0015-trust.json")
+  local write_ok, write_err = pcall(WheelConfig.write_trust_store, {}, "/tmp/bitty/ctx0015-trust.json")
+  WheelHost.backend = installed
+
+  assert(not read_ok, "trust-store reads must fail without a host surface")
+  local read_denial = assert_typed_error(read_err, "E_CAPABILITY_DENIED")
+  assert(read_denial.message == "capability 'fs.read' is not granted")
+
+  assert(not write_ok, "trust-store writes must fail without a host surface")
+  local write_denial = assert_typed_error(write_err, "E_CAPABILITY_DENIED")
+  assert(write_denial.message == "capability 'fs.write' is not granted")
+end)
+
+run_test("WheelHost: temporary files use a private runtime directory", function()
+  local root = "/tmp/bitty/test_host_private_tmp"
+  os.execute("rm -rf " .. root)
+
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root .. "/runtime" })
+  local dir = backend.tmp_dir()
+  assert(dir == root .. "/runtime", "tmp_dir must honor the injected workspace/runtime root")
+
+  local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(dir))
+  assert(listing.ok == true and listing.code == 0, "the private directory must exist")
+  local mode = listing.stdout:match("^(%S+)")
+  assert(string.sub(mode or "", 1, 10) == "drwx------",
+    "the temporary directory must have mode 0700, got " .. tostring(mode))
+
+  local first = backend.tmp_path()
+  local second = backend.tmp_path()
+  assert(first ~= second, "temporary paths must be unique")
+  assert(string.sub(first, 1, #dir + 1) == dir .. "/", "temporary paths must stay inside the private directory")
+
+  local wrote = backend.write_file(first, "private payload")
+  assert(wrote == true, "the caller must be able to write the temporary file")
+  assert(backend.remove_file(first) == true, "the caller must be able to remove the temporary file")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: routed harness paths contain no direct host primitives", function()
+  local DIRECT_PATTERNS = {
+    "io%.open",
+    "io%.popen",
+    "os%.tmpname",
+    "os%.clock",
+    "os%.remove",
+    "os%.execute",
+    "os%.time",
+  }
+
+  local function direct_hits(source)
+    local hits = {}
+    for _, pattern in ipairs(DIRECT_PATTERNS) do
+      if string.find(source, pattern) then
+        table.insert(hits, pattern)
+      end
+    end
+    return hits
+  end
+
+  -- Control: the detector must catch the patterns it claims to guard.
+  assert(#direct_hits("local f = io.open('/tmp/x')") == 1, "guard must detect io.open")
+  assert(#direct_hits("local t = os.clock()") == 1, "guard must detect os.clock")
+
+  local pipe = assert(io.popen("ls -1 lua/wheel/*.lua", "r"))
+  local files = {}
+  for line in pipe:lines() do
+    files[#files + 1] = line
+  end
+  pipe:close()
+  assert(#files >= 14, "guard must inspect every harness module")
+
+  local checked = 0
+  for _, path in ipairs(files) do
+    local fh = assert(io.open(path, "rb"))
+    local source = fh:read("*a")
+    fh:close()
+    if path == "lua/wheel/host.lua" then
+      -- The seam is the one module allowed to touch the stdlib primitives.
+      assert(#direct_hits(source) > 0, "the host seam must own the direct primitives")
+    else
+      local hits = direct_hits(source)
+      assert(#hits == 0, path .. " must route every host primitive through WheelHost: "
+        .. table.concat(hits, ", "))
+      checked = checked + 1
+    end
+  end
+  assert(checked >= 13, "guard must cover every non-host harness module")
+end)
+
 run_test("WheelHost: proc primitives (run_command, run_program, command_runner)", function()
   -- run_command executes a shell command and captures stdout
   local res = WheelHost.proc.run_command("echo wheel-host-ok")
@@ -5482,10 +5661,17 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
   local saved = {
     mkdir_p = backend.mkdir_p,
     list_dir = backend.list_dir,
+    read_file = backend.read_file,
+    write_file = backend.write_file,
+    exists = backend.exists,
+    remove_file = backend.remove_file,
     run_command = backend.run_command,
+    run_program = backend.run_program,
     now = backend.now,
+    clock = backend.clock,
   }
   local calls = {}
+  local clock_calls = 0
   backend.mkdir_p = function(path)
     table.insert(calls, { kind = "mkdir_p", path = path })
     return saved.mkdir_p(path)
@@ -5501,23 +5687,62 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
       total = 2,
     }
   end
+  backend.read_file = function(path)
+    table.insert(calls, { kind = "read_file", path = path })
+    return saved.read_file(path)
+  end
+  backend.write_file = function(path, content)
+    table.insert(calls, { kind = "write_file", path = path })
+    return saved.write_file(path, content)
+  end
+  backend.exists = function(path)
+    table.insert(calls, { kind = "exists", path = path })
+    return saved.exists(path)
+  end
+  backend.remove_file = function(path)
+    table.insert(calls, { kind = "remove_file", path = path })
+    return saved.remove_file(path)
+  end
   backend.run_command = function(shell_string)
     table.insert(calls, { kind = "run_command", command = shell_string })
     return { ok = true, code = 0, stdout = "seam-stdout", stderr = "" }
   end
+  backend.run_program = function(program, args)
+    table.insert(calls, { kind = "run_program", program = program, args = args })
+    return { ok = true, code = 0, stdout = "match-a\nmatch-b", stderr = "" }
+  end
   backend.now = function()
     return 1234567890
+  end
+  backend.clock = function()
+    clock_calls = clock_calls + 1
+    if clock_calls == 1 then
+      return 10
+    end
+    return 10.5
   end
 
   local ok, err = pcall(function()
     local reg = WheelTool.get_default_registry()
     local env = { workspace_root = root, role = WheelAgent.Role.CODING }
 
-    -- write_file -> fs.mkdir_p
+    -- write_file -> fs.exists / fs.mkdir_p / fs.write_file
     local w = reg:dispatch("write_file", { path = "routed/sample.txt", content = "x", overwrite = true }, env)
     assert(w.success == true, "write_file must succeed: " .. tostring(w.stderr))
+    assert(w.duration_ms == 500, "dispatch must measure CPU time through WheelHost.time.clock")
 
-    -- run_command -> proc.run_command
+    -- read_file / edit_file -> fs.read_file + fs.write_file
+    local r_file = reg:dispatch("read_file", { path = "routed/sample.txt" }, env)
+    assert(r_file.success == true, "read_file must succeed: " .. tostring(r_file.stderr))
+    assert(r_file.stdout == "x", "read_file must return host content")
+    local e = reg:dispatch("edit_file", {
+      path = "routed/sample.txt",
+      target = "x",
+      replacement = "edited",
+    }, env)
+    assert(e.success == true, "edit_file must succeed: " .. tostring(e.stderr))
+
+    -- run_command -> proc.run_command (explicit shell-string primitive)
     local r = reg:dispatch("run_command", { command = "echo routed" }, env)
     assert(r.success == true, "run_command must succeed")
     assert(r.stdout == "seam-stdout", "run_command output must come from the seam")
@@ -5528,10 +5753,14 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
     assert(l.stdout == "listing-a\nlisting-b", "list_directory output must come from the seam")
     assert(l.total_entries == 2)
 
-    -- search_code -> proc.run_command
+    -- search_code -> proc.run_program (argv, no shell string)
     local s = reg:dispatch("search_code", { query = "routed" }, env)
     assert(s.success == true)
-    assert(s.stdout == "seam-stdout", "search_code output must come from the seam")
+    assert(s.stdout == "match-a\nmatch-b", "search_code output must come from the seam")
+
+    -- fs.remove_file -> provider temp cleanup path
+    local removed = WheelHost.fs.remove_file(root .. "/routed/sample.txt")
+    assert(removed == true, "remove_file must remove the temp file")
 
     -- auto-spillover action ids -> time.now
     local outcome = WheelTool.process_spillover({ tool = "probe", success = true, stdout = "", stderr = "" })
@@ -5540,58 +5769,85 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
 
   backend.mkdir_p = saved.mkdir_p
   backend.list_dir = saved.list_dir
+  backend.read_file = saved.read_file
+  backend.write_file = saved.write_file
+  backend.exists = saved.exists
+  backend.remove_file = saved.remove_file
   backend.run_command = saved.run_command
+  backend.run_program = saved.run_program
   backend.now = saved.now
+  backend.clock = saved.clock
   if not ok then
     error(err)
   end
 
   -- Each primitive was exercised by the expected call sites
   local mkdir_path, list_path = nil, nil
-  local run_cmds = {}
+  local run_cmds, argv_calls = {}, {}
+  local saw_read, saw_write, saw_exists, saw_remove = false, false, false, false
   for _, call in ipairs(calls) do
     if call.kind == "mkdir_p" then
       mkdir_path = call.path
-    end
-    if call.kind == "list_dir" then
+    elseif call.kind == "list_dir" then
       list_path = call.path
-    end
-    if call.kind == "run_command" then
+    elseif call.kind == "read_file" then
+      saw_read = true
+    elseif call.kind == "write_file" then
+      saw_write = true
+    elseif call.kind == "exists" then
+      saw_exists = true
+    elseif call.kind == "remove_file" then
+      saw_remove = true
+    elseif call.kind == "run_command" then
       table.insert(run_cmds, call.command)
+    elseif call.kind == "run_program" then
+      table.insert(argv_calls, call)
     end
   end
   assert(mkdir_path == root .. "/routed", "write_file must create parents through fs.mkdir_p")
   assert(list_path == root, "list_directory must list through fs.list_dir: " .. tostring(list_path))
-  assert(#run_cmds == 2, "run_command and search_code must execute through proc.run_command")
-  local saw_shell, saw_grep = false, false
-  for _, cmd in ipairs(run_cmds) do
-    if string.find(cmd, "(echo routed) 2>&1", 1, true) then
-      saw_shell = true
-    end
-    if string.find(cmd, "grep -rn", 1, true) then
-      saw_grep = true
-    end
-  end
-  assert(saw_shell, "run_command must keep wrapping the command with cd/2>&1")
-  assert(saw_grep, "search_code must keep its grep pipeline")
+  assert(saw_read, "read_file/edit_file must read through fs.read_file")
+  assert(saw_write, "write_file/edit_file must write through fs.write_file")
+  assert(saw_exists, "write_file must test existence through fs.exists")
+  assert(saw_remove, "temporary-file cleanup must use fs.remove_file")
+  assert(#run_cmds == 1, "only the Execute-intent run_command may exercise the shell primitive")
+  assert(string.find(run_cmds[1], "(echo routed) 2>&1", 1, true) ~= nil,
+    "run_command must keep wrapping the command with cd/2>&1")
+  assert(#argv_calls == 1, "search_code must execute through proc.run_program")
+  assert(argv_calls[1].program == "grep", "search_code must invoke grep directly")
+  local grep_argv = table.concat(argv_calls[1].args, " ")
+  assert(string.find(grep_argv, "-rn", 1, true) ~= nil, "search_code must keep recursive line numbers")
+  assert(string.find(grep_argv, "-F", 1, true) ~= nil, "search_code must keep fixed-string matching")
+  assert(string.find(grep_argv, "routed", 1, true) ~= nil, "search_code must pass the query as argv")
 
   os.execute("rm -rf " .. root)
 end)
 
 run_test("WheelHost: StdioAdapter routes tmp and process through the seam", function()
-  local backend = WheelHost.backend
-  local saved_tmpname = backend.tmpname
-  local saved_run = backend.run_command
-  local tmp_seen, run_seen = false, false
+  local root = "/tmp/bitty/test_host_seam_stdio"
+  os.execute("rm -rf " .. root)
+  os.execute("mkdir -p " .. root)
 
-  backend.tmpname = function()
+  local backend = WheelHost.backend
+  local saved_tmp_path = backend.tmp_path
+  local saved_run = backend.run_command
+  local saved_remove = backend.remove_file
+  local tmp_seen, run_seen, remove_seen = false, false, false
+  local tmp_path = root .. "/prompt.txt"
+
+  backend.tmp_path = function()
     tmp_seen = true
-    return saved_tmpname()
+    return tmp_path
   end
   backend.run_command = function(shell_string)
     run_seen = true
     assert(string.find(shell_string, "mock_model_cli", 1, true) ~= nil, "stdio command must reach the seam")
+    assert(string.find(shell_string, tmp_path, 1, true) ~= nil, "stdio prompt path must reach the seam")
     return { ok = true, code = 0, stdout = "stdio-seam-output", stderr = "" }
+  end
+  backend.remove_file = function(path)
+    remove_seen = (path == tmp_path)
+    return saved_remove(path)
   end
 
   local ok, err = pcall(function()
@@ -5603,21 +5859,33 @@ run_test("WheelHost: StdioAdapter routes tmp and process through the seam", func
     assert(res.content == "stdio-seam-output")
   end)
 
-  backend.tmpname = saved_tmpname
+  backend.tmp_path = saved_tmp_path
   backend.run_command = saved_run
+  backend.remove_file = saved_remove
+  os.execute("rm -rf " .. root)
   if not ok then
     error(err)
   end
   assert(tmp_seen, "StdioAdapter must obtain its temp file through WheelHost.tmp.name")
   assert(run_seen, "StdioAdapter must execute through WheelHost.proc.run_command")
+  assert(remove_seen, "StdioAdapter must remove its temp file through WheelHost.fs.remove_file")
 end)
 
 run_test("WheelHost: context and team wall-clock sites route through time.now", function()
   local backend = WheelHost.backend
   local saved_now = backend.now
+  local saved_clock = backend.clock
   local fixed_now = 1700000000
+  local clock_calls = 0
   backend.now = function()
     return fixed_now
+  end
+  backend.clock = function()
+    clock_calls = clock_calls + 1
+    if clock_calls == 1 then
+      return 5
+    end
+    return 5.25
   end
 
   local ok, err = pcall(function()
@@ -5649,9 +5917,21 @@ run_test("WheelHost: context and team wall-clock sites route through time.now", 
     local ho_ok, ho_record = team:handoff("seam-worker", "seam-reviewer", "TASK-TIME-SEAM")
     assert(ho_ok == true, "handoff must succeed: " .. tostring(ho_record))
     assert(ho_record.timestamp == fixed_now, "handoff timestamp must use WheelHost.time.now")
+
+    -- Team orchestration duration -> WheelHost.time.clock
+    clock_calls = 0
+    local empty_kernel = WheelKernel.new({ in_memory = true })
+    local empty_team = WheelTeam.new({ kernel = empty_kernel })
+    empty_kernel:create_task({ id = "TASK-CLOCK-EMPTY", title = "Already complete" })
+    empty_kernel:start_task("TASK-CLOCK-EMPTY", "clock-worker")
+    empty_kernel:complete_task("TASK-CLOCK-EMPTY", 1)
+    local report = empty_team:run_orchestration_loop()
+    assert(report.duration_ms == 250,
+      "orchestration duration must use WheelHost.time.clock, got " .. tostring(report.duration_ms))
   end)
 
   backend.now = saved_now
+  backend.clock = saved_clock
   if not ok then
     error(err)
   end
