@@ -117,13 +117,14 @@ test: deps
 # test-only Python client reads the key from its own environment; the Lua
 # harness adapter never receives it.
 test-live:
-    @if [ -z "${OPENROUTER_API_KEY:-}" ]; then \
-        echo "test-live skipped: OPENROUTER_API_KEY is not set"; \
-        exit 0; \
-    fi; \
-    if ! command -v python3 >/dev/null 2>&1; then \
+    @if ! command -v python3 >/dev/null 2>&1; then \
         echo "test-live requires python3 for the test-only HTTP client" >&2; \
         exit 1; \
+    fi; \
+    python3 tests/test_live_http_client_redirect.py; \
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then \
+        echo "test-live live portion skipped: OPENROUTER_API_KEY is not set (redirect policy test passed)"; \
+        exit 0; \
     fi; \
     if command -v lua5.1 >/dev/null 2>&1; then \
         lua5.1 tests/test_live_openrouter.lua; \

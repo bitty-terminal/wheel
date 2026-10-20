@@ -4347,6 +4347,33 @@ run_test("WheelProvider.AnthropicAdapter: bounded max_tokens and typed rejection
   assert(res ~= nil)
   assert(captured[2].max_tokens == 256, "anthropic request override must be serialized")
 
+  -- Anthropic stream path: the SSE request payload must carry the bound too.
+  local stream_captured = {}
+  local streaming = WheelProvider.AnthropicAdapter.new({
+    api_key = "ant-token",
+    http_client = function(req)
+      table.insert(stream_captured, WheelProvider.JSON.decode(req.body))
+      if req.stream and req.on_stream_chunk then
+        req.on_stream_chunk("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+      end
+      return { status = 200, body = "" }
+    end,
+  })
+
+  local sres, serr = streaming:stream({
+    messages = { { role = "user", content = "hi" } },
+    max_completion_tokens = 768,
+  }, function() end)
+  assert(sres ~= nil and serr == nil, "anthropic stream must succeed: " .. tostring(serr))
+  assert(stream_captured[1].stream == true, "anthropic stream payload must set stream=true")
+  assert(stream_captured[1].max_tokens == 768, "anthropic stream payload must carry the override")
+
+  sres, serr = streaming:stream({
+    messages = { { role = "user", content = "hi" } },
+  }, function() end)
+  assert(sres ~= nil and serr == nil, "anthropic default stream must succeed: " .. tostring(serr))
+  assert(stream_captured[2].max_tokens == DEFAULT, "anthropic stream payload must carry the default")
+
   local bad_res, bad_err = anthropic:complete({
     messages = { { role = "user", content = "hi" } },
     max_completion_tokens = 0,

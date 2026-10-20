@@ -352,32 +352,33 @@ Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_proj
 
 ## Layout
 
-| Path                             | Purpose                                                                                                                                                                                                             |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `README.md`                      | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                    |
-| `bitty-plugin.toml`              | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                         |
-| `lua/wheel/init.lua`             | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
-| `lua/wheel/errors.lua`           | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                     |
-| `lua/wheel/schema.lua`           | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                             |
-| `lua/wheel/commands.lua`         | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                   |
-| `lua/wheel/config.lua`           | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
-| `lua/wheel/host.lua`             | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
-| `lua/wheel/kernel.lua`           | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
-| `lua/wheel/agent.lua`            | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                             |
-| `lua/wheel/team.lua`             | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                        |
-| `lua/wheel/context.lua`          | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                  |
-| `lua/wheel/tool.lua`             | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                        |
-| `lua/wheel/provider.lua`         | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                      |
-| `lua/wheel/runner.lua`           | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                |
-| `lua/wheel/ui.lua`               | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                         |
-| `tests/test_wheel.lua`           | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                 |
-| `tests/test_live_openrouter.lua` | Opt-in live OpenRouter test (`just test-live`): complete, tool call, SSE stream, and runner ReAct turn; skips when `OPENROUTER_API_KEY` is absent.                                                                  |
-| `tests/live_http_client.py`      | Test-only stdlib HTTP transport for `just test-live`; reads the key from its inherited environment and never accepts it through argv, files, or request JSON.                                                       |
-| `tests/e2e_cross_process.lua`    | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                               |
-| `package.json`                   | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                    |
-| `bun.lock`                       | Locked dependency graph installed by `just install`.                                                                                                                                                                |
-| `justfile`                       | Quality gates with pinned tool versions, including the SDK README checker in `just check`.                                                                                                                          |
-| `.github/workflows/ci.yml`       | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                              |
+| Path                                      | Purpose                                                                                                                                                                                                             |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`                               | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                    |
+| `bitty-plugin.toml`                       | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                         |
+| `lua/wheel/init.lua`                      | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
+| `lua/wheel/errors.lua`                    | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                     |
+| `lua/wheel/schema.lua`                    | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                             |
+| `lua/wheel/commands.lua`                  | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                   |
+| `lua/wheel/config.lua`                    | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
+| `lua/wheel/host.lua`                      | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
+| `lua/wheel/kernel.lua`                    | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
+| `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                             |
+| `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                        |
+| `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                  |
+| `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                        |
+| `lua/wheel/provider.lua`                  | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                      |
+| `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                |
+| `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                         |
+| `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                 |
+| `tests/test_live_openrouter.lua`          | Opt-in live OpenRouter test (`just test-live`): complete, tool call, SSE stream, and runner ReAct turn; runs after the key-free redirect-policy test.                                                               |
+| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the key from its inherited environment, rejects redirects, and never accepts the key through argv, files, or request JSON.                              |
+| `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                           |
+| `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                               |
+| `package.json`                            | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                    |
+| `bun.lock`                                | Locked dependency graph installed by `just install`.                                                                                                                                                                |
+| `justfile`                                | Quality gates with pinned tool versions, including the SDK README checker in `just check`.                                                                                                                          |
+| `.github/workflows/ci.yml`                | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                              |
 
 ## Architecture
 
@@ -427,7 +428,7 @@ Wheel integrates heterogeneous large language models and autonomous ReAct execut
   - `AnthropicAdapter`: Anthropic Messages API (`/v1/messages`) supporting Claude 3.5 Sonnet, `thinking` token blocks, and `tool_use` blocks.
   - `StdioAdapter`: Subprocess CLI streaming runner (pipes to `ollama run`, `llm`, or local model binaries).
 - **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
-- **Bounded Completion Budget**: Every provider request carries an explicit completion `max_tokens` from `WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS` (4096) or a validated `max_completion_tokens` override, bounded at 32768. The context window remains a separate `context_budget`; zero, negative, non-integer, non-numeric, and oversized overrides fail with a typed `E_COMPLETION_BUDGET_INVALID` error before an HTTP request is sent.
+- **Bounded Completion Budget**: Every OpenAI-compatible and Anthropic HTTP provider request carries an explicit completion `max_tokens` from `WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS` (4096) or a validated `max_completion_tokens` override, bounded at 32768. The stdio adapter has no completion-token field and is outside this boundary. The context window remains a separate `context_budget`; zero, negative, non-integer, non-numeric, and oversized overrides fail with a typed `E_COMPLETION_BUDGET_INVALID` error before an HTTP request is sent.
 - **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`) combining Three-Zone context compilation, streaming token callbacks, structured 6-field `Rationale` extraction, path-sandboxed tool dispatch with auto-spillover, and automated checkpoint commits.
 
 ### Git-Inspired Context Versioning Engine
@@ -504,16 +505,17 @@ the named configuration failures match the Lua sources.
 ### Offline and live tests
 
 `just check`, `just test`, and CI are offline: they use mock providers and never
-read a provider credential or reach the network. The live provider test is a
-separate, manual, opt-in target:
+use a live credential for a request or reach the network. The live provider test
+is a separate, manual, opt-in target:
 
 ```sh
 OPENROUTER_API_KEY=... just test-live
 ```
 
-- `just test-live` is not part of `just check` or CI. It skips with exit 0 and a
+- `just test-live` is not part of `just check` or CI. It runs the key-free
+  redirect-policy test first, then skips the live portion with exit 0 and a
   clear message when `OPENROUTER_API_KEY` is absent.
-- The target calls `deepseek/deepseek-v4.1-flash` through
+- The live portion calls `deepseek/deepseek-v4.1-flash` through
   `https://openrouter.ai/api/v1` and covers a non-streaming completion, a tool
   call with parsed arguments, an SSE stream, and one runner ReAct turn with a
   stub tool.
@@ -524,6 +526,11 @@ OPENROUTER_API_KEY=... just test-live
   The key is never passed in argv, written to a request file, logged, or placed
   in a captured artifact, and the live test asserts it never appears in its
   captured output.
+- The client refuses every HTTP redirect without a second hop, so the
+  authorization header cannot be forwarded to another host or downgraded to
+  plaintext HTTP. `tests/test_live_http_client_redirect.py` proves this against
+  loopback servers for both a cross-host and a scheme-change 302; it requires no
+  key and no external network.
 - Every live request carries an explicit completion `max_tokens` from the named
   default or a validated override, so the provider's credit check cannot assume
   the model's maximum completion window.
