@@ -111,13 +111,15 @@ test: deps
         echo "No lua interpreter found; skipping runtime test execution" >&2; \
     fi
 
-# Opt-in live provider test against OpenRouter. Manual only: it requires
-# OPENROUTER_API_KEY in the inherited environment, is never part of
-# `just check` or CI, and skips with exit 0 when the key is absent. The
+# Opt-in live provider test against OpenRouter. Manual only; never part of
+# `just check` or CI. It always runs the key-free redirect-policy test first
+# and fails closed if that test fails. When OPENROUTER_API_KEY is absent, only
+# the live provider portion is skipped after the redirect test succeeds. The
 # test-only Python client reads the key from its own environment; the Lua
 # harness adapter never receives it.
 test-live:
-    @if ! command -v python3 >/dev/null 2>&1; then \
+    @set -e; \
+    if ! command -v python3 >/dev/null 2>&1; then \
         echo "test-live requires python3 for the test-only HTTP client" >&2; \
         exit 1; \
     fi; \
