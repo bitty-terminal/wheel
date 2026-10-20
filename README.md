@@ -73,7 +73,8 @@ Wheel is focused on software engineering workflows.
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `bitty-plugin.toml`           | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                         |
 | `lua/wheel/init.lua`          | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`). |
-| `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape and a Wheel-local generic internal error.                                                                                           |
+| `lua/wheel/errors.lua`        | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                     |
+| `lua/wheel/schema.lua`        | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                             |
 | `lua/wheel/config.lua`        | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                    |
 | `lua/wheel/host.lua`          | WheelHost authority seam: process, tmp, and time primitives over the production standalone POSIX backend; some file paths still use direct `io.open` (gaps in SECURITY-MODEL).                                      |
 | `lua/wheel/kernel.lua`        | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                  |
@@ -221,6 +222,22 @@ the transitional plugin surface; they are not the 0.1.0 distribution path.
 - `bitty-terminal.wheel:checkpoint`: Display recent context checkpoints (commit ancestry log).
 - `bitty-terminal.wheel:reflog`: Display recent context reflog transitions and audit journal.
 
+Every command is declared once in the lazy command table in `lua/wheel/init.lua`
+with an explicit `args_schema` and `result_schema`. All 14 commands currently
+accept no arguments: their argument schema is a closed object with no declared
+properties, so any supplied field is rejected with `E_ARGS_INVALID` (class
+`validation`) before the handler runs. Each command returns the notification projection it displays,
+`{ title, body }`, with bounded title and body lengths, so CLI, palette, IPC,
+and agent consumers can type the result without scraping presentation text. A
+malformed or unbounded schema fails registration with `E_SCHEMA_INVALID`, and a
+handler result that drifts from its schema fails with `E_RESULT_INVALID`; both
+are `validation` errors. The schema vocabulary is finite: `string`, `integer`,
+`number`, `boolean`, `array`, and `object` types with `properties`, `required`,
+`additionalProperties` (always `false` for objects), `items`, `enum`,
+`minimum`/`maximum`, `minLength`/`maxLength`, and `minItems`/`maxItems`.
+Unsupported keywords, unbounded strings, arrays, or numbers, cycles, and
+over-deep schemas are rejected rather than ignored.
+
 ## Development
 
 Install the pinned dependencies once, then run the same gate CI runs:
@@ -236,11 +253,21 @@ offline. `just manifest` validates the transitional `bitty-plugin.toml` with the
 authoritative SDK linter against the accepted contract in bitty-docs
 `docs/specifications/plugin-platform-rfc.md` (file name, identity,
 compatibility, capability closed set, lazy triggers, hard limits). `just lua`
-runs the pinned `luaparse` 0.3.1 CLI over the entry point; `just lua-control`
+runs the pinned `luaparse` 0.3.1 CLI over every Lua source; `just lua-control`
 feeds the same parser an invalid snippet and requires rejection, so a recipe
 that stopped reading the entry point cannot pass silently. `just check` runs
 all three. The manifest gate keeps the transitional artifact honest until a
 follow-up removes it; it is not evidence of plugin compatibility.
+
+`bitty-plugin-lint` also validates table-form `[lazy].commands` schemas when a
+manifest carries them, but the transitional manifest is intentionally unchanged
+and stays in string form, so the linter never sees the Lua registration
+schemas. `lua/wheel/schema.lua` is therefore the registration authority: it
+admits the finite vocabulary above and rejects unknown keywords, unbounded
+strings, arrays, or numbers, missing `additionalProperties = false`, cycles,
+and over-deep schemas before a command is captured. The unit suite exercises
+those admission bounds and the invocation checks; it does not claim host-side
+validation evidence.
 
 Run the unit test suite and the cross-process end-to-end integration drill:
 
@@ -296,16 +323,21 @@ through unchanged; a recognized nil-global message becomes
 `E_CAPABILITY_DENIED`; a table with extra fields, non-string fields, or a
 message longer than the 160-character Wheel bound is normalized to
 `E_INTERNAL`, as is every other non-capability failure. A malformed table is
-never presented as a capability denial. One internal exception exists: the
+never presented as a capability denial. Schema and argument validation errors
+use the same three-field shape with class `validation`. One internal exception
+exists: the
 dispatch-budget sentinel is marked with a module-local token
 (`WheelErrors.passthrough`) and keeps its identity so the budget failure is
 not misreported. The token is not reachable from a handler and cannot be
 forged with a table field; it is not part of the public error contract.
 
-| `code`                | `class`   | Meaning                                                                                                            |
-| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------ |
-| `E_CAPABILITY_DENIED` | `runtime` | The host removed a surface the command needs. The message names the missing capability family.                     |
-| `E_INTERNAL`          | `runtime` | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
+| `code`                | `class`      | Meaning                                                                                                            |
+| --------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `E_CAPABILITY_DENIED` | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                     |
+| `E_INTERNAL`          | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
+| `E_ARGS_INVALID`      | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                               |
+| `E_SCHEMA_INVALID`    | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                           |
+| `E_RESULT_INVALID`    | `validation` | A handler result did not match its closed `result_schema`.                                                         |
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family

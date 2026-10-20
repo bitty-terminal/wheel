@@ -74,6 +74,7 @@ manifest: deps
 lua: deps
     bun run luaparse --quiet --file lua/wheel/init.lua
     bun run luaparse --quiet --file lua/wheel/errors.lua
+    bun run luaparse --quiet --file lua/wheel/schema.lua
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/config.lua
     bun run luaparse --quiet --file lua/wheel/host.lua
