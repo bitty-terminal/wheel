@@ -12,6 +12,7 @@
 -- 7. WheelToolRegistry for extensible tool registration and safe execution dispatch.
 
 local WheelTool = {}
+local WheelErrors = require("wheel.errors")
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end
@@ -21,12 +22,17 @@ if not ok_context then WheelContext = nil end
 
 --- Load the host seam strictly. Tool execution has no direct stdlib fallback:
 -- a missing seam is an installation defect, and an unavailable primitive is a
--- typed denial from the seam itself.
+-- typed denial from the seam itself. A typed seam error (for example an
+-- unsupported platform) is re-raised unchanged so its class/code survive.
 local function load_host()
   local rooted = "wheel.host"
   local ok, mod = pcall(require, rooted)
   if ok then return mod end
+  package.loaded[rooted] = nil
   local cause = mod
+  if WheelErrors.is_typed(cause) then
+    error(cause, 0)
+  end
   if type(cause) ~= "string"
     or not cause:find("module '" .. rooted .. "' not found", 1, true) then
     error("wheel.tool: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
@@ -35,6 +41,10 @@ local function load_host()
   local alternate = "lua.wheel.host"
   ok, mod = pcall(require, alternate)
   if ok then return mod end
+  package.loaded[alternate] = nil
+  if WheelErrors.is_typed(mod) then
+    error(mod, 0)
+  end
   if type(mod) == "string"
     and mod:find("module '" .. alternate .. "' not found", 1, true) then
     mod = cause
@@ -501,7 +511,7 @@ local tool_read_file = {
       stdout = content,
       stderr = "",
       lines_read = #lines,
-      total_lines = line_no,
+      total_lines = #lines,
     }
   end,
 }
@@ -772,16 +782,23 @@ local tool_search_code = {
     end
 
     -- Bound the observation to the first 100 lines without a shell pipeline.
+    -- The previous `head` pipeline emitted a newline for every kept line;
+    -- preserve that shape while the full-output capture stays tracked in
+    -- CTX-0016 (bounded output).
     local lines = split_content_lines(res.stdout or "")
     local bounded = {}
     for index = 1, math.min(#lines, 100) do
       table.insert(bounded, lines[index])
     end
+    local output = table.concat(bounded, "\n")
+    if #bounded > 0 then
+      output = output .. "\n"
+    end
 
     return {
       success = true,
       exit_code = 0,
-      stdout = table.concat(bounded, "\n"),
+      stdout = output,
       stderr = "",
     }
   end,

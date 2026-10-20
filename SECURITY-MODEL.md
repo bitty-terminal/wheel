@@ -158,7 +158,9 @@ not receive it.
 ### Arbitrary argv
 
 - The preferred execution primitive is an explicit program plus argument
-  vector, with no shell parsing.
+  vector, with no unquoted shell string at the call site. The current standalone
+  backend joins single-quoted arguments and executes them through the POSIX
+  shell; a native argv spawn remains CTX-0016 work.
 - The working directory must resolve inside the workspace root. The resolver
   rules above apply.
 - The child environment must be a scrubbed baseline plus explicitly allowed

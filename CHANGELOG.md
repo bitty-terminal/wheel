@@ -71,7 +71,7 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `WheelHost` seam (`lua/wheel/host.lua`); the standalone POSIX backend is the
   production backend for the 0.1.0 harness, and a host ABI adapter is not part
   of the 0.1.0 path. CTX-0015 completes the migration to filesystem, CPU-time,
-  and private temporary-file primitives. No user-visible behavior change.
+  and private temporary-file primitives.
 - Command handlers now cross the typed failure boundary: `plan`, `trust`, and
   `orchestrate` report missing `env.read`/`fs.read` authority instead of raw
   nil-member failures, and the `trust` command reads project configuration
@@ -84,6 +84,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0015 review fixes: `WheelHost.tmp_path` no longer reads wall-clock time or
+  substitutes a `"0"` stamp (uniqueness is process-local; cross-process
+  exclusivity remains CTX-0016), and `tmp_dir` rejects a symlinked harness-owned
+  temporary directory before `chmod` can follow it. `read_file` reports
+  `total_lines` as the emitted line count and `search_code` keeps the previous
+  trailing newline. Typed platform denials now survive the tool/provider host
+  loaders. Full-output capture before the 100-line bound, whole-file reads
+  before `max_bytes`, and exclusive `0600` temporary-file creation remain
+  tracked in CTX-0016 / wheel#74.
 - Entry-point activation now loads only the required registration and status
   surface (typed errors, command schemas, command layer, kernel, and UI).
   `agent`, `config`, `team`, `context`, `tool`, `provider`, `runner`, and `host`

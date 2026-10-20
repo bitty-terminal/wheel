@@ -3560,6 +3560,74 @@ run_test("WheelTool: Core file tools (read_file, write_file, edit_file)", functi
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelTool: read_file total_lines reports only emitted lines", function()
+  local root = "/tmp/bitty/test_tool_read_bounds"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/lines.txt", "w"))
+  for index = 1, 10 do
+    fh:write("line-" .. index .. "\n")
+  end
+  fh:close()
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("read_file")
+
+  local full = tool.execute({ path = "lines.txt" }, env)
+  assert(full.success == true)
+  assert(full.lines_read == 10, "full read must emit all 10 lines")
+  assert(full.total_lines == 10, "full read total_lines must match the emitted lines")
+
+  local ranged = tool.execute({ path = "lines.txt", start_line = 2, end_line = 4 }, env)
+  assert(ranged.success == true)
+  assert(ranged.lines_read == 3, "ranged read must emit three lines")
+  assert(ranged.total_lines == 3,
+    "total_lines must count emitted lines, not the whole file or the end_line offset")
+  assert(ranged.stdout == "line-2\nline-3\nline-4", "ranged output must stay exact")
+
+  local end_bounded = tool.execute({ path = "lines.txt", end_line = 3 }, env)
+  assert(end_bounded.lines_read == 3 and end_bounded.total_lines == 3,
+    "end_line must bound total_lines as well as the output")
+
+  local byte_bounded = tool.execute({ path = "lines.txt", max_bytes = 20 }, env)
+  assert(byte_bounded.success == true)
+  assert(byte_bounded.total_lines == byte_bounded.lines_read,
+    "max_bytes truncation must report only emitted lines")
+  assert(byte_bounded.total_lines < 10, "max_bytes must stop before the whole file")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: search_code bounds output and keeps the trailing newline", function()
+  local root = "/tmp/bitty/test_tool_search_bounds"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/matches.txt", "w"))
+  for index = 1, 150 do
+    fh:write("needle " .. index .. "\n")
+  end
+  fh:close()
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("search_code")
+
+  local found = tool.execute({ query = "needle" }, env)
+  assert(found.success == true)
+  assert(found.stdout:sub(-1) == "\n",
+    "search_code must keep the previous head pipeline's trailing newline")
+  local line_count = 0
+  for _ in found.stdout:gmatch("\n") do
+    line_count = line_count + 1
+  end
+  assert(line_count == 100, "search_code must keep at most 100 lines, got " .. line_count)
+
+  local missing = tool.execute({ query = "needle-not-present" }, env)
+  assert(missing.success == true)
+  assert(missing.stdout == "", "an empty result must not add a newline")
+
+  os.execute("rm -rf " .. root)
+end)
+
 -- ===========================================================================
 -- 13. WheelTool: Role Authority Gating & Intent Enforcement
 -- ===========================================================================
@@ -5561,6 +5629,102 @@ run_test("WheelHost: temporary files use a private runtime directory", function(
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelHost: tmp_path uniqueness does not depend on os.time", function()
+  local root = "/tmp/bitty/test_host_tmp_no_time"
+  os.execute("rm -rf " .. root)
+
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root .. "/runtime" })
+  local saved_time = os.time
+  os.time = nil
+  local ok, first, second, now_ok, now_err = pcall(function()
+    local a = backend.tmp_path()
+    local b = backend.tmp_path()
+    local denied, denial = pcall(backend.now)
+    return a, b, denied, denial
+  end)
+  os.time = saved_time
+
+  assert(ok, "tmp_path must not require os.time: " .. tostring(first))
+  assert(first ~= second, "tmp_path must still be unique without os.time")
+  assert(type(first) == "string" and first:sub(1, #(root .. "/runtime/")) == root .. "/runtime/",
+    "tmp_path must stay inside the private directory")
+  assert(now_ok == false, "time.now must fail closed when os.time is unavailable")
+  local denial = assert_typed_error(now_err, "E_CAPABILITY_DENIED")
+  assert(denial.message == "capability 'time.now' is not granted")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", function()
+  local root = "/tmp/bitty/test_host_tmp_symlink"
+  os.execute("rm -rf " .. root)
+  os.execute("mkdir -p " .. root .. "/real-target " .. root .. "/real-parent")
+  os.execute("ln -s " .. root .. "/real-target " .. root .. "/linked-runtime")
+  os.execute("ln -s " .. root .. "/real-parent " .. root .. "/linked-parent")
+
+  -- A legitimate parent symlink is allowed: only the final harness-owned
+  -- directory is inspected.
+  local parent_backend = WheelHost.create_backend("standalone", {
+    tmp_root = root .. "/linked-parent/runtime",
+  })
+  local parent_dir, parent_err = parent_backend.tmp_dir()
+  assert(parent_dir == root .. "/linked-parent/runtime",
+    "a non-owned parent symlink must not be rejected: " .. tostring(parent_err))
+
+  -- A symlinked final directory is rejected before chmod follows it.
+  os.execute("chmod 755 " .. root .. "/real-target")
+  local linked_backend = WheelHost.create_backend("standalone", {
+    tmp_root = root .. "/linked-runtime",
+  })
+  local ok, err = pcall(linked_backend.tmp_dir)
+  assert(not ok, "a symlinked harness-owned temp directory must be rejected")
+  local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
+  assert(denial.message == "capability 'fs.write' is not granted")
+
+  local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(root .. "/real-target"))
+  local mode = listing.stdout:match("^(%S+)")
+  assert(string.sub(mode or "", 1, 10) == "drwxr-xr-x",
+    "rejecting the link must not chmod its target, got " .. tostring(mode))
+
+  -- The state fallback's harness-owned `wheel` component is also guarded.
+  os.execute("mkdir -p " .. root .. "/state/other")
+  os.execute("ln -s " .. root .. "/state/other " .. root .. "/state/wheel")
+  local state_backend = WheelHost.create_backend("standalone", {
+    tmp_root = root .. "/state/wheel/tmp",
+  })
+  local state_ok, state_err = pcall(state_backend.tmp_dir)
+  assert(not state_ok, "a symlinked harness-owned wheel component must be rejected")
+  assert_typed_error(state_err, "E_CAPABILITY_DENIED")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: typed platform denials survive tool and provider loaders", function()
+  local saved_config = package.config
+  package.config = "\\\n?\n!\n-\n"
+
+  local function probe(module)
+    local saved_modules = detach_wheel_modules()
+    local ok, err = pcall(require, module)
+    restore_wheel_modules(saved_modules)
+    return ok, err
+  end
+
+  local tool_ok, tool_err = probe("wheel.tool")
+  local provider_ok, provider_err = probe("wheel.provider")
+  package.config = saved_config
+
+  assert(not tool_ok, "wheel.tool must fail closed on a non-POSIX platform")
+  local tool_denial = assert_typed_error(tool_err, "E_CAPABILITY_DENIED")
+  assert(tool_denial.message == "capability 'host.backend.standalone' is not granted",
+    "wheel.tool must preserve the typed host-backend denial")
+
+  assert(not provider_ok, "wheel.provider must fail closed on a non-POSIX platform")
+  local provider_denial = assert_typed_error(provider_err, "E_CAPABILITY_DENIED")
+  assert(provider_denial.message == "capability 'host.backend.standalone' is not granted",
+    "wheel.provider must preserve the typed host-backend denial")
+end)
+
 run_test("WheelHost: routed harness paths contain no direct host primitives", function()
   local DIRECT_PATTERNS = {
     "io%.open",
@@ -5756,7 +5920,7 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
     -- search_code -> proc.run_program (argv, no shell string)
     local s = reg:dispatch("search_code", { query = "routed" }, env)
     assert(s.success == true)
-    assert(s.stdout == "match-a\nmatch-b", "search_code output must come from the seam")
+    assert(s.stdout == "match-a\nmatch-b\n", "search_code output must come from the seam and keep the trailing newline")
 
     -- fs.remove_file -> provider temp cleanup path
     local removed = WheelHost.fs.remove_file(root .. "/routed/sample.txt")

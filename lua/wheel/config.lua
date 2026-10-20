@@ -11,7 +11,13 @@ local ok_host, host_or_err = pcall(require, "wheel.host")
 if ok_host then
   WheelHost = host_or_err
 else
+  -- Lua 5.1 leaves a load sentinel after a failed require; clear it so the
+  -- alternate root (and later tool/provider loaders) see the real cause.
+  package.loaded["wheel.host"] = nil
   local cause = host_or_err
+  if WheelErrors.is_typed(cause) then
+    error(cause, 0)
+  end
   if type(cause) ~= "string"
     or not cause:find("module 'wheel.host' not found", 1, true) then
     error("wheel.config: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
@@ -20,13 +26,19 @@ else
   local ok_alt, alternate = pcall(require, "lua.wheel.host")
   if ok_alt then
     WheelHost = alternate
-  elseif type(alternate) == "string"
-    and alternate:find("module 'lua.wheel.host' not found", 1, true) then
-    -- Standalone config remains usable without the host seam; the caller
-    -- fails closed if it reaches a host-dependent operation.
-    WheelHost = nil
   else
-    error("wheel.config: cannot load submodule 'wheel.host': " .. tostring(alternate), 0)
+    package.loaded["lua.wheel.host"] = nil
+    if WheelErrors.is_typed(alternate) then
+      error(alternate, 0)
+    end
+    if type(alternate) == "string"
+      and alternate:find("module 'lua.wheel.host' not found", 1, true) then
+      -- Standalone config remains usable without the host seam; the caller
+      -- fails closed if it reaches a host-dependent operation.
+      WheelHost = nil
+    else
+      error("wheel.config: cannot load submodule 'wheel.host': " .. tostring(alternate), 0)
+    end
   end
 end
 

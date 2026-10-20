@@ -17,7 +17,9 @@
 --   WheelHost.fs.remove_file(path)          remove a file
 --   WheelHost.fs.exists(path)               test for a readable file
 --   WheelHost.proc.run_command(shell_string, env?)  run a shell command line
---   WheelHost.proc.run_program(program, args)       run argv without a shell
+--   WheelHost.proc.run_program(program, args)       run argv with each element
+--                                                   single-quoted for the
+--                                                   standalone POSIX shell
 --   WheelHost.proc.shell_quote(value)       quote one POSIX shell argument
 --   WheelHost.tmp.dir()                     private runtime directory
 --   WheelHost.tmp.name()                    unique path inside that directory
@@ -47,10 +49,11 @@
 -- `io.popen`, `os.remove`, `os.execute`, `os.time`, and `os.clock`, preserving
 -- the exact behavior the call sites had before this seam existed. The command
 -- string passed to `proc.run_command` is the explicit shell-string primitive
--- used by Execute-intent tools; inspect-intent call sites use `run_program`
--- (argv quoted one argument at a time). `WheelHost.backend` is the documented
--- swap point for tests and for any future in-process backend; call sites never
--- touch it directly.
+-- used by Execute-intent tools; inspect-intent call sites use `run_program`,
+-- which quotes each argv element and executes the joined command through the
+-- standalone POSIX shell. No call site builds an unquoted shell string.
+-- `WheelHost.backend` is the documented swap point for tests and for any
+-- future in-process backend; call sites never touch it directly.
 --
 -- Temporary files:
 -- `WheelHost.tmp.name()` never uses the ambient temporary-name API. It returns
@@ -139,6 +142,50 @@ local function require_surface(available, capability)
   if not available then
     error(WheelErrors.capability_denied(capability), 0)
   end
+end
+
+--- Test whether <path> itself is a symbolic link (argv `test -L`).
+-- Any result other than the POSIX true/false status fails closed, so a missing
+-- `test` or an unexpected invocation error cannot be read as "not a link".
+-- @param path string
+-- @return boolean
+local function path_is_symlink(path)
+  require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+  local ok, _, code = os.execute("test -L " .. shell_quote(path))
+  -- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the
+  -- exit code in `code`. Normalize both before deciding.
+  local status
+  if ok == true then
+    status = 0
+  elseif type(ok) == "number" then
+    status = (ok >= 256) and math.floor(ok / 256) or ok
+  else
+    status = code
+  end
+  if status == 0 then
+    return true
+  end
+  if status == 1 then
+    return false
+  end
+  error(WheelErrors.capability_denied("fs.write"), 0)
+end
+
+--- Return the harness-owned parent component to guard alongside <dir>.
+-- Only the `wheel` component of the state fallback (`.../wheel/tmp`) is
+-- harness-owned. A legitimate parent such as `/tmp` (itself a symlink on some
+-- systems) is intentionally not rejected.
+-- @param dir string
+-- @return string?
+local function owned_parent_path(dir)
+  if type(dir) ~= "string" then
+    return nil
+  end
+  local prefix = dir:match("^(.*)/wheel/tmp$")
+  if prefix then
+    return prefix .. "/wheel"
+  end
+  return nil
 end
 
 --- Return the backend platform selected for construction.
@@ -334,6 +381,10 @@ function standalone.new(opts)
   end
 
   --- Resolve, create, and repair the private temporary directory.
+  -- The harness-owned directory (and the `wheel` component of the state
+  -- fallback) must not be a symbolic link: `chmod` must never follow a
+  -- pre-existing link. Legitimate parent links such as `/tmp` are allowed
+  -- because only the harness-owned path is inspected.
   -- @return string dir
   function backend.tmp_dir()
     local dir = tmp_root
@@ -357,23 +408,43 @@ function standalone.new(opts)
     if not dir or dir == "" then
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
+
+    local parent = owned_parent_path(dir)
     require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
-    local ok = os.execute("(mkdir -p -- " .. shell_quote(dir)
-      .. " && chmod 700 -- " .. shell_quote(dir) .. ") 2>/dev/null")
-    if not (ok == true or ok == 0) then
+    if path_is_symlink(dir) or (parent and path_is_symlink(parent)) then
+      error(WheelErrors.capability_denied("fs.write"), 0)
+    end
+
+    local mkdir_ok = os.execute("mkdir -p -- " .. shell_quote(dir) .. " 2>/dev/null")
+    if not (mkdir_ok == true or mkdir_ok == 0) then
+      error(WheelErrors.capability_denied("fs.write"), 0)
+    end
+
+    -- Re-check after mkdir so a link that appeared during creation is not
+    -- chmodded; the check plus chmod narrows the remaining race window.
+    if path_is_symlink(dir) or (parent and path_is_symlink(parent)) then
+      error(WheelErrors.capability_denied("fs.write"), 0)
+    end
+
+    local chmod_ok = os.execute("chmod 700 -- " .. shell_quote(dir) .. " 2>/dev/null")
+    if not (chmod_ok == true or chmod_ok == 0) then
       error(WheelErrors.capability_denied("fs.write"), 0)
     end
     return dir
   end
 
   --- Return a unique path inside the private temporary directory.
-  -- The file is not created; the caller owns creation and cleanup.
+  -- The file is not created; the caller owns creation and cleanup. Uniqueness
+  -- is process-local: the backend instance token plus a monotonic sequence
+  -- cannot repeat within this process. The token is not a cross-process
+  -- uniqueness guarantee; exclusive `0600` creation remains CTX-0016 work. No
+  -- wall-clock read is involved, so a missing `os.time` cannot produce a silent
+  -- "0" fallback.
   -- @return string
   function backend.tmp_path()
     local dir = backend.tmp_dir()
-    local stamp = type(os) == "table" and type(os.time) == "function" and tostring(os.time()) or "0"
     tmp_sequence = tmp_sequence + 1
-    return string.format("%s/wheel-%s-%s-%d", dir, stamp, process_token, tmp_sequence)
+    return string.format("%s/wheel-%s-%d", dir, process_token, tmp_sequence)
   end
 
   --- Wall-clock time in seconds since the epoch (os.time semantics).
@@ -525,8 +596,9 @@ function WheelHost.proc.run_command(shell_string, env)
   return invoke("process.spawn", "run_command", shell_string)
 end
 
---- Execute a program with an explicit argument vector (no shell parsing at the
--- call site). The standalone backend quotes each element for its POSIX shell.
+--- Execute a program with an explicit argument vector (no unquoted shell
+-- string at the call site). The standalone backend joins the single-quoted
+-- elements and executes the command through the POSIX shell.
 -- The command_runner override applies to shell-string execution only, so it is
 -- not consulted here.
 -- @param program string

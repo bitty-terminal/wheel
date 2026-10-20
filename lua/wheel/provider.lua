@@ -24,12 +24,18 @@ end
 
 --- Load the host seam strictly for the StdioAdapter temp-file and process path.
 -- Remote adapters do not touch the seam, but the module owns one loader so a
--- broken installation fails at the seam rather than at a nil call site.
+-- broken installation fails at the seam rather than at a nil call site. A
+-- typed seam error (for example an unsupported platform) is re-raised
+-- unchanged so its class/code survive.
 local function load_host()
   local rooted = "wheel.host"
   local ok, mod = pcall(require, rooted)
   if ok then return mod end
+  package.loaded[rooted] = nil
   local cause = mod
+  if WheelErrors.is_typed(cause) then
+    error(cause, 0)
+  end
   if type(cause) ~= "string"
     or not cause:find("module '" .. rooted .. "' not found", 1, true) then
     error("wheel.provider: cannot load submodule 'wheel.host': " .. tostring(cause), 0)
@@ -38,6 +44,10 @@ local function load_host()
   local alternate = "lua.wheel.host"
   ok, mod = pcall(require, alternate)
   if ok then return mod end
+  package.loaded[alternate] = nil
+  if WheelErrors.is_typed(mod) then
+    error(mod, 0)
+  end
   if type(mod) == "string"
     and mod:find("module '" .. alternate .. "' not found", 1, true) then
     mod = cause
