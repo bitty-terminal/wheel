@@ -224,14 +224,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - CTX-0028 / wheel#93 snapshot and session hardening: snapshot validation now
   sanitizes `stash_pushed`/`stash_popped` bus events on import and canonical
   encoding as well as export, so a crafted or pre-fix unredacted snapshot
-  cannot restore stash slot content. Session cleanup leaves metadata and FIFOs
-  untouched when metadata is missing or unreadable unless the start lock was
-  already self-owned or this daemon published metadata; Lua 5.1 raw signal
-  statuses normalize to `128 + signal` and fail the liveness probe closed;
-  stale start-lock tails are pruned only while the start-lock mutex is held;
-  and `Session.acquire_lock` releases a self-owned lock and mutex after an
+  cannot restore stash slot content; non-string or invalid optional stash
+  metadata is omitted instead of failing a live export. Session cleanup leaves
+  metadata and FIFOs untouched when metadata is missing or unreadable unless
+  the start lock was already self-owned from a failed startup; Lua 5.1 raw
+  signal statuses normalize to `128 + signal` and fail the liveness probe
+  closed; stale start-lock tails are pruned only while the start-lock mutex is
+  held; and `Session.acquire_lock` releases a self-owned lock and mutex after an
   unexpected host exception. The README error table records
-  `E_SESSION_START_MISMATCH`.
+  `E_SESSION_START_MISMATCH` and `E_SESSION_UNRESPONSIVE`.
 - CTX-0027 concurrent test scratch roots: `tests/test_wheel.lua` now derives one
   private root per run from `WHEEL_TEST_TMP` or `os.tmpname()` and builds every
   filesystem fixture under it, instead of sharing fixed global scratch

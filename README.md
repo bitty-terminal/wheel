@@ -748,6 +748,7 @@ and never embed the runtime.
   | `E_SESSION_ALREADY_RUNNING`  | A live daemon already owns the session.                                                    |
   | `E_SESSION_START_FAILED`     | The daemon did not become ready; a required host primitive is usually unavailable.         |
   | `E_SESSION_START_MISMATCH`   | Live metadata belongs to a different starter and was not adopted by the waiting start.     |
+  | `E_SESSION_UNRESPONSIVE`     | Metadata reports a live pid but the control plane did not answer the probe.                |
   | `E_SESSION_BUSY`             | Another client holds the per-session lock or a start-lock mutex is held by a live process. |
   | `E_SESSION_METADATA_INVALID` | Metadata is present but fails protocol, name, pid, or version validation.                  |
   | `E_SESSION_UNSAFE_PATH`      | A session path, metadata, or FIFO is symlinked, foreign-owned, or not `0700`/`0600`.       |

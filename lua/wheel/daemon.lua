@@ -372,13 +372,12 @@ local function cleanup(state)
       Session.release_start_lock(state.session_dir, state.pid)
       return
     end
-  elseif not self_owned and state.metadata_published ~= true then
+  elseif not self_owned then
     -- Missing or unreadable metadata does not identify the files as this
-    -- daemon's. A foreign live daemon can be in exactly that state after a
-    -- same-user tamper or a failed publish; leave its metadata/FIFOs alone.
-    -- A failed post-handoff startup is safe to clean because the start lock is
-    -- still self-owned, and a daemon that already published metadata owns the
-    -- files even if the record has since disappeared.
+    -- daemon's. A successor (live or starting) can be in exactly that state
+    -- after a same-user tamper or a failed publish; leave its metadata/FIFOs
+    -- alone. A failed post-handoff startup is safe to clean because the start
+    -- lock is still self-owned.
     Session.release_start_lock(state.session_dir, state.pid)
     return
   end
@@ -538,7 +537,6 @@ function Daemon.run(opts)
     request = request,
     response = response,
     running = true,
-    metadata_published = false,
   }
 
   local time_ok, started_at = pcall(WheelHost.time.now)
@@ -575,7 +573,6 @@ function Daemon.run(opts)
     log_daemon_error(write_err and write_err.code or "E_SESSION_IO", "cannot publish session metadata")
     return 3
   end
-  state.metadata_published = true
   local released_ok, released = pcall(Session.release_start_lock, session_dir, pid)
   if not released_ok or released == false then
     pcall(cleanup, state)

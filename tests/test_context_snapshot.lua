@@ -767,16 +767,22 @@ return function(run_test)
     }
     local seen = {}
     for _, event in ipairs(crafted.bus_history) do
-      if event.type == "stash_pushed" or event.type == "stash_popped" then
-        seen[event.type] = true
+      if event.type == "stash_pushed" then
+        seen.stash_pushed = true
+        -- Pre-fix producer metadata can be non-string plain data, and the
+        -- optional timestamp can be invalid; sanitization omits both.
         event.stash = {
-          id = "stash@{0}",
-          message = "crafted payload",
+          id = 123,
+          message = { note = "table metadata" },
           branch = "main",
-          timestamp_ms = 1700000000000,
+          timestamp_ms = "not-a-number",
           redacted = false,
           slots = smuggled_slots,
         }
+      elseif event.type == "stash_popped" then
+        seen.stash_popped = true
+        -- A non-table stash is replaced with the empty redacted shape.
+        event.stash = "non-table-stash-" .. marker
       end
     end
     assert(seen.stash_pushed and seen.stash_popped,
@@ -793,13 +799,24 @@ return function(run_test)
     assert(#restored:stash_list() == 0,
       "snapshot import must never materialize stash entries")
     for _, event in ipairs(restored.bus:history()) do
-      if event.type == "stash_pushed" or event.type == "stash_popped" then
+      if event.type == "stash_pushed" then
         assert(event.stash.redacted == true,
           "import must mark every stash event redacted")
         assert(event.stash.slots == nil,
           "import must drop the stash slot map")
-        assert(event.stash.message == "crafted payload",
-          "bounded stash metadata may be retained")
+        assert(event.stash.id == nil,
+          "a non-string stash id must be omitted, not stringified")
+        assert(event.stash.message == nil,
+          "a non-string stash message must be omitted")
+        assert(event.stash.timestamp_ms == nil,
+          "an invalid optional stash timestamp must be omitted")
+        assert(event.stash.branch == "main",
+          "bounded string metadata may be retained")
+      elseif event.type == "stash_popped" then
+        assert(event.stash.redacted == true
+          and event.stash.slots == nil
+          and event.stash.id == nil,
+          "a non-table stash must normalize to the empty redacted shape")
       end
     end
     assert_deep_equal(crafted, crafted_before,
@@ -832,6 +849,54 @@ return function(run_test)
       "export must not mark the live event redacted in place")
     assert(live_event.stash.slots["scratch/wip"].content == marker,
       "export must not strip live stash content")
+  end)
+
+  run_test("WheelContext snapshots: live non-string stash metadata still exports", function()
+    local ctx = WheelContext.new()
+    assert(ctx:put_slot("scratch/numeric", "numeric").success)
+    local numeric = assert(ctx:stash_push(123))
+    assert(ctx:put_slot("scratch/table", "table").success)
+    local table_message = { note = "not a string" }
+    local tabular = assert(ctx:stash_push(table_message))
+    assert(numeric.message == 123 and tabular.message == table_message,
+      "the live stash entries must keep their original metadata")
+
+    local before = deep_copy(ctx.bus:history())
+    local snapshot = assert(ctx:export_snapshot())
+    assert_deep_equal(ctx.bus:history(), before,
+      "export must not mutate live bus history with non-string metadata")
+
+    local exported = {}
+    for _, event in ipairs(snapshot.bus_history) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true,
+          "every exported stash event must be redacted")
+        assert(event.stash.slots == nil,
+          "every exported stash event must drop the slot map")
+        assert(event.stash.message == nil,
+          "non-string stash messages must be omitted from the snapshot")
+        exported[#exported + 1] = event
+      end
+    end
+    assert(#exported == 2, "both live stash events must export")
+
+    local restored = assert(WheelContext.import_snapshot(snapshot))
+    for _, event in ipairs(restored.bus:history()) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true
+          and event.stash.slots == nil
+          and event.stash.message == nil,
+          "restored non-string stash metadata must stay omitted")
+      end
+    end
+    local live_numeric
+    for _, event in ipairs(ctx.bus:history()) do
+      if event.type == "stash_pushed" and event.stash.message == 123 then
+        live_numeric = event
+      end
+    end
+    assert(live_numeric ~= nil,
+      "the live numeric message must remain untouched after export")
   end)
 
   run_test("WheelContext snapshots: key nodes count toward the value node bound", function()

@@ -474,9 +474,9 @@ run_test("Daemon: cleanup leaves control files when metadata is missing", functi
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
 
-  -- A foreign live daemon can be in exactly this state after a same-user
-  -- metadata removal or a failed publish. Cleanup did not observe a self-owned
-  -- start lock and never published metadata, so it must not unlink the files.
+  -- A successor can be in exactly this state after a same-user metadata
+  -- removal or a failed publish. Cleanup did not observe a self-owned start
+  -- lock, so it must not unlink the files.
   local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
   Daemon.cleanup(state)
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
@@ -489,7 +489,7 @@ run_test("Daemon: cleanup leaves control files when metadata is missing", functi
   remove_tree(dir)
 end)
 
-run_test("Daemon: cleanup leaves control files when metadata is unreadable", function()
+run_test("Daemon: cleanup leaves a successor's unreadable metadata alone", function()
   local name = "cleanup-invalid-meta"
   local dir = session_dir(name)
   local owner = WheelHost.proc.pid()
@@ -507,7 +507,7 @@ run_test("Daemon: cleanup leaves control files when metadata is unreadable", fun
   local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
   Daemon.cleanup(state)
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_META).exists == true,
-    "cleanup must not remove unreadable metadata")
+    "cleanup must not remove a successor's unreadable metadata")
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
     "cleanup must not remove FIFOs when metadata is unreadable")
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == true)
@@ -517,7 +517,7 @@ run_test("Daemon: cleanup leaves control files when metadata is unreadable", fun
   remove_tree(dir)
 end)
 
-run_test("Daemon: cleanup removes files when it published metadata before it vanished", function()
+run_test("Daemon: cleanup preserves a successor's metadata after publication", function()
   local name = "cleanup-published-meta"
   local dir = session_dir(name)
   local owner = WheelHost.proc.pid()
@@ -526,8 +526,9 @@ run_test("Daemon: cleanup removes files when it published metadata before it van
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
 
-  -- Missing metadata is still attributable when this daemon published it
-  -- successfully before the record disappeared.
+  -- Even when this daemon published metadata earlier, a missing record no
+  -- longer identifies the current files. The start lock is not self-owned, so
+  -- cleanup must preserve them for the successor.
   local state = {
     session_dir = dir,
     name = name,
@@ -536,10 +537,14 @@ run_test("Daemon: cleanup removes files when it published metadata before it van
     metadata_published = true,
   }
   Daemon.cleanup(state)
-  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
-  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
-  assert(WheelHost.fs.stat(dir).exists == false,
-    "a published daemon may remove its own empty directory")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
+    "cleanup must not remove a successor's FIFOs")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == true)
+  assert(WheelHost.fs.stat(dir).exists == true,
+    "cleanup must leave the successor's session directory")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK).exists == false,
+    "cleanup must release the start lock it acquired")
+  remove_tree(dir)
 end)
 
 run_test("Daemon: an injected dispatch exception is typed and shutdown still cleans up", function()

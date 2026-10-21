@@ -413,7 +413,7 @@ or multi-user surface.
   is never signalled; only stale metadata, FIFOs, locks, and metadata temp files
   are removed. Cleanup leaves metadata and FIFOs in place when it cannot
   attribute them (missing or unreadable metadata) unless it still holds its own
-  start lock or published the metadata. A daemon takes over the start lock under
+  start lock from a failed startup. A daemon takes over the start lock under
   its mutex before writing metadata; a delayed older starter that lost the
   handoff aborts without replacing the newer metadata or FIFOs.
 - The daemon does not own a task DAG, call a provider, execute an agent, or

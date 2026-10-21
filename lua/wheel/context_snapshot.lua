@@ -691,29 +691,37 @@ local function copy_reflog(value, path, commits, deps, state)
   return reflog
 end
 
-local function sanitize_stash_event(event, path, deps)
+local function sanitize_stash_event(event, deps)
   local stash = rawget(event, "stash")
-  if stash == nil then
-    return event
-  end
-  if type(stash) ~= "table" then
-    reject(path .. ".stash", "must be a table")
-  end
   local redacted = { redacted = true }
-  for _, field in ipairs(STASH_METADATA_STRING_FIELDS) do
-    local value = rawget(stash, field)
-    if value ~= nil then
-      redacted[field] = check_string(value, path .. ".stash." .. field,
-        deps.max_metadata_bytes, true)
+
+  -- Stash content is always dropped. Metadata is best-effort: a live producer
+  -- may have used a non-string message or id, and a crafted snapshot may carry
+  -- invalid optional fields. Omit anything that is not bounded plain data
+  -- instead of stringifying it or failing the whole snapshot.
+  if type(stash) == "table" then
+    for _, field in ipairs(STASH_METADATA_STRING_FIELDS) do
+      local value = rawget(stash, field)
+      if type(value) == "string" and #value <= deps.max_metadata_bytes then
+        redacted[field] = value
+      end
+    end
+    local timestamp_ms = rawget(stash, "timestamp_ms")
+    if type(timestamp_ms) == "number" and timestamp_ms == timestamp_ms
+      and timestamp_ms ~= math.huge and timestamp_ms ~= -math.huge
+      and timestamp_ms >= 0 then
+      redacted.timestamp_ms = timestamp_ms
     end
   end
-  local timestamp_ms = rawget(stash, "timestamp_ms")
-  if timestamp_ms ~= nil then
-    redacted.timestamp_ms = check_timestamp(timestamp_ms,
-      path .. ".stash.timestamp_ms")
+
+  local copy = {}
+  for key, value in pairs(event) do
+    if key ~= "stash" then
+      copy[key] = value
+    end
   end
-  event.stash = redacted
-  return event
+  copy.stash = redacted
+  return copy
 end
 
 local function copy_bus_history(value, path, deps, state)
@@ -728,16 +736,18 @@ local function copy_bus_history(value, path, deps, state)
     if rawget(event, "timestamp_ms") == nil then
       reject(event_path, "missing required field 'timestamp_ms'")
     end
-    if rawget(event, "type") ~= nil then
-      check_string(rawget(event, "type"), event_path .. ".type",
+    local event_type = rawget(event, "type")
+    if event_type ~= nil then
+      check_string(event_type, event_path .. ".type",
         deps.max_metadata_bytes, true)
     end
 
-    local copied = copy_plain(event, event_path, deps, state, 0, {}, {})
-    check_timestamp(copied.timestamp_ms, event_path .. ".timestamp_ms")
-    if STASH_EVENT_TYPES[copied.type] then
-      sanitize_stash_event(copied, event_path, deps)
+    local candidate = event
+    if type(event_type) == "string" and STASH_EVENT_TYPES[event_type] then
+      candidate = sanitize_stash_event(event, deps)
     end
+    local copied = copy_plain(candidate, event_path, deps, state, 0, {}, {})
+    check_timestamp(copied.timestamp_ms, event_path .. ".timestamp_ms")
     history[index] = copied
   end
   return history
