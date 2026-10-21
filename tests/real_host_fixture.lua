@@ -28,9 +28,10 @@
 --
 -- Limitations (documented in README.md):
 --   * offline; no network, credentials, release claim, or plugin-VM evidence.
---   * no process timeout, cancellation, process-group, or scrubbed-environment
---     bounds (CTX-0016).
---   * no OS sandbox or Bitty panel/terminal presentation run.
+--   * no asynchronous cancellation, OS sandbox, or Bitty panel/terminal
+--     presentation run. Timeout, process-group, stdin, and scrubbed-environment
+--     bounds are covered below; a child that calls setsid can still escape the
+--     recorded group.
 --   * single host and one interpreter per run; CPU frequency is not pinned.
 
 -- WHEEL_ROOT points the fixture at an installed artifact tree instead of the
@@ -563,8 +564,9 @@ local function build_evidence(status, failure)
   lines[#lines + 1] = "  environment read."
   lines[#lines + 1] = "- No release artifact, compatibility claim, or released-host"
   lines[#lines + 1] = "  integration is claimed."
-  lines[#lines + 1] = "- Process timeout, cancellation, process-group, and scrubbed-"
-  lines[#lines + 1] = "  environment bounds are not covered (CTX-0016)."
+  lines[#lines + 1] = "- Process timeout, normal-exit process-group sweep, stdin, and"
+  lines[#lines + 1] = "  scrubbed-environment bounds are covered; asynchronous cancellation"
+  lines[#lines + 1] = "  and a child that calls setsid are not covered."
   lines[#lines + 1] = "- No OS sandbox/containment evidence and no Bitty panel/terminal"
   lines[#lines + 1] = "  presentation run; the host table is a presentation double only."
   lines[#lines + 1] = "- `os.clock()` is process CPU time, not elapsed wall clock; CPU"
@@ -738,8 +740,34 @@ local function main()
   check(WheelHost.fs.write_file(tmp_one, "tmp-real-host"), "cannot write a temporary file")
   check(WheelHost.fs.read_file(tmp_one) == "tmp-real-host", "cannot read the temporary file")
   check(WheelHost.fs.remove_file(tmp_one), "cannot remove the temporary file")
+
+  -- Exclusive 0600 creation refuses pre-existing files and symlinks.
+  local exclusive = WheelHost.tmp.name()
+  check(WheelHost.tmp.create_exclusive(exclusive, "exclusive-real-host"),
+    "exclusive temporary creation must succeed on a fresh path")
+  local exclusive_mode = WheelHost.proc.run_program("stat", { "-c", "%a", exclusive })
+  check(exclusive_mode.ok and trim(exclusive_mode.stdout) == "600",
+    "exclusive temporary files must be mode 0600: " .. tostring(exclusive_mode.stdout))
+  local reused, reused_err = WheelHost.tmp.create_exclusive(exclusive, "overwrite")
+  check(reused == false and type(reused_err) == "string",
+    "exclusive temporary creation must refuse an existing path")
+  check(WheelHost.fs.read_file(exclusive) == "exclusive-real-host",
+    "an existing temporary file must not be truncated")
+  local tmp_link = WheelHost.tmp.name()
+  local made_link = WheelHost.proc.run_program("ln", { "-s", exclusive, tmp_link })
+  check(made_link.ok and made_link.code == 0, "cannot create the temporary symlink fixture")
+  local followed, followed_err = WheelHost.tmp.create_exclusive(tmp_link, "link-overwrite")
+  check(followed == false and type(followed_err) == "string",
+    "exclusive temporary creation must refuse a pre-existing symlink")
+  check(WheelHost.fs.read_file(exclusive) == "exclusive-real-host",
+    "a temporary symlink must never be followed")
+  check(WheelHost.fs.remove_file(exclusive), "cannot remove the exclusive temporary file")
+  check(WheelHost.fs.remove_file(tmp_link), "cannot remove the temporary symlink")
+
   state.coverage[#state.coverage + 1] =
     "WheelHost.tmp: private 0700 directory, unique paths, real write/read/remove"
+  state.coverage[#state.coverage + 1] =
+    "WheelHost.tmp.create_exclusive: 0600 exclusive creation, existing file/link refused"
 
   -- 5. Filesystem primitive with real files.
   local file_path = workspace .. "/nested/real-host.txt"
@@ -767,12 +795,82 @@ local function main()
   check(shell_result.ok and shell_result.code == 0, "run_command must launch")
   check(shell_result.stdout == "shell-real-host",
     "run_command must execute the quoted shell-string primitive")
+
+  -- stdin crosses the argv primitive without a shell string.
+  local stdin_result = WheelHost.proc.run_program("cat", {}, { stdin = "stdin-real-host" })
+  check(stdin_result.ok and stdin_result.code == 0,
+    "run_program must accept stdin bytes")
+  check(stdin_result.stdout == "stdin-real-host",
+    "run_program must deliver stdin to the child verbatim")
+
+  -- The child environment is scrubbed: harness and secret-shaped variables
+  -- from the parent process are absent, while PATH is explicit.
+  local env_result = WheelHost.proc.run_program("sh", {
+    "-c",
+    'printf "%s|%s|%s" "${WHEEL_REAL_HOST_BASE-unset}" "${OPENROUTER_API_KEY-unset}" "$PATH"',
+  })
+  check(env_result.ok and env_result.code == 0, "the scrubbed environment probe must run")
+  local env_parts = {}
+  for part in (env_result.stdout .. "|"):gmatch("([^|]*)|") do
+    env_parts[#env_parts + 1] = part
+  end
+  check(env_parts[1] == "unset" and env_parts[2] == "unset",
+    "harness and secret-shaped variables must not reach a child: " .. tostring(env_result.stdout))
+  check(type(env_parts[3]) == "string" and env_parts[3]:sub(1, 1) == "/",
+    "the child PATH must be explicit and absolute: " .. tostring(env_parts[3]))
+
+  -- Timeout and process-group ownership: a child and its grandchild must be
+  -- terminated by the timeout's owned process group, not by a name/pattern
+  -- kill. The PID is recorded by the child itself.
+  local group_pid_file = BASE .. "/process-group.pid"
+  local timed = WheelHost.proc.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. shell_quote(group_pid_file) .. "; wait",
+  }, { timeout_ms = 500 })
+  check(timed.ok and timed.timed_out and timed.outcome == WheelHost.PROCESS_OUTCOME.TIMEOUT,
+    "a timed-out process must report the typed timeout outcome")
+  check(timed.code == 124 or timed.code == 137,
+    "GNU timeout must map expiry to 124/137, got " .. tostring(timed.code))
+  local grandchild = WheelHost.fs.read_file(group_pid_file)
+  grandchild = grandchild and trim(grandchild) or ""
+  check(grandchild:match("^%d+$") ~= nil, "the child must record its grandchild PID")
+  local settle = WheelHost.proc.run_program("sleep", { "0.2" })
+  check(settle.ok and settle.code == 0, "the bounded settle wait must run")
+  local group_probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", grandchild },
+    { discard_stderr = true })
+  local group_state = group_probe.code == 0 and trim(group_probe.stdout) or ""
+  check(group_state == "" or group_state:sub(1, 1) == "Z",
+    "the timed-out process group must leave no running grandchild: " .. tostring(group_state))
+
+  -- Normal completion must also sweep the recorded group, not only timeout.
+  local normal_pid_file = BASE .. "/normal-exit.pid"
+  local normal = WheelHost.proc.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. shell_quote(normal_pid_file),
+  })
+  check(normal.ok and normal.code == 0,
+    "a normal command with a background child must return success")
+  local normal_pid = WheelHost.fs.read_file(normal_pid_file)
+  normal_pid = normal_pid and trim(normal_pid) or ""
+  check(normal_pid:match("^%d+$") ~= nil, "the child must record its background PID")
+  local normal_probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", normal_pid },
+    { discard_stderr = true })
+  local normal_state = normal_probe.code == 0 and trim(normal_probe.stdout) or ""
+  check(normal_state == "" or normal_state:sub(1, 1) == "Z",
+    "normal completion must leave no running background child: " .. tostring(normal_state))
+
   check(type(WheelHost.time.now()) == "number" and WheelHost.time.now() > 0,
     "WheelHost.time.now must return a real wall-clock value")
   check(type(WheelHost.time.clock()) == "number" and WheelHost.time.clock() >= 0,
     "WheelHost.time.clock must return a real CPU-time value")
   state.coverage[#state.coverage + 1] =
     "WheelHost.proc: real argv execution and quoted shell-string execution"
+  state.coverage[#state.coverage + 1] =
+    "WheelHost.proc: stdin channel, scrubbed allowlist environment, and typed timeout"
+  state.coverage[#state.coverage + 1] =
+    "WheelHost.proc: timeout terminated the recorded process group (child and grandchild)"
+  state.coverage[#state.coverage + 1] =
+    "WheelHost.proc: normal completion swept the recorded process group (background child)"
   state.coverage[#state.coverage + 1] =
     "WheelHost.time: real wall-clock and CPU-time reads"
 
@@ -1127,10 +1225,15 @@ os.exit(1)
   print("[INFO] evidence: " .. EVIDENCE_PATH)
 
   if OWNS_BASE then
-    local removed = WheelHost.proc.run_program("rm", { "-rf", BASE })
+    -- Remove the ephemeral base from a temp root outside it: capture files for
+    -- this command must survive the removal long enough to record the status.
+    local cleanup_root = BASE .. ".cleanup"
+    local cleanup_backend = WheelHost.create_backend("standalone", { tmp_root = cleanup_root })
+    local removed = cleanup_backend.run_program("rm", { "-rf", BASE })
     if not (removed.ok and removed.code == 0) then
       print("[WARN] could not remove the ephemeral base: " .. tostring(removed.stderr))
     end
+    os.execute("rmdir " .. shell_quote(cleanup_root) .. " 2>/dev/null")
   end
 end
 

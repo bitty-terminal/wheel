@@ -462,28 +462,22 @@ end
 --- Hash exact bytes with a native SHA-256 utility when one is available.
 -- The content is written to a private temporary file so the utility hashes the
 -- exact bytes that will be evaluated; the caller's project entry is never read
--- a second time. The temporary file lives in the harness-owned 0700 runtime
--- directory, is chmodded 0600 when the host supports it, and is removed before
--- returning. Returns nil when no native implementation can produce a digest.
+-- a second time. `tmp.create` creates the file exclusively with mode 0600 in
+-- the harness-owned 0700 runtime directory, so a pre-existing path or symlink
+-- is refused. The file is removed before returning; a cleanup failure is
+-- fail-closed (nil digest) so the bounded pure-Lua path is used instead of
+-- reporting success while leaving private bytes behind. Returns nil when no
+-- native implementation can produce a digest.
 -- @param content string
 -- @return string? lowercase 64-hex digest
 local function native_sha256(content)
   local host = require_host("fs.read")
   local ok_tmp, temp = pcall(function()
-    return host.tmp.name()
+    return host.tmp.create(content)
   end)
   if not ok_tmp or type(temp) ~= "string" or temp == "" then
     return nil
   end
-
-  local write_ok, write_result = pcall(function()
-    return host.fs.write_file(temp, content)
-  end)
-  if not write_ok or write_result ~= true then
-    pcall(function() host.fs.remove_file(temp) end)
-    return nil
-  end
-  pcall(function() host.fs.chmod(temp, "600") end)
 
   local digest = nil
   local candidates = {
@@ -503,7 +497,16 @@ local function native_sha256(content)
     end
   end
 
-  pcall(function() host.fs.remove_file(temp) end)
+  local removed = host.fs.remove_file(temp)
+  if removed ~= true then
+    -- Do not leave a 0600 copy of project configuration behind when the
+    -- unlink fails; blanking it is best-effort and the digest still fails
+    -- closed to the bounded pure-Lua path.
+    pcall(function()
+      host.fs.write_file(temp, "")
+    end)
+    return nil
+  end
   return digest
 end
 

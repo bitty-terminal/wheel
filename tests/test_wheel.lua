@@ -4318,6 +4318,7 @@ run_test("WheelTool: read_file total_lines reports only emitted lines", function
   assert(byte_bounded.total_lines == byte_bounded.lines_read,
     "max_bytes truncation must report only emitted lines")
   assert(byte_bounded.total_lines < 10, "max_bytes must stop before the whole file")
+  assert(byte_bounded.truncated == true, "a bounded read must report truncation")
 
   os.execute("rm -rf " .. root)
 end)
@@ -4344,6 +4345,8 @@ run_test("WheelTool: search_code bounds output and keeps the trailing newline", 
     line_count = line_count + 1
   end
   assert(line_count == 100, "search_code must keep at most 100 lines, got " .. line_count)
+  assert(found.truncated == true,
+    "search_code must report that the bounded observation dropped lines")
 
   local missing = tool.execute({ query = "needle-not-present" }, env)
   assert(missing.success == true)
@@ -4451,6 +4454,20 @@ run_test("WheelTool: Auto-spillover pipeline and content-addressed blob recovery
   -- Formatted observation contains tool header and preview
   local obs = outcome:format_observation()
   assert(string.find(obs, "[Tool: run_command (exit=0, 45ms, spilled=", 1, true) ~= nil)
+  local flagged = WheelTool.process_spillover({
+    tool = "run_command",
+    success = false,
+    exit_code = 124,
+    timed_out = true,
+    truncated = true,
+    stdout = "",
+    stderr = "timed out",
+  })
+  local flagged_obs = flagged:format_observation()
+  assert(flagged_obs:find("timed_out", 1, true) ~= nil,
+    "formatted observations must surface the timeout flag")
+  assert(flagged_obs:find("truncated", 1, true) ~= nil,
+    "formatted observations must surface the truncation flag")
 
   -- Content-addressed blob was written to context
   local slot = context:get_slot("blobs/" .. outcome.spillover_hash)
@@ -4831,7 +4848,9 @@ run_test("WheelProvider: tool formatters and adapter factory", function()
 
   local stdio_p = WheelProvider.create({ provider = "local", model = "qwen2.5-coder" })
   assert(stdio_p.name == "stdio")
-  assert(string.find(stdio_p.command, "ollama run", 1, true) ~= nil)
+  assert(type(stdio_p.command) == "table")
+  assert(table.concat(stdio_p.command, " ") == "ollama run qwen2.5-coder",
+    "the stdio factory must produce an argv command")
 end)
 
 run_test("WheelProvider.MockProvider: completions, streaming chunks, and tool calling", function()
@@ -6340,6 +6359,8 @@ run_test("WheelHost: unavailable primitives return typed denials", function()
     { label = "proc.shell_quote", capability = "process.spawn", call = function() return WheelHost.proc.shell_quote("x") end },
     { label = "tmp.dir", capability = "fs.write", call = function() return WheelHost.tmp.dir() end },
     { label = "tmp.name", capability = "fs.write", call = function() return WheelHost.tmp.name() end },
+    { label = "tmp.create", capability = "fs.write", call = function() return WheelHost.tmp.create("x") end },
+    { label = "tmp.create_exclusive", capability = "fs.write", call = function() return WheelHost.tmp.create_exclusive("/tmp/x", "x") end },
     { label = "time.now", capability = "time.now", call = function() return WheelHost.time.now() end },
     { label = "time.clock", capability = "time.clock", call = function() return WheelHost.time.clock() end },
   }
@@ -6702,12 +6723,11 @@ run_test("WheelHost: proc primitives (run_command, run_program, command_runner)"
   assert(res.code == 0, "echo must exit 0")
   assert(string.find(res.stdout, "wheel-host-ok", 1, true) ~= nil, "stdout must be captured")
 
-  -- A failing command is still launched; Lua 5.1/LuaJIT close() does not
-  -- expose the popen exit status (5.2+ reports code 7), so the code is
-  -- interpreter-dependent exactly as it was before the seam
+  -- A failing command is still launched; the wrapper records the exit status.
   local fail = WheelHost.proc.run_command("exit 7")
   assert(fail.ok == true, "a spawned failing command is still launched")
-  assert(fail.code == 0 or fail.code == 7, "exit code must be captured when the interpreter exposes it")
+  assert(fail.code == 7 and fail.exit_code == 7, "the recorded exit code must be captured")
+  assert(fail.outcome == WheelHost.PROCESS_OUTCOME.EXITED)
 
   -- run_program passes an argv verbatim (no shell word splitting)
   local argv = WheelHost.proc.run_program("echo", { "argv", "with spaces" })
@@ -6734,6 +6754,651 @@ run_test("WheelHost: proc primitives (run_command, run_program, command_runner)"
   })
   assert(failing.ok == true and failing.code == 3, "runner exit code is preserved")
   assert(failing.stderr == "boom")
+end)
+
+local function test_process_state(pid)
+  local probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", tostring(pid) },
+    { discard_stderr = true })
+  if probe.code ~= 0 then
+    return nil
+  end
+  local state = (probe.stdout or ""):match("^%s*(%S+)")
+  return state
+end
+
+local function assert_test_process_gone(pid, label)
+  for _ = 1, 10 do
+    local state = test_process_state(pid)
+    if state == nil then
+      return
+    end
+    os.execute("sleep 0.05")
+  end
+  local state = test_process_state(pid)
+  assert(state == nil, label .. " must not leave a running process; state=" .. tostring(state))
+end
+
+run_test("WheelHost: timeout kills only the recorded process group", function()
+  local root = "/tmp/bitty/test_host_proc_group"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local pid_file = root .. "/grandchild.pid"
+
+  local res = backend.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. WheelHost.proc.shell_quote(pid_file) .. "; wait",
+  }, { timeout_ms = 500 })
+
+  assert(res.ok == true, "a timed-out process is still a launched process")
+  assert(res.timed_out == true and (res.exit_code == 124 or res.exit_code == 137),
+    "GNU timeout must map expiry to 124/137: " .. tostring(res.code))
+  assert(res.outcome == WheelHost.PROCESS_OUTCOME.TIMEOUT, "timeout must be a typed outcome")
+
+  local fh = io.open(pid_file, "r")
+  local grandchild = fh and fh:read("*l") or nil
+  if fh then fh:close() end
+  assert(type(grandchild) == "string" and grandchild:match("^%d+$") ~= nil,
+    "the child must record its grandchild PID")
+
+  -- Give the group signal a moment to be delivered and reaped, then observe
+  -- the PID without sending any signal.
+  os.execute("sleep 0.2")
+  local probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", grandchild },
+    { discard_stderr = true })
+  local state = probe.code == 0 and (probe.stdout or ""):match("^%s*(%S+)") or nil
+  assert(state == nil or state:sub(1, 1) == "Z",
+    "the timed-out process group must not leave a running grandchild: " .. tostring(state))
+
+  -- Capture files must be removed on the timeout path as well.
+  local leftover = {}
+  local listing = io.popen("ls -1a " .. WheelHost.proc.shell_quote(root))
+  if listing then
+    for line in listing:lines() do
+      if line:match("^wheel%-") then
+        leftover[#leftover + 1] = line
+      end
+    end
+    listing:close()
+  end
+  assert(#leftover == 0, "timeout capture files must be cleaned up: " .. table.concat(leftover, ","))
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: normal exit sweeps the recorded process group", function()
+  local root = "/tmp/bitty/test_host_proc_normal_exit"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+
+  local pid_file = root .. "/background.pid"
+  local res = backend.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. WheelHost.proc.shell_quote(pid_file),
+  })
+  assert(res.ok == true and res.code == 0, "a backgrounding command must still exit normally")
+  local fh = io.open(pid_file, "r")
+  local pid = fh and fh:read("*l") or nil
+  if fh then fh:close() end
+  assert(type(pid) == "string" and pid:match("^%d+$") ~= nil,
+    "the child must record its background PID")
+  assert_test_process_gone(pid, "normal-exit background child")
+
+  -- The explicit shell-string primitive must sweep as well.
+  local shell_pid_file = root .. "/shell-background.pid"
+  local shell_res = WheelHost.proc.run_command(
+    "sleep 30 & echo $! > " .. WheelHost.proc.shell_quote(shell_pid_file))
+  assert(shell_res.ok == true and shell_res.code == 0,
+    "run_command must still return the shell status")
+  local sfh = io.open(shell_pid_file, "r")
+  local shell_pid = sfh and sfh:read("*l") or nil
+  if sfh then sfh:close() end
+  assert(type(shell_pid) == "string" and shell_pid:match("^%d+$") ~= nil,
+    "run_command must record its background PID")
+  assert_test_process_gone(shell_pid, "run_command background child")
+
+  -- A TERM-ignoring child must receive KILL after the bounded sweep grace.
+  local stubborn_file = root .. "/stubborn.pid"
+  local stubborn = backend.run_program("sh", {
+    "-c",
+    "sh -c 'trap \"\" TERM; sleep 30' & echo $! > "
+      .. WheelHost.proc.shell_quote(stubborn_file),
+  })
+  assert(stubborn.ok == true and stubborn.code == 0,
+    "a command with a TERM-ignoring child must still exit normally")
+  local tfh = io.open(stubborn_file, "r")
+  local stubborn_pid = tfh and tfh:read("*l") or nil
+  if tfh then tfh:close() end
+  assert(type(stubborn_pid) == "string" and stubborn_pid:match("^%d+$") ~= nil,
+    "the TERM-ignoring child must record its PID")
+  assert_test_process_gone(stubborn_pid, "TERM-ignoring background child")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: process environment allowlist and stdin channel", function()
+  local saved_getenv = os.getenv
+  os.getenv = function(name)
+    if name == "WHEEL_SYNTHETIC_TOKEN" then
+      return "synthetic-secret-value"
+    end
+    if name == "PATH" then
+      return "/usr/bin:/bin:relative:."
+    end
+    return saved_getenv(name)
+  end
+
+  local ok, res = pcall(WheelHost.proc.run_program, "sh", {
+    "-c",
+    'printf "%s|%s|%s" "${WHEEL_SYNTHETIC_TOKEN-unset}" "$PATH" "${WHEEL_DECLARED-unset}"',
+  }, { env = { WHEEL_DECLARED = "declared" } })
+  os.getenv = saved_getenv
+
+  assert(ok, "the scrubbed process must run: " .. tostring(res))
+  assert(res.ok == true and res.code == 0, tostring(res.stderr))
+  assert(res.stdout == "unset|/usr/bin:/bin|declared",
+    "only declared variables and absolute PATH entries may reach the child: " .. tostring(res.stdout))
+
+  -- No undeclared variable (including shell-added PWD/SHLVL) may survive.
+  local allowed = {
+    PATH = true, HOME = true, LANG = true, LC_ALL = true, TERM = true,
+    TMPDIR = true, XDG_RUNTIME_DIR = true, XDG_STATE_HOME = true,
+    XDG_CONFIG_HOME = true,
+  }
+  local listed = WheelHost.proc.run_program("env", {})
+  assert(listed.ok and listed.code == 0, "the environment inventory must run")
+  for line in listed.stdout:gmatch("[^\n]+") do
+    local name = line:match("^([^=]+)=")
+    assert(name ~= nil and allowed[name] == true,
+      "the child environment must contain only allowlisted names, found " .. tostring(name))
+  end
+
+  -- A secret-shaped explicit declaration is refused without echoing the value.
+  local secret = WheelHost.proc.run_program("true", {}, { env = { OPENAI_API_KEY = "sk-test-value" } })
+  assert(secret.ok == false and secret.outcome == WheelHost.PROCESS_OUTCOME.FAILURE)
+  assert(secret.stderr:find("OPENAI_API_KEY", 1, true) ~= nil, "the refusal must name the variable")
+  assert(secret.stderr:find("sk-test-value", 1, true) == nil, "the refusal must not echo the value")
+
+  for _, name in ipairs({ "LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "IFS", "SHELLOPTS" }) do
+    local forbidden = WheelHost.proc.run_program("true", {}, {
+      env = { [name] = "injected" },
+    })
+    assert(forbidden.ok == false and forbidden.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+      name .. " must be refused as a child environment name")
+  end
+
+  -- A leading-dash program name must not become an env option.
+  local split = WheelHost.proc.run_program("-S", { "echo ENVSPLIT" })
+  assert(split.stdout:find("ENVSPLIT", 1, true) == nil,
+    "env -S must not split the child argument vector")
+  local split_long = WheelHost.proc.run_program("--split-string=echo ENVSPLIT", {})
+  assert(split_long.stdout:find("ENVSPLIT", 1, true) == nil,
+    "env --split-string must not split the child argument vector")
+  local clear = WheelHost.proc.run_program("-i", {})
+  assert(clear.stdout == "", "env -i must not execute or print the child environment")
+  local assignment = WheelHost.proc.run_program("FOO=bar", {})
+  assert(assignment.stdout == "" and assignment.code ~= 0,
+    "a program containing '=' must be refused as an env assignment")
+
+  -- stdin is carried without a shell string; the default is /dev/null.
+  local cat = WheelHost.proc.run_program("cat", {}, { stdin = "stdin-line-1\nstdin-line-2" })
+  assert(cat.ok and cat.code == 0 and cat.stdout == "stdin-line-1\nstdin-line-2",
+    "stdin must round-trip through the argv primitive")
+  local eof = WheelHost.proc.run_program("sh", { "-c", 'read x; printf "%s" "${x:-none}"' })
+  assert(eof.ok and eof.stdout == "none", "stdin must default to /dev/null")
+
+  local too_big = WheelHost.proc.run_program("cat", {}, {
+    stdin = string.rep("x", WheelHost.LIMITS.MAX_STDIN_BYTES + 1),
+  })
+  assert(too_big.ok == false and too_big.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+    "stdin above the 1 MiB bound must fail closed")
+  assert(too_big.stderr:find("stdin", 1, true) ~= nil, "the stdin bound failure must be explained")
+
+  -- A PATH without absolute entries is unavailable, not silently inherited.
+  os.getenv = function(name)
+    if name == "PATH" then
+      return "relative:."
+    end
+    return saved_getenv(name)
+  end
+  local no_path = WheelHost.proc.run_program("true")
+  os.getenv = saved_getenv
+  assert(no_path.ok == false and no_path.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "an implicit PATH must fail closed as unavailable")
+
+  -- Invalid bounds are a typed failure.
+  local bad_timeout = WheelHost.proc.run_program("true", {}, { timeout_ms = 1 })
+  assert(bad_timeout.ok == false and bad_timeout.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+    "an out-of-range timeout must be a typed failure")
+end)
+
+run_test("WheelHost: process output truncation is explicit", function()
+  local res = WheelHost.proc.run_program("sh", {
+    "-c",
+    "printf '%4096s' ''; printf '%4096s' '' >&2",
+  }, { max_output_bytes = 64 })
+
+  assert(res.ok == true and res.code == 0)
+  assert(res.truncated == true and res.stdout_truncated == true and res.stderr_truncated == true,
+    "both captured streams must report truncation")
+  assert(#res.stdout == 64 and #res.stderr == 64,
+    "captured streams must be cut at the configured cap")
+
+  local merged = WheelHost.proc.run_program("sh", {
+    "-c",
+    "printf '%4096s' ''; printf '%4096s' '' >&2",
+  }, { max_output_bytes = 64, merge_stderr = true })
+  assert(merged.truncated == true and #merged.stdout == 128 and merged.stderr == "",
+    "merged output must stay bounded and keep the merge shape")
+end)
+
+run_test("WheelHost: temporary files are exclusive, 0600, and never follow a path", function()
+  local dir = WheelHost.tmp.dir()
+  local path = WheelHost.tmp.name()
+  assert(WheelHost.tmp.create_exclusive(path, "payload") == true,
+    "exclusive creation must succeed on a fresh path")
+  local info = WheelHost.fs.stat(path)
+  assert(info.mode == 384, "exclusive temporary files must be mode 0600, got " .. tostring(info.mode))
+  assert(WheelHost.fs.read_file(path) == "payload")
+
+  local replaced, replace_err = WheelHost.tmp.create_exclusive(path, "overwrite")
+  assert(replaced == false and type(replace_err) == "string",
+    "an existing path must be refused")
+  assert(WheelHost.fs.read_file(path) == "payload", "an existing file must not be truncated")
+
+  local target = WheelHost.tmp.name()
+  assert(WheelHost.tmp.create_exclusive(target, "target-content") == true)
+  local link = WheelHost.tmp.name()
+  os.execute("ln -s " .. WheelHost.proc.shell_quote(target) .. " " .. WheelHost.proc.shell_quote(link))
+  local linked, link_err = WheelHost.tmp.create_exclusive(link, "link-payload")
+  assert(linked == false and type(link_err) == "string",
+    "a pre-existing symlink must be refused")
+  assert(WheelHost.fs.read_file(target) == "target-content",
+    "a symlink target must never be followed or overwritten")
+
+  local dev_link = WheelHost.tmp.name()
+  os.execute("ln -s /dev/null " .. WheelHost.proc.shell_quote(dev_link))
+  local dev_ok, dev_err = WheelHost.tmp.create_exclusive(dev_link, "dev-payload")
+  assert(dev_ok == false and type(dev_err) == "string",
+    "a symlink to /dev/null must be refused")
+  WheelHost.fs.remove_file(dev_link)
+
+  local fifo = WheelHost.tmp.name()
+  os.execute("mkfifo " .. WheelHost.proc.shell_quote(fifo))
+  local fifo_ok, fifo_err = WheelHost.tmp.create_exclusive(fifo, "fifo-payload")
+  assert(fifo_ok == false and type(fifo_err) == "string",
+    "a pre-existing FIFO must be refused without blocking")
+  WheelHost.fs.remove_file(fifo)
+
+  local created = WheelHost.tmp.create("fresh")
+  assert(type(created) == "string", "tmp.create must return a path")
+  assert(WheelHost.fs.read_file(created) == "fresh")
+  assert(WheelHost.fs.stat(created).mode == 384, "tmp.create must produce mode 0600")
+
+  WheelHost.fs.remove_file(path)
+  WheelHost.fs.remove_file(target)
+  WheelHost.fs.remove_file(link)
+  WheelHost.fs.remove_file(created)
+end)
+
+run_test("WheelHost: temp write failure surfaces cleanup errors", function()
+  local path = WheelHost.tmp.name()
+  local real_open = io.open
+  local real_remove = os.remove
+  local probe_path = nil
+  io.open = function(target, mode)
+    if mode == "r+" then
+      probe_path = target
+      return nil, "simulated write-open failure"
+    end
+    return real_open(target, mode)
+  end
+  os.remove = function(target)
+    if target == probe_path then
+      return nil, "simulated remove failure"
+    end
+    return real_remove(target)
+  end
+  local ok, err = WheelHost.tmp.create_exclusive(path, "content")
+  io.open = real_open
+  os.remove = real_remove
+  assert(ok == false and type(err) == "string", "a temp write failure must fail closed")
+  assert(err:find("cleanup failed", 1, true) ~= nil,
+    "a temp cleanup failure must be surfaced")
+  if probe_path then
+    real_remove(probe_path)
+  end
+  real_remove(path)
+end)
+
+run_test("WheelHost: process capture files are cleaned up on success, error, and timeout", function()
+  local root = "/tmp/bitty/test_host_proc_cleanup"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+
+  local function leftovers()
+    local names = {}
+    local pipe = io.popen("ls -1a " .. WheelHost.proc.shell_quote(root))
+    if pipe then
+      for line in pipe:lines() do
+        if line:match("^wheel%-") then
+          names[#names + 1] = line
+        end
+      end
+      pipe:close()
+    end
+    return names
+  end
+
+  local success = backend.run_program("echo", { "ok" })
+  assert(success.ok and success.code == 0 and #leftovers() == 0,
+    "successful runs must remove capture files")
+
+  local error_run = backend.run_program("sh", { "-c", "exit 3" })
+  assert(error_run.code == 3 and #leftovers() == 0,
+    "failed runs must remove capture files")
+
+  local timed = backend.run_program("sh", { "-c", "sleep 5" }, { timeout_ms = 100 })
+  assert(timed.timed_out and #leftovers() == 0,
+    "timed-out runs must remove capture files")
+
+  -- A spawn failure must also clean up and remain typed.
+  local warm = backend.run_program("true")
+  assert(warm.ok, "the tool cache must warm before the spawn-failure probe")
+  local real_popen = io.popen
+  io.popen = function()
+    return nil
+  end
+  local spawn_failed = backend.run_program("true")
+  io.popen = real_popen
+  assert(spawn_failed.ok == false and spawn_failed.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+    "a failed spawn must be a typed failure")
+  assert(#leftovers() == 0, "a failed spawn must remove capture files")
+
+  -- Cleanup failure is typed and capture files are created 0600.
+  local real_remove = os.remove
+  local failed_path = nil
+  os.remove = function(path)
+    if failed_path == nil and path:match("^/.*/wheel%-") then
+      failed_path = path
+      return nil, "simulated cleanup failure"
+    end
+    return real_remove(path)
+  end
+  local cleanup_failed = backend.run_program("echo", { "cleanup" })
+  os.remove = real_remove
+  assert(cleanup_failed.ok == false and cleanup_failed.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+    "a cleanup failure must be a typed failure")
+  assert(cleanup_failed.stderr:find("cleanup failed", 1, true) ~= nil,
+    "a cleanup failure must be reported")
+  assert(type(failed_path) == "string", "the cleanup failure must identify a capture file")
+  local failed_info = WheelHost.fs.stat(failed_path)
+  assert(failed_info.mode == 384, "capture files must be mode 0600")
+
+  for _, path in ipairs(leftovers()) do
+    real_remove(root .. "/" .. path)
+  end
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: missing sleep and timeout are typed unavailable outcomes", function()
+  local root = "/tmp/bitty/test_host_missing_sweep_tools"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local function probe(name)
+    local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+    local real_popen = io.popen
+    io.popen = function(command, mode)
+      if command:find(name, 1, true) ~= nil then
+        return nil
+      end
+      return real_popen(command, mode)
+    end
+    local res = backend.run_program("true")
+    io.popen = real_popen
+    return res
+  end
+  local no_timeout = probe("timeout")
+  assert(no_timeout.ok == false and no_timeout.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "a missing timeout must fail closed as unavailable")
+  assert(no_timeout.stderr:find("timeout", 1, true) ~= nil)
+  local no_sleep = probe("sleep")
+  assert(no_sleep.ok == false and no_sleep.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "a missing sleep must fail closed as unavailable")
+  assert(no_sleep.stderr:find("sleep", 1, true) ~= nil)
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: missing setsid is a typed unavailable outcome", function()
+  local root = "/tmp/bitty/test_host_no_setsid"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local real_popen = io.popen
+  io.popen = function(command, mode)
+    if command:find("setsid", 1, true) ~= nil then
+      return nil
+    end
+    return real_popen(command, mode)
+  end
+  local res = backend.run_program("true")
+  io.popen = real_popen
+  assert(res.ok == false and res.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "a missing setsid must fail closed as unavailable")
+  assert(res.stderr:find("setsid", 1, true) ~= nil, "the unavailable outcome must name setsid")
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: read_file enforces max_bytes while reading", function()
+  local root = "/tmp/bitty/test_tool_read_bounded"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/big.txt", "w"))
+  for index = 1, 20 do
+    fh:write(string.format("line-%02d-payload\n", index))
+  end
+  fh:close()
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("read_file")
+
+  local saved_read_file = WheelHost.fs.read_file
+  WheelHost.fs.read_file = function()
+    error("read_file must not load the whole file for a bounded read")
+  end
+  local ok, res = pcall(tool.execute, { path = "big.txt", max_bytes = 40 }, env)
+  WheelHost.fs.read_file = saved_read_file
+
+  assert(ok, "bounded read must not call fs.read_file: " .. tostring(res))
+  assert(res.success == true)
+  assert(res.stdout:find("output truncated", 1, true) ~= nil,
+    "the bounded read must report truncation")
+  assert(#res.stdout < 20 * 18, "the output must stay far below the whole file size")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: run_command reports a typed timeout", function()
+  local root = "/tmp/bitty/test_tool_run_timeout"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local res = reg:dispatch("run_command", { command = "sleep 5", timeout_ms = 300 }, env)
+
+  assert(res.success == false, "a timed-out command must fail")
+  assert(res.timed_out == true and res.outcome == WheelHost.PROCESS_OUTCOME.TIMEOUT,
+    "the tool result must carry the typed timeout")
+  assert(res.exit_code == 124 or res.exit_code == 137,
+    "the timeout exit code must be 124/137, got " .. tostring(res.exit_code))
+  assert(res.stderr:find("timed out", 1, true) ~= nil, "the tool must explain the timeout")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: read_file fails loud when start_line exceeds the bounded prefix", function()
+  local root = "/tmp/bitty/test_tool_read_start_line"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/big.txt", "w"))
+  for index = 1, 2000 do
+    fh:write(string.format("line-%04d-%s\n", index, string.rep("x", 40)))
+  end
+  fh:close()
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("read_file")
+
+  local bounded = tool.execute({ path = "big.txt", start_line = 1990 }, env)
+  assert(bounded.success == false, "a start_line beyond the bounded prefix must fail loud")
+  assert(bounded.exit_code == 1 and bounded.truncated == true,
+    "the bounded-prefix failure must be typed as truncated")
+  assert(bounded.stderr:find("bounded read prefix", 1, true) ~= nil,
+    "the failure must explain the bounded prefix")
+
+  local expanded = tool.execute({
+    path = "big.txt",
+    start_line = 1990,
+    max_bytes = WheelTool.MAX_READ_BYTES,
+  }, env)
+  assert(expanded.success == true and expanded.lines_read > 0,
+    "a larger max_bytes must reach the requested start_line")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: read_file marks a partial line at the bounded prefix", function()
+  local root = "/tmp/bitty/test_tool_read_partial"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/partial.txt", "w"))
+  fh:write(string.rep("a", 50) .. "\n" .. string.rep("b", 100) .. "\n" .. "c\n")
+  fh:close()
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("read_file")
+
+  local partial = tool.execute({ path = "partial.txt", max_bytes = 100, start_line = 2 }, env)
+  assert(partial.success == true)
+  assert(partial.truncated == true,
+    "a prefix ending inside an included line must be marked truncated")
+  assert(partial.stdout:find("output truncated", 1, true) ~= nil,
+    "the partial-line result must carry a truncation marker")
+
+  local complete = tool.execute({ path = "partial.txt", max_bytes = 100, start_line = 1, end_line = 1 }, env)
+  assert(complete.success == true and complete.truncated == false,
+    "a complete in-range line must not be marked truncated")
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: search_code fails on grep errors", function()
+  local root = "/tmp/bitty/test_tool_search_errors"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/file.txt", "w"))
+  fh:write("needle\n")
+  fh:close()
+
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("search_code")
+
+  local no_match = tool.execute({ query = "absent" }, env)
+  assert(no_match.success == true and no_match.stdout == "",
+    "grep exit 1 must remain a successful no-match")
+
+  local missing = tool.execute({ query = "needle", path = "missing-directory" }, env)
+  assert(missing.success == false and missing.exit_code == 2,
+    "a grep I/O failure must fail with exit code 2")
+  assert(#missing.stderr > 0, "a grep I/O failure must retain stderr")
+
+  local saved_getenv = os.getenv
+  os.getenv = function(name)
+    if name == "PATH" then
+      return "/nonexistent"
+    end
+    return saved_getenv(name)
+  end
+  local no_grep = tool.execute({ query = "needle" }, env)
+  os.getenv = saved_getenv
+  assert(no_grep.success == false and no_grep.exit_code == 127,
+    "a missing grep must fail with exit code 127")
+  assert(no_grep.stderr:find("grep", 1, true) ~= nil,
+    "a missing grep must retain its diagnostic")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: list_directory fails closed on missing ls and timeout", function()
+  local root = "/tmp/bitty/test_tool_list_errors"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("list_directory")
+
+  local missing = tool.execute({ path = "missing-directory" }, env)
+  assert(missing.success == false and missing.exit_code == 2,
+    "a missing directory must fail with the ls exit code")
+  assert(#missing.stderr > 0, "a missing directory must retain ls stderr")
+
+  local saved_getenv = os.getenv
+  os.getenv = function(name)
+    if name == "PATH" then
+      return "/nonexistent"
+    end
+    return saved_getenv(name)
+  end
+  local no_ls = tool.execute({ path = "." }, env)
+  os.getenv = saved_getenv
+  assert(no_ls.success == false and no_ls.exit_code == 127,
+    "a missing ls must fail with exit code 127")
+  assert(no_ls.stderr:find("ls", 1, true) ~= nil,
+    "a missing ls must retain its diagnostic")
+
+  local saved_list = WheelHost.fs.list_dir
+  WheelHost.fs.list_dir = function()
+    return {
+      ok = true, code = 0, entries = { "entry" }, total = 1,
+      truncated = true, stdout = "entry", stderr = "",
+    }
+  end
+  local truncated_list = tool.execute({ path = "." }, env)
+  assert(truncated_list.success == true and truncated_list.truncated == true,
+    "list_directory must surface capture truncation")
+
+  WheelHost.fs.list_dir = function()
+    return {
+      ok = false, code = 124, timed_out = true,
+      outcome = WheelHost.PROCESS_OUTCOME.TIMEOUT, entries = {}, stderr = "",
+    }
+  end
+  local timed = tool.execute({ path = "." }, env)
+  WheelHost.fs.list_dir = saved_list
+  assert(timed.success == false and timed.timed_out == true,
+    "a list timeout must fail with the typed timeout")
+  assert(timed.exit_code == 124 or timed.exit_code == 137,
+    "a list timeout must preserve 124/137")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelTool: list_directory paginates entries", function()
+  local root = "/tmp/bitty/test_tool_list_pagination"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  for index = 1, 5 do
+    local fh = assert(io.open(root .. "/file-" .. index .. ".txt", "w"))
+    fh:write("x\n")
+    fh:close()
+  end
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local res = reg:get_tool("list_directory").execute({ path = ".", max_entries = 2 }, env)
+  assert(res.success == true)
+  assert(res.total_entries >= 5, "pagination must count all entries")
+  local returned = 0
+  for _ in res.stdout:gmatch("\n") do
+    returned = returned + 1
+  end
+  if #res.stdout > 0 and res.stdout:sub(-1) ~= "\n" then
+    returned = returned + 1
+  end
+  assert(returned <= 2, "pagination must cap returned entries, got " .. returned)
+  os.execute("rm -rf " .. root)
 end)
 
 run_test("WheelHost: tool call sites route through the seam (capture doubles)", function()
@@ -6906,35 +7571,27 @@ run_test("WheelHost: tool call sites route through the seam (capture doubles)", 
   os.execute("rm -rf " .. root)
 end)
 
-run_test("WheelHost: StdioAdapter routes tmp and process through the seam", function()
-  local root = "/tmp/bitty/test_host_seam_stdio"
-  os.execute("rm -rf " .. root)
-  os.execute("mkdir -p " .. root)
-
+run_test("WheelHost: StdioAdapter routes argv and stdin through the seam", function()
   local backend = WheelHost.backend
-  local saved_tmp_path = backend.tmp_path
-  local saved_run = backend.run_command
-  local saved_remove = backend.remove_file
-  local tmp_seen, run_seen, remove_seen = false, false, false
-  local tmp_path = root .. "/prompt.txt"
+  local saved_run_program = backend.run_program
+  local seen = nil
 
-  backend.tmp_path = function()
-    tmp_seen = true
-    return tmp_path
-  end
-  backend.run_command = function(shell_string)
-    run_seen = true
-    assert(string.find(shell_string, "mock_model_cli", 1, true) ~= nil, "stdio command must reach the seam")
-    assert(string.find(shell_string, tmp_path, 1, true) ~= nil, "stdio prompt path must reach the seam")
-    return { ok = true, code = 0, stdout = "stdio-seam-output", stderr = "" }
-  end
-  backend.remove_file = function(path)
-    remove_seen = (path == tmp_path)
-    return saved_remove(path)
+  backend.run_program = function(program, args, opts)
+    seen = { program = program, args = args, opts = opts }
+    return {
+      ok = true,
+      code = 0,
+      exit_code = 0,
+      stdout = "stdio-seam-output",
+      stderr = "",
+      outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+      timed_out = false,
+      truncated = false,
+    }
   end
 
   local ok, err = pcall(function()
-    local stdio = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+    local stdio = WheelProvider.StdioAdapter.new({ command = "mock_model_cli --flag" })
     local res, complete_err = stdio:complete({
       messages = { { role = "user", content = "hello seam" } },
     })
@@ -6942,16 +7599,104 @@ run_test("WheelHost: StdioAdapter routes tmp and process through the seam", func
     assert(res.content == "stdio-seam-output")
   end)
 
-  backend.tmp_path = saved_tmp_path
-  backend.run_command = saved_run
-  backend.remove_file = saved_remove
-  os.execute("rm -rf " .. root)
+  backend.run_program = saved_run_program
   if not ok then
     error(err)
   end
-  assert(tmp_seen, "StdioAdapter must obtain its temp file through WheelHost.tmp.name")
-  assert(run_seen, "StdioAdapter must execute through WheelHost.proc.run_command")
-  assert(remove_seen, "StdioAdapter must remove its temp file through WheelHost.fs.remove_file")
+  assert(seen ~= nil, "StdioAdapter must execute through WheelHost.proc.run_program")
+  assert(seen.program == "mock_model_cli", "the command must be split into argv")
+  assert(seen.args[1] == "--flag", "argv must preserve the trailing argument")
+  assert(type(seen.opts) == "table" and type(seen.opts.stdin) == "string",
+    "the prompt must cross the seam as stdin")
+  assert(seen.opts.stdin:find("hello seam", 1, true) ~= nil,
+    "the stdin payload must contain the formatted prompt")
+end)
+
+run_test("WheelProvider: stdio command refusal, timeout, and output truncation are typed", function()
+  local backend = WheelHost.backend
+  local saved_run_program = backend.run_program
+
+  -- Shell syntax is refused before any process starts.
+  local via_shell = WheelProvider.StdioAdapter.new({ command = "mock | evil" })
+  local shell_res, shell_err = via_shell:complete({ messages = {} })
+  assert(shell_res == nil and type(shell_err) == "string"
+    and shell_err:find("shell syntax", 1, true) ~= nil,
+    "a shell-syntax stdio command must be refused")
+
+  local timeout_res, timeout_err = nil, nil
+  backend.run_program = function()
+    return {
+      ok = true,
+      code = 124,
+      exit_code = 124,
+      stdout = "",
+      stderr = "",
+      outcome = WheelHost.PROCESS_OUTCOME.TIMEOUT,
+      timed_out = true,
+      truncated = false,
+    }
+  end
+  local timed = WheelProvider.StdioAdapter.new({ command = "mock_model_cli", timeout_ms = 500 })
+  timeout_res, timeout_err = timed:complete({ messages = {} })
+
+  backend.run_program = function()
+    return {
+      ok = true,
+      code = 0,
+      exit_code = 0,
+      stdout = "bounded",
+      stderr = "",
+      outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+      timed_out = false,
+      truncated = true,
+    }
+  end
+  local truncated = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+  local trunc_res, trunc_err = truncated:complete({ messages = {} })
+
+  backend.run_program = function()
+    return {
+      ok = true,
+      code = 1,
+      exit_code = 1,
+      stdout = "",
+      stderr = "stdio stderr detail",
+      outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+      timed_out = false,
+      truncated = false,
+    }
+  end
+  local failed = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+  local fail_res, fail_err = failed:complete({ messages = {} })
+
+  backend.run_program = function()
+    return {
+      ok = true,
+      code = 0,
+      exit_code = 0,
+      stdout = "model-answer",
+      stderr = "cli warning",
+      outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+      timed_out = false,
+      truncated = false,
+    }
+  end
+  local clean = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+  local clean_res, clean_err = clean:complete({ messages = {} })
+
+  backend.run_program = saved_run_program
+
+  assert(timeout_res == nil and type(timeout_err) == "string"
+    and timeout_err:find("timed out", 1, true) ~= nil,
+    "a timed-out stdio process must fail with a typed message")
+  assert(trunc_res == nil and type(trunc_err) == "string"
+    and trunc_err:find("capture bound", 1, true) ~= nil,
+    "truncated stdio output must fail closed instead of returning partial content")
+  assert(fail_res == nil and type(fail_err) == "string"
+    and fail_err:find("stdio stderr detail", 1, true) ~= nil,
+    "nonzero stdio exit must retain stderr diagnostics")
+  assert(clean_res ~= nil and clean_res.content == "model-answer",
+    "successful stdio content must not include stderr diagnostics: " .. tostring(clean_err))
 end)
 
 run_test("WheelHost: context and team wall-clock sites route through time.now", function()

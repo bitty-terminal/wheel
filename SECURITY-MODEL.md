@@ -106,14 +106,14 @@ level.
 
 ### Authority ledger
 
-| Authority class       | 0.1.0 status        | Default scope                                                     | Default mode                                                                                         |
-| --------------------- | ------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| Workspace read        | Approved            | The session workspace root                                        | Enabled for Inspect-intent tools                                                                     |
-| Workspace write       | Approved            | The session workspace root                                        | Enabled for Modify-intent tools, subject to role gates                                               |
-| Arbitrary argv        | Approved            | Programs resolved on `PATH` or by absolute path; cwd in workspace | Enabled for Execute-intent tools                                                                     |
-| Shell command strings | Approved, high risk | Non-login shell; cwd in workspace                                 | Interactive sessions only unless an unattended session opts in                                       |
-| Network egress        | Approved            | Outbound TLS to configured provider endpoints                     | Enabled for harness provider clients; no inbound or listening socket                                 |
-| Secret environment    | Approved, high risk | Named provider keys only                                          | Enabled per configured provider; child-process non-inheritance is required but not implemented (gap) |
+| Authority class       | 0.1.0 status        | Default scope                                                     | Default mode                                                                                                          |
+| --------------------- | ------------------- | ----------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Workspace read        | Approved            | The session workspace root                                        | Enabled for Inspect-intent tools                                                                                      |
+| Workspace write       | Approved            | The session workspace root                                        | Enabled for Modify-intent tools, subject to role gates                                                                |
+| Arbitrary argv        | Approved            | Programs resolved on `PATH` or by absolute path; cwd in workspace | Enabled for Execute-intent tools                                                                                      |
+| Shell command strings | Approved, high risk | Non-login shell; cwd in workspace                                 | Interactive sessions only unless an unattended session opts in                                                        |
+| Network egress        | Approved            | Outbound TLS to configured provider endpoints                     | Enabled for harness provider clients; no inbound or listening socket                                                  |
+| Secret environment    | Approved, high risk | Named provider keys only                                          | Enabled per configured provider; host-spawned commands receive an allowlisted environment with no secret-shaped names |
 
 Every class is deny-by-default at the policy layer even though the owner
 approved the ceiling: a session, role, or tool that is not granted a class does
@@ -158,27 +158,61 @@ not receive it.
 ### Arbitrary argv
 
 - The preferred execution primitive is an explicit program plus argument
-  vector, with no unquoted shell string at the call site. The current standalone
-  backend joins single-quoted arguments and executes them through the POSIX
-  shell; a native argv spawn remains CTX-0016 work.
+  vector, with no unquoted shell string at the call site. The standalone
+  backend passes each element as a positional argument to a constant POSIX
+  `sh` wrapper (`exec "$@"`); no caller value is interpolated into the script
+  text. A native `execve`-style spawn is still not available in pure Lua and
+  is an open point, not a claim.
 - The working directory must resolve inside the workspace root. The resolver
   rules above apply.
-- The child environment must be a scrubbed baseline plus explicitly allowed
-  variables. Secret names in the ledger must never be included. `HOME` is passed
-  only because ordinary build tools require it; that still grants the child the
-  user's ambient file access, which is a residual risk, not a sandbox claim.
-  The current `run_command` path calls `io.popen` with the parent environment,
-  so allowlisted provider keys are inherited today; this is a known gap.
-- The harness records the resolved executable path, argv, cwd, exit status, and
-  duration before the process is allowed to run.
+- The child environment is rebuilt from a fixed allowlist rather than
+  inherited: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`,
+  `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `XDG_CONFIG_HOME`, plus explicit
+  caller declarations. `PATH` is copied from the parent and sanitized to
+  absolute entries; it is not inherited implicitly. Secret-shaped names (`*_KEY`, `*_TOKEN`, `*_SECRET`,
+  `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIAL[S]`), `LD_*`/`DYLD_*`, and shell
+  injection names (`IFS`, `ENV`, `BASH_ENV`, `CDPATH`, `GLOBIGNORE`,
+  `SHELLOPTS`, `BASHOPTS`, `PS4`, `PROMPT_COMMAND`) are refused even when a
+  caller declares them. The wrapper also strips shell-added `PWD`/`SHLVL`/`_` with
+  `env -u` for argv children; an explicit shell-string child still starts a
+  shell, which may set its own `SHLVL` or `_` variable. `HOME` is passed only because
+  ordinary build tools require it; that still grants the child the user's
+  ambient file access, which is a residual risk, not a sandbox claim.
+- The harness is required to record the resolved executable path, argv, cwd,
+  exit status, and duration before the process is allowed to run. No execution
+  audit stream exists yet, so this remains a known gap.
 - Each invocation has a finite timeout, bounded output, and a process group
-  owned by the harness. Cancellation targets only PIDs and process groups the
-  harness recorded at launch. Name- or pattern-based killing is forbidden.
-- Interactive stdin and TTY allocation are off by default. A user-requested
-  attach may enable them for that job only.
-- Detached execution, daemonization, and reparenting out of the owned process
-  tree are denied. A child that daemonizes is treated as an orphan risk and
-  cleaned up through its recorded process group.
+  recorded through a `setsid` session leader. GNU `timeout` (or `gtimeout`)
+  enforces expiry, signals the command group, and escalates to SIGKILL after a
+  bounded grace. After the direct command exits for any reason, a supervisor
+  sends TERM then KILL to the recorded PGID, preserving the command's exit
+  status; this removes background grandchildren that outlive normal completion.
+  The supervisor validates the PGID file as a user-owned `0600` regular file
+  with link count 1, rejects non-numeric/`<=1` values, and checks the group
+  exists before signaling. The harness never sends a name- or pattern-based kill
+  and never deliberately signals an unrecorded group. It cannot prove PGID
+  identity after the leader exits: same-user PGID reuse between leader exit and
+  the signal remains an accepted residual. `setsid`, `sleep`, `env`,
+  `timeout`/`gtimeout`, and `sh` must be resolvable or the primitive fails
+  closed as `unavailable`.
+  stdout and stderr are captured to private `0600` files and read back through
+  a fixed cap of 256 KiB per stream; the result carries `timed_out`,
+  `truncated`, `exit_code`, and a typed `outcome`. GNU maps expiry to 124 and
+  kill-after escalation to 137, so a child that itself exits 124/137 is
+  indistinguishable and is reported as a timeout.
+- There is no asynchronous cancellation hook in the single-threaded Lua
+  runtime yet. Timeout expiry and the post-exit group sweep are the termination
+  triggers; a caller cannot interrupt an in-flight invocation. This is a known
+  limitation, not a claim that the policy's recorded-PID cancellation
+  requirement is complete.
+- Interactive stdin and TTY allocation are off by default. stdin is
+  `/dev/null` unless the caller supplies bytes, which are staged in an
+  exclusive `0600` file inside the private runtime directory. No TTY is
+  allocated for a child.
+- Detached execution, daemonization, and reparenting out of the recorded process
+  tree are denied; the post-exit sweep terminates background members of the
+  recorded group. A child that calls `setsid` itself can still escape group
+  termination; that remains an orphan risk and is recorded below.
 - Executing setuid/setgid binaries and invoking privilege-transition tools
   (`sudo`, `su`, `doas`, `pkexec`) is denied.
 - Network access by spawned programs is not mediated by the harness. The argv
@@ -198,8 +232,8 @@ controls are mandatory:
    operation behind the same role gates as argv, with its own audit event. It
    is not folded into the generic process call.
 3. **Non-login, non-interactive shell.** The harness invokes a non-login shell
-   with `-c`, does not source profile or rc files, and does not allocate a TTY
-   unless the user explicitly attaches.
+   with `-c`, does not source profile or rc files, and allocates no TTY. stdin
+   is `/dev/null` unless the caller supplies bytes.
 4. **Workspace cwd.** The working directory resolves inside the workspace root.
 5. **Scrubbed environment.** The shell receives the same scrubbed environment
    as argv. Secret environment variables are absent.
@@ -214,8 +248,11 @@ controls are mandatory:
 9. **No remote-pipe execution.** Piping downloaded content directly into a shell
    or interpreter is denied. The content must be fetched, inspected, and
    executed as a separate recorded step.
-10. **Bounded execution.** The same timeout, output bound, process-group
-    ownership, and recorded-PID cancellation rules as argv apply.
+10. **Bounded execution.** The same timeout, 256 KiB-per-stream capture bound,
+    setsid-recorded group, and post-exit TERM/KILL sweep as argv apply.
+    Asynchronous cancellation by recorded PID is not exposed by the current
+    runtime; timeout expiry and normal-exit group cleanup are the in-flight
+    termination triggers.
 
 Residual risk: a shell command can write outside the workspace root because the
 harness has no OS-level confinement in 0.1.0. The path sandbox governs
@@ -270,8 +307,11 @@ authority.
   provider. Project configuration cannot redirect the header to another host.
 - Child processes must never inherit an allowlisted secret. A command that needs
   a credential must obtain it outside Wheel or through a future explicit
-  credential-helper design with its own review. The current `run_command` path
-  inherits the parent environment; this is a release-blocking known gap.
+  credential-helper design with its own review. The process primitive rebuilds
+  the child environment from an allowlist that contains no secret names, and it
+  refuses secret-shaped caller declarations, so an allowlisted provider key is
+  absent from argv and shell children. The same-user `HOME` grant and the
+  unresolved non-secret variables listed under known gaps remain.
 - Every output sink applies two redaction passes: exact-value redaction for
   loaded secrets, and shape-based redaction for bearer tokens, key prefixes,
   `api_key`/`token`/`secret` assignments, and long token-like runs. Redaction
@@ -295,7 +335,14 @@ authority.
   The standalone backend uses `$XDG_RUNTIME_DIR/wheel` when set, otherwise
   `$XDG_STATE_HOME/wheel/tmp`, otherwise `$HOME/.local/state/wheel/tmp`; the
   directory is created or repaired with mode 0700 before a path is returned.
-  The ambient `os.tmpname` location is not used.
+  New files are created with `mktemp` in the private `0700` directory and
+  verified with `stat`/`id` as user-owned regular `0600` files with link count 1;
+  exact paths use an `ln` hard-link commit so a pre-existing regular file, FIFO,
+  device, or symlink is refused, never followed, truncated, or opened. Process capture files and
+  staged stdin use the same primitive and are removed on success, error,
+  timeout, and spawn failure; a cleanup failure is reported as a typed `failure`
+  instead of a false success. The ambient
+  `os.tmpname` location is not used.
 - Durable harness state lives under `$XDG_STATE_HOME/wheel/`; user
   configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
   outside model-visible workspace authority. No state path is hardcoded to a
@@ -675,25 +722,25 @@ secret environment reads.
 
 ### Threats and controls
 
-| Threat                                            | Control                                                                                    | Residual risk                                              |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------- |
-| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                        | A legitimate-looking destructive command can still pass    |
-| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval     | The model can be persuaded within its granted authority    |
-| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget        | Trusted code can still consume CPU/memory and shape policy |
-| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors      | TOCTOU races the runtime cannot fully close                |
-| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests      | Novel secret shapes may evade heuristic redaction          |
-| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification    | Compromised harness or user-level malware can exfiltrate   |
-| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in                                     | Shell can write anywhere the user can; no OS confinement   |
-| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority   | Upstream compromise remains possible                       |
-| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                | Same-user processes can rewrite it                         |
-| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                              | Same-user processes can tamper with the log                |
-| Orphaned or daemonized processes                  | Owned process groups, no detach, recorded-PID cancellation, cleanup on close               | A child can still escape supervision by design or defect   |
-| Denial of service through output or configuration | Finite output, timeouts, instruction/time/memory budget for project configuration          | Resource exhaustion can still degrade the session          |
-| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened | A reader may still assume plugin semantics                 |
-| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending             | Not designed or implemented in 0.1.0                       |
-| Update-channel compromise                         | Signed artifacts and verified updates are required before release                          | No signing or update channel exists yet                    |
-| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                          | A tool with a root grant can reach that whole root         |
-| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed           | Runtime-level dumps are outside harness control            |
+| Threat                                            | Control                                                                                                      | Residual risk                                                         |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
+| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                                          | A legitimate-looking destructive command can still pass               |
+| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval                       | The model can be persuaded within its granted authority               |
+| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget                          | Trusted code can still consume CPU/memory and shape policy            |
+| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors                        | TOCTOU races the runtime cannot fully close                           |
+| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests                        | Novel secret shapes may evade heuristic redaction                     |
+| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification                      | Compromised harness or user-level malware can exfiltrate              |
+| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in                                                       | Shell can write anywhere the user can; no OS confinement              |
+| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                     | Upstream compromise remains possible                                  |
+| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                  | Same-user processes can rewrite it                                    |
+| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                | Same-user processes can tamper with the log                           |
+| Orphaned or daemonized processes                  | setsid-recorded PGID, metadata validation, existence check, post-exit TERM/KILL sweep, no detach             | A child that calls setsid escapes; same-user PGID reuse is possible   |
+| Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration | Disk capture during a run has no file-size quota; CPU is not budgeted |
+| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                   | A reader may still assume plugin semantics                            |
+| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                               | Not designed or implemented in 0.1.0                                  |
+| Update-channel compromise                         | Signed artifacts and verified updates are required before release                                            | No signing or update channel exists yet                               |
+| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                            | A tool with a root grant can reach that whole root                    |
+| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                             | Runtime-level dumps are outside harness control                       |
 
 ### Residual risks accepted for 0.1.0
 
@@ -758,10 +805,14 @@ network boundary, covering at minimum:
 
 The current `tests/real_host_fixture.lua` covers activation, command smoke, real
 filesystem/process/temporary-file behavior, path and destructive-command
-denials, and the trust approval/content-change/re-approval/revocation-across-
-restart flow against a private XDG state directory. It does not cover process
-timeout/cancellation, a provider stub, audit output, or a Bitty panel
-presentation, so Gate 2 remains open and this is not a security approval.
+denials, a real process timeout with a child-plus-grandchild process-group
+check, a normal-exit background-child sweep, a scrubbed-environment probe, stdin
+round-trip, exclusive `0600` temporary creation with a symlink refusal, and the trust
+approval/content-change/re-approval/revocation-across-restart flow against a
+private XDG state directory. Cancellation (as distinct from timeout) is not
+implemented, and the fixture does not cover a provider stub, audit output, or a
+Bitty panel presentation, so Gate 2 remains open and this is not a security
+approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
@@ -806,7 +857,10 @@ that the policy relies on, and they remain unverified until the gates pass:
   wall-clock, and CPU-time calls. The production backend is the standalone
   POSIX surface, selected explicitly with `select_backend("standalone")`;
   unsupported platforms and unavailable primitives fail closed with typed
-  denials. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
+  denials. The process primitive runs under GNU timeout with a
+  `setsid`-recorded process group, a post-exit TERM/KILL sweep, a 256 KiB
+  per-stream capture cap, a rebuilt allowlist environment, and an explicit
+  stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
   `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
@@ -823,13 +877,21 @@ Known gaps relative to this policy (not claims of compliance):
   absolute paths outside the root, but does not reject NUL/control bytes,
   resolve symlink targets, reject non-regular files, or re-validate at open
   time. Writes truncate in place; there is no atomic temp-file-plus-rename.
-- Inspect-intent tools now pass argv through `WheelHost.proc.run_program` and
-  quote cwd with a single-quote helper, but `run_command` remains the explicit
-  shell-string primitive: the command body is model-provided by design and is
-  screened only by the partial deny-list.
-- The child environment is inherited from the parent. `run_command` does not
-  scrub allowlisted provider keys, so spawned processes can read them.
-  Non-inheritance is required before release.
+- Inspect-intent tools pass argv through `WheelHost.proc.run_program` and
+  quote cwd with a single-quote helper; `run_command` remains the explicit
+  shell-string primitive and the command body is model-provided by design, so
+  it is screened only by the partial deny-list. The argv primitive still runs
+  through a constant POSIX `sh` wrapper because pure Lua has no `execve`; the
+  wrapper passes every element as `"$@"` and interpolates no caller text.
+- The child environment is rebuilt from the fixed allowlist described above
+  and never inherited; secret-shaped names are refused even as explicit
+  declarations. Remaining gaps: `HOME` still grants the child the user's
+  ambient file access; a caller may declare any non-secret non-injection name;
+  wrapper tools (`env`, `timeout`/`gtimeout`, `sh`) are resolved through the
+  caller's `PATH`, so a same-user `PATH` compromise can substitute them; host
+  path helpers (`mkdir`, `chmod`, `test`, `ln`) also run through the parent
+  environment, though their argv is host-controlled and they never execute
+  caller text.
 - A home-rooted workspace does not exclude the harness's own
   `$XDG_CONFIG_HOME`/`$XDG_STATE_HOME` files, so a file tool can read or write
   the trust store or audit log when they fall under the root. The trust-store
@@ -844,9 +906,27 @@ Known gaps relative to this policy (not claims of compliance):
 - The role matrix is only partially enforced: `Research`/`Reviewer` are
   read-only and `Commander` is denied Modify, but there is no `Primary` role,
   and Commander Custom-mutating and the full matrix are not enforced.
-- The process backend does not enforce the accepted timeout, bounded output,
-  interactive stdin/TTY-off default, detached-execution denial, or an owned
-  process group; cancellation by recorded PID/process group is policy only.
+- The process primitive enforces a finite timeout (default 120 s, maximum
+  10 min), a 256 KiB capture cap per stream, `/dev/null` stdin unless bytes are
+  supplied, a `setsid`-recorded process group, timeout SIGKILL escalation, and
+  a post-exit TERM/KILL sweep (250 ms grace) on success, error, and timeout.
+  Remaining gaps: there is no asynchronous cancellation hook, so timeout expiry
+  and the post-exit sweep are the only termination triggers; GNU timeout maps
+  expiry to 124 and kill-after to 137, so a child that itself exits 124/137 is
+  indistinguishable; `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
+  must be resolvable or the primitive fails closed as `unavailable`; timeout
+  enforcement is not a real-time guarantee; disk capture has no per-file quota,
+  only the timeout bound; a child that calls `setsid` itself escapes the
+  recorded group; the supervisor checks that the recorded PGID exists but cannot
+  prove its identity after the leader exits, so same-user PGID reuse is an
+  accepted residual; and there is no rlimit, cgroup, seccomp, or OS confinement
+  for spawned programs.
+- Temporary-file creation and the subsequent content write are separate
+  operations. The directory is `0700`, so another OS user cannot substitute a
+  path, but a same-user process could replace the freshly created path before
+  the writer opens it; pure Lua 5.1 has no `O_NOFOLLOW`/`O_EXCL` write handle.
+  This narrows to the same-user boundary already accepted elsewhere, not an OS
+  guarantee.
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
   host, shows escaped full content plus a pure-Lua change diff under a per-run
@@ -865,12 +945,12 @@ Known gaps relative to this policy (not claims of compliance):
   seams; no command or environment variable reaches them in production paths,
   but they are not a policy boundary.
 - Native hashing and host metadata resolve `sha256sum`/`shasum`/`openssl`,
-  `realpath`/`readlink`, `stat`, `test`, `id`, and `mktemp` through `PATH`. A
-  same-user attacker who controls the environment or `PATH` can influence
-  those tools; the checks are not a privilege boundary. Trust approval is a
-  high-risk operation, and the policy requires it to fail closed when audit
-  cannot record it; no execution audit stream exists yet, so that control is
-  not implemented.
+  `realpath`/`readlink`, `stat`, `test`, `id`, `mktemp`, `env`, `setsid`,
+  `sleep`, `timeout`/`gtimeout`, and `sh` through `PATH`. A same-user attacker
+  who controls the environment or `PATH` can influence those tools; the checks
+  are not a privilege boundary. Trust approval is a high-risk operation, and the
+  policy requires it to fail closed when audit cannot record it; no execution
+  audit stream exists yet, so that control is not implemented.
 - The trust store is a same-user file, so a same-user process can still rewrite
   it; ownership and permission checks narrow accidental or cross-user misuse,
   not a compromised account. The atomic rename orders the replacement but the
