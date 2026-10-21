@@ -97,6 +97,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- CTX-0022 local gate: `just test` selects `lua5.1`, then `luajit`, then `lua`
+  through `scripts/test-gate.sh`; `just test-gate` self-tests the selection
+  branches, and LuaJIT disables the JIT for the evaluated config chunk so the
+  instruction-limit test cannot hang. `tmp_root` normalization collapses
+  repeated `/` separators and drops `.` segments before the `.../wheel/tmp`
+  symlink guard.
 - `StdioAdapter` passes the formatted prompt on stdin through the argv process
   primitive instead of writing a non-exclusive prompt temp file and invoking a
   shell redirection. String commands are tokenized conservatively (quotes only)
@@ -156,6 +162,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0022 typed loader diagnostics: `team`, `context`, and `tool` load
+  `wheel.errors` first, clear Lua 5.1 failed-require sentinels, preserve the
+  typed `E_CAPABILITY_DENIED` class/code and rooted cause, keep present-but-
+  broken module causes, and restore the alternate `lua.wheel.errors` root.
 - CTX-0016 final security pass: temp files use `mktemp` plus 0600 regular-file
   ownership/link validation, exact paths are committed with a hard link, and
   FIFO/symlink-to-device/pre-existing paths are refused; the PGID file is
