@@ -38,7 +38,12 @@ function M.usage()
 end
 
 local function add_scenario(options, value)
+  if value:sub(1, 1) == "," or value:sub(-1) == "," or value:find(",,", 1, true) then
+    return "--scenario contains an empty scenario name"
+  end
+  local found = false
   for name in value:gmatch("[^,]+") do
+    found = true
     if not VALID_SCENARIO[name] then
       return string.format("unknown scenario '%s'; valid scenarios: %s",
         name, table.concat(M.SCENARIOS, ", "))
@@ -47,6 +52,9 @@ local function add_scenario(options, value)
       options.selected[name] = true
       options.scenarios[#options.scenarios + 1] = name
     end
+  end
+  if not found then
+    return "--scenario requires at least one scenario name"
   end
   return nil
 end

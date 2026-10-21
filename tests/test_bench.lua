@@ -243,6 +243,10 @@ run_test("bench: empty or subset smoke invocations fail closed", function()
   local empty_output, empty_code = run_bench("--scenario , --samples 1 --format json")
   assert(empty_code == 2,
     "empty scenario selector must be rejected, got " .. tostring(empty_code) .. ": " .. empty_output)
+  local mixed_output, mixed_code = run_bench(
+    "--scenario activation --scenario , --samples 1 --format json")
+  assert(mixed_code == 2,
+    "a later empty selector must be rejected, got " .. tostring(mixed_code) .. ": " .. mixed_output)
 end)
 
 run_test("bench: smoke evaluation rejects missing groups and failing ceilings", function()
@@ -260,6 +264,12 @@ run_test("bench: smoke evaluation rejects missing groups and failing ceilings", 
   }
   local evaluation = smoke.evaluate(record)
   assert(evaluation.passed == false, "a failing/missing smoke check must fail")
+  local empty_groups = {}
+  for _, name in ipairs({ "activation", "process", "runner", "orchestration", "context" }) do
+    empty_groups[#empty_groups + 1] = { name = name, series = {} }
+  end
+  assert(smoke.evaluate(empty_groups).passed == false,
+    "present but empty smoke groups must fail")
   local failed = 0
   for _, check in ipairs(evaluation.checks) do
     if not check.ok then failed = failed + 1 end

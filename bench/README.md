@@ -87,7 +87,10 @@ unavailable. A missing interpreter fails closed.
   activation sample.
 - `process` measures each call individually. The per-call distribution across
   all calls is reported, not a batch total. The fixed sweep grace is reported
-  separately from the command's own timeout.
+  separately from the command's own timeout. Process calls are fresh OS
+  boundaries, so `--warmup` does not apply to this scenario; the JSON records
+  the requested value for the other scenarios. The 1,000-slot context series
+  also runs without a warm-up to avoid doubling its cost.
 - `runner` measures the whole `run_task` call in CPU time and the mock
   provider's stream work through a thin wrapper; runner overhead is the
   difference. The mock performs no I/O and no sleeps.

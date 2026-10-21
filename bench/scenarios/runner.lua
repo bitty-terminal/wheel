@@ -147,7 +147,7 @@ function M.run(ctx)
     totals[turns] = {}
     provider[turns] = {}
     overhead[turns] = {}
-    for _ = 1, math.max(1, ctx.warmup) do
+    for _ = 1, ctx.warmup do
       run_once(turns)
     end
     for _ = 1, samples do

@@ -25,6 +25,7 @@ M.ORCHESTRATION_MAX_SCALING = 200         -- 10-task median / 1-task median
 
 M.CONTEXT_COMPILE_P95_US = 2000000        -- 2 s at the largest context cardinality
 M.CONTEXT_MAX_SCALING = 500               -- smoke 100-slot median / 10-slot median (full suite also runs 1000)
+M.MIN_CHECKS = 13
 
 local function by_name(records)
   local map = {}
@@ -154,7 +155,7 @@ local function evaluate(records)
       scaling, M.CONTEXT_MAX_SCALING, "ratio")
   end
 
-  local passed = #checks > 0
+  local passed = #checks >= M.MIN_CHECKS
   for _, name in ipairs({ "activation", "process", "runner", "orchestration", "context" }) do
     if not map[name] then
       passed = false

@@ -116,10 +116,11 @@ function M.run(ctx)
     counts[size] = samples
     collected[size] = { put_us = {}, get_us = {}, compile_us = {} }
 
-    -- A warm-up at 1,000 slots would double the most expensive series for no
-    -- information when the real sample count is one.
-    local warmup = math.max(1, ctx.warmup)
-    if samples <= 1 or size >= 1000 then
+    -- Honor the requested warm-up exactly. At 1,000 slots a warm-up would
+    -- double the most expensive series for little information, so that one
+    -- cardinality deliberately runs cold; the record and README say so.
+    local warmup = ctx.warmup
+    if size >= 1000 then
       warmup = 0
     end
     for _ = 1, warmup do
