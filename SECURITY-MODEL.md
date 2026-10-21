@@ -187,9 +187,14 @@ not receive it.
   bounded grace. After the direct command exits for any reason, a supervisor
   sends TERM then KILL to the recorded PGID, preserving the command's exit
   status; this removes background grandchildren that outlive normal completion.
-  The harness never sends a name- or pattern-based kill and never signals an
-  unrecorded group. `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
-  must be resolvable or the primitive fails closed as `unavailable`.
+  The supervisor validates the PGID file as a user-owned `0600` regular file
+  with link count 1, rejects non-numeric/`<=1` values, and checks the group
+  exists before signaling. The harness never sends a name- or pattern-based kill
+  and never deliberately signals an unrecorded group. It cannot prove PGID
+  identity after the leader exits: same-user PGID reuse between leader exit and
+  the signal remains an accepted residual. `setsid`, `sleep`, `env`,
+  `timeout`/`gtimeout`, and `sh` must be resolvable or the primitive fails
+  closed as `unavailable`.
   stdout and stderr are captured to private `0600` files and read back through
   a fixed cap of 256 KiB per stream; the result carries `timed_out`,
   `truncated`, `exit_code`, and a typed `outcome`. GNU maps expiry to 124 and
@@ -330,11 +335,13 @@ authority.
   The standalone backend uses `$XDG_RUNTIME_DIR/wheel` when set, otherwise
   `$XDG_STATE_HOME/wheel/tmp`, otherwise `$HOME/.local/state/wheel/tmp`; the
   directory is created or repaired with mode 0700 before a path is returned.
-  New files are created exclusively with mode 0600 (`set -C` under `umask 077`)
-  and a pre-existing path or symbolic link is refused, never followed or
-  truncated. Process capture files and staged stdin use the same primitive and
-  are removed on success, error, timeout, and spawn failure; a cleanup failure
-  is reported as a typed `failure` instead of a false success. The ambient
+  New files are created with `mktemp` in the private `0700` directory and
+  verified with `stat`/`id` as user-owned regular `0600` files with link count 1;
+  exact paths use an `ln` hard-link commit so a pre-existing regular file, FIFO,
+  device, or symlink is refused, never followed, truncated, or opened. Process capture files and
+  staged stdin use the same primitive and are removed on success, error,
+  timeout, and spawn failure; a cleanup failure is reported as a typed `failure`
+  instead of a false success. The ambient
   `os.tmpname` location is not used.
 - Durable harness state lives under `$XDG_STATE_HOME/wheel/`; user
   configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
@@ -727,7 +734,7 @@ secret environment reads.
 | Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                     | Upstream compromise remains possible                                  |
 | Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                  | Same-user processes can rewrite it                                    |
 | Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                | Same-user processes can tamper with the log                           |
-| Orphaned or daemonized processes                  | setsid-recorded PGID, timeout plus post-exit TERM/KILL sweep, no detach                                      | A child that calls setsid can still escape the recorded group         |
+| Orphaned or daemonized processes                  | setsid-recorded PGID, metadata validation, existence check, post-exit TERM/KILL sweep, no detach             | A child that calls setsid escapes; same-user PGID reuse is possible   |
 | Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration | Disk capture during a run has no file-size quota; CPU is not budgeted |
 | Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                   | A reader may still assume plugin semantics                            |
 | Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                               | Not designed or implemented in 0.1.0                                  |
@@ -910,8 +917,10 @@ Known gaps relative to this policy (not claims of compliance):
   must be resolvable or the primitive fails closed as `unavailable`; timeout
   enforcement is not a real-time guarantee; disk capture has no per-file quota,
   only the timeout bound; a child that calls `setsid` itself escapes the
-  recorded group; and there is no rlimit, cgroup, seccomp, or OS confinement for
-  spawned programs.
+  recorded group; the supervisor checks that the recorded PGID exists but cannot
+  prove its identity after the leader exits, so same-user PGID reuse is an
+  accepted residual; and there is no rlimit, cgroup, seccomp, or OS confinement
+  for spawned programs.
 - Temporary-file creation and the subsequent content write are separate
   operations. The directory is `0700`, so another OS user cannot substitute a
   path, but a same-user process could replace the freshly created path before

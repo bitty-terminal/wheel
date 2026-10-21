@@ -516,7 +516,8 @@ local tool_read_file = {
     local truncated = false
     local reached_start = not start_l
 
-    for _, line in ipairs(split_content_lines(file_content)) do
+    local file_lines = split_content_lines(file_content)
+    for _, line in ipairs(file_lines) do
       line_no = line_no + 1
       if start_l and line_no >= start_l then
         reached_start = true
@@ -543,7 +544,8 @@ local tool_read_file = {
       end
     end
 
-    if start_l and not reached_start and #file_content > max_b then
+    local prefix_truncated = #file_content > max_b
+    if start_l and not reached_start and prefix_truncated then
       return {
         success = false,
         exit_code = 1,
@@ -556,6 +558,18 @@ local tool_read_file = {
       }
     end
 
+    if not truncated and prefix_truncated then
+      local prefix_lines = #file_lines
+      local last_line_partial = file_content:sub(-1) ~= "\n"
+      if last_line_partial then
+        local range_includes_partial = (not end_l or end_l >= prefix_lines)
+          and (not start_l or start_l <= prefix_lines)
+        truncated = range_includes_partial
+      elseif not end_l or end_l > prefix_lines then
+        truncated = true
+      end
+    end
+
     local content = table.concat(lines, "\n")
     if truncated then
       content = content .. string.format("\n[... output truncated at %d bytes ...]", bytes_accum)
@@ -566,6 +580,7 @@ local tool_read_file = {
       exit_code = 0,
       stdout = content,
       stderr = "",
+      truncated = truncated,
       lines_read = #lines,
       total_lines = #lines,
     }
@@ -827,6 +842,7 @@ local tool_list_directory = {
       stdout = table.concat(entries, "\n"),
       stderr = "",
       total_entries = count,
+      truncated = listing.truncated == true,
     }
   end,
 }

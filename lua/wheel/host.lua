@@ -280,7 +280,7 @@ WheelHost.LIMITS = {
 --- session/PGID leader), preserves the command status, then terminates any
 --- remaining members of the recorded PGID with TERM and a bounded KILL. It never
 --- uses a name or pattern; `$pgid` is validated as a numeric PGID greater than 1.
-local SUPERVISOR_SCRIPT = 'pgid_file="$1"; grace="$2"; sleep_bin="$3"; shift 3; "$@"; status=$?; if [ -s "$pgid_file" ]; then read -r pgid < "$pgid_file" || pgid=""; case "$pgid" in ""|*[!0-9]*) : ;; *) if [ "$pgid" -gt 1 ]; then kill -TERM -"$pgid" 2>/dev/null || :; if kill -0 -"$pgid" 2>/dev/null; then "$sleep_bin" "$grace" 2>/dev/null || :; kill -KILL -"$pgid" 2>/dev/null || :; fi; fi ;; esac; fi; exit "$status"'
+local SUPERVISOR_SCRIPT = 'pgid_file="$1"; grace="$2"; sleep_bin="$3"; shift 3; "$@"; status=$?; if [ -s "$pgid_file" ] && [ -f "$pgid_file" ] && [ ! -L "$pgid_file" ] && [ "$(stat -c \'%u %a %h\' -- "$pgid_file" 2>/dev/null)" = "$(id -u) 600 1" ]; then read -r pgid < "$pgid_file" || pgid=""; case "$pgid" in ""|*[!0-9]*) : ;; *) if [ "$pgid" -gt 1 ] && kill -0 -"$pgid" 2>/dev/null; then kill -TERM -"$pgid" 2>/dev/null || :; if kill -0 -"$pgid" 2>/dev/null; then "$sleep_bin" "$grace" 2>/dev/null || :; kill -KILL -"$pgid" 2>/dev/null || :; fi; fi ;; esac; fi; exit "$status"'
 
 --- Session leader. It records its own PID/PGID in the exclusive file created
 --- by the host, then replaces itself with the scrubbed command chain. No caller
@@ -469,46 +469,6 @@ local function build_child_environment(getenv, overrides)
   return assignments
 end
 
---- Create an empty file exclusively with mode 0600.
--- `set -C` (noclobber) makes the redirection fail if the path exists, and
--- `umask 077` makes the new file 0600 before it becomes visible. A pre-existing
--- file or symbolic link is never followed or truncated.
--- @param path string
--- @return boolean ok, string? err
-local function create_private_file(path)
-  require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
-  local status = normalized_exit_status(os.execute(
-    "( umask 077; set -C; : > " .. shell_quote(path) .. " ) 2>/dev/null"))
-  if status ~= 0 then
-    return false, "temporary path already exists or cannot be created"
-  end
-  return true
-end
-
---- Write bytes to a file that was just created exclusively.
--- The path is inside the harness-owned 0700 directory and was created empty by
--- `create_private_file`; `r+` never creates or truncates a path.
--- @param path string
--- @param content string
--- @return boolean ok, string? err
-local function write_private_file(path, content)
-  require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
-  local file, open_err = io.open(path, "r+")
-  if not file then
-    return false, tostring(open_err)
-  end
-  local wrote, write_err = file:write(content or "")
-  if not wrote then
-    file:close()
-    return false, tostring(write_err or "write failed")
-  end
-  local close_ok, close_err = file:close()
-  if not close_ok then
-    return false, tostring(close_err or "close failed")
-  end
-  return true
-end
-
 --- Test whether <path> itself is a symbolic link (argv `test -L`).
 -- Any result other than the POSIX true/false status fails closed, so a missing
 -- `test` or an unexpected invocation error cannot be read as "not a link".
@@ -534,6 +494,139 @@ local function path_is_symlink(path)
     return false
   end
   error(WheelErrors.capability_denied("fs.write"), 0)
+end
+
+--- Cached effective uid for private-file ownership checks.
+local cached_euid = nil
+
+--- Return the current effective uid, failing closed when it cannot be read.
+-- @return number? uid
+local function current_euid()
+  if cached_euid ~= nil then
+    return cached_euid
+  end
+  require_surface(type(io) == "table" and type(io.popen) == "function", "fs.write")
+  local pipe = io.popen("id -u 2>/dev/null", "r")
+  if not pipe then
+    return nil
+  end
+  local line = pipe:read("*l")
+  pipe:close()
+  local uid = tonumber((line or ""):match("^%s*(%d+)%s*$"))
+  if uid == nil then
+    return nil
+  end
+  cached_euid = uid
+  return uid
+end
+
+--- Read lstat-style metadata for a private file through `stat`.
+-- The caller already rejects symlinks with `test -L`; this probe supplies
+-- owner, mode, link count, and type. Any unparsable result fails closed.
+-- @param path string
+-- @return table? { uid, mode, links, kind }
+local function private_file_metadata(path)
+  require_surface(type(io) == "table" and type(io.popen) == "function", "fs.write")
+  local pipe = io.popen("stat -c '%u %a %h %F' -- " .. shell_quote(path) .. " 2>/dev/null", "r")
+  if not pipe then
+    return nil
+  end
+  local line = pipe:read("*l")
+  pipe:close()
+  local uid, mode, links, kind = (line or ""):match("^(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+  if not uid or not mode or not links or not kind then
+    return nil
+  end
+  return {
+    uid = tonumber(uid),
+    mode = tonumber(mode, 8),
+    links = tonumber(links),
+    kind = kind:lower(),
+  }
+end
+
+--- Verify that <path> is the harness-owned regular 0600 file it claims to be.
+-- Rejects symbolic links, FIFOs, devices, directories, foreign ownership,
+-- group/world permissions, and multiply-linked paths before a caller opens it.
+-- @param path string
+-- @return boolean ok, string? err
+local function verify_private_file(path)
+  if path_is_symlink(path) then
+    return false, "private path is a symbolic link"
+  end
+  local euid = current_euid()
+  if euid == nil then
+    return false, "cannot determine the effective uid"
+  end
+  local info = private_file_metadata(path)
+  if info == nil then
+    return false, "private path metadata is unavailable"
+  end
+  if not info.kind:match("^regular") then
+    return false, "private path is not a regular file"
+  end
+  if info.uid ~= euid then
+    return false, "private path is not owned by the current user"
+  end
+  if info.mode ~= 384 then
+    return false, "private path is not mode 0600"
+  end
+  if info.links ~= 1 then
+    return false, "private path has an unexpected hard-link count"
+  end
+  return true
+end
+
+--- Create a new empty 0600 regular file with `mktemp` in <dir> and verify it.
+-- The caller receives a freshly created path, never a pre-existing one.
+-- @param dir string
+-- @return string? path, string? err
+local function create_private_temp(dir)
+  require_surface(type(io) == "table" and type(io.popen) == "function", "fs.write")
+  local pipe = io.popen("mktemp " .. shell_quote(dir .. "/wheel-XXXXXX") .. " 2>/dev/null", "r")
+  if not pipe then
+    return nil, "mktemp is unavailable"
+  end
+  local path = pipe:read("*l")
+  pipe:close()
+  path = path and path:match("^%s*(.-)%s*$") or ""
+  if path == "" or path:sub(1, #dir + 1) ~= dir .. "/" then
+    return nil, "mktemp did not return a private path"
+  end
+  local ok, err = verify_private_file(path)
+  if not ok then
+    os.remove(path)
+    return nil, err
+  end
+  return path
+end
+
+--- Write bytes to a verified private 0600 regular file that was just created.
+-- The path is checked for regular-file type, ownership, mode, and link count
+-- immediately before the open; `r+` never creates or truncates a path.
+-- @param path string
+-- @param content string
+-- @return boolean ok, string? err
+local function write_private_file(path, content)
+  require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
+  local verified, verify_err = verify_private_file(path)
+  if not verified then
+    return false, verify_err
+  end
+  local file, open_err = io.open(path, "r+")
+  if not file then
+    return false, tostring(open_err)
+  end
+  local wrote, write_err = file:write(content or "")
+  if not wrote then
+    file:close()
+    return false, tostring(write_err or "write failed")
+  end
+  local close_ok, close_err = file:close()
+  if not close_ok then
+    return false, tostring(close_err or "close failed")
+  end
+  return true
 end
 
 --- Return the harness-owned parent component to guard alongside <dir>.
@@ -659,7 +752,7 @@ function standalone.new(opts)
   -- separate, and a nonzero `ls` status or timeout is reported as failure so a
   -- missing/broken `ls` never becomes directory content.
   -- @param path string
-  -- @return table { ok, code, stdout, stderr, entries, total, timed_out, outcome }
+  -- @return table { ok, code, stdout, stderr, entries, total, timed_out, truncated, outcome }
   function backend.list_dir(path)
     local res = backend.run_program("ls", { "-la", "--", path })
     local entries = split_lines(res.stdout)
@@ -671,6 +764,7 @@ function standalone.new(opts)
       entries = entries,
       total = #entries,
       timed_out = res.timed_out,
+      truncated = res.truncated == true,
       outcome = res.outcome,
     }
   end
@@ -1022,16 +1116,23 @@ function standalone.new(opts)
         "the 'sleep' utility is unavailable; cannot bound the process-group sweep",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
+    for _, required in ipairs({ "mktemp", "stat", "id" }) do
+      if not resolve_tool(required) then
+        return process_failure(
+          "the '" .. required .. "' utility is unavailable; cannot validate private files",
+          WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
+      end
+    end
 
     local created = {}
     local function fresh_temp()
+      local dir_ok, dir = pcall(backend.tmp_dir)
+      if not dir_ok then
+        return nil
+      end
       for _ = 1, MAX_TMP_CREATE_ATTEMPTS do
-        local path_ok, path = pcall(backend.tmp_path)
-        if not path_ok then
-          return nil
-        end
-        local ok = create_private_file(path)
-        if ok then
+        local path = create_private_temp(dir)
+        if path then
           created[#created + 1] = path
           return path
         end
@@ -1354,9 +1455,9 @@ function standalone.new(opts)
     return string.format("%s/wheel-%s-%d", dir, process_token, tmp_sequence)
   end
 
-  --- Create <path> exclusively with mode 0600 and write <content>.
-  -- A pre-existing regular file or symbolic link is refused, never followed or
-  -- truncated. The caller owns removal.
+  --- Create <path> inside the private runtime directory with mode 0600 and
+  -- write <content>. A pre-existing regular file, FIFO, device, or symbolic
+  -- link is refused, never followed or truncated. The caller owns removal.
   -- @param path string
   -- @param content string?
   -- @return boolean ok, string? err
@@ -1368,18 +1469,44 @@ function standalone.new(opts)
     if content ~= nil and type(content) ~= "string" then
       return false, "temporary content must be a string"
     end
-    local ok, create_err = create_private_file(path)
-    if not ok then
-      return false, create_err
+    local dir_ok, dir = pcall(backend.tmp_dir)
+    if not dir_ok or path:sub(1, #dir + 1) ~= dir .. "/" or has_dot_only_segment(path) then
+      return false, "temporary path is outside the private directory"
     end
-    local wrote, write_err = write_private_file(path, content or "")
+    local probe, probe_err = create_private_temp(dir)
+    if not probe then
+      return false, probe_err
+    end
+    local wrote, write_err = write_private_file(probe, content or "")
     if not wrote then
-      local removed, remove_err = os.remove(path)
+      local removed, remove_err = os.remove(probe)
       if not removed then
         return false, tostring(write_err)
-          .. "; cleanup failed: " .. tostring(remove_err or path)
+          .. "; cleanup failed: " .. tostring(remove_err or probe)
       end
       return false, tostring(write_err)
+    end
+    local exists = normalized_exit_status(os.execute(
+      "test -e " .. shell_quote(path) .. " || test -L " .. shell_quote(path))) == 0
+    if exists then
+      os.remove(probe)
+      return false, "temporary path already exists"
+    end
+    local linked = normalized_exit_status(os.execute(
+      "ln -- " .. shell_quote(probe) .. " " .. shell_quote(path) .. " 2>/dev/null"))
+    if linked ~= 0 then
+      os.remove(probe)
+      return false, "temporary path already exists or cannot be linked"
+    end
+    local removed, remove_err = os.remove(probe)
+    if not removed then
+      os.remove(path)
+      return false, "temporary-link cleanup failed: " .. tostring(remove_err or probe)
+    end
+    local verified, verify_err = verify_private_file(path)
+    if not verified then
+      os.remove(path)
+      return false, verify_err
     end
     return true
   end
@@ -1393,17 +1520,20 @@ function standalone.new(opts)
     if content ~= nil and type(content) ~= "string" then
       return nil, "temporary content must be a string"
     end
-    for _ = 1, MAX_TMP_CREATE_ATTEMPTS do
-      local path_ok, path = pcall(backend.tmp_path)
-      if not path_ok then
-        return nil, "the private temporary directory is unavailable"
-      end
-      local ok = backend.tmp_create_exclusive(path, content)
-      if ok then
-        return path
-      end
+    local dir_ok, dir = pcall(backend.tmp_dir)
+    if not dir_ok then
+      return nil, "the private temporary directory is unavailable"
     end
-    return nil, "cannot create an exclusive temporary file"
+    local path, create_err = create_private_temp(dir)
+    if not path then
+      return nil, create_err
+    end
+    local wrote, write_err = write_private_file(path, content or "")
+    if not wrote then
+      os.remove(path)
+      return nil, write_err
+    end
+    return path
   end
 
   --- Wall-clock time in seconds since the epoch (os.time semantics).
@@ -1650,8 +1780,9 @@ function WheelHost.tmp.create(content)
   return invoke("fs.write", "tmp_create", content)
 end
 
---- Create `path` exclusively with mode 0600 and write `content`. A pre-existing
--- file or symlink is refused. The caller owns removal.
+--- Create `path` (inside the private runtime directory) exclusively with mode
+-- 0600 and write `content`. A pre-existing file, FIFO, device, or symlink is
+-- refused. The caller owns removal.
 -- @param path string
 -- @param content string?
 -- @return boolean ok, string? err

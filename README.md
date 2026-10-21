@@ -195,10 +195,11 @@ Standalone harness development does not require a Bitty host. Prerequisites:
 - Lua 5.1 or LuaJIT for the test and end-to-end recipes; a `lua` binary also
   satisfies the recipe when neither is installed.
 - A POSIX host with standard shell utilities. Process execution additionally
-  requires `env`, `sleep`, GNU `timeout` (or Homebrew `gtimeout`), and
-  util-linux `setsid` on `PATH`; without them the process primitive fails closed
-  as `unavailable` instead of running without a recorded process group or
-  timeout. Windows support is not claimed.
+  requires `env`, `sleep`, `mktemp`, `stat`, `id`, `ln`, GNU `timeout` (or
+  Homebrew `gtimeout`), and util-linux `setsid` on `PATH`; without them the
+  process/temp primitive fails closed as `unavailable` instead of running
+  without a recorded process group, timeout, or verified private file. Windows
+  support is not claimed.
 
 From a checkout of the repository:
 
@@ -541,6 +542,12 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   negative, fractional, non-numeric, or above `MAX_COMPLETION_TOKENS` (32768).
   Use a positive integer within the bound or omit the override for the named
   default.
+- `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
+  `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
+  `PATH`; these
+  are documented host prerequisites. Temp files are created with `mktemp` and
+  verified as user-owned regular `0600` files with link count 1; FIFOs, devices,
+  symlinks, and pre-existing paths are refused.
 - `timed out` or `unavailable` from `run_command`/`search_code` — the process
   primitive maps GNU timeout expiry to exit code 124/137 and fails closed with
   `unavailable` when `env`, `sleep`, `timeout`/`gtimeout`, `setsid`, or `sh` is
@@ -611,7 +618,7 @@ context budgets:
 - **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
 - **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
-- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (bounded chunked reads; line ranges apply inside the bounded prefix and a `start_line` beyond it fails loud), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (bounded process execution with a timeout, a setsid-recorded process-group supervisor, a post-exit TERM/KILL sweep, scrubbed environment, typed timeout/unavailable outcomes, and metrics), `list_directory` (fails closed on `ls` errors/timeouts), `search_code` (bounded `grep` capture before the 100-line observation cap; grep errors fail closed), and `read_blob`.
+- **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (bounded chunked reads; line ranges apply inside the bounded prefix, a `start_line` beyond it fails loud, and a prefix ending inside an included line reports `truncated=true` with a marker), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (bounded process execution with a timeout, a setsid-recorded process-group supervisor, a post-exit TERM/KILL sweep, scrubbed environment, typed timeout/unavailable outcomes, and metrics), `list_directory` (fails closed on `ls` errors/timeouts), `search_code` (bounded `grep` capture before the 100-line observation cap; grep errors fail closed), and `read_blob`.
 
 ### Autonomous Wave Orchestration & Task Execution Loop
 
@@ -749,7 +756,9 @@ implementation evidence, not a release claim and not full Gate 2 evidence. It
 does not cover asynchronous cancellation (not implemented), OS sandboxing, or a
 Bitty panel/terminal presentation run. A grandchild that calls `setsid` can
 leave the setsid-recorded process group; timeout enforcement is not a real-time
-guarantee; and disk capture during a run has no per-file quota. `os.clock()` measures
+guarantee; and disk capture during a run has no per-file quota. The supervisor validates
+the recorded PGID file and checks the group exists, but same-user PGID reuse
+between leader exit and signal cannot be ruled out. `os.clock()` measures
 process CPU time, not elapsed wall clock; CPU frequency is not pinned, and one
 host runs one interpreter per run. The record is not a canonical specification
 and does not satisfy SECURITY-MODEL.md Gate 2 on its own.

@@ -156,6 +156,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0016 final security pass: temp files use `mktemp` plus 0600 regular-file
+  ownership/link validation, exact paths are committed with a hard link, and
+  FIFO/symlink-to-device/pre-existing paths are refused; the PGID file is
+  validated and the group checked before signals (same-user PGID reuse remains
+  an accepted residual); `read_file` marks a prefix ending inside an included
+  line as truncated. `list_directory` reports capture truncation. Tests add
+  FIFO/symlink-to-/dev/null refusal, partial-line read, missing sleep/timeout,
+  `=` program rejection, pagination, and truncation flags.
 - CTX-0016 second security pass: a `setsid`-recorded supervisor now sweeps the
   process group with bounded TERM/KILL after normal completion, so a
   backgrounded grandchild cannot outlive the tool call; `env --` prevents a

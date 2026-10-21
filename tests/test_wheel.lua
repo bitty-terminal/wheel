@@ -4318,6 +4318,7 @@ run_test("WheelTool: read_file total_lines reports only emitted lines", function
   assert(byte_bounded.total_lines == byte_bounded.lines_read,
     "max_bytes truncation must report only emitted lines")
   assert(byte_bounded.total_lines < 10, "max_bytes must stop before the whole file")
+  assert(byte_bounded.truncated == true, "a bounded read must report truncation")
 
   os.execute("rm -rf " .. root)
 end)
@@ -6934,6 +6935,9 @@ run_test("WheelHost: process environment allowlist and stdin channel", function(
     "env --split-string must not split the child argument vector")
   local clear = WheelHost.proc.run_program("-i", {})
   assert(clear.stdout == "", "env -i must not execute or print the child environment")
+  local assignment = WheelHost.proc.run_program("FOO=bar", {})
+  assert(assignment.stdout == "" and assignment.code ~= 0,
+    "a program containing '=' must be refused as an env assignment")
 
   -- stdin is carried without a shell string; the default is /dev/null.
   local cat = WheelHost.proc.run_program("cat", {}, { stdin = "stdin-line-1\nstdin-line-2" })
@@ -7011,6 +7015,20 @@ run_test("WheelHost: temporary files are exclusive, 0600, and never follow a pat
   assert(WheelHost.fs.read_file(target) == "target-content",
     "a symlink target must never be followed or overwritten")
 
+  local dev_link = WheelHost.tmp.name()
+  os.execute("ln -s /dev/null " .. WheelHost.proc.shell_quote(dev_link))
+  local dev_ok, dev_err = WheelHost.tmp.create_exclusive(dev_link, "dev-payload")
+  assert(dev_ok == false and type(dev_err) == "string",
+    "a symlink to /dev/null must be refused")
+  WheelHost.fs.remove_file(dev_link)
+
+  local fifo = WheelHost.tmp.name()
+  os.execute("mkfifo " .. WheelHost.proc.shell_quote(fifo))
+  local fifo_ok, fifo_err = WheelHost.tmp.create_exclusive(fifo, "fifo-payload")
+  assert(fifo_ok == false and type(fifo_err) == "string",
+    "a pre-existing FIFO must be refused without blocking")
+  WheelHost.fs.remove_file(fifo)
+
   local created = WheelHost.tmp.create("fresh")
   assert(type(created) == "string", "tmp.create must return a path")
   assert(WheelHost.fs.read_file(created) == "fresh")
@@ -7026,14 +7044,16 @@ run_test("WheelHost: temp write failure surfaces cleanup errors", function()
   local path = WheelHost.tmp.name()
   local real_open = io.open
   local real_remove = os.remove
+  local probe_path = nil
   io.open = function(target, mode)
-    if target == path and mode == "r+" then
+    if mode == "r+" then
+      probe_path = target
       return nil, "simulated write-open failure"
     end
     return real_open(target, mode)
   end
   os.remove = function(target)
-    if target == path then
+    if target == probe_path then
       return nil, "simulated remove failure"
     end
     return real_remove(target)
@@ -7044,6 +7064,9 @@ run_test("WheelHost: temp write failure surfaces cleanup errors", function()
   assert(ok == false and type(err) == "string", "a temp write failure must fail closed")
   assert(err:find("cleanup failed", 1, true) ~= nil,
     "a temp cleanup failure must be surfaced")
+  if probe_path then
+    real_remove(probe_path)
+  end
   real_remove(path)
 end)
 
@@ -7114,6 +7137,33 @@ run_test("WheelHost: process capture files are cleaned up on success, error, and
   for _, path in ipairs(leftovers()) do
     real_remove(root .. "/" .. path)
   end
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: missing sleep and timeout are typed unavailable outcomes", function()
+  local root = "/tmp/bitty/test_host_missing_sweep_tools"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local function probe(name)
+    local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+    local real_popen = io.popen
+    io.popen = function(command, mode)
+      if command:find(name, 1, true) ~= nil then
+        return nil
+      end
+      return real_popen(command, mode)
+    end
+    local res = backend.run_program("true")
+    io.popen = real_popen
+    return res
+  end
+  local no_timeout = probe("timeout")
+  assert(no_timeout.ok == false and no_timeout.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "a missing timeout must fail closed as unavailable")
+  assert(no_timeout.stderr:find("timeout", 1, true) ~= nil)
+  local no_sleep = probe("sleep")
+  assert(no_sleep.ok == false and no_sleep.outcome == WheelHost.PROCESS_OUTCOME.UNAVAILABLE,
+    "a missing sleep must fail closed as unavailable")
+  assert(no_sleep.stderr:find("sleep", 1, true) ~= nil)
   os.execute("rm -rf " .. root)
 end)
 
@@ -7214,6 +7264,29 @@ run_test("WheelTool: read_file fails loud when start_line exceeds the bounded pr
   os.execute("rm -rf " .. root)
 end)
 
+run_test("WheelTool: read_file marks a partial line at the bounded prefix", function()
+  local root = "/tmp/bitty/test_tool_read_partial"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local fh = assert(io.open(root .. "/partial.txt", "w"))
+  fh:write(string.rep("a", 50) .. "\n" .. string.rep("b", 100) .. "\n" .. "c\n")
+  fh:close()
+  local reg = WheelTool.get_default_registry()
+  local env = { workspace_root = root, role = WheelAgent.Role.CODING }
+  local tool = reg:get_tool("read_file")
+
+  local partial = tool.execute({ path = "partial.txt", max_bytes = 100, start_line = 2 }, env)
+  assert(partial.success == true)
+  assert(partial.truncated == true,
+    "a prefix ending inside an included line must be marked truncated")
+  assert(partial.stdout:find("output truncated", 1, true) ~= nil,
+    "the partial-line result must carry a truncation marker")
+
+  local complete = tool.execute({ path = "partial.txt", max_bytes = 100, start_line = 1, end_line = 1 }, env)
+  assert(complete.success == true and complete.truncated == false,
+    "a complete in-range line must not be marked truncated")
+  os.execute("rm -rf " .. root)
+end)
+
 run_test("WheelTool: search_code fails on grep errors", function()
   local root = "/tmp/bitty/test_tool_search_errors"
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
@@ -7278,6 +7351,16 @@ run_test("WheelTool: list_directory fails closed on missing ls and timeout", fun
     "a missing ls must retain its diagnostic")
 
   local saved_list = WheelHost.fs.list_dir
+  WheelHost.fs.list_dir = function()
+    return {
+      ok = true, code = 0, entries = { "entry" }, total = 1,
+      truncated = true, stdout = "entry", stderr = "",
+    }
+  end
+  local truncated_list = tool.execute({ path = "." }, env)
+  assert(truncated_list.success == true and truncated_list.truncated == true,
+    "list_directory must surface capture truncation")
+
   WheelHost.fs.list_dir = function()
     return {
       ok = false, code = 124, timed_out = true,
