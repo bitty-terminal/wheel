@@ -95,7 +95,20 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/tool.lua
     bun run luaparse --quiet --file lua/wheel/provider.lua
     bun run luaparse --quiet --file lua/wheel/runner.lua
+    bun run luaparse --quiet --file bench/run.lua
+    bun run luaparse --quiet --file bench/lib/cli.lua
+    bun run luaparse --quiet --file bench/lib/env.lua
+    bun run luaparse --quiet --file bench/lib/json.lua
+    bun run luaparse --quiet --file bench/lib/smoke.lua
+    bun run luaparse --quiet --file bench/lib/stats.lua
+    bun run luaparse --quiet --file bench/lib/time.lua
+    bun run luaparse --quiet --file bench/scenarios/activation.lua
+    bun run luaparse --quiet --file bench/scenarios/context.lua
+    bun run luaparse --quiet --file bench/scenarios/orchestration.lua
+    bun run luaparse --quiet --file bench/scenarios/process.lua
+    bun run luaparse --quiet --file bench/scenarios/runner.lua
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
+    bun run luaparse --quiet --file tests/test_bench.lua
     bun run luaparse --quiet --file tests/test_wheel.lua
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
@@ -113,6 +126,18 @@ test: deps
 test-gate: deps
     bash scripts/test-gate.sh --self-test
 
+# Unit tests for the benchmark statistics, argument parsing, JSON encoding, and
+# fail-closed CLI behavior, plus one short context-scenario run. Uses the same
+# interpreter selection as `just test` and stays offline.
+test-bench: deps
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "No lua interpreter found; skipping benchmark tests" >&2; \
+    else \
+        "$interpreter" tests/test_bench.lua; \
+    fi
+
 # Opt-in real-host activation and command-smoke fixture for the standalone
 # Option B harness. Requires lua5.1 and fails closed when it is absent instead
 # of skipping. CI installs Lua 5.1 and runs this after `just check`; the fixture
@@ -125,6 +150,23 @@ test-real-host:
         exit 1; \
     fi; \
     lua5.1 tests/real_host_fixture.lua
+
+# Run the full offline benchmark suite (manual). Mock providers only: no
+# network, credentials, or live provider latency. Expect roughly a minute
+# because each process call pays the production 250 ms post-exit sweep grace.
+# Extra arguments go to bench/run.lua.
+bench *args:
+    sh bench/run.sh {{args}}
+
+# Emit the full benchmark record as machine-readable JSON on stdout. Redirect
+# it under gitignored recording/ when keeping a result.
+bench-json *args:
+    sh bench/run.sh --format json {{args}}
+
+# Short bounded release-smoke subset with generous regression ceilings. This is
+# a regression signal, not a host baseline or a release performance claim.
+bench-release-smoke *args:
+    sh bench/run.sh --smoke {{args}}
 
 # Build the deterministic standalone harness artifact for the version in the
 # root VERSION file: dist/wheel-<version>.tar.gz, its SHA-256 sidecar, and a
@@ -150,12 +192,13 @@ rollback-local prefix:
 verify-package:
     bash scripts/verify-package.sh
 
-# Shell gates for the packaging and test-gate scripts (not part of `check`
-# because the CI image does not guarantee shfmt). The older workflow-*.sh
-# scripts are outside this gate; reformatting them is a separate change.
+# Shell gates for the packaging, benchmark, and test-gate scripts (not part of
+# `check` because the CI image does not guarantee shfmt). The older
+# workflow-*.sh scripts are outside this gate; reformatting them is a separate
+# change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and
@@ -204,7 +247,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test test-bench lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

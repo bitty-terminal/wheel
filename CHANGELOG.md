@@ -94,6 +94,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   entries and secret-shaped or injection names are refused. The new
   `WheelHost.tmp.create` / `create_exclusive` primitives create files
   exclusively with mode 0600 and refuse pre-existing paths and symlinks.
+- Offline benchmark suite (CTX-0025 / wheel#86): `bench/` measures cold and warm
+  entry-point activation (CPU plus separate instrumented instruction counts),
+  `WheelHost.proc.run_program` normal exit and timeout at 1/5/20 calls,
+  `WheelRunner.run_task` mock-provider turns at 1/5/10, mock-team orchestration
+  at 1/5/10 tasks, and context slot write/read plus Three-Zone compilation at
+  10/100/1,000 slots. `just bench` and `just bench-json` run the full manual
+  suite; `just bench-release-smoke` is a short bounded subset with generous
+  regression ceilings. Results record revision, interpreter, CPU/OS/kernel,
+  pinning, cardinality, sample count, and min/median/p95/max/IQR, with no host
+  paths or committed host baseline. `just check` now runs the benchmark unit
+  tests and one short context-scenario run.
 
 ### Changed
 
