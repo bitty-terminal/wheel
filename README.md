@@ -588,6 +588,8 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                  |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
+| `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                         |
+| `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                           |
 | `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                            |
 | `tests/test_live_provider_selection.py`   | Key-free offline selector test: default/case-insensitive selection, per-provider key and host binding, HTTPS-only requests, and fail-closed diagnostics.                                                             |
 | `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                |
@@ -830,6 +832,30 @@ WHEEL_LIVE_PROVIDER=commandcode just test-live  # Command Code
 - The test helper is not a production HTTP client and adds no runtime
   dependency; the harness provider boundary is unchanged.
 
+## Benchmarks
+
+Wheel has an offline benchmark suite for its multiplicative paths: entry-point
+activation, bounded process calls, runner turns, multi-agent orchestration, and
+context compilation. Every scenario is deterministic and uses mock providers;
+there is no network, credential, live provider, or artificial sleep.
+
+```sh
+just bench                 # full suite, human-readable (manual, about a minute)
+just bench-json            # full suite, machine-readable record on stdout
+just bench-release-smoke   # bounded subset with generous regression ceilings
+```
+
+The suite records the revision, interpreter, CPU/OS/kernel, pinning, wall-clock
+source, scenario, cardinality, sample count, and min/median/p95/max/IQR. It
+selects `lua5.1` first and warns when a fallback interpreter is used; `taskset`
+pinning is optional with a documented unpinned fallback. No host-specific
+baseline is committed. The release-smoke ceilings are a regression signal, not
+a release performance claim, until the owner accepts thresholds.
+
+`just check` runs the benchmark unit tests and one short context-scenario run;
+the full suite stays manual. See [bench/README.md](bench/README.md) for the
+method, sample counts, JSON shape, and limitations.
+
 ## Authority
 
 Wheel 0.1.0 runs as an independent harness process and holds the user's OS
@@ -892,6 +918,9 @@ for this surface is documented under
 6. Keep the repository free of secrets and of install scripts with ambient
    authority. The 0.1.0 installer is offline, digest-verified, and does not
    evaluate artifact content.
+7. Run `just bench-release-smoke` on the release revision and keep its record
+   under `recording/`. The ceilings are regression signals; they become a
+   release budget only after the owner accepts them.
 
 ## Security
 
