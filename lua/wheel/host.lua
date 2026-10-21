@@ -332,7 +332,9 @@ local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); Lua 5.2+ reports
 -- `nil, "exit", code` (or `nil, "signal", signal`). All returns must be
 -- captured; otherwise the string reason would be mistaken for a code and a
--- probe failure would look like exit status 1.
+-- probe failure would look like exit status 1. A non-zero raw status below 256
+-- is a signal, not an exit code: the low seven bits carry the signal number and
+-- bit 7 is the core-dump flag.
 -- @param ok boolean|number|nil
 -- @param reason string|nil
 -- @param code number|nil
@@ -345,7 +347,10 @@ local function normalized_exit_status(ok, reason, code)
     if ok >= 256 then
       return math.floor(ok / 256)
     end
-    return ok
+    if ok == 0 then
+      return 0
+    end
+    return 128 + (ok % 128)
   end
   if ok == nil and reason == "exit" and type(code) == "number" then
     return code

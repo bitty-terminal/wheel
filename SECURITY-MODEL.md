@@ -403,15 +403,19 @@ or multi-user surface.
 - One client lock file serialises each request/response exchange; a per-lock
   mutex serialises stale-lock reclamation. A moved lock whose owner changed is
   restored with a non-replacing hard link instead of deleted, and a concurrent
-  caller fails with a typed busy error. The daemon is single-threaded and
-  processes one frame at a time.
+  caller fails with a typed busy error. Start-lock tails are pruned only while
+  the start-lock mutex is held, and the canonical start mutex is never
+  reclaimed outside that contract. The daemon is single-threaded and processes
+  one frame at a time.
 - Shutdown is an explicit `shutdown` method. Clients never signal a pid they did
   not read from validated metadata, and `pkill`, `killall`, and name- or
   pattern-based kills are forbidden. A stale pid is detected with `kill -0` and
   is never signalled; only stale metadata, FIFOs, locks, and metadata temp files
-  are removed. A daemon takes over the start lock under its mutex before writing
-  metadata; a delayed older starter that lost the handoff aborts without
-  replacing the newer metadata or FIFOs.
+  are removed. Cleanup leaves metadata and FIFOs in place when it cannot
+  attribute them (missing or unreadable metadata) unless it still holds its own
+  start lock from a failed startup. A daemon takes over the start lock under
+  its mutex before writing metadata; a delayed older starter that lost the
+  handoff aborts without replacing the newer metadata or FIFOs.
 - The daemon does not own a task DAG, call a provider, execute an agent, or
   expose a remote listener. Those remain outside this experimental slice.
 

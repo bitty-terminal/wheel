@@ -36,6 +36,9 @@ local WheelHost = require("wheel.host")
 
 local Session = {}
 
+-- Lua 5.1 exposes `unpack`; 5.2+ moved it to `table.unpack`.
+local unpack_values = table.unpack or unpack
+
 -- ---------------------------------------------------------------------------
 -- Constants
 -- ---------------------------------------------------------------------------
@@ -1056,6 +1059,30 @@ local function acquire_mutex(session_dir, lock_name, owner_pid)
   return false, err_busy()
 end
 
+--- Run `fn` with exception cleanup while preserving coroutine yields.
+-- Lua 5.1 cannot yield across `pcall`, and the lock path may call an injectable
+-- host probe that yields in tests. Resuming the body in its own coroutine and
+-- forwarding yields keeps the protected boundary compatible with both.
+-- @param fn function
+-- @return boolean ok, ...
+local function run_protected(fn)
+  if type(coroutine) ~= "table" or type(coroutine.create) ~= "function" then
+    return pcall(fn)
+  end
+  local co = coroutine.create(fn)
+  local args = {}
+  while true do
+    local results = { coroutine.resume(co, unpack_values(args)) }
+    if not results[1] then
+      return false, results[2]
+    end
+    if coroutine.status(co) == "dead" then
+      return true, unpack_values(results, 2)
+    end
+    args = { coroutine.yield(unpack_values(results, 2)) }
+  end
+end
+
 --- Acquire one exclusive session lock file for `owner_pid`.
 -- Reclamation of a dead owner is serialized by a per-lock mutex: the stale main
 -- lock is renamed and its moved owner verified before removal, and the new main
@@ -1071,50 +1098,61 @@ function Session.acquire_lock(session_dir, lock_name, owner_pid)
     return false, err_io()
   end
   local path = lock_path(session_dir, lock_name)
-  for _ = 1, Session.MAX_LOCK_ATTEMPTS do
-    local mutex_ok, mutex_err = acquire_mutex(session_dir, lock_name, owner_pid)
-    if not mutex_ok then
-      return false, mutex_err or err_busy()
-    end
-
-    local created = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
-    if created then
-      local owner = read_lock_owner(session_dir, lock_name)
-      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
-      if owner == owner_pid then
-        return true, nil
+  local ok, acquired, acquire_err = run_protected(function()
+    for _ = 1, Session.MAX_LOCK_ATTEMPTS do
+      local mutex_ok, mutex_err = acquire_mutex(session_dir, lock_name, owner_pid)
+      if not mutex_ok then
+        return false, mutex_err or err_busy()
       end
-      return false, err_busy()
-    end
 
-    local owner, read_err = read_lock_owner(session_dir, lock_name)
-    if owner == nil then
-      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
-      return false, read_err or err_lock_unsafe()
-    end
-    if owner == false then
-      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
-      -- The main lock disappeared; retry under a fresh mutex.
-    else
-      local alive, probe_err = WheelHost.proc.is_alive(owner)
-      if probe_err ~= nil or alive then
+      local created = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
+      if created then
+        local owner = read_lock_owner(session_dir, lock_name)
         release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+        if owner == owner_pid then
+          return true, nil
+        end
         return false, err_busy()
       end
-      if not claim_stale_lock(session_dir, lock_name, owner) then
+
+      local owner, read_err = read_lock_owner(session_dir, lock_name)
+      if owner == nil then
         release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+        return false, read_err or err_lock_unsafe()
+      end
+      if owner == false then
+        release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+        -- The main lock disappeared; retry under a fresh mutex.
+      else
+        local alive, probe_err = WheelHost.proc.is_alive(owner)
+        if probe_err ~= nil or alive then
+          release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+          return false, err_busy()
+        end
+        if not claim_stale_lock(session_dir, lock_name, owner) then
+          release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+          return false, err_busy()
+        end
+        local created_after = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
+        local owner_after = created_after and read_lock_owner(session_dir, lock_name) or nil
+        release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+        if created_after and owner_after == owner_pid then
+          return true, nil
+        end
         return false, err_busy()
       end
-      local created_after = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
-      local owner_after = created_after and read_lock_owner(session_dir, lock_name) or nil
-      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
-      if created_after and owner_after == owner_pid then
-        return true, nil
-      end
-      return false, err_busy()
     end
+    return false, err_busy()
+  end)
+  if not ok then
+    -- A long-lived embedder must not keep a self-owned main lock or mutex after
+    -- an unexpected host exception. Both releases are ownership-checked, so a
+    -- lock owned by another pid is never removed.
+    pcall(release_named_lock, session_dir, lock_name, owner_pid)
+    pcall(release_named_lock, session_dir, lock_name .. ".mutex", owner_pid)
+    return false, err_io()
   end
-  return false, err_busy()
+  return acquired, acquire_err
 end
 
 --- Release one session lock file only when it is still owned by `owner_pid`.
@@ -1641,7 +1679,7 @@ local function prune_dead_lock(session_dir, name, canonical, euid)
   return true, nil
 end
 
-local function prune_body(session_dir, client_mutex_held)
+local function prune_body(session_dir, client_mutex_held, start_mutex_held)
   local listing = WheelHost.fs.list_dir(session_dir)
   if not listing or listing.ok ~= true then
     return false, err_io()
@@ -1672,12 +1710,25 @@ local function prune_body(session_dir, client_mutex_held)
           ok, prune_err = true, nil
         end
       elseif name == start_aux then
-        ok, prune_err = prune_dead_lock(session_dir, name, true, euid)
-      elseif name:match("^" .. client_prefix .. "%.stale%.")
-        or name:match("^" .. start_prefix .. "%.stale%.")
-        or name:match("^" .. client_aux_prefix .. "%.stale%.")
+        -- The canonical start mutex is acquired by prune itself when possible;
+        -- never reclaim it outside that mutex contract.
+        ok, prune_err = true, nil
+      elseif name:match("^" .. start_prefix .. "%.stale%.")
         or name:match("^" .. start_aux_prefix .. "%.stale%.") then
-        ok, prune_err = prune_dead_lock(session_dir, name, false, euid)
+        -- Start-lock tails participate in the start-lock mutex contract: touch
+        -- them only while this prune call holds the start mutex.
+        if start_mutex_held then
+          ok, prune_err = prune_dead_lock(session_dir, name, false, euid)
+        else
+          ok, prune_err = true, nil
+        end
+      elseif name:match("^" .. client_prefix .. "%.stale%.")
+        or name:match("^" .. client_aux_prefix .. "%.stale%.") then
+        if client_mutex_held then
+          ok, prune_err = prune_dead_lock(session_dir, name, false, euid)
+        else
+          ok, prune_err = true, nil
+        end
       elseif name:match("^meta%.json%..*%.tmp$") then
         local info = stat_path(path)
         if info and info.exists then
@@ -1702,15 +1753,19 @@ local function prune_body(session_dir, client_mutex_held)
 end
 
 --- Remove known stale lock/temp files from a session directory.
--- Canonical client locks are reclaimed only while the client-lock mutex is
--- held; stale tails and metadata temp files are removed after an owned-regular
--- check. Unknown files are left alone and can keep the directory from being
--- removed, which fails closed.
+-- Canonical client locks and client tails are reclaimed only while the
+-- client-lock mutex is held; start-lock tails are reclaimed only while the
+-- start-lock mutex is held, and the canonical start mutex is never reclaimed
+-- here. Metadata temp files are removed after an owned-regular check. Unknown
+-- files are left alone and can keep the directory from being removed, which
+-- fails closed.
 -- @param session_dir string
--- @param owner_pid number? identity for the client-lock mutex
+-- @param owner_pid number? identity for the client- and start-lock mutexes
 -- @return boolean ok, table? err
 function Session.prune_stale_files(session_dir, owner_pid)
   local client_mutex_held = false
+  local start_mutex_held = false
+  local start_error
   if valid_pid(owner_pid) then
     local acquired_ok, acquired = pcall(
       acquire_mutex, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
@@ -1718,8 +1773,29 @@ function Session.prune_stale_files(session_dir, owner_pid)
     if not acquired_ok then
       pcall(release_named_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
     end
+    local start_ok, start_acquired, start_err = pcall(
+      acquire_mutex, session_dir, Session.FILE_START_LOCK, owner_pid)
+    start_mutex_held = start_ok and start_acquired == true
+    if not start_ok then
+      pcall(release_named_lock, session_dir, Session.FILE_START_LOCK .. ".mutex", owner_pid)
+      start_error = err_io()
+    elseif not start_acquired and start_err and start_err.code ~= "E_SESSION_BUSY" then
+      -- An unsafe or unreadable start mutex must fail the prune closed instead
+      -- of silently skipping the start-lock entries.
+      start_error = start_err
+    end
   end
-  local ok, result, err = pcall(prune_body, session_dir, client_mutex_held)
+  if start_error then
+    if client_mutex_held then
+      pcall(release_named_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
+    end
+    return false, start_error
+  end
+  local ok, result, err = pcall(
+    prune_body, session_dir, client_mutex_held, start_mutex_held)
+  if start_mutex_held then
+    pcall(release_named_lock, session_dir, Session.FILE_START_LOCK .. ".mutex", owner_pid)
+  end
   if client_mutex_held then
     pcall(release_named_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
   end

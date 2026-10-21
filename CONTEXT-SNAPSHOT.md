@@ -87,7 +87,16 @@ detached.
 
 An event record is any plain-data table with a finite `timestamp_ms`; a `type`
 field, when present, must be a string. Map keys are limited to 256 bytes. Events
-are preserved as audit history, not replayed.
+are preserved as audit history, not replayed. `stash_pushed` and `stash_popped`
+events are normalized to bounded metadata (`id`, `message`, `head_hash`,
+`branch`, `timestamp_ms`, and `redacted = true`); their `stash.slots` map is
+removed by validation on export, import, and canonical encoding. Optional
+metadata on a normal stash event that is not a bounded string or valid
+timestamp is omitted rather than stringified or rejected. An event that exposes
+its stash fields only through `__pairs`/`__index` is sanitized after plain-data
+copying; an over-bound optional field exposed that way may still fail closed on
+the plain-data bounds before sanitization. In every case an unredacted event
+cannot carry stash content through a snapshot.
 
 `head` may name a branch ref that has no commit yet (an unborn branch, including
 a force-deleted active branch). That is a valid context state; the snapshot does
@@ -188,8 +197,9 @@ Snapshot v1 captures working slots, the tree hash, `HEAD`, refs, commits, the
 reflog, and bus history. It deliberately does not capture:
 
 - stash entries (`stash_push`), which are transient working state; their bus
-  events are retained with the slot map redacted (`stash.redacted = true`), so
-  stash content cannot bypass this exclusion;
+  events are retained with bounded metadata and the slot map removed
+  (`stash.redacted = true`), so stash content cannot bypass this exclusion
+  through export, import, or canonical encoding;
 - bus subscribers and callbacks; a caller-supplied import bus keeps its existing
   subscribers, but snapshot subscribers are not recreated;
 - the `kernel` link;

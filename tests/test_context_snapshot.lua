@@ -49,6 +49,30 @@ local function assert_deep_equal(actual, expected, path)
   end
 end
 
+-- Lua 5.2+ honors a `__pairs` metamethod; Lua 5.1 and LuaJIT ignore it.
+local function pairs_metamethod_supported()
+  local probe = setmetatable({}, {
+    __pairs = function()
+      local done = false
+      return function()
+        if done then
+          return nil
+        end
+        done = true
+        return "probe", true
+      end, nil, nil
+    end,
+  })
+  for key in pairs(probe) do
+    if key == "probe" then
+      return true
+    end
+  end
+  return false
+end
+
+local has_pairs_metamethod = pairs_metamethod_supported()
+
 local function with_fixed_clock(fn)
   local backend = WheelHost.backend
   local saved_now = backend.now
@@ -741,5 +765,338 @@ return function(run_test)
     assert(popped_event and popped_event.stash.redacted == true
       and popped_event.stash.slots == nil,
       "stash_popped events must also be redacted")
+  end)
+
+  run_test("WheelContext snapshots: import sanitizes unredacted stash bus events", function()
+    local ctx = WheelContext.new()
+    local marker = "crafted-stash-content-marker"
+    assert(ctx:put_slot("scratch/wip", marker).success)
+    local entry = assert(ctx:stash_push("wip"))
+    -- Publish the matching pop event without applying it, so the marker exists
+    -- only in stash payloads and never in the working slot tree.
+    ctx.bus:publish({ type = "stash_popped", stash = entry })
+    local snapshot = assert(ctx:export_snapshot())
+
+    local crafted = deep_copy(snapshot)
+    local smuggled_slots = {
+      ["scratch/wip"] = {
+        name = "scratch/wip",
+        content = marker,
+        hash = WheelContext.compute_hash(marker),
+        version = 1,
+        kind = "scratch",
+        size_bytes = #marker,
+        updated_at_ms = 1,
+      },
+    }
+    local seen = {}
+    for _, event in ipairs(crafted.bus_history) do
+      if event.type == "stash_pushed" then
+        seen.stash_pushed = true
+        -- Pre-fix producer metadata can be non-string plain data, and the
+        -- optional timestamp can be invalid; sanitization omits both.
+        event.stash = {
+          id = 123,
+          message = { note = "table metadata" },
+          branch = "main",
+          timestamp_ms = "not-a-number",
+          redacted = false,
+          slots = smuggled_slots,
+        }
+      elseif event.type == "stash_popped" then
+        seen.stash_popped = true
+        -- A non-table stash is replaced with the empty redacted shape.
+        event.stash = "non-table-stash-" .. marker
+      end
+    end
+    assert(seen.stash_pushed and seen.stash_popped,
+      "fixture must carry both stash event types")
+    local crafted_before = deep_copy(crafted)
+
+    -- Validation normalizes stash payloads, so even canonical bytes for a
+    -- crafted snapshot cannot carry the smuggled content.
+    local canonical = assert(WheelContext.canonical_snapshot(crafted))
+    assert(canonical:find(marker, 1, true) == nil,
+      "canonical bytes must not contain an unredacted stash payload")
+
+    local restored = assert(WheelContext.import_snapshot(crafted))
+    assert(#restored:stash_list() == 0,
+      "snapshot import must never materialize stash entries")
+    for _, event in ipairs(restored.bus:history()) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true,
+          "import must mark every stash event redacted")
+        assert(event.stash.slots == nil,
+          "import must drop the stash slot map")
+        assert(event.stash.id == nil,
+          "a non-string stash id must be omitted, not stringified")
+        assert(event.stash.message == nil,
+          "a non-string stash message must be omitted")
+        assert(event.stash.timestamp_ms == nil,
+          "an invalid optional stash timestamp must be omitted")
+        assert(event.stash.branch == "main",
+          "bounded string metadata may be retained")
+      elseif event.type == "stash_popped" then
+        assert(event.stash.redacted == true
+          and event.stash.slots == nil
+          and event.stash.id == nil,
+          "a non-table stash must normalize to the empty redacted shape")
+      end
+    end
+    assert_deep_equal(crafted, crafted_before,
+      "import must not mutate the caller snapshot")
+    assert(WheelContext.canonical_snapshot(assert(restored:export_snapshot()))
+      == WheelContext.canonical_snapshot(crafted),
+      "sanitized import must round-trip canonically")
+  end)
+
+  run_test("WheelContext snapshots: export leaves live bus history unchanged", function()
+    local ctx = WheelContext.new()
+    local marker = "live-stash-content-marker"
+    assert(ctx:put_slot("scratch/wip", marker).success)
+    assert(ctx:stash_push("wip") ~= nil)
+
+    local live_event
+    for _, event in ipairs(ctx.bus:history()) do
+      if event.type == "stash_pushed" then
+        live_event = event
+      end
+    end
+    assert(live_event and live_event.stash and live_event.stash.slots ~= nil,
+      "the live bus must keep its full stash payload")
+    local before = deep_copy(ctx.bus:history())
+
+    assert(ctx:export_snapshot() ~= nil)
+    assert_deep_equal(ctx.bus:history(), before,
+      "export must not mutate live bus history")
+    assert(live_event.stash.redacted == nil,
+      "export must not mark the live event redacted in place")
+    assert(live_event.stash.slots["scratch/wip"].content == marker,
+      "export must not strip live stash content")
+  end)
+
+  run_test("WheelContext snapshots: live non-string stash metadata still exports", function()
+    local ctx = WheelContext.new()
+    assert(ctx:put_slot("scratch/numeric", "numeric").success)
+    local numeric = assert(ctx:stash_push(123))
+    assert(ctx:put_slot("scratch/table", "table").success)
+    local table_message = { note = "not a string" }
+    local tabular = assert(ctx:stash_push(table_message))
+    assert(numeric.message == 123 and tabular.message == table_message,
+      "the live stash entries must keep their original metadata")
+
+    local before = deep_copy(ctx.bus:history())
+    local snapshot = assert(ctx:export_snapshot())
+    assert_deep_equal(ctx.bus:history(), before,
+      "export must not mutate live bus history with non-string metadata")
+
+    local exported = {}
+    for _, event in ipairs(snapshot.bus_history) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true,
+          "every exported stash event must be redacted")
+        assert(event.stash.slots == nil,
+          "every exported stash event must drop the slot map")
+        assert(event.stash.message == nil,
+          "non-string stash messages must be omitted from the snapshot")
+        exported[#exported + 1] = event
+      end
+    end
+    assert(#exported == 2, "both live stash events must export")
+
+    local restored = assert(WheelContext.import_snapshot(snapshot))
+    for _, event in ipairs(restored.bus:history()) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true
+          and event.stash.slots == nil
+          and event.stash.message == nil,
+          "restored non-string stash metadata must stay omitted")
+      end
+    end
+    local live_numeric
+    for _, event in ipairs(ctx.bus:history()) do
+      if event.type == "stash_pushed" and event.stash.message == 123 then
+        live_numeric = event
+      end
+    end
+    assert(live_numeric ~= nil,
+      "the live numeric message must remain untouched after export")
+  end)
+
+  if has_pairs_metamethod then
+    run_test("WheelContext snapshots: metatable stash fields cannot bypass redaction", function()
+      local marker = "metatable-stash-content-marker"
+      local stash_payload = {
+        id = "stash@{0}",
+        message = { note = "table metadata" },
+        slots = {
+          ["scratch/wip"] = {
+            name = "scratch/wip",
+            content = marker,
+            hash = WheelContext.compute_hash(marker),
+            version = 1,
+            kind = "scratch",
+            size_bytes = #marker,
+            updated_at_ms = 1,
+          },
+        },
+      }
+      local timestamp_ms = 1700000000000
+      local fields = {
+        { "type", "stash_pushed" },
+        { "timestamp_ms", timestamp_ms },
+        { "stash", stash_payload },
+      }
+      local event = setmetatable({ timestamp_ms = timestamp_ms }, {
+        __pairs = function()
+          local index = 0
+          return function()
+            index = index + 1
+            local field = fields[index]
+            if field then
+              return field[1], field[2]
+            end
+            return nil
+          end, nil, nil
+        end,
+        __index = function(_, key)
+          if key == "type" then
+            return "stash_pushed"
+          end
+          if key == "stash" then
+            return stash_payload
+          end
+          if key == "timestamp_ms" then
+            return timestamp_ms
+          end
+          return nil
+        end,
+      })
+      assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
+        "the raw event must not expose the fabricated fields")
+
+      -- Feed the metatable event directly to snapshot validation. Publishing
+      -- it on a live bus would exercise the producer redaction path instead of
+      -- the post-copy sanitizer.
+      local source = assert(WheelContext.new():export_snapshot())
+      source.bus_history = { event }
+
+      local canonical = assert(WheelContext.canonical_snapshot(source))
+      assert(canonical:find(marker, 1, true) == nil,
+        "canonical bytes must not contain metatable stash content")
+
+      local restored = assert(WheelContext.import_snapshot(source))
+      local imported
+      for _, entry in ipairs(restored.bus:history()) do
+        if entry.type == "stash_pushed" then
+          imported = entry
+        end
+      end
+      assert(imported ~= nil,
+        "the metatable event must be copied as a stash event")
+      assert(imported.stash.redacted == true and imported.stash.slots == nil,
+        "import must remove metatable stash content")
+      assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
+        "validation must not materialize fabricated fields on the source event")
+    end)
+  end
+
+  run_test("WheelContext snapshots: key nodes count toward the value node bound", function()
+    local ctx = WheelContext.new()
+    local event = { type = "key_bound", timestamp_ms = 1 }
+    for index = 1, 28 do
+      event["key_" .. index] = index
+    end
+    ctx.bus:publish(event)
+    assert(count_keys(event) == 30, "fixture must carry exactly 30 keys")
+
+    local saved_nodes = WheelContextSnapshot.MAX_VALUE_NODES
+    WheelContextSnapshot.MAX_VALUE_NODES = 60
+    local rejected, reject_err = ctx:export_snapshot()
+    WheelContextSnapshot.MAX_VALUE_NODES = 61
+    local accepted = ctx:export_snapshot()
+    WheelContextSnapshot.MAX_VALUE_NODES = saved_nodes
+
+    assert(rejected == nil and WheelErrors.is_typed(reject_err)
+      and reject_err.code == "E_SNAPSHOT_INVALID",
+      "30 keys must exceed a 60-node bound when keys count as nodes")
+    assert(reject_err.message:find("node", 1, true) ~= nil,
+      "node-bound rejection must name the bound: " .. reject_err.message)
+    assert(accepted ~= nil,
+      "the same event must fit when the bound is raised by one node")
+  end)
+
+  run_test("WheelContext snapshots: a committed 256-byte branch ref round-trips", function()
+    local ctx = WheelContext.new()
+    local name = string.rep("b", WheelContext.MAX_REF_NAME_BYTES)
+    assert(#name == 256, "the caller-visible ref bound must stay 256 bytes")
+    assert(ctx:put_slot("workspace/base", "base").success)
+    assert(ctx:commit_checkpoint({
+      message = "root",
+      timestamp_ms = 1700000000000,
+    }) ~= nil)
+    assert(ctx:create_branch(name) == true)
+    assert(ctx:checkout(name) == true)
+    local commit = assert(ctx:commit_checkpoint({
+      message = "boundary",
+      timestamp_ms = 1700000001000,
+    }))
+
+    local ref = "refs/heads/" .. name
+    local snapshot = assert(ctx:export_snapshot())
+    assert(snapshot.head == ref, "HEAD must name the 256-byte branch")
+    assert(snapshot.refs[ref] == commit.hash,
+      "the 256-byte branch ref must round-trip through export")
+    local restored = assert(WheelContext.import_snapshot(snapshot))
+    assert(restored:current_branch() == name)
+    assert(restored:head_commit_hash() == commit.hash)
+    assert(WheelContext.canonical_snapshot(snapshot)
+      == WheelContext.canonical_snapshot(assert(restored:export_snapshot())))
+  end)
+
+  run_test("WheelContext snapshots: stash_pop refuses an exhausted working slot version", function()
+    local ctx = WheelContext.new()
+    assert(ctx:put_slot("workspace/project", "stashed value").success)
+    assert(ctx:stash_push("wip") ~= nil)
+
+    local base = "working value"
+    ctx._slots["workspace/project"] = {
+      name = "workspace/project",
+      content = base,
+      hash = WheelContext.compute_hash(base),
+      version = WheelContext.MAX_SLOT_VERSION,
+      kind = "workspace",
+      size_bytes = #base,
+      updated_at_ms = 1,
+    }
+    ctx._tree_hash = nil
+
+    local popped, pop_err = ctx:stash_pop(1)
+    assert(popped == nil and pop_err.error == "version_exhausted",
+      "stash_pop must fail closed before mutating an exhausted working slot")
+    assert(#ctx:stash_list() == 1, "a refused pop must keep the stash entry")
+    assert(ctx._slots["workspace/project"].content == base,
+      "a refused pop must leave the working slot unchanged")
+    assert(ctx:export_snapshot() ~= nil,
+      "a refused pop must leave an exportable context")
+  end)
+
+  run_test("WheelContext snapshots: slot_removed clamps its event version at the bound", function()
+    local ctx = WheelContext.new()
+    assert(ctx:put_slot("workspace/project", "value").success)
+    ctx._slots["workspace/project"].version = WheelContext.MAX_SLOT_VERSION
+
+    local removed = assert(ctx:remove_slot("workspace/project"))
+    assert(removed.removed == true)
+    local event
+    for _, candidate in ipairs(ctx.bus:history()) do
+      if candidate.type == "slot_removed" then
+        event = candidate
+      end
+    end
+    assert(event and event.version == WheelContext.MAX_SLOT_VERSION,
+      "slot_removed must clamp the event version instead of overflowing")
+    assert(ctx:export_snapshot() ~= nil,
+      "a clamped removal event must remain exportable")
   end)
 end

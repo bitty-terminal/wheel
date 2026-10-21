@@ -349,7 +349,8 @@ local function cleanup(state)
   -- concurrent starter that owns it makes this cleanup a no-op.
   local owned_ok, owned = pcall(
     Session.lock_owned_by, state.session_dir, Session.FILE_START_LOCK, state.pid)
-  local locked = owned_ok and owned == true
+  local self_owned = owned_ok and owned == true
+  local locked = self_owned
   if not locked then
     local acquire_ok, acquired = pcall(
       Session.acquire_lock, state.session_dir, Session.FILE_START_LOCK, state.pid)
@@ -366,7 +367,17 @@ local function cleanup(state)
   end
 
   local meta = Session.read_metadata(state.session_dir, state.name)
-  if meta and meta.pid ~= state.pid then
+  if meta then
+    if meta.pid ~= state.pid then
+      Session.release_start_lock(state.session_dir, state.pid)
+      return
+    end
+  elseif not self_owned then
+    -- Missing or unreadable metadata does not identify the files as this
+    -- daemon's. A successor (live or starting) can be in exactly that state
+    -- after a same-user tamper or a failed publish; leave its metadata/FIFOs
+    -- alone. A failed post-handoff startup is safe to clean because the start
+    -- lock is still self-owned.
     Session.release_start_lock(state.session_dir, state.pid)
     return
   end

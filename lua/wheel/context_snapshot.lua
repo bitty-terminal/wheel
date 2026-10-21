@@ -77,6 +77,17 @@ local REFLOG_FIELDS = {
   "index", "from_hash", "to_hash", "ref", "action", "message", "timestamp_ms",
 }
 
+-- Stash entries are outside snapshot v1, but their bus events carry the whole
+-- slot map. Validation sanitizes those events on every path (export, import,
+-- and canonical encoding), so a crafted or pre-fix unredacted snapshot cannot
+-- restore stash content through bus history.
+local STASH_EVENT_TYPES = {
+  stash_pushed = true,
+  stash_popped = true,
+}
+
+local STASH_METADATA_STRING_FIELDS = { "id", "message", "head_hash", "branch" }
+
 -- A private sentinel keeps validation failures separate from programming
 -- errors caught by the public pcall boundary.
 local REJECTION_KEY = {}
@@ -680,6 +691,39 @@ local function copy_reflog(value, path, commits, deps, state)
   return reflog
 end
 
+local function sanitize_stash_event(event, deps)
+  local stash = rawget(event, "stash")
+  local redacted = { redacted = true }
+
+  -- Stash content is always dropped. Metadata is best-effort: a live producer
+  -- may have used a non-string message or id, and a crafted snapshot may carry
+  -- invalid optional fields. Omit anything that is not bounded plain data
+  -- instead of stringifying it or failing the whole snapshot.
+  if type(stash) == "table" then
+    for _, field in ipairs(STASH_METADATA_STRING_FIELDS) do
+      local value = rawget(stash, field)
+      if type(value) == "string" and #value <= deps.max_metadata_bytes then
+        redacted[field] = value
+      end
+    end
+    local timestamp_ms = rawget(stash, "timestamp_ms")
+    if type(timestamp_ms) == "number" and timestamp_ms == timestamp_ms
+      and timestamp_ms ~= math.huge and timestamp_ms ~= -math.huge
+      and timestamp_ms >= 0 then
+      redacted.timestamp_ms = timestamp_ms
+    end
+  end
+
+  local copy = {}
+  for key, value in pairs(event) do
+    if key ~= "stash" then
+      copy[key] = value
+    end
+  end
+  copy.stash = redacted
+  return copy
+end
+
 local function copy_bus_history(value, path, deps, state)
   local count = check_array(value, path, deps.max_bus_history)
   local history = {}
@@ -692,13 +736,25 @@ local function copy_bus_history(value, path, deps, state)
     if rawget(event, "timestamp_ms") == nil then
       reject(event_path, "missing required field 'timestamp_ms'")
     end
-    if rawget(event, "type") ~= nil then
-      check_string(rawget(event, "type"), event_path .. ".type",
+    local event_type = rawget(event, "type")
+    if event_type ~= nil then
+      check_string(event_type, event_path .. ".type",
         deps.max_metadata_bytes, true)
     end
 
-    local copied = copy_plain(event, event_path, deps, state, 0, {}, {})
+    local candidate = event
+    if type(event_type) == "string" and STASH_EVENT_TYPES[event_type] then
+      candidate = sanitize_stash_event(event, deps)
+    end
+    local copied = copy_plain(candidate, event_path, deps, state, 0, {}, {})
     check_timestamp(copied.timestamp_ms, event_path .. ".timestamp_ms")
+    -- `__pairs`/`__index` can fabricate stash fields that rawget cannot see.
+    -- Sanitize the plain copy again so canonical bytes and import never carry
+    -- a stash slot map regardless of how the source table presented itself.
+    local copied_type = rawget(copied, "type")
+    if type(copied_type) == "string" and STASH_EVENT_TYPES[copied_type] then
+      copied = sanitize_stash_event(copied, deps)
+    end
     history[index] = copied
   end
   return history
