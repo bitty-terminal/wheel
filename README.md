@@ -85,7 +85,7 @@ upgrade, and rollback. The release target is `v0.1.0`; see
 `dist/wheel-0.1.0.tar.gz` contains the standalone harness library:
 
 - `lua/` — the `wheel` module tree (`lua/wheel/*.lua`).
-- `LICENSE`, `README.md`, and `SECURITY-MODEL.md`.
+- `LICENSE`, `README.md`, `SECURITY-MODEL.md`, and `CONTEXT-SNAPSHOT.md`.
 - `repo.toml` — repository identity and release pointer.
 - `VERSION` — the artifact version (`0.1.0`).
 
@@ -491,12 +491,15 @@ of the public error contract.
 `WheelRunner` before a network request when a `max_completion_tokens` override
 fails validation; it is not a command argument failure.
 
-`E_SNAPSHOT_INVALID` is raised by `WheelContext.import_snapshot` and
-`WheelContext.validate_snapshot` before any object is constructed. The message
-is a bounded schema path and reason; slot content, source paths, and secrets are
-never included. Snapshot v1 does not restore stash entries, bus subscribers, the
-kernel link, or budget configuration. The format and bounds are documented in
-[CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
+`E_SNAPSHOT_INVALID` is raised by `export_snapshot`, `import_snapshot`,
+`validate_snapshot`, and `canonical_snapshot` when snapshot state fails
+validation. Validation completes before any new context is exposed. The message
+is a bounded schema path and reason; slot content is never included (schema paths
+may name caller-provided slot, ref, or event keys). Invalid snapshot options are
+argument failures and use `E_ARGS_INVALID`. Snapshot v1 does not restore stash
+entries, bus subscribers, the kernel link, `config` directives, or budget
+configuration; stash event slot payloads are redacted from preserved bus history.
+The format and bounds are documented in [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 
 `E_MODULE_LOAD_FAILED` is raised at activation when a required Wheel submodule
 cannot be loaded, or on first use when an optional lazy submodule fails. The
@@ -554,9 +557,9 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   negative, fractional, non-numeric, or above `MAX_COMPLETION_TOKENS` (32768).
   Use a positive integer within the bound or omit the override for the named
   default.
-- `E_SNAPSHOT_INVALID` — an imported `WheelContext` snapshot is malformed,
-  tampered, oversized, partial, or cryptographically inconsistent. Re-export
-  from the live context instead of editing the snapshot table; see
+- `E_SNAPSHOT_INVALID` — a `WheelContext` snapshot is malformed, tampered,
+  oversized, partial, or cryptographically inconsistent. Re-export from the live
+  context instead of editing the snapshot table; see
   [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 - `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
@@ -582,6 +585,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | Path                                      | Purpose                                                                                                                                                                                                              |
 | ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `README.md`                               | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                     |
+| `CONTEXT-SNAPSHOT.md`                     | WheelContext snapshot v1 format, canonical encoding, bounds, integrity limits, trust boundary, and excluded state.                                                                                                   |
 | `bitty-plugin.toml`                       | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                          |
 | `lua/wheel/init.lua`                      | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`).  |
 | `lua/wheel/errors.lua`                    | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                      |
@@ -593,11 +597,13 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                              |
 | `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                         |
 | `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                   |
+| `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                           |
 | `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                         |
 | `lua/wheel/provider.lua`                  | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                       |
 | `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                 |
 | `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                          |
 | `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                  |
+| `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                       |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
 | `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                         |

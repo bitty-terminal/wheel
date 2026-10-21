@@ -5,6 +5,7 @@
 -- coverage stays readable without duplicating the suite harness.
 
 local WheelContext = require("wheel.context")
+local WheelContextSnapshot = require("wheel.context_snapshot")
 local WheelErrors = require("wheel.errors")
 local WheelHost = require("wheel.host")
 
@@ -515,14 +516,197 @@ return function(run_test)
       "canonical bytes must escape newlines")
   end)
 
-  run_test("WheelContext snapshots: stash, subscribers, and local budgets are not preserved", function()
+  run_test("WheelContext snapshots: bounded reflog wraps and round-trips", function()
+    local ctx = WheelContext.new()
+    local total = WheelContext.MAX_REFLOG + 2
+    for index = 1, total do
+      ctx:commit_checkpoint({
+        message = "wrap-" .. index,
+        timestamp_ms = 1700000000000 + index,
+      })
+    end
+    local snapshot = assert(ctx:export_snapshot())
+    assert(#snapshot.reflog == WheelContext.MAX_REFLOG)
+    for index = 2, #snapshot.reflog do
+      assert(snapshot.reflog[index].index > snapshot.reflog[index - 1].index,
+        "producer must keep reflog indexes strictly increasing across the ring")
+    end
+
+    local restored = assert(WheelContext.import_snapshot(snapshot))
+    restored:commit_checkpoint({
+      message = "after-restore",
+      timestamp_ms = 1700000009000,
+    })
+    local after = assert(restored:export_snapshot())
+    assert(#after.reflog == WheelContext.MAX_REFLOG)
+    for index = 2, #after.reflog do
+      assert(after.reflog[index].index > after.reflog[index - 1].index,
+        "post-import commits must keep the reflog increasing")
+    end
+  end)
+
+  run_test("WheelContext snapshots: version and reflog index maxima are enforced", function()
+    local fixture = build_fixture()
+    local snapshot = assert(fixture.ctx:export_snapshot())
+
+    reject_mutation(snapshot, "slot version above maximum", function(copy)
+      copy.slots["workspace/project"].version = WheelContext.MAX_SLOT_VERSION + 1
+    end)
+    reject_mutation(snapshot, "reflog index above maximum", function(copy)
+      copy.reflog[1].index = WheelContext.MAX_REFLOG_INDEX + 1
+    end)
+    reject_mutation(snapshot, "huge slot version", function(copy)
+      copy.slots["workspace/project"].version = 1e300
+    end)
+    reject_mutation(snapshot, "huge reflog index", function(copy)
+      copy.reflog[1].index = 1e300
+    end)
+
+    local maxed = deep_copy(snapshot)
+    maxed.slots["workspace/project"].version = WheelContext.MAX_SLOT_VERSION
+    local count = #maxed.reflog
+    for index, entry in ipairs(maxed.reflog) do
+      entry.index = WheelContext.MAX_REFLOG_INDEX - count + index
+    end
+    local restored = assert(WheelContext.import_snapshot(maxed))
+    assert(restored._slots["workspace/project"].version
+      == WheelContext.MAX_SLOT_VERSION)
+    local put_ok, put_err = restored:put_slot("workspace/project", "next")
+    assert(put_ok == nil and put_err.error == "version_exhausted",
+      "producer must fail closed at the slot version bound")
+
+    restored:commit_checkpoint({
+      message = "after-max-index",
+      timestamp_ms = 1700000009000,
+    })
+    local after = assert(restored:export_snapshot())
+    for index = 2, #after.reflog do
+      assert(after.reflog[index].index > after.reflog[index - 1].index,
+        "producer must repair an exhausted reflog index deterministically")
+    end
+  end)
+
+  run_test("WheelContext snapshots: caller-supplied bus history is replaced, subscribers retained", function()
+    local fixture = build_fixture()
+    local snapshot = assert(fixture.ctx:export_snapshot())
+    local bus = WheelContext.ContextBus.new()
+    local notifications = {}
+    bus:subscribe("peer", function(event)
+      notifications[#notifications + 1] = event.type
+    end)
+    bus:publish({ type = "caller_history", timestamp_ms = 1 })
+
+    local restored = assert(WheelContext.import_snapshot(snapshot, { bus = bus }))
+    assert(restored.bus == bus, "import must keep the supplied bus identity")
+    assert(bus:is_subscribed("peer") == true,
+      "import must retain caller bus subscribers")
+    local history = bus:history()
+    assert_deep_equal(history, snapshot.bus_history, "bus_history")
+    assert(#history == #snapshot.bus_history)
+    for _, event in ipairs(history) do
+      assert(event.type ~= "caller_history",
+        "caller history must be replaced, not merged")
+    end
+    bus:publish({ type = "after_restore", timestamp_ms = 2 })
+    assert(notifications[#notifications] == "after_restore",
+      "retained subscribers must receive later events")
+  end)
+
+  run_test("WheelContext snapshots: oversized keys and key counts fail closed", function()
+    local fixture = build_fixture()
+    local snapshot = assert(fixture.ctx:export_snapshot())
+
+    reject_mutation(snapshot, "oversized slot key", function(copy)
+      local key = string.rep("s", WheelContext.MAX_SLOT_NAME_BYTES + 1)
+      local slot = deep_copy(copy.slots["workspace/project"])
+      slot.name = key
+      copy.slots["workspace/project"] = nil
+      copy.slots[key] = slot
+    end)
+    reject_mutation(snapshot, "oversized ref key", function(copy)
+      local key = "refs/heads/" .. string.rep("r",
+        WheelContext.MAX_REF_NAME_BYTES + 1)
+      copy.refs[key] = fixture.c1.hash
+    end)
+    reject_mutation(snapshot, "oversized schema field key", function(copy)
+      copy[string.rep("f", 300)] = true
+    end)
+    reject_mutation(snapshot, "oversized plain map key", function(copy)
+      copy.bus_history[1][string.rep("p", 300)] = "value"
+    end)
+
+    local event = { type = "many_keys", timestamp_ms = 1 }
+    for index = 1, 40 do
+      event["key_" .. index] = index
+    end
+    local key_ctx = WheelContext.new()
+    key_ctx.bus:publish(event)
+    local saved_nodes = WheelContextSnapshot.MAX_VALUE_NODES
+    WheelContextSnapshot.MAX_VALUE_NODES = 16
+    local key_snapshot, key_err = key_ctx:export_snapshot()
+    WheelContextSnapshot.MAX_VALUE_NODES = saved_nodes
+    assert(key_snapshot == nil and WheelErrors.is_typed(key_err)
+      and key_err.code == "E_SNAPSHOT_INVALID",
+      "plain-data keys must count toward the node bound")
+  end)
+
+  run_test("WheelContext snapshots: option errors and live ref names are consistent", function()
+    local fixture = build_fixture()
+    local snapshot = assert(fixture.ctx:export_snapshot())
+    local imported, import_err = WheelContext.import_snapshot(snapshot, "bad")
+    assert(imported == nil and WheelErrors.is_typed(import_err)
+      and import_err.code == "E_ARGS_INVALID",
+      "invalid import options must be a typed argument failure")
+    local exported, export_err = fixture.ctx:export_snapshot("bad")
+    assert(exported == nil and WheelErrors.is_typed(export_err)
+      and export_err.code == "E_ARGS_INVALID",
+      "invalid export options must be a typed argument failure")
+
+    local ctx = WheelContext.new()
+    local too_long = string.rep("b", WheelContext.MAX_REF_NAME_BYTES + 1)
+    local created, create_err = ctx:create_branch(too_long)
+    assert(created == nil and create_err.error == "invalid_branch_name",
+      "live branch creation must enforce the snapshot ref-name bound")
+    assert(ctx:create_branch(string.rep("b", WheelContext.MAX_REF_NAME_BYTES)) == true,
+      "a ref name at the snapshot bound must remain valid")
+    assert(ctx:export_snapshot() ~= nil,
+      "a live ref at the snapshot bound must export")
+  end)
+
+  run_test("WheelContext snapshots: stash content is redacted from bus history", function()
     local fixture = build_fixture()
     local ctx = fixture.ctx
-    assert(ctx:put_slot("scratch/wip", "work in progress").success)
+    local stash_content = "stash-only-content-marker"
+    assert(ctx:put_slot("scratch/wip", stash_content).success)
     assert(ctx:stash_push("wip") ~= nil)
     ctx.bus:subscribe("peer", function() end)
 
+    local live_event
+    for _, event in ipairs(ctx.bus:history()) do
+      if event.type == "stash_pushed" then
+        live_event = event
+      end
+    end
+    assert(live_event and live_event.stash and live_event.stash.slots ~= nil,
+      "the live bus must keep its full stash payload")
+
     local snapshot = assert(ctx:export_snapshot())
+    local snapshot_event
+    for _, event in ipairs(snapshot.bus_history) do
+      if event.type == "stash_pushed" then
+        snapshot_event = event
+      end
+    end
+    assert(snapshot_event and snapshot_event.stash ~= nil,
+      "snapshot must retain stash event metadata")
+    assert(snapshot_event.stash.redacted == true,
+      "snapshot stash events must be marked redacted")
+    assert(snapshot_event.stash.slots == nil,
+      "snapshot stash events must not carry the slot map")
+    local canonical = assert(WheelContext.canonical_snapshot(snapshot))
+    assert(canonical:find(stash_content, 1, true) == nil,
+      "snapshot bytes must not leak stash slot content")
+
     local restored = assert(WheelContext.import_snapshot(snapshot, {
       max_budget_bytes = 4096,
     }))
@@ -532,9 +716,30 @@ return function(run_test)
       "snapshot v1 must not restore bus subscribers")
     assert(restored.max_budget_bytes == 4096,
       "local budgets come from import options, not the snapshot")
+    for _, event in ipairs(restored.bus:history()) do
+      if event.type == "stash_pushed" then
+        assert(event.stash.redacted == true and event.stash.slots == nil,
+          "restored stash events must remain redacted")
+      end
+    end
+    assert(WheelContext.canonical_snapshot(snapshot)
+      == WheelContext.canonical_snapshot(assert(restored:export_snapshot())),
+      "redacted stash history must round-trip canonically")
 
     local defaults = assert(WheelContext.import_snapshot(snapshot))
     assert(defaults.max_budget_bytes == WheelContext.MAX_TOTAL_BUDGET_BYTES,
       "a snapshot without import options uses context defaults")
+
+    assert(ctx:stash_pop(1) ~= nil)
+    local popped = assert(ctx:export_snapshot())
+    local popped_event
+    for _, event in ipairs(popped.bus_history) do
+      if event.type == "stash_popped" then
+        popped_event = event
+      end
+    end
+    assert(popped_event and popped_event.stash.redacted == true
+      and popped_event.stash.slots == nil,
+      "stash_popped events must also be redacted")
   end)
 end

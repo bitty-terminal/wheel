@@ -23,9 +23,15 @@ local MAX_COMMIT_PARENTS = 64
 local MAX_REFS = 256
 local MAX_REFLOG = 256
 local MAX_BUS_HISTORY = 64
+local MAX_TOTAL_BYTES = 64 * 1024 * 1024
 local MAX_METADATA_BYTES = 64 * 1024
 local MAX_ACTION_BYTES = 64
 local MAX_REF_NAME_BYTES = 256
+local MAX_FIELD_NAME_BYTES = 64
+local MAX_PLAIN_KEY_BYTES = 256
+local MAX_SLOT_VERSION = 2147483647
+local MAX_REFLOG_INDEX = 2147483647
+local MAX_SAFE_INTEGER = 9007199254740991
 local MAX_VALUE_DEPTH = 32
 local MAX_VALUE_NODES = 100000
 local VALUE_OVERHEAD_BYTES = 16
@@ -39,9 +45,15 @@ WheelContextSnapshot.MAX_COMMIT_PARENTS = MAX_COMMIT_PARENTS
 WheelContextSnapshot.MAX_REFS = MAX_REFS
 WheelContextSnapshot.MAX_REFLOG = MAX_REFLOG
 WheelContextSnapshot.MAX_BUS_HISTORY = MAX_BUS_HISTORY
+WheelContextSnapshot.MAX_TOTAL_BYTES = MAX_TOTAL_BYTES
 WheelContextSnapshot.MAX_METADATA_BYTES = MAX_METADATA_BYTES
 WheelContextSnapshot.MAX_ACTION_BYTES = MAX_ACTION_BYTES
 WheelContextSnapshot.MAX_REF_NAME_BYTES = MAX_REF_NAME_BYTES
+WheelContextSnapshot.MAX_FIELD_NAME_BYTES = MAX_FIELD_NAME_BYTES
+WheelContextSnapshot.MAX_PLAIN_KEY_BYTES = MAX_PLAIN_KEY_BYTES
+WheelContextSnapshot.MAX_SLOT_VERSION = MAX_SLOT_VERSION
+WheelContextSnapshot.MAX_REFLOG_INDEX = MAX_REFLOG_INDEX
+WheelContextSnapshot.MAX_SAFE_INTEGER = MAX_SAFE_INTEGER
 WheelContextSnapshot.MAX_VALUE_DEPTH = MAX_VALUE_DEPTH
 WheelContextSnapshot.MAX_VALUE_NODES = MAX_VALUE_NODES
 
@@ -73,7 +85,7 @@ local REJECTION_VALUE = {}
 local function reject(path, reason)
   error({
     [REJECTION_KEY] = REJECTION_VALUE,
-    detail = tostring(path) .. ": " .. tostring(reason),
+    detail = tostring(reason) .. " (" .. tostring(path) .. ")",
   }, 0)
 end
 
@@ -105,10 +117,12 @@ local function charge(state, deps, path, bytes)
   end
 end
 
-local function check_fields(value, path, required, optional)
+local function check_fields(value, path, required, optional, deps)
   if type(value) ~= "table" then
     reject(path, "must be a table")
   end
+  local max_field_name_bytes = (deps and deps.max_field_name_bytes)
+    or MAX_FIELD_NAME_BYTES
   local allowed = {}
   for _, field in ipairs(required) do
     allowed[field] = true
@@ -119,6 +133,9 @@ local function check_fields(value, path, required, optional)
   for key in pairs(value) do
     if type(key) ~= "string" then
       reject(path, "field names must be strings")
+    end
+    if #key > max_field_name_bytes then
+      reject(path, "field name exceeds the maximum length")
     end
     if not allowed[key] then
       reject(path, "unknown field '" .. key .. "'")
@@ -152,10 +169,12 @@ local function check_number(value, path)
   return value
 end
 
-local function check_integer(value, path, minimum)
+local function check_integer(value, path, minimum, maximum)
   check_number(value, path)
-  if value ~= math.floor(value) or value < minimum then
-    reject(path, "must be an integer >= " .. tostring(minimum))
+  maximum = maximum or MAX_SAFE_INTEGER
+  if value ~= math.floor(value) or value < minimum or value > maximum then
+    reject(path, "must be an integer between " .. tostring(minimum)
+      .. " and " .. tostring(maximum))
   end
   return value
 end
@@ -256,13 +275,15 @@ local function copy_slot_map(value, path, deps, state)
     if type(key) ~= "string" then
       reject(path, "slot keys must be strings")
     end
+    -- Validate the key before building a path from it: an over-bound name must
+    -- not amplify memory or the error detail.
+    check_slot_name(key, path .. "[slot]", deps)
 
     local slot_path = path .. "[" .. key .. "]"
-    check_fields(slot, slot_path, SLOT_FIELDS)
+    check_fields(slot, slot_path, SLOT_FIELDS, nil, deps)
     if rawget(slot, "name") ~= key then
       reject(slot_path, "name must match its table key")
     end
-    check_slot_name(key, slot_path, deps)
 
     local content = rawget(slot, "content")
     if type(content) ~= "string" then
@@ -273,7 +294,8 @@ local function copy_slot_map(value, path, deps, state)
     end
 
     local size = rawget(slot, "size_bytes")
-    check_integer(size, slot_path .. ".size_bytes", 0)
+    check_integer(size, slot_path .. ".size_bytes", 0,
+      deps.max_slot_content_bytes)
     if size ~= #content then
       reject(slot_path, "size_bytes does not match the content length")
     end
@@ -291,7 +313,7 @@ local function copy_slot_map(value, path, deps, state)
     end
 
     local version = rawget(slot, "version")
-    check_integer(version, slot_path .. ".version", 1)
+    check_integer(version, slot_path .. ".version", 1, deps.max_slot_version)
 
     local kind = rawget(slot, "kind")
     if type(kind) ~= "string" or not deps.slot_kinds[kind] then
@@ -357,12 +379,27 @@ local function copy_plain(value, path, deps, state, depth, visiting, memo)
   local numeric_keys = 0
   local all_numeric = true
   for key in pairs(value) do
-    keys[#keys + 1] = key
-    if type(key) == "number" and key >= 1 and key == math.floor(key) then
+    local key_type = type(key)
+    if key_type == "string" then
+      if #key > deps.max_plain_key_bytes then
+        reject(path, "map key exceeds the maximum length")
+      end
+      charge(state, deps, path, #key + VALUE_OVERHEAD_BYTES)
+      all_numeric = false
+    elseif key_type == "number" and key >= 1 and key == math.floor(key) then
+      charge(state, deps, path, VALUE_OVERHEAD_BYTES)
       numeric_keys = numeric_keys + 1
     else
-      all_numeric = false
+      reject(path, "table keys must be strings or a dense integer array")
     end
+
+    -- Keys are structural nodes; counting them here bounds work before the
+    -- key list is sorted or copied.
+    state.nodes = state.nodes + 1
+    if state.nodes > deps.max_nodes then
+      reject(path, "exceeds the total value node bound")
+    end
+    keys[#keys + 1] = key
   end
 
   local is_array = false
@@ -395,7 +432,6 @@ local function copy_plain(value, path, deps, state, depth, visiting, memo)
   end
   table.sort(keys, byte_less)
   for _, key in ipairs(keys) do
-    charge(state, deps, path, #key + VALUE_OVERHEAD_BYTES)
     copy[key] = copy_plain(value[key], path .. "." .. key, deps, state,
       depth + 1, visiting, memo)
   end
@@ -420,7 +456,7 @@ local function copy_commit_map(value, path, deps, state)
     end
 
     local commit_path = path .. "[" .. key:sub(1, 8) .. "]"
-    check_fields(commit, commit_path, COMMIT_FIELDS, COMMIT_OPTIONAL_FIELDS)
+    check_fields(commit, commit_path, COMMIT_FIELDS, COMMIT_OPTIONAL_FIELDS, deps)
     check_hash(rawget(commit, "hash"), commit_path .. ".hash")
     if rawget(commit, "hash") ~= key then
       reject(commit_path, "hash must match its table key")
@@ -551,10 +587,12 @@ local function copy_ref_map(value, path, commits, deps, state)
     if type(ref) ~= "string" then
       reject(path, "ref keys must be strings")
     end
-    check_branch_ref(ref, path .. "[" .. ref .. "]", deps)
-    check_hash(hash, path .. "[" .. ref .. "]")
+    -- Validate the name before building a path from it.
+    check_branch_ref(ref, path .. "[ref]", deps)
+    local ref_path = path .. "[" .. ref .. "]"
+    check_hash(hash, ref_path)
     if commits[hash] == nil then
-      reject(path .. "[" .. ref .. "]", "references an unknown commit")
+      reject(ref_path, "references an unknown commit")
     end
     charge(state, deps, path, #ref + 64 + VALUE_OVERHEAD_BYTES)
     refs[ref] = hash
@@ -600,10 +638,10 @@ local function copy_reflog(value, path, commits, deps, state)
   for index = 1, count do
     local entry = value[index]
     local entry_path = path .. "[" .. tostring(index) .. "]"
-    check_fields(entry, entry_path, REFLOG_FIELDS)
+    check_fields(entry, entry_path, REFLOG_FIELDS, nil, deps)
 
     local entry_index = rawget(entry, "index")
-    check_integer(entry_index, entry_path .. ".index", 1)
+    check_integer(entry_index, entry_path .. ".index", 1, deps.max_reflog_index)
     if entry_index <= last_index then
       reject(entry_path .. ".index", "must be strictly increasing")
     end
@@ -673,7 +711,7 @@ local function validate_snapshot(snapshot, deps)
     reject("snapshot", "snapshot validator dependencies are incomplete")
   end
 
-  check_fields(snapshot, "snapshot", TOP_LEVEL_FIELDS)
+  check_fields(snapshot, "snapshot", TOP_LEVEL_FIELDS, nil, deps)
   if rawget(snapshot, "format") ~= deps.format then
     reject("snapshot.format", "unsupported snapshot format")
   end

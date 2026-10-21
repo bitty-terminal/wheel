@@ -84,11 +84,17 @@ WheelContext.MAX_TOTAL_BUDGET_BYTES = 64 * 1024 -- 64 KiB
 WheelContext.DEFAULT_ZONE1_MAX_BYTES = 16 * 1024 -- 16 KiB
 WheelContext.DEFAULT_ZONE2_MAX_BYTES = 32 * 1024 -- 32 KiB
 WheelContext.DEFAULT_ZONE3_MAX_BYTES = 16 * 1024 -- 16 KiB
-WheelContext.MAX_BUS_HISTORY = 64
-WheelContext.MAX_REFLOG = 256
-WheelContext.SNAPSHOT_FORMAT = "wheel-context-snapshot/1"
-WheelContext.SNAPSHOT_VERSION = 1
-WheelContext.MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024 -- 64 MiB total snapshot bound
+
+-- Snapshot policy constants have one source: the snapshot module. Keeping the
+-- public context aliases avoids a second format/version/bound that can drift.
+WheelContext.MAX_BUS_HISTORY = WheelSnapshot.MAX_BUS_HISTORY
+WheelContext.MAX_REFLOG = WheelSnapshot.MAX_REFLOG
+WheelContext.SNAPSHOT_FORMAT = WheelSnapshot.FORMAT
+WheelContext.SNAPSHOT_VERSION = WheelSnapshot.VERSION
+WheelContext.MAX_SNAPSHOT_BYTES = WheelSnapshot.MAX_TOTAL_BYTES
+WheelContext.MAX_REFLOG_INDEX = WheelSnapshot.MAX_REFLOG_INDEX
+WheelContext.MAX_SLOT_VERSION = WheelSnapshot.MAX_SLOT_VERSION
+WheelContext.MAX_REF_NAME_BYTES = WheelSnapshot.MAX_REF_NAME_BYTES
 
 WheelContext.SlotKind = {
   WORKSPACE = "workspace",
@@ -244,6 +250,18 @@ local function validate_slot_name(name)
   return true, nil
 end
 
+--- Bound a caller-controlled label for a diagnostic.
+-- @param value any
+-- @param limit number Maximum bytes before truncation
+-- @return string
+local function bounded_label(value, limit)
+  local text = type(value) == "string" and value or tostring(value)
+  if #text > limit then
+    return text:sub(1, limit - 3) .. "..."
+  end
+  return text
+end
+
 --- Assemble the snapshot validator's dependency and bound table.
 -- Snapshot-wide bounds are read at call time so a caller can tighten them
 -- without editing the shared module. The per-slot content and total limits are
@@ -261,14 +279,18 @@ local function snapshot_deps()
     max_slot_content_bytes = WheelContext.MAX_SLOT_CONTENT_BYTES,
     max_total_bytes = WheelContext.MAX_SNAPSHOT_BYTES,
     max_slot_entries = WheelSnapshot.MAX_SLOT_ENTRIES,
+    max_slot_version = WheelContext.MAX_SLOT_VERSION,
     max_commits = WheelSnapshot.MAX_COMMITS,
     max_commit_parents = WheelSnapshot.MAX_COMMIT_PARENTS,
     max_refs = WheelSnapshot.MAX_REFS,
     max_reflog = WheelContext.MAX_REFLOG,
+    max_reflog_index = WheelContext.MAX_REFLOG_INDEX,
     max_bus_history = WheelContext.MAX_BUS_HISTORY,
     max_metadata_bytes = WheelSnapshot.MAX_METADATA_BYTES,
     max_action_bytes = WheelSnapshot.MAX_ACTION_BYTES,
-    max_ref_name_bytes = WheelSnapshot.MAX_REF_NAME_BYTES,
+    max_ref_name_bytes = WheelContext.MAX_REF_NAME_BYTES,
+    max_field_name_bytes = WheelSnapshot.MAX_FIELD_NAME_BYTES,
+    max_plain_key_bytes = WheelSnapshot.MAX_PLAIN_KEY_BYTES,
     max_depth = WheelSnapshot.MAX_VALUE_DEPTH,
     max_nodes = WheelSnapshot.MAX_VALUE_NODES,
   }
@@ -349,6 +371,13 @@ function WheelContext:put_slot(name, content, expected_version)
         current_version = current_ver,
       }
     end
+  end
+
+  if current_ver >= WheelContext.MAX_SLOT_VERSION then
+    return nil, {
+      error = "version_exhausted",
+      message = "slot version bound reached for '" .. name .. "'",
+    }
   end
 
   local h = WheelContext.compute_hash(content)
@@ -473,7 +502,7 @@ function WheelContext:remove_slot(name, expected_version)
   self.bus:publish({
     type = "slot_removed",
     name = name,
-    version = existing.version + 1,
+    version = math.min(existing.version + 1, WheelContext.MAX_SLOT_VERSION),
     timestamp_ms = WheelHost.time.now() * 1000,
   })
 
@@ -636,12 +665,51 @@ function WheelContext:_restore_slots_from_commit(commit)
   self._tree_hash = commit.tree_hash
 end
 
+--- Choose the next reflog index, repairing an exhausted or non-monotonic
+-- retained ring deterministically. Normal entries advance from the last
+-- retained index, not from the array length, so a trimmed ring keeps a strictly
+-- increasing sequence.
+-- @param reflog table Retained reflog records
+-- @return number
+local function next_reflog_index(reflog)
+  local last = reflog[#reflog]
+  if not last then
+    return 1
+  end
+  local last_index = last.index
+  local monotonic = type(last_index) == "number"
+    and last_index == math.floor(last_index)
+    and last_index >= 1
+    and last_index < WheelContext.MAX_REFLOG_INDEX
+  if monotonic then
+    for index = 1, #reflog do
+      local entry_index = reflog[index].index
+      local previous = reflog[index - 1]
+      if type(entry_index) ~= "number"
+        or entry_index ~= math.floor(entry_index)
+        or entry_index < 1
+        or (previous and (type(previous.index) ~= "number"
+          or entry_index <= previous.index)) then
+        monotonic = false
+        break
+      end
+    end
+  end
+  if not monotonic then
+    for index, entry in ipairs(reflog) do
+      entry.index = index
+    end
+    return #reflog + 1
+  end
+  return last_index + 1
+end
+
 --- Append an audit record to the context reflog.
 -- @param entry table Reflog descriptor
 -- @return table The stored reflog record
 function WheelContext:_append_reflog(entry)
   local record = {
-    index = #self._reflog + 1,
+    index = next_reflog_index(self._reflog),
     from_hash = entry.from_hash or "(empty)",
     to_hash = entry.to_hash or "(empty)",
     ref = entry.ref or self._head,
@@ -782,8 +850,13 @@ end
 -- @param start_point string|nil Commit hash or ref to branch from (default current HEAD)
 -- @return boolean, table|nil true on success, or nil, error table
 function WheelContext:create_branch(name, start_point)
-  if type(name) ~= "string" or not name:match("^[%w%._%-%/]+$") or name:find("%.%.") or name:sub(1, 1) == "/" or name:sub(-1) == "/" then
-    return nil, { error = "invalid_branch_name", message = "Invalid branch name: " .. tostring(name) }
+  if type(name) ~= "string" or #name > WheelContext.MAX_REF_NAME_BYTES
+    or not name:match("^[%w%._%-%/]+$") or name:find("%.%.")
+    or name:sub(1, 1) == "/" or name:sub(-1) == "/" then
+    return nil, {
+      error = "invalid_branch_name",
+      message = "Invalid branch name: " .. bounded_label(name, 64),
+    }
   end
   local ref = "refs/heads/" .. name
   if self._refs[ref] ~= nil then
@@ -1007,6 +1080,19 @@ function WheelContext:stash_pop(index)
   end
   if index < 1 or index > #self._stash then
     return nil, { error = "invalid_index", message = "Stash index out of range: " .. tostring(index) }
+  end
+
+  -- Refuse before mutating either the stash stack or the working slots.
+  local candidate = self._stash[index]
+  for key in pairs(candidate.slots) do
+    local existing = self._slots[key]
+    if existing and type(existing.version) == "number"
+      and existing.version >= WheelContext.MAX_SLOT_VERSION then
+      return nil, {
+        error = "version_exhausted",
+        message = "slot version bound reached for '" .. key .. "'",
+      }
+    end
   end
 
   local entry = table.remove(self._stash, index)
@@ -1345,17 +1431,55 @@ end
 -- Versioned Snapshot Export and Restore
 -- ---------------------------------------------------------------------------
 
+-- Stash entries are intentionally outside snapshot v1, but their bus events
+-- carry the full slot map. Replace that payload with bounded metadata so a
+-- snapshot never smuggles stash content through the event history.
+local SNAPSHOT_STASH_EVENT_TYPES = {
+  stash_pushed = true,
+  stash_popped = true,
+}
+
+local function snapshot_bus_history(bus)
+  local history = bus:history()
+  local sanitized = {}
+  for index, event in ipairs(history) do
+    if type(event) == "table" and SNAPSHOT_STASH_EVENT_TYPES[event.type]
+      and type(event.stash) == "table" then
+      local stash = event.stash
+      local redacted = {
+        id = stash.id,
+        message = stash.message,
+        head_hash = stash.head_hash,
+        branch = stash.branch,
+        timestamp_ms = stash.timestamp_ms,
+        redacted = true,
+      }
+      local copy = {}
+      for key, value in pairs(event) do
+        copy[key] = value
+      end
+      copy.stash = redacted
+      sanitized[index] = copy
+    else
+      sanitized[index] = event
+    end
+  end
+  return sanitized
+end
+
 --- Export the complete in-memory context state as a versioned snapshot.
 -- The snapshot is a deep, caller-owned copy: mutating it never changes the
 -- context. It preserves working slots, the Merkle tree hash, HEAD, refs,
 -- commits, the bounded reflog, and the bounded bus history. Stash entries,
--- bus subscribers, the kernel link, and local budget configuration are not
--- part of snapshot v1.
+-- bus subscribers, the kernel link, `config` directives, and local budget
+-- configuration are not part of snapshot v1. Stash event slot payloads are
+-- redacted from the preserved bus history.
 -- @param opts table|nil Reserved; must be a table when provided
--- @return table|nil snapshot, or nil and a typed E_SNAPSHOT_INVALID cause
+-- @return table|nil snapshot, or nil and a typed cause
 function WheelContext:export_snapshot(opts)
   if opts ~= nil and type(opts) ~= "table" then
-    return nil, WheelErrors.snapshot_invalid("export options must be a table")
+    return nil, WheelErrors.args_invalid("context.export_snapshot",
+      "options must be a table")
   end
 
   local raw = {
@@ -1367,7 +1491,7 @@ function WheelContext:export_snapshot(opts)
     refs = self._refs,
     commits = self._commits,
     reflog = self._reflog,
-    bus_history = self.bus:history(),
+    bus_history = snapshot_bus_history(self.bus),
   }
   local snapshot, detail = WheelSnapshot.validate(raw, snapshot_deps())
   if not snapshot then
@@ -1389,8 +1513,10 @@ end
 
 --- Restore a new WheelContext from a validated snapshot.
 -- Validation and deep copying complete before the new object is populated, so
--- a failed import never exposes a partially restored context. The input table
--- is never mutated.
+-- a failed import never exposes a partially restored context. The snapshot
+-- table is never mutated. When `opts.bus` is supplied, the snapshot bus history
+-- replaces that bus's existing history and its subscribers are retained; the
+-- provided bus is the only caller-owned object import mutates.
 -- @param snapshot table
 -- @param opts table|nil WheelContext.new options (kernel, config, bus, budgets)
 -- @return WheelContext|nil, or nil and a typed cause

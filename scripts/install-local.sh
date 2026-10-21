@@ -223,14 +223,14 @@ validate_archive() {
 
 validate_installed_tree() {
   local tree=$1 expected_version=$2
-  local allowed=" VERSION LICENSE README.md SECURITY-MODEL.md repo.toml lua "
+  local allowed=" VERSION LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml lua "
   local required path name installed_version
   [ -d "$tree" ] && [ ! -L "$tree" ] || die "installed tree is not a directory: $tree"
   [ -f "$tree/VERSION" ] || die "installed tree is missing VERSION"
   installed_version="$(<"$tree/VERSION")"
   [ "$installed_version" = "$expected_version" ] ||
     die "installed VERSION '$installed_version' does not match '$expected_version'"
-  for required in LICENSE README.md SECURITY-MODEL.md repo.toml lua/wheel/init.lua; do
+  for required in LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml lua/wheel/init.lua; do
     [ -f "$tree/$required" ] || die "installed tree is missing $required"
   done
   [ -z "$(find "$tree" -type l -print -quit)" ] ||

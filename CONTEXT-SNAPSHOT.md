@@ -32,17 +32,22 @@ local bytes, encode_err = WheelContext.canonical_snapshot(snapshot)
 - `WheelContext.validate_snapshot(snapshot)` returns `true`, or
   `nil, typed_error`. It never constructs a context.
 - `WheelContext.import_snapshot(snapshot, opts)` validates and deep-copies the
-  snapshot before constructing a new `WheelContext`. It never mutates the input
-  and never exposes a partially populated object. `opts` are the normal
-  `WheelContext.new` options (`kernel`, `config`, `bus`, and budget overrides);
-  they are local policy and are not read from the snapshot.
+  snapshot before constructing a new `WheelContext`. It never mutates the
+  snapshot table and never exposes a partially populated object. `opts` are the
+  normal `WheelContext.new` options (`kernel`, `config`, `bus`, and budget
+  overrides); they are local policy and are not read from the snapshot. When
+  `opts.bus` is supplied, the snapshot bus history replaces that bus's existing
+  history and its subscribers are retained; the provided bus is the only
+  caller-owned object import mutates.
 - `WheelContext.canonical_snapshot(snapshot)` validates the snapshot and returns
   canonical bytes for deterministic comparison. The bytes are not a stable wire
   format; a future transport must version its own encoding.
 
-All failures use the `wheel.errors` bridge shape with class `validation` and
-code `E_SNAPSHOT_INVALID`. The message is a bounded, single-line schema path and
-reason; it never includes slot content.
+Snapshot validation failures use the `wheel.errors` bridge shape with class
+`validation` and code `E_SNAPSHOT_INVALID`. Invalid `opts` are argument failures
+and use `E_ARGS_INVALID`. The message is a bounded, single-line schema path and
+reason. Schema paths may name caller-provided slot, ref, or event keys; slot
+content is never included.
 
 ## Format version 1
 
@@ -61,25 +66,28 @@ The top-level fields are all required and are the only accepted fields:
 | `bus_history` | Dense array of recent event tables in chronological order.           |
 
 A slot record has exactly `name`, `content`, `hash`, `version`, `kind`,
-`size_bytes`, and `updated_at_ms`. The map key must equal `name`; `hash` must be
-the SHA-256 of `content`; `size_bytes` must equal the content length; `kind`
-must be one of the known slot kinds and must match the name's prefix.
+`size_bytes`, and `updated_at_ms`. The map key must equal `name`; names are at
+most 256 bytes; `hash` must be the SHA-256 of `content`; `size_bytes` must equal
+the content length; `version` is an integer from 1 to 2147483647; `kind` must be
+one of the known slot kinds and must match the name's prefix.
 
 A commit record has exactly `hash`, `tree_hash`, `slots`, `parent_hashes`,
 `author`, `message`, and `timestamp_ms`, plus optional `task_id` and
 `rationale`. The map key must equal `hash`; the tree hash must match the
 commit's slot map; the commit hash must match the existing `commit:v1` preimage;
-and every parent hash must name another commit in the same snapshot.
+and every parent hash must name another commit in the same snapshot. `rationale`
+must be plain data (the same depth, node, string, and key bounds as events).
 
 A reflog record has exactly `index`, `from_hash`, `to_hash`, `ref`, `action`,
-`message`, and `timestamp_ms`. Reflog indexes are strictly increasing. The
-`from_hash` and `to_hash` endpoints may be `(empty)`, `(initial)`, a branch ref,
-or a commit hash present in `commits`. The `ref` is a branch ref, `(detached)`,
-or a commit hash when a commit moved HEAD while detached.
+`message`, and `timestamp_ms`. Reflog indexes are strictly increasing integers
+from 1 to 2147483647. The `from_hash` and `to_hash` endpoints may be `(empty)`,
+`(initial)`, a branch ref, or a commit hash present in `commits`. The `ref` is a
+branch ref, `(detached)`, or a commit hash when a commit moved HEAD while
+detached.
 
 An event record is any plain-data table with a finite `timestamp_ms`; a `type`
-field, when present, must be a string. Events are preserved as audit history,
-not replayed.
+field, when present, must be a string. Map keys are limited to 256 bytes. Events
+are preserved as audit history, not replayed.
 
 `head` may name a branch ref that has no commit yet (an unborn branch, including
 a force-deleted active branch). That is a valid context state; the snapshot does
@@ -104,15 +112,23 @@ byte-stable for every accepted snapshot.
 
 Validation fails closed before constructing a context. The accepted bounds are:
 
-- slot content: 16 MiB per slot;
+- slot names: 256 bytes; slot content: 16 MiB per slot; slot versions: 1 to
+  2147483647;
 - total snapshot: 64 MiB of logical payload and structure;
 - slots: 4096 per map, 65536 slot entries across the working tree and commits;
 - commits: 4096, with at most 64 parents per commit;
-- refs: 256;
-- reflog: 256 records;
+- refs: 256 entries, each branch name at most 256 bytes;
+- reflog: 256 records, each index 1 to 2147483647 and strictly increasing, each
+  action at most 64 bytes;
 - bus history: 64 events;
-- metadata strings: 64 KiB;
-- plain-data values: depth 32 and 100000 nodes.
+- metadata strings (author, message, task ID, rationale strings, and event
+  string values): 64 KiB per string;
+- schema field names: 64 bytes; plain-data map keys: 256 bytes;
+- plain-data values: depth 32 and 100000 nodes, counting map keys as nodes.
+
+The producer refuses a slot write when its version reaches the bound
+(`version_exhausted`) and deterministically renumbers a retained reflog when its
+index reaches the reflog bound, so a bounded context remains exportable.
 
 Validation rejects:
 
@@ -124,12 +140,12 @@ Validation rejects:
 - commit hashes that do not match their preimage, unknown commit parents, and
   commit parent cycles;
 - reflog endpoints that name unknown commits or malformed refs;
-- non-plain event payloads (functions, threads, userdata), cycles, or
-  over-bound history.
+- non-plain event payloads (functions, threads, userdata), cycles, over-bound
+  keys, or over-bound history.
 
 A snapshot whose commits reference parents outside the snapshot is rejected as
-partial. Export a state whose commit graph is closed, or omit the incomplete
-history deliberately.
+partial. The live context must have a closed commit graph before export; there is
+no export option that omits commits.
 
 ## Integrity limits
 
@@ -142,6 +158,9 @@ cover every field:
   or `updated_at_ms`;
 - the commit preimage binds the tree hash, parents, author, task ID, timestamp,
   and message, not `rationale`;
+- `head` and `refs` are unauthenticated pointers; a tamperer can redirect either
+  to any commit that already exists in the snapshot while every hash remains
+  valid;
 - reflog entries and bus events have no cryptographic binding.
 
 An attacker who can rewrite a snapshot can therefore alter those unbound fields
@@ -168,10 +187,14 @@ Callers that persist a snapshot must:
 Snapshot v1 captures working slots, the tree hash, `HEAD`, refs, commits, the
 reflog, and bus history. It deliberately does not capture:
 
-- stash entries (`stash_push`), which are transient working state;
-- bus subscribers and callbacks;
+- stash entries (`stash_push`), which are transient working state; their bus
+  events are retained with the slot map redacted (`stash.redacted = true`), so
+  stash content cannot bypass this exclusion;
+- bus subscribers and callbacks; a caller-supplied import bus keeps its existing
+  subscribers, but snapshot subscribers are not recreated;
 - the `kernel` link;
-- local budget configuration (`max_budget_bytes`, zone limits); pass these as
+- the `config` table/directives and local budget configuration
+  (`max_budget_bytes`, zone limits); pass `config` and budget overrides as
   import options or accept the defaults;
 - cached derived values beyond the tree hash.
 

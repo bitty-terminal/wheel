@@ -16,10 +16,11 @@
 -- vocabulary (`E_SCHEMA_INVALID`, `E_ARGS_INVALID`, `E_RESULT_INVALID`) with
 -- class `validation`, and the same three-field bridge shape.
 --
--- Context snapshot restore failures use a Wheel-local `E_SNAPSHOT_INVALID`
--- validation code. The snapshot is caller-supplied, potentially tampered data;
--- the cause stays a bounded single-line schema path so validation never
--- reflects slot content or an unbounded attacker-controlled key.
+-- Context snapshot validation failures use a Wheel-local
+-- `E_SNAPSHOT_INVALID` validation code. The snapshot is caller-supplied,
+-- potentially tampered data; the cause stays a bounded single-line schema path
+-- so validation never reflects slot content or an unbounded attacker-controlled
+-- key.
 
 local WheelErrors = {}
 
@@ -192,10 +193,12 @@ local SNAPSHOT_DETAIL_MAX_LENGTH = 112
 -- @return table
 function WheelErrors.snapshot_invalid(detail)
   local reason = type(detail) == "string" and detail or "invalid snapshot"
-  reason = reason:gsub("%c", "?")
+  -- Bound before sanitizing so an oversized key or path cannot be copied in
+  -- full just to be discarded.
   if #reason > SNAPSHOT_DETAIL_MAX_LENGTH then
     reason = reason:sub(1, SNAPSHOT_DETAIL_MAX_LENGTH - 3) .. "..."
   end
+  reason = reason:gsub("%c", "?")
   return typed(
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_SNAPSHOT_INVALID,
