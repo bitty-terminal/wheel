@@ -18,6 +18,13 @@ local function execute_succeeded(status)
   return status == true or status == 0
 end
 
+local function pid_is_alive(pid)
+  if type(pid) ~= "string" or pid:match("^%d+$") == nil then
+    return false
+  end
+  return execute_succeeded(os.execute("kill -0 " .. pid .. " 2>/dev/null"))
+end
+
 -- Per-run private directory: `os.tmpname` yields a unique path, and the
 -- placeholder is replaced by this run's drill directory so concurrent drills
 -- never share FIFOs, a database, or a log.
@@ -29,6 +36,8 @@ local DB_PATH = E2E_DIR .. "/wheel_drill.db"
 
 -- Only PIDs launched by this drill are ever signaled; shutdown removes a PID
 -- from the set so a failed run cannot signal a reused process.
+local HOST_EXIT_WAIT_ATTEMPTS = 50
+local HOST_EXIT_WAIT_INTERVAL_SECONDS = "0.05"
 local recorded_pids = {}
 local cleaned_up = false
 
@@ -116,7 +125,14 @@ local function spawn_host(db_file)
     end)
     pipe_out:close()
     pipe_in:close()
-    os.execute("sleep 0.1")
+    local attempts = HOST_EXIT_WAIT_ATTEMPTS
+    while attempts > 0 and pid_is_alive(pid) do
+      os.execute("sleep " .. HOST_EXIT_WAIT_INTERVAL_SECONDS)
+      attempts = attempts - 1
+    end
+    if pid_is_alive(pid) then
+      os.execute("kill -9 " .. pid .. " 2>/dev/null || :")
+    end
     for index, value in ipairs(recorded_pids) do
       if value == pid then
         table.remove(recorded_pids, index)

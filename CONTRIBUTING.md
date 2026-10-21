@@ -71,10 +71,13 @@ other's data. `just test` adds an outer temporary base and removes it when the
 suite exits, even before the suite's own cleanup hook runs.
 
 `WHEEL_TEST_TMP` must be an absolute path built from `A-Z`, `a-z`, `0-9`, `.`,
-`_`, `-`, and `/`. Whitespace, shell metacharacters, and relative paths are
-rejected before the suite creates or removes anything, because fixture commands
-embed derived paths in shell strings. Run `just test-roots` to verify an unsafe
-base is rejected without touching a sentinel file outside the run root.
+`_`, `-`, and `/`, without a `..` segment. Whitespace, shell metacharacters,
+relative paths, and parent-directory segments are rejected before the suite
+creates its run directory or any fixture, because fixture commands embed
+derived paths in shell strings. The suite first removes its `os.tmpname()`
+probe placeholder, so only that probe exists before validation. Run
+`just test-roots` to verify an unsafe base is rejected without touching a
+sentinel file outside the run root.
 
 Run `just test-concurrent` to prove the isolation: it starts two suites
 concurrently against one shared scratch base, asserts that two distinct per-run

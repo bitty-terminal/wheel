@@ -29,8 +29,8 @@ local function execute_succeeded(status)
 end
 
 -- Fixture commands interpolate derived paths into shell strings. Reject a
--- caller base that could split a command or inject shell syntax before any
--- directory is created or removed.
+-- caller base that could split a command, escape the intended tree, or inject
+-- shell syntax before the run root is created.
 local function validate_test_base(path, label)
   if type(path) ~= "string" or path == "" then
     error(label .. " must be a non-empty absolute path", 0)
@@ -40,6 +40,11 @@ local function validate_test_base(path, label)
   end
   if path == "/" or not path:match("^/[A-Za-z0-9._/-]+$") then
     error(label .. " must not contain whitespace or shell metacharacters", 0)
+  end
+  for segment in path:gmatch("[^/]+") do
+    if segment == ".." then
+      error(label .. " must not contain '..' segments", 0)
+    end
   end
   return path
 end
@@ -124,6 +129,7 @@ run_test("Wheel test harness: unsafe WHEEL_TEST_TMP bases are rejected", functio
     TEST_RUN_ROOT .. "/with$dollar",
     TEST_RUN_ROOT .. "/with'quote",
     TEST_RUN_ROOT .. "/with\nnewline",
+    TEST_RUN_ROOT .. "/../escape",
     "/",
     "",
   }
@@ -8185,8 +8191,7 @@ run_test("WheelHost: Lua 5.2+ os.execute liveness probes fail closed", function(
 end)
 
 run_test("WheelHost: private file, FIFO, and pid primitives", function()
-  local root = "/tmp/bitty/wheel-host-ctx0024-"
-    .. tostring(WheelHost.proc.pid()) .. "-" .. tostring(os.time())
+  local root = test_path("wheel-host-ctx0024")
   os.execute("rm -rf " .. root)
   assert(WheelHost.fs.mkdir_p(root) == true)
   assert(WheelHost.fs.chmod(root, "700") == true)
