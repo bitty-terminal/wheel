@@ -61,6 +61,32 @@ or linters by name):
 6. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
    stop at review; independent review is required for acceptance.
 
+## Test scratch roots
+
+`tests/test_wheel.lua` creates one private root per run: a unique child of
+`WHEEL_TEST_TMP` when that variable is set, otherwise the unique path returned
+by `os.tmpname()`. Every filesystem fixture is constructed under that root, and
+the suite removes only its own root, so concurrent worktrees cannot delete each
+other's data. `just test` adds an outer temporary base and removes it when the
+suite exits, even before the suite's own cleanup hook runs.
+
+`WHEEL_TEST_TMP` must be an absolute path built from `A-Z`, `a-z`, `0-9`, `.`,
+`_`, `-`, and `/`, without a `..` segment. Whitespace, shell metacharacters,
+relative paths, and parent-directory segments are rejected before the suite
+creates its run directory or any fixture, because fixture commands embed
+derived paths in shell strings. The suite first removes its `os.tmpname()`
+probe placeholder, so only that probe exists before validation. Run
+`just test-roots` to verify an unsafe base is rejected without touching a
+sentinel file outside the run root.
+
+Run `just test-concurrent` to prove the isolation: it starts two suites
+concurrently against one shared scratch base, asserts that two distinct per-run
+roots exist while both run, and fails if either suite fails or if the base is
+not empty afterwards. The check roughly doubles the suite runtime, so it is a
+local gate rather than part of `just check`. The cross-process drill in
+`tests/e2e_cross_process.lua` also creates its own per-run FIFO/database
+directory and cleans recorded host processes and the directory on failure.
+
 ## Delivery lifecycle
 
 Changes follow Issue -> Branch -> Commit -> Pull Request -> Review -> Merge,

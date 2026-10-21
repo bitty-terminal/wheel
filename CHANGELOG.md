@@ -217,6 +217,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0027 concurrent test scratch roots: `tests/test_wheel.lua` now derives one
+  private root per run from `WHEEL_TEST_TMP` or `os.tmpname()` and builds every
+  filesystem fixture under it, instead of sharing fixed global scratch
+  directories. The suite removes only its own root, normalizes Lua 5.1/LuaJIT
+  numeric and Lua 5.2+ boolean `os.execute` success, rejects a `WHEEL_TEST_TMP`
+  base outside a safe absolute charset or containing a `..` segment before the
+  run root is created, and guards the CWD-local relative-root fixture.
+  `just test` adds a removable outer base; the cross-process drill uses a
+  unique FIFO/database directory, waits for each recorded host process, and
+  cleans recorded processes and the directory on failure. `just test-concurrent`
+  stops and waits for both suites before removing their scratch tree on an
+  interrupt, asserts two distinct roots while both run, and proves they pass
+  without deleting each other's files; `just test-roots` proves an unsafe base
+  is rejected without deleting a sentinel. Test-only change; no production
+  behavior.
 - CTX-0021 / wheel#81 process-group identity: the `setsid` session leader is
   now retained through the bounded TERM/grace/KILL sweep, writes the direct
   command's exit status to the private status file before sending any signal,

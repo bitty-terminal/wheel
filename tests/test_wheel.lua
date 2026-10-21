@@ -13,15 +13,131 @@ local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
 local WheelCommands = require("wheel.commands")
 
+-- Every filesystem fixture in this suite lives under one private per-run root.
+-- Concurrent worktrees therefore never share a directory, and each process
+-- deletes only the root it created. `WHEEL_TEST_TMP` may name a caller-owned
+-- base; it must be an absolute path made of shell-safe characters, and the run
+-- still creates its own unique child beneath it so two calls that share a base
+-- cannot collide.
+local function shell_quote(value)
+  return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+-- Lua 5.1 and LuaJIT return a numeric status; Lua 5.2+ return true on success.
+local function execute_succeeded(status)
+  return status == true or status == 0
+end
+
+-- Fixture commands interpolate derived paths into shell strings. Reject a
+-- caller base that could split a command, escape the intended tree, or inject
+-- shell syntax before the run root is created.
+local function validate_test_base(path, label)
+  if type(path) ~= "string" or path == "" then
+    error(label .. " must be a non-empty absolute path", 0)
+  end
+  if path:sub(1, 1) ~= "/" then
+    error(label .. " must be an absolute path", 0)
+  end
+  if path == "/" or not path:match("^/[A-Za-z0-9._/-]+$") then
+    error(label .. " must not contain whitespace or shell metacharacters", 0)
+  end
+  for segment in path:gmatch("[^/]+") do
+    if segment == ".." then
+      error(label .. " must not contain '..' segments", 0)
+    end
+  end
+  return path
+end
+
+local TEST_RUN_ROOT = nil
+local TEST_RUN_ROOT_REMOVED = false
+
+local function cleanup_test_run_root()
+  if TEST_RUN_ROOT_REMOVED or not TEST_RUN_ROOT then
+    return
+  end
+  TEST_RUN_ROOT_REMOVED = true
+  os.execute("rm -rf -- " .. shell_quote(TEST_RUN_ROOT))
+end
+
+local function bootstrap_test_run_root()
+  local placeholder = os.tmpname()
+  local unique = placeholder:match("([^/]+)$")
+  local base = os.getenv("WHEEL_TEST_TMP")
+  local root
+
+  local ok, bootstrap_err = pcall(function()
+    if not unique or unique == "" then
+      error("os.tmpname returned an unusable path", 0)
+    end
+    if type(base) == "string" and base ~= "" then
+      validate_test_base(base, "WHEEL_TEST_TMP")
+      root = base .. "/wheel-test-" .. unique
+    else
+      -- Reuse the unique os.tmpname path as this run's private root.
+      root = placeholder
+    end
+    validate_test_base(root, "Wheel test root")
+  end)
+
+  -- Some Lua 5.1 builds create the os.tmpname placeholder file; never leave it
+  -- behind, including on validation failure.
+  os.remove(placeholder)
+  if not ok then
+    error(bootstrap_err, 0)
+  end
+
+  -- Assign before mkdir so the failure path removes any partial root.
+  TEST_RUN_ROOT = root
+  local command
+  if type(base) == "string" and base ~= "" then
+    command = "mkdir -p -- " .. shell_quote(base)
+      .. " && mkdir -- " .. shell_quote(root)
+  else
+    command = "mkdir -- " .. shell_quote(root)
+  end
+  if not execute_succeeded(os.execute(command)) then
+    cleanup_test_run_root()
+    error("cannot create the Wheel test root", 0)
+  end
+  return root
+end
+
+TEST_RUN_ROOT = bootstrap_test_run_root()
+
+local function test_path(name)
+  return TEST_RUN_ROOT .. "/" .. name
+end
+
 local function run_test(name, fn)
   local ok, err = pcall(fn)
   if ok then
     print("[PASS] " .. name)
   else
     print("[FAIL] " .. name .. ": " .. tostring(err))
+    cleanup_test_run_root()
     os.exit(1)
   end
 end
+
+run_test("Wheel test harness: unsafe WHEEL_TEST_TMP bases are rejected", function()
+  validate_test_base(TEST_RUN_ROOT .. "/safe-base", "test base")
+  local unsafe = {
+    "relative/base",
+    TEST_RUN_ROOT .. "/with space",
+    TEST_RUN_ROOT .. "/with;meta",
+    TEST_RUN_ROOT .. "/with$dollar",
+    TEST_RUN_ROOT .. "/with'quote",
+    TEST_RUN_ROOT .. "/with\nnewline",
+    TEST_RUN_ROOT .. "/../escape",
+    "/",
+    "",
+  }
+  for _, candidate in ipairs(unsafe) do
+    local ok = pcall(validate_test_base, candidate, "test base")
+    assert(not ok, "unsafe base must be rejected: " .. tostring(candidate):gsub("\n", "\\n"))
+  end
+end)
 
 -- ===========================================================================
 -- 1. WheelKernel Tests
@@ -1649,7 +1765,7 @@ end
 
 -- Real package.path fixtures for loader tests. These write only under the
 -- repository's ephemeral scratch root and never stub the global `require`.
-local MODULE_LOAD_FIXTURE_ROOT = "/tmp/bitty/test_wheel_module_loaders"
+local MODULE_LOAD_FIXTURE_ROOT = test_path("test_wheel_module_loaders")
 local REPO_PACKAGE_PATH = "./lua/?.lua;./lua/?/init.lua"
 
 local function reset_module_fixture_root()
@@ -2542,7 +2658,7 @@ run_test("WheelConfig: sandboxed evaluation restricts ambient authority", functi
 end)
 
 run_test("WheelConfig: hierarchical layering (Defaults < Global < Project)", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_config_layering"
+  local tmp_dir = test_path("test_wheel_config_layering")
   os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. tmp_dir .. "/global " .. tmp_dir .. "/proj/.wheel")
 
   local global_file = tmp_dir .. "/global/init.lua"
@@ -2602,7 +2718,7 @@ run_test("WheelConfig: hierarchical layering (Defaults < Global < Project)", fun
 end)
 
 run_test("WheelConfig: direct trust requires the exact current hash", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_trust_gate"
+  local tmp_dir = test_path("test_wheel_trust_gate")
   local proj_dir = tmp_dir .. "/my_repo"
   local trust_file = tmp_dir .. "/trusted_projects.json"
   os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel")
@@ -2701,7 +2817,7 @@ run_test("WheelConfig: direct trust requires the exact current hash", function()
 end)
 
 run_test("WheelConfig: consent view, canonical alias, legacy migration, and revocation", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_trust_consent"
+  local tmp_dir = test_path("test_wheel_trust_consent")
   local real_dir = tmp_dir .. "/real"
   local link_dir = tmp_dir .. "/link"
   local trust_file = tmp_dir .. "/trusted_projects.json"
@@ -2804,7 +2920,7 @@ run_test("WheelConfig: consent view, canonical alias, legacy migration, and revo
 end)
 
 run_test("WheelConfig: consent rendering escapes control bytes and forged delimiters", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_consent_rendering"
+  local tmp_dir = test_path("test_wheel_consent_rendering")
   local proj_dir = tmp_dir .. "/proj"
   local trust_file = tmp_dir .. "/trusted_projects.json"
   os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. proj_dir .. "/.wheel")
@@ -2851,7 +2967,7 @@ run_test("WheelConfig: consent rendering escapes control bytes and forged delimi
 end)
 
 run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent evaluation", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_trust_bounds"
+  local tmp_dir = test_path("test_wheel_trust_bounds")
   local proj_dir = tmp_dir .. "/proj"
   local outside = tmp_dir .. "/outside.lua"
   local trust_file = tmp_dir .. "/trusted_projects.json"
@@ -2921,7 +3037,7 @@ run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent eva
   local original_getenv = os.getenv
   os.getenv = function(name)
     if name == "PWD" then
-      return "/tmp/bitty/definitely-not-the-project-root"
+      return test_path("definitely-not-the-project-root")
     end
     return original_getenv(name)
   end
@@ -2953,7 +3069,7 @@ run_test("WheelConfig: bounded reader, entry type checks, and no pre-consent eva
 end)
 
 run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores fail closed", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_trust_store_security"
+  local tmp_dir = test_path("test_wheel_trust_store_security")
   local proj_dir = tmp_dir .. "/proj"
   local store_dir = tmp_dir .. "/state/wheel"
   local trust_file = store_dir .. "/trusted_projects.json"
@@ -3061,7 +3177,7 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
 
   -- An unresolvable record is preserved rather than silently dropped during
   -- an unrelated write.
-  local missing_root = "/tmp/bitty/ctx0020-not-mounted-project"
+  local missing_root = test_path("ctx0020-not-mounted-project")
   local preserve_file = tmp_dir .. "/preserve.json"
   local preserve_store = {
     version = 1,
@@ -3089,7 +3205,7 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
   local oversize_file = tmp_dir .. "/oversize.json"
   local oversize = { version = 1, projects = {} }
   for index = 1, 40 do
-    oversize.projects["/tmp/bitty/ctx0020-oversize-" .. index] = {
+    oversize.projects[test_path("ctx0020-oversize-" .. index)] = {
       hash = string.rep("c", 64),
       content = string.rep("A", WheelConfig.MAX_PROJECT_CONFIG_BYTES),
       approved_at = 1,
@@ -3104,7 +3220,7 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
   local count_file = tmp_dir .. "/count.json"
   local count_store = { version = 1, projects = {} }
   for index = 1, WheelConfig.MAX_TRUST_STORE_PROJECTS + 1 do
-    count_store.projects["/tmp/bitty/ctx0020-count-" .. index] = {
+    count_store.projects[test_path("ctx0020-count-" .. index)] = {
       hash = string.rep("d", 64),
     }
   end
@@ -3118,7 +3234,7 @@ run_test("WheelConfig: corrupt, symlinked, writable, and foreign-version stores 
 end)
 
 run_test("WheelConfig: confirmation repairs a user-owned store parent and preserves records", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_store_parent_repair"
+  local tmp_dir = test_path("test_wheel_store_parent_repair")
   local state_dir = tmp_dir .. "/state/wheel"
   local trust_file = state_dir .. "/trusted_projects.json"
   local proj_a = tmp_dir .. "/a"
@@ -3287,7 +3403,7 @@ run_test("WheelAgent: headless panel working container invariants and telemetry"
   assert(st.panel_id == "headless:panel:worker-default-01")
 
   -- Agent configured via hermetic WheelConfig (isolated from host/repo environment)
-  local empty_tmp_dir = "/tmp/bitty/test_wheel_empty_cfg"
+  local empty_tmp_dir = test_path("test_wheel_empty_cfg")
   os.execute("rm -rf " .. empty_tmp_dir .. " && mkdir -p " .. empty_tmp_dir)
   local cfg = WheelConfig.load({
     project_root = empty_tmp_dir,
@@ -3317,7 +3433,7 @@ run_test("WheelAgent: headless panel working container invariants and telemetry"
 end)
 
 run_test("WheelConfig: skill capability discovery with filtering", function()
-  local tmp_dir = "/tmp/bitty/test_wheel_skills"
+  local tmp_dir = test_path("test_wheel_skills")
   os.execute("rm -rf " .. tmp_dir .. " && mkdir -p " .. tmp_dir .. "/.agents/skills/skill-alpha " .. tmp_dir .. "/.agents/skills/skill-beta " .. tmp_dir .. "/.agents/skills/skill-gamma")
 
   local f1 = io.open(tmp_dir .. "/.agents/skills/skill-alpha/SKILL.md", "w")
@@ -3422,7 +3538,7 @@ run_test("WheelTeam: workspace colleague registration and roster", function()
   local kernel = WheelKernel.new({ in_memory = true })
   local team = WheelTeam.new({
     kernel = kernel,
-    workspace_root = "/tmp/bitty/test_workspace",
+    workspace_root = test_path("test_workspace"),
   })
 
   assert(team ~= nil)
@@ -4254,7 +4370,7 @@ run_test("WheelTool: ActionIntent enum and schema validation", function()
 end)
 
 run_test("WheelTool: Path sandboxing and directory traversal rejection", function()
-  local root = "/tmp/bitty/test_tool_sandbox"
+  local root = test_path("test_tool_sandbox")
 
   -- Safe relative paths resolve within root
   local p1, err1 = WheelTool.sanitize_path("foo/bar.txt", root)
@@ -4321,7 +4437,7 @@ end)
 -- ===========================================================================
 
 run_test("WheelTool: Core file tools (read_file, write_file, edit_file)", function()
-  local root = "/tmp/bitty/test_tool_sandbox"
+  local root = test_path("test_tool_sandbox")
   os.execute("mkdir -p " .. root)
   local reg = WheelTool.get_default_registry()
   local env = { workspace_root = root, role = WheelAgent.Role.CODING }
@@ -4377,7 +4493,7 @@ run_test("WheelTool: Core file tools (read_file, write_file, edit_file)", functi
 end)
 
 run_test("WheelTool: read_file total_lines reports only emitted lines", function()
-  local root = "/tmp/bitty/test_tool_read_bounds"
+  local root = test_path("test_tool_read_bounds")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/lines.txt", "w"))
   for index = 1, 10 do
@@ -4416,7 +4532,7 @@ run_test("WheelTool: read_file total_lines reports only emitted lines", function
 end)
 
 run_test("WheelTool: search_code bounds output and keeps the trailing newline", function()
-  local root = "/tmp/bitty/test_tool_search_bounds"
+  local root = test_path("test_tool_search_bounds")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/matches.txt", "w"))
   for index = 1, 150 do
@@ -4453,7 +4569,7 @@ end)
 
 run_test("WheelTool: Role authority gating and intent enforcement", function()
   local reg = WheelTool.get_default_registry()
-  local root = "/tmp/bitty/test_tool_sandbox"
+  local root = test_path("test_tool_sandbox")
   os.execute("mkdir -p " .. root)
 
   -- Research role: strictly read-only (Inspect & Verify allowed; Modify & Execute denied)
@@ -4583,7 +4699,7 @@ end)
 -- ===========================================================================
 
 run_test("WheelAgent: execute_tool, call_tools, and Action Recording", function()
-  local root = "/tmp/bitty/test_agent_tools"
+  local root = test_path("test_agent_tools")
   os.execute("mkdir -p " .. root)
   local kernel = WheelKernel.new({ in_memory = true })
   local context = WheelContext.new({ kernel = kernel })
@@ -6298,7 +6414,7 @@ end)
 -- ===========================================================================
 
 run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", function()
-  local root = "/tmp/bitty/test_host_seam_fs"
+  local root = test_path("test_host_seam_fs")
   os.execute("rm -rf " .. root)
 
   -- mkdir_p creates the whole nested tree
@@ -6340,7 +6456,7 @@ run_test("WheelHost: fs primitives (mkdir_p, write_file, read_file, list_dir)", 
   assert(bounded_over == "host seam payload\n", "bounded read must return the full file under the bound")
   local bounded_empty = WheelHost.fs.read_file_bounded(target, 0)
   assert(bounded_empty == "", "a zero bound must return an empty string")
-  local directory_read, directory_read_err = WheelHost.fs.read_file_bounded("/tmp", 10)
+  local directory_read, directory_read_err = WheelHost.fs.read_file_bounded(TEST_RUN_ROOT, 10)
   assert(directory_read == nil and type(directory_read_err) == "string",
     "a read failure must return nil and an error, never an empty string")
   if WheelHost.fs.exists("/dev/full") then
@@ -6434,25 +6550,26 @@ end)
 run_test("WheelHost: unavailable primitives return typed denials", function()
   local installed = WheelHost.backend
   WheelHost.backend = {}
+  local probe = test_path("unavailable-probe")
 
   local cases = {
-    { label = "fs.mkdir_p", capability = "fs.write", call = function() return WheelHost.fs.mkdir_p("/tmp/x") end },
-    { label = "fs.list_dir", capability = "fs.read", call = function() return WheelHost.fs.list_dir("/tmp") end },
-    { label = "fs.read_file", capability = "fs.read", call = function() return WheelHost.fs.read_file("/tmp/x") end },
-    { label = "fs.read_file_bounded", capability = "fs.read", call = function() return WheelHost.fs.read_file_bounded("/tmp/x", 1) end },
-    { label = "fs.write_file", capability = "fs.write", call = function() return WheelHost.fs.write_file("/tmp/x", "x") end },
-    { label = "fs.chmod", capability = "fs.write", call = function() return WheelHost.fs.chmod("/tmp/x", "600") end },
-    { label = "fs.rename", capability = "fs.write", call = function() return WheelHost.fs.rename("/tmp/x", "/tmp/y") end },
-    { label = "fs.remove_file", capability = "fs.write", call = function() return WheelHost.fs.remove_file("/tmp/x") end },
-    { label = "fs.exists", capability = "fs.read", call = function() return WheelHost.fs.exists("/tmp/x") end },
-    { label = "fs.stat", capability = "fs.read", call = function() return WheelHost.fs.stat("/tmp/x") end },
+    { label = "fs.mkdir_p", capability = "fs.write", call = function() return WheelHost.fs.mkdir_p(probe) end },
+    { label = "fs.list_dir", capability = "fs.read", call = function() return WheelHost.fs.list_dir(probe) end },
+    { label = "fs.read_file", capability = "fs.read", call = function() return WheelHost.fs.read_file(probe) end },
+    { label = "fs.read_file_bounded", capability = "fs.read", call = function() return WheelHost.fs.read_file_bounded(probe, 1) end },
+    { label = "fs.write_file", capability = "fs.write", call = function() return WheelHost.fs.write_file(probe, "x") end },
+    { label = "fs.chmod", capability = "fs.write", call = function() return WheelHost.fs.chmod(probe, "600") end },
+    { label = "fs.rename", capability = "fs.write", call = function() return WheelHost.fs.rename(probe, probe .. ".moved") end },
+    { label = "fs.remove_file", capability = "fs.write", call = function() return WheelHost.fs.remove_file(probe) end },
+    { label = "fs.exists", capability = "fs.read", call = function() return WheelHost.fs.exists(probe) end },
+    { label = "fs.stat", capability = "fs.read", call = function() return WheelHost.fs.stat(probe) end },
     { label = "proc.run_command", capability = "process.spawn", call = function() return WheelHost.proc.run_command("true") end },
     { label = "proc.run_program", capability = "process.spawn", call = function() return WheelHost.proc.run_program("true") end },
     { label = "proc.shell_quote", capability = "process.spawn", call = function() return WheelHost.proc.shell_quote("x") end },
     { label = "tmp.dir", capability = "fs.write", call = function() return WheelHost.tmp.dir() end },
     { label = "tmp.name", capability = "fs.write", call = function() return WheelHost.tmp.name() end },
     { label = "tmp.create", capability = "fs.write", call = function() return WheelHost.tmp.create("x") end },
-    { label = "tmp.create_exclusive", capability = "fs.write", call = function() return WheelHost.tmp.create_exclusive("/tmp/x", "x") end },
+    { label = "tmp.create_exclusive", capability = "fs.write", call = function() return WheelHost.tmp.create_exclusive(probe, "x") end },
     { label = "time.now", capability = "time.now", call = function() return WheelHost.time.now() end },
     { label = "time.clock", capability = "time.clock", call = function() return WheelHost.time.clock() end },
   }
@@ -6476,8 +6593,8 @@ end)
 run_test("WheelHost: config file access fails closed through the seam", function()
   local installed = WheelHost.backend
   WheelHost.backend = {}
-  local read_ok, read_err = pcall(WheelConfig.read_trust_store, "/tmp/bitty/ctx0015-trust.json")
-  local write_ok, write_err = pcall(WheelConfig.write_trust_store, {}, "/tmp/bitty/ctx0015-trust.json")
+  local read_ok, read_err = pcall(WheelConfig.read_trust_store, test_path("ctx0015-trust.json"))
+  local write_ok, write_err = pcall(WheelConfig.write_trust_store, {}, test_path("ctx0015-trust.json"))
   WheelHost.backend = installed
 
   assert(not read_ok, "trust-store reads must fail without a host surface")
@@ -6490,7 +6607,7 @@ run_test("WheelHost: config file access fails closed through the seam", function
 end)
 
 run_test("WheelHost: temporary files use a private runtime directory", function()
-  local root = "/tmp/bitty/test_host_private_tmp"
+  local root = test_path("test_host_private_tmp")
   os.execute("rm -rf " .. root)
 
   local backend = WheelHost.create_backend("standalone", { tmp_root = root .. "/runtime" })
@@ -6516,7 +6633,7 @@ run_test("WheelHost: temporary files use a private runtime directory", function(
 end)
 
 run_test("WheelHost: tmp_path uniqueness does not depend on os.time", function()
-  local root = "/tmp/bitty/test_host_tmp_no_time"
+  local root = test_path("test_host_tmp_no_time")
   os.execute("rm -rf " .. root)
 
   local backend = WheelHost.create_backend("standalone", { tmp_root = root .. "/runtime" })
@@ -6542,7 +6659,7 @@ run_test("WheelHost: tmp_path uniqueness does not depend on os.time", function()
 end)
 
 run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", function()
-  local root = "/tmp/bitty/test_host_tmp_symlink"
+  local root = test_path("test_host_tmp_symlink")
   os.execute("rm -rf " .. root)
   os.execute("mkdir -p " .. root .. "/real-target " .. root .. "/real-parent")
   os.execute("ln -s " .. root .. "/real-target " .. root .. "/linked-runtime")
@@ -6611,7 +6728,7 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
 end)
 
 run_test("WheelHost: repeated and dot segments normalize before use", function()
-  local root = "/tmp/bitty/test_host_tmp_normalize"
+  local root = test_path("test_host_tmp_normalize")
   os.execute("rm -rf " .. root)
 
   local backend = WheelHost.create_backend("standalone", {
@@ -6641,7 +6758,7 @@ run_test("WheelHost: repeated and dot segments normalize before use", function()
 end)
 
 run_test("WheelHost: temp roots reject root, dot-only, and symlink traversal", function()
-  local root = "/tmp/bitty/test_host_tmp_guard"
+  local root = test_path("test_host_tmp_guard")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root .. "/base " .. root .. "/real-parent")
   -- `...` is a symlink to the parent directory; it must not be followed.
   os.execute("ln -s .. " .. root .. "/base/...")
@@ -6664,7 +6781,7 @@ run_test("WheelHost: temp roots reject root, dot-only, and symlink traversal", f
   end
 
   local forms = {
-    "/", "//", "/.", "/./", "/tmp/..", "/tmp/../..", "..",
+    "/", "//", "/.", "/./", TEST_RUN_ROOT .. "/..", TEST_RUN_ROOT .. "/../..", "..",
     root .. "/base/.../victim",
     root .. "/base//.../victim",
     root .. "/base/./.../victim",
@@ -6697,19 +6814,28 @@ run_test("WheelHost: temp roots reject root, dot-only, and symlink traversal", f
     "a non-owned parent symlink must still resolve: " .. tostring(alias_err))
 
   -- Legitimate relative roots still normalize (trailing separator and `/.`).
-  local relative = "ctx0015_relative_tmp_dir"
+  -- The name carries this run's unique suffix so concurrent runs sharing a
+  -- working directory cannot remove each other's relative fixture. The body is
+  -- guarded so a mid-test failure still removes that CWD-local directory.
+  local relative = "wheel-test-relative-"
+    .. (TEST_RUN_ROOT:match("([^/]+)$") or "run")
   os.execute("rm -rf " .. relative)
-  local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
-  local slash_dir, slash_err = with_slash.tmp_dir()
-  assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
-  local slash_listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(relative))
-  local slash_mode = slash_listing.stdout:match("^(%S+)")
-  assert(string.sub(slash_mode or "", 1, 10) == "drwx------",
-    "relative trailing-slash root must be 0700, got " .. tostring(slash_mode))
-  local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
-  local dot_dir, dot_err = with_dot.tmp_dir()
-  assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
+  local body_ok, body_err = pcall(function()
+    local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
+    local slash_dir, slash_err = with_slash.tmp_dir()
+    assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
+    local slash_listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(relative))
+    local slash_mode = slash_listing.stdout:match("^(%S+)")
+    assert(string.sub(slash_mode or "", 1, 10) == "drwx------",
+      "relative trailing-slash root must be 0700, got " .. tostring(slash_mode))
+    local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
+    local dot_dir, dot_err = with_dot.tmp_dir()
+    assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
+  end)
   os.execute("rm -rf " .. relative .. " " .. root)
+  if not body_ok then
+    error(body_err, 0)
+  end
 end)
 
 run_test("WheelHost: non-string tmp_root fails typed", function()
@@ -6959,7 +7085,7 @@ local function kill_recorded_test_pid(pid)
 end
 
 run_test("WheelHost: timeout kills only the recorded process group", function()
-  local root = "/tmp/bitty/test_host_proc_group"
+  local root = test_path("test_host_proc_group")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local pid_file = root .. "/grandchild.pid"
@@ -7010,7 +7136,7 @@ run_test("WheelHost: timeout kills only the recorded process group", function()
 end)
 
 run_test("WheelHost: normal exit sweeps the recorded process group", function()
-  local root = "/tmp/bitty/test_host_proc_normal_exit"
+  local root = test_path("test_host_proc_normal_exit")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
 
@@ -7060,7 +7186,7 @@ run_test("WheelHost: normal exit sweeps the recorded process group", function()
 end)
 
 run_test("WheelHost: retained leader preserves status and reports the recorded PGID", function()
-  local root = "/tmp/bitty/test_host_pgid_identity"
+  local root = test_path("test_host_pgid_identity")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local record = root .. "/background.txt"
@@ -7092,7 +7218,7 @@ run_test("WheelHost: retained leader preserves status and reports the recorded P
 end)
 
 run_test("WheelHost: the retained leader holds the PGID through the sweep", function()
-  local root = "/tmp/bitty/test_host_pgid_retention"
+  local root = test_path("test_host_pgid_retention")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local marker = root .. "/leader-alive"
@@ -7133,7 +7259,7 @@ run_test("WheelHost: the retained leader holds the PGID through the sweep", func
 end)
 
 run_test("WheelHost: an unrelated process group is never signaled", function()
-  local root = "/tmp/bitty/test_host_pgid_decoy"
+  local root = test_path("test_host_pgid_decoy")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local decoy_pid_file = root .. "/decoy.pid"
@@ -7175,7 +7301,7 @@ run_test("WheelHost: an unrelated process group is never signaled", function()
 end)
 
 run_test("WheelHost: an identity-lost leader is reported unverified and signals nothing", function()
-  local root = "/tmp/bitty/test_host_pgid_identity_loss"
+  local root = test_path("test_host_pgid_identity_loss")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local orphan_file = root .. "/orphan.pid"
@@ -7404,7 +7530,7 @@ run_test("WheelHost: temp write failure surfaces cleanup errors", function()
 end)
 
 run_test("WheelHost: process capture files are cleaned up on success, error, and timeout", function()
-  local root = "/tmp/bitty/test_host_proc_cleanup"
+  local root = test_path("test_host_proc_cleanup")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
 
@@ -7474,7 +7600,7 @@ run_test("WheelHost: process capture files are cleaned up on success, error, and
 end)
 
 run_test("WheelHost: missing sleep and timeout are typed unavailable outcomes", function()
-  local root = "/tmp/bitty/test_host_missing_sweep_tools"
+  local root = test_path("test_host_missing_sweep_tools")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local function probe(name)
     local backend = WheelHost.create_backend("standalone", { tmp_root = root })
@@ -7501,7 +7627,7 @@ run_test("WheelHost: missing sleep and timeout are typed unavailable outcomes", 
 end)
 
 run_test("WheelHost: missing setsid is a typed unavailable outcome", function()
-  local root = "/tmp/bitty/test_host_no_setsid"
+  local root = test_path("test_host_no_setsid")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local backend = WheelHost.create_backend("standalone", { tmp_root = root })
   local real_popen = io.popen
@@ -7520,7 +7646,7 @@ run_test("WheelHost: missing setsid is a typed unavailable outcome", function()
 end)
 
 run_test("WheelTool: read_file enforces max_bytes while reading", function()
-  local root = "/tmp/bitty/test_tool_read_bounded"
+  local root = test_path("test_tool_read_bounded")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/big.txt", "w"))
   for index = 1, 20 do
@@ -7549,7 +7675,7 @@ run_test("WheelTool: read_file enforces max_bytes while reading", function()
 end)
 
 run_test("WheelTool: run_command reports a typed timeout", function()
-  local root = "/tmp/bitty/test_tool_run_timeout"
+  local root = test_path("test_tool_run_timeout")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
 
   local reg = WheelTool.get_default_registry()
@@ -7567,7 +7693,7 @@ run_test("WheelTool: run_command reports a typed timeout", function()
 end)
 
 run_test("WheelTool: read_file fails loud when start_line exceeds the bounded prefix", function()
-  local root = "/tmp/bitty/test_tool_read_start_line"
+  local root = test_path("test_tool_read_start_line")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/big.txt", "w"))
   for index = 1, 2000 do
@@ -7598,7 +7724,7 @@ run_test("WheelTool: read_file fails loud when start_line exceeds the bounded pr
 end)
 
 run_test("WheelTool: read_file marks a partial line at the bounded prefix", function()
-  local root = "/tmp/bitty/test_tool_read_partial"
+  local root = test_path("test_tool_read_partial")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/partial.txt", "w"))
   fh:write(string.rep("a", 50) .. "\n" .. string.rep("b", 100) .. "\n" .. "c\n")
@@ -7621,7 +7747,7 @@ run_test("WheelTool: read_file marks a partial line at the bounded prefix", func
 end)
 
 run_test("WheelTool: search_code fails on grep errors", function()
-  local root = "/tmp/bitty/test_tool_search_errors"
+  local root = test_path("test_tool_search_errors")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local fh = assert(io.open(root .. "/file.txt", "w"))
   fh:write("needle\n")
@@ -7658,7 +7784,7 @@ run_test("WheelTool: search_code fails on grep errors", function()
 end)
 
 run_test("WheelTool: list_directory fails closed on missing ls and timeout", function()
-  local root = "/tmp/bitty/test_tool_list_errors"
+  local root = test_path("test_tool_list_errors")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   local reg = WheelTool.get_default_registry()
   local env = { workspace_root = root, role = WheelAgent.Role.CODING }
@@ -7711,7 +7837,7 @@ run_test("WheelTool: list_directory fails closed on missing ls and timeout", fun
 end)
 
 run_test("WheelTool: list_directory paginates entries", function()
-  local root = "/tmp/bitty/test_tool_list_pagination"
+  local root = test_path("test_tool_list_pagination")
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
   for index = 1, 5 do
     local fh = assert(io.open(root .. "/file-" .. index .. ".txt", "w"))
@@ -7735,7 +7861,7 @@ run_test("WheelTool: list_directory paginates entries", function()
 end)
 
 run_test("WheelHost: tool call sites route through the seam (capture doubles)", function()
-  local root = "/tmp/bitty/test_host_seam_routes"
+  local root = test_path("test_host_seam_routes")
   os.execute("rm -rf " .. root)
 
   local backend = WheelHost.backend
@@ -8065,8 +8191,7 @@ run_test("WheelHost: Lua 5.2+ os.execute liveness probes fail closed", function(
 end)
 
 run_test("WheelHost: private file, FIFO, and pid primitives", function()
-  local root = "/tmp/bitty/wheel-host-ctx0024-"
-    .. tostring(WheelHost.proc.pid()) .. "-" .. tostring(os.time())
+  local root = test_path("wheel-host-ctx0024")
   os.execute("rm -rf " .. root)
   assert(WheelHost.fs.mkdir_p(root) == true)
   assert(WheelHost.fs.chmod(root, "700") == true)
@@ -8191,6 +8316,9 @@ end)
 -- receives the shared runner, so the suite keeps one PASS/FAIL contract.
 local run_context_snapshot_tests = assert(loadfile("tests/test_context_snapshot.lua"))()
 run_context_snapshot_tests(run_test)
+
+-- Remove only this run's root; any caller-owned WHEEL_TEST_TMP base remains.
+cleanup_test_run_root()
 
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
