@@ -517,6 +517,36 @@ run_test("Daemon: cleanup leaves a successor's unreadable metadata alone", funct
   remove_tree(dir)
 end)
 
+run_test("Daemon: cleanup preserves a readable foreign-pid session", function()
+  local name = "cleanup-foreign-pid"
+  local dir = session_dir(name)
+  local owner = WheelHost.proc.pid()
+  local foreign_pid = owner + 1
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+  assert(Session.write_metadata(dir, {
+    protocol = Session.PROTOCOL,
+    name = name,
+    pid = foreign_pid,
+    started_at = WheelHost.time.now(),
+    wheel_version = "0.1.0",
+  }))
+
+  local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_META).exists == true,
+    "cleanup must not remove readable metadata owned by another pid")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
+    "cleanup must not remove a foreign pid's FIFOs")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == true)
+  assert(WheelHost.fs.stat(dir).exists == true)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK).exists == false,
+    "cleanup must release the start lock it acquired")
+  remove_tree(dir)
+end)
+
 run_test("Daemon: cleanup preserves a successor's metadata after publication", function()
   local name = "cleanup-published-meta"
   local dir = session_dir(name)
@@ -526,15 +556,14 @@ run_test("Daemon: cleanup preserves a successor's metadata after publication", f
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
 
-  -- Even when this daemon published metadata earlier, a missing record no
-  -- longer identifies the current files. The start lock is not self-owned, so
+  -- Missing metadata no longer identifies the current files, whether or not
+  -- this daemon published earlier. The start lock is not self-owned, so
   -- cleanup must preserve them for the successor.
   local state = {
     session_dir = dir,
     name = name,
     pid = owner,
     start_owner = nil,
-    metadata_published = true,
   }
   Daemon.cleanup(state)
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,

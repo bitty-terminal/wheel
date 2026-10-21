@@ -748,6 +748,13 @@ local function copy_bus_history(value, path, deps, state)
     end
     local copied = copy_plain(candidate, event_path, deps, state, 0, {}, {})
     check_timestamp(copied.timestamp_ms, event_path .. ".timestamp_ms")
+    -- `__pairs`/`__index` can fabricate stash fields that rawget cannot see.
+    -- Sanitize the plain copy again so canonical bytes and import never carry
+    -- a stash slot map regardless of how the source table presented itself.
+    local copied_type = rawget(copied, "type")
+    if type(copied_type) == "string" and STASH_EVENT_TYPES[copied_type] then
+      copied = sanitize_stash_event(copied, deps)
+    end
     history[index] = copied
   end
   return history

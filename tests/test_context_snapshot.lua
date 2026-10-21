@@ -49,6 +49,30 @@ local function assert_deep_equal(actual, expected, path)
   end
 end
 
+-- Lua 5.2+ honors a `__pairs` metamethod; Lua 5.1 and LuaJIT ignore it.
+local function pairs_metamethod_supported()
+  local probe = setmetatable({}, {
+    __pairs = function()
+      local done = false
+      return function()
+        if done then
+          return nil
+        end
+        done = true
+        return "probe", true
+      end, nil, nil
+    end,
+  })
+  for key in pairs(probe) do
+    if key == "probe" then
+      return true
+    end
+  end
+  return false
+end
+
+local has_pairs_metamethod = pairs_metamethod_supported()
+
 local function with_fixed_clock(fn)
   local backend = WheelHost.backend
   local saved_now = backend.now
@@ -898,6 +922,87 @@ return function(run_test)
     assert(live_numeric ~= nil,
       "the live numeric message must remain untouched after export")
   end)
+
+  if has_pairs_metamethod then
+    run_test("WheelContext snapshots: metatable stash fields cannot bypass redaction", function()
+      local marker = "metatable-stash-content-marker"
+      local stash_payload = {
+        id = "stash@{0}",
+        message = { note = "table metadata" },
+        slots = {
+          ["scratch/wip"] = {
+            name = "scratch/wip",
+            content = marker,
+            hash = WheelContext.compute_hash(marker),
+            version = 1,
+            kind = "scratch",
+            size_bytes = #marker,
+            updated_at_ms = 1,
+          },
+        },
+      }
+      local timestamp_ms = 1700000000000
+      local fields = {
+        { "type", "stash_pushed" },
+        { "timestamp_ms", timestamp_ms },
+        { "stash", stash_payload },
+      }
+      local event = setmetatable({}, {
+        __pairs = function()
+          local index = 0
+          return function()
+            index = index + 1
+            local field = fields[index]
+            if field then
+              return field[1], field[2]
+            end
+            return nil
+          end, nil, nil
+        end,
+        __index = function(_, key)
+          if key == "type" then
+            return "stash_pushed"
+          end
+          if key == "stash" then
+            return stash_payload
+          end
+          if key == "timestamp_ms" then
+            return timestamp_ms
+          end
+          return nil
+        end,
+      })
+      assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
+        "the raw event must not expose the fabricated fields")
+
+      local ctx = WheelContext.new()
+      ctx.bus:publish(event)
+      local snapshot = assert(ctx:export_snapshot())
+      local exported
+      for _, entry in ipairs(snapshot.bus_history) do
+        if entry.type == "stash_pushed" then
+          exported = entry
+        end
+      end
+      assert(exported ~= nil,
+        "the metatable event must be copied as a stash event")
+      assert(exported.stash.redacted == true and exported.stash.slots == nil,
+        "post-copy sanitization must remove metatable stash content")
+      local canonical = assert(WheelContext.canonical_snapshot(snapshot))
+      assert(canonical:find(marker, 1, true) == nil,
+        "canonical bytes must not contain metatable stash content")
+
+      local restored = assert(WheelContext.import_snapshot(snapshot))
+      for _, entry in ipairs(restored.bus:history()) do
+        if entry.type == "stash_pushed" then
+          assert(entry.stash.redacted == true and entry.stash.slots == nil,
+            "imported metatable stash content must remain redacted")
+        end
+      end
+      assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
+        "export must not materialize fabricated fields on the live event")
+    end)
+  end
 
   run_test("WheelContext snapshots: key nodes count toward the value node bound", function()
     local ctx = WheelContext.new()
