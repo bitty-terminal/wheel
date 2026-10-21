@@ -15,11 +15,17 @@
 --   WheelHost.fs.read_file(path)            read a whole file
 --   WheelHost.fs.read_file_bounded(path, n) read at most n bytes, chunked
 --   WheelHost.fs.write_file(path, content)  write a whole file
+--   WheelHost.fs.create_private_file(path, content)
+--                                           exclusive 0600 regular file at a path
+--   WheelHost.fs.mkfifo(path)               exclusive 0600 FIFO
+--   WheelHost.fs.open_fifo(path)            open a verified 0600 FIFO read/write
+--   WheelHost.fs.remove_dir(path)           remove one empty directory
 --   WheelHost.fs.chmod(path, mode)          set a file mode
 --   WheelHost.fs.rename(from, to)           atomically rename within a filesystem
 --   WheelHost.fs.remove_file(path)          remove a file
 --   WheelHost.fs.exists(path)               test for a readable file
 --   WheelHost.fs.stat(path)                 lstat-style metadata and type probes
+--   WheelHost.fs.euid()                     current effective uid
 --   WheelHost.proc.run_command(shell_string, env?, opts?)
 --                                           run a shell command line (explicit
 --                                           shell-string primitive)
@@ -27,6 +33,8 @@
 --                                           run argv with stdin, cwd, timeout,
 --                                           output cap, and scrubbed env
 --   WheelHost.proc.shell_quote(value)       quote one POSIX shell argument
+--   WheelHost.proc.pid()                    current process id
+--   WheelHost.proc.is_alive(pid)            `kill -0` liveness probe
 --   WheelHost.tmp.dir()                     private runtime directory
 --   WheelHost.tmp.name()                    unique path inside that directory
 --   WheelHost.tmp.create(content)           exclusive 0600 file, returns path
@@ -607,6 +615,39 @@ local function verify_private_file(path)
   return true
 end
 
+--- Verify that <path> is the harness-owned FIFO it claims to be.
+-- Rejects symbolic links, regular files, devices, directories, foreign
+-- ownership, group/world permissions, and multiply-linked paths before a
+-- caller opens it.
+-- @param path string
+-- @return boolean ok, string? err
+local function verify_private_fifo(path)
+  if path_is_symlink(path) then
+    return false, "private FIFO path is a symbolic link"
+  end
+  local euid = current_euid()
+  if euid == nil then
+    return false, "cannot determine the effective uid"
+  end
+  local info = private_file_metadata(path)
+  if info == nil then
+    return false, "private FIFO metadata is unavailable"
+  end
+  if not info.kind:match("^fifo") then
+    return false, "private path is not a FIFO"
+  end
+  if info.uid ~= euid then
+    return false, "private FIFO is not owned by the current user"
+  end
+  if info.mode ~= 384 then
+    return false, "private FIFO is not mode 0600"
+  end
+  if info.links ~= 1 then
+    return false, "private FIFO has an unexpected hard-link count"
+  end
+  return true
+end
+
 --- Create a new empty 0600 regular file with `mktemp` in <dir> and verify it.
 -- The caller receives a freshly created path, never a pre-existing one.
 -- @param dir string
@@ -916,67 +957,100 @@ function standalone.new(opts)
   end
 
   --- Return lstat-style metadata for <path>.
-  -- `test` probes type and link status; `stat` supplies owner and mode when
-  -- the platform provides it. A missing path returns exists = false without an
-  -- error. A probe that cannot run fails closed with the typed denial, so an
-  -- unavailable `test` is never read as "not a symlink" or "not a file".
+  -- One bounded shell probe reports link status, existence, and GNU/BSD stat
+  -- metadata. This keeps the read-only probe cheap (the process supervisor is
+  -- for command execution, not for per-path inspection) while preserving the
+  -- existing shape: type probes follow a final symlink, `symlink` reports the
+  -- link itself, and a missing path returns exists = false without an error.
+  -- A probe that cannot run fails closed with the typed denial, so an
+  -- unavailable surface is never read as "not a symlink" or "not a file".
   -- @param path string
-  -- @return table { exists, symlink, regular, directory, uid?, mode? }
+  -- @return table { exists, symlink, regular, directory, fifo, uid?, mode? }
   function backend.stat(path)
-    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.read")
+    require_surface(type(io) == "table" and type(io.popen) == "function", "fs.read")
 
     local target = path
+    if type(target) ~= "string" or target == "" or target:find("[%z\n\r]") then
+      error(WheelErrors.capability_denied("fs.read"), 0)
+    end
     if target:sub(1, 1) ~= "/" and target:sub(1, 1) ~= "." then
       target = "./" .. target
     end
 
-    local function probe(flag)
-      local ok, _, code = os.execute("test " .. flag .. " " .. shell_quote(target))
-      local status
-      if ok == true then
-        status = 0
-      elseif type(ok) == "number" then
-        status = (ok >= 256) and math.floor(ok / 256) or ok
-      else
-        status = code
-      end
-      if status == 0 then
-        return true
-      end
-      if status == 1 then
-        return false
-      end
+    local command = "p=$1; "
+      .. "if test -L \"$p\"; then printf 'LINK\\n'; fi; "
+      .. "if test -e \"$p\"; then printf 'EXISTS\\n'; fi; "
+      .. "rc=0; stat -L -c '%u %a %h %F' -- \"$p\" 2>/dev/null "
+      .. "|| stat -L -f '%u %Lp %l %HT' -- \"$p\" 2>/dev/null "
+      .. "|| rc=$?; "
+      .. "if [ \"$rc\" -ne 0 ] && test -e \"$p\"; then printf 'UNREADABLE\\n'; fi"
+    local pipe = io.popen("sh -c " .. shell_quote(command) .. " sh " .. shell_quote(target) .. " 2>/dev/null", "r")
+    if not pipe then
+      error(WheelErrors.capability_denied("fs.read"), 0)
+    end
+    local output = pipe:read("*a")
+    local closed = pipe:close()
+    if closed == nil then
       error(WheelErrors.capability_denied("fs.read"), 0)
     end
 
-    local symlink = probe("-L")
-    local regular = probe("-f")
-    local directory = probe("-d")
-    local exists = regular or directory or symlink or probe("-e")
-
+    local symlink, exists = false, false
     local uid, mode
-    local formats = {
-      { "-c", "%u %a" },
-      { "-f", "%u %Lp" },
-    }
-    for _, format in ipairs(formats) do
-      local res = backend.run_program("stat", { format[1], format[2], "--", target },
-        { discard_stderr = true })
-      if res.ok and res.code == 0 then
-        local owner, permissions = (res.stdout or ""):match("^%s*(%d+)%s+([0-7]+)")
-        if owner and permissions then
+    for line in tostring(output or ""):gmatch("[^\n]+") do
+      if line == "LINK" then
+        symlink = true
+      elseif line == "EXISTS" then
+        exists = true
+      elseif line == "UNREADABLE" then
+        error(WheelErrors.capability_denied("fs.read"), 0)
+      else
+        local owner, permissions, links, kind = line:match("^(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+        if owner and permissions and links and kind then
           uid = tonumber(owner)
           mode = tonumber(permissions, 8)
-          break
+          exists = true
+          local normalized = kind:lower()
+          if normalized:find("regular", 1, true) then
+            return {
+              exists = true,
+              symlink = symlink,
+              regular = true,
+              directory = false,
+              fifo = false,
+              uid = uid,
+              mode = mode,
+            }
+          elseif normalized:find("directory", 1, true) then
+            return {
+              exists = true,
+              symlink = symlink,
+              regular = false,
+              directory = true,
+              fifo = false,
+              uid = uid,
+              mode = mode,
+            }
+          elseif normalized:find("fifo", 1, true) then
+            return {
+              exists = true,
+              symlink = symlink,
+              regular = false,
+              directory = false,
+              fifo = true,
+              uid = uid,
+              mode = mode,
+            }
+          end
         end
       end
     end
 
     return {
-      exists = exists,
+      exists = exists or symlink,
       symlink = symlink,
-      regular = regular,
-      directory = directory,
+      regular = false,
+      directory = false,
+      fifo = false,
       uid = uid,
       mode = mode,
     }
@@ -997,6 +1071,106 @@ function standalone.new(opts)
       return true
     end
     return false, "chmod failed"
+  end
+
+  --- Return the current effective uid, or nil when it cannot be read.
+  -- @return number? uid
+  function backend.euid()
+    return current_euid()
+  end
+
+  --- Create a new regular file with mode 0600 at <path> and write <content>.
+  -- The path must not exist; POSIX noclobber (`set -C`) makes creation
+  -- exclusive, so a pre-existing file, FIFO, device, or symbolic link is
+  -- refused rather than followed or truncated. The caller owns removal.
+  -- @param path string
+  -- @param content string?
+  -- @return boolean ok, string? err
+  function backend.create_private_file(path, content)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
+      return false, "invalid private file path"
+    end
+    if content ~= nil and type(content) ~= "string" then
+      return false, "private file content must be a string"
+    end
+    local exists = normalized_exit_status(os.execute(
+      "test -e " .. shell_quote(path) .. " || test -L " .. shell_quote(path))) == 0
+    if exists then
+      return false, "private file path already exists"
+    end
+    local created = normalized_exit_status(os.execute(
+      "umask 077; set -C; : > " .. shell_quote(path) .. " 2>/dev/null"))
+    if created ~= 0 then
+      return false, "private file path already exists or cannot be created"
+    end
+    local verified, verify_err = verify_private_file(path)
+    if not verified then
+      os.remove(path)
+      return false, verify_err
+    end
+    local wrote, write_err = write_private_file(path, content or "")
+    if not wrote then
+      os.remove(path)
+      return false, write_err
+    end
+    return true
+  end
+
+  --- Create a new FIFO with mode 0600 at <path>.
+  -- The path must not exist; `mkfifo` fails on an existing path (including a
+  -- symbolic link), and the result is verified as an owned, singly linked,
+  -- mode-0600 FIFO before it is returned.
+  -- @param path string
+  -- @return boolean ok, string? err
+  function backend.mkfifo(path)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
+      return false, "invalid FIFO path"
+    end
+    local exists = normalized_exit_status(os.execute(
+      "test -e " .. shell_quote(path) .. " || test -L " .. shell_quote(path))) == 0
+    if exists then
+      return false, "FIFO path already exists"
+    end
+    local created = normalized_exit_status(os.execute(
+      "umask 077; mkfifo -m 600 -- " .. shell_quote(path) .. " 2>/dev/null"))
+    if created ~= 0 then
+      return false, "FIFO creation failed"
+    end
+    return verify_private_fifo(path)
+  end
+
+  --- Open a verified private FIFO read/write.
+  -- `r+` maps to POSIX O_RDWR, which neither blocks waiting for a peer nor
+  -- reports a spurious end-of-file while the caller holds the handle. The
+  -- path is verified as an owned mode-0600 FIFO immediately before the open;
+  -- a symbolic link, foreign owner, or weaker mode is refused.
+  -- @param path string
+  -- @return file? handle, string? err
+  function backend.open_fifo(path)
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.read")
+    local verified, verify_err = verify_private_fifo(path)
+    if not verified then
+      return nil, verify_err
+    end
+    local handle, open_err = io.open(path, "r+")
+    if not handle then
+      return nil, tostring(open_err or "cannot open FIFO")
+    end
+    return handle
+  end
+
+  --- Remove one empty directory (POSIX `rmdir`). Never recursive.
+  -- @param path string
+  -- @return boolean ok, string? err
+  function backend.remove_dir(path)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    local status = normalized_exit_status(os.execute("rmdir -- " .. shell_quote(path) .. " 2>/dev/null"))
+    if status == 0 then
+      return true
+    end
+    return false, "directory is not empty or cannot be removed"
   end
 
   --- Atomically rename <from> to <to> on the same filesystem.
@@ -1638,6 +1812,49 @@ function standalone.new(opts)
     return os.clock()
   end
 
+  --- Return the current process id.
+  -- A short-lived POSIX shell reports its own parent (`$PPID`), which is the
+  -- interpreter process. Values that do not parse as a pid above 1 fail closed.
+  -- @return number? pid
+  function backend.pid()
+    require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
+    local pipe = io.popen('printf "%s" "$PPID" 2>/dev/null', "r")
+    if not pipe then
+      return nil
+    end
+    local line = pipe:read("*l")
+    pipe:close()
+    local pid = tonumber((line or ""):match("^%s*(%d+)%s*$"))
+    if pid == nil or pid <= 1 then
+      return nil
+    end
+    return pid
+  end
+
+  --- Probe whether <pid> is a live process for this user.
+  -- `kill -0` only checks existence and permission; no signal is delivered.
+  -- A permission denial is reported as not alive, which is the safe answer for
+  -- a pid that cannot be this user's session daemon. An unavailable probe
+  -- surface or an unexpected status returns an error so callers fail closed
+  -- instead of treating "unknown" as stale.
+  -- @param pid number
+  -- @return boolean alive, string? err
+  function backend.proc_is_alive(pid)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "process.spawn")
+    if type(pid) ~= "number" or pid ~= pid or pid % 1 ~= 0 or pid <= 1 then
+      return false, "invalid pid"
+    end
+    local status = normalized_exit_status(os.execute(
+      "kill -0 " .. tostring(pid) .. " 2>/dev/null"))
+    if status == 0 then
+      return true
+    end
+    if status == 1 then
+      return false
+    end
+    return false, "liveness probe failed"
+  end
+
   return backend
 end
 
@@ -1767,9 +1984,46 @@ end
 
 --- Return lstat-style metadata and type probes for a path.
 -- @param path string
--- @return table { exists, symlink, regular, directory, uid?, mode? }
+-- @return table { exists, symlink, regular, directory, fifo, uid?, mode? }
 function WheelHost.fs.stat(path)
   return invoke("fs.read", "stat", path)
+end
+
+--- Return the current effective uid, or nil when it cannot be read.
+-- @return number? uid
+function WheelHost.fs.euid()
+  return invoke("fs.read", "euid")
+end
+
+--- Create a new regular file with mode 0600 at `path` and write `content`.
+-- The path must not exist; a pre-existing file, FIFO, device, or symbolic link
+-- is refused rather than followed or truncated. The caller owns removal.
+-- @param path string
+-- @param content string?
+-- @return boolean ok, string? err
+function WheelHost.fs.create_private_file(path, content)
+  return invoke("fs.write", "create_private_file", path, content)
+end
+
+--- Create a new FIFO with mode 0600 at `path`.
+-- @param path string
+-- @return boolean ok, string? err
+function WheelHost.fs.mkfifo(path)
+  return invoke("fs.write", "mkfifo", path)
+end
+
+--- Open a verified private FIFO read/write (O_RDWR; never blocks on a peer).
+-- @param path string
+-- @return file? handle, string? err
+function WheelHost.fs.open_fifo(path)
+  return invoke("fs.read", "open_fifo", path)
+end
+
+--- Remove one empty directory. Never recursive.
+-- @param path string
+-- @return boolean ok, string? err
+function WheelHost.fs.remove_dir(path)
+  return invoke("fs.write", "remove_dir", path)
 end
 
 --- Process primitives.
@@ -1843,6 +2097,21 @@ end
 -- @return string
 function WheelHost.proc.shell_quote(value)
   return invoke("process.spawn", "shell_quote", value)
+end
+
+--- Return the current process id, or nil when it cannot be read.
+-- @return number? pid
+function WheelHost.proc.pid()
+  return invoke("process.spawn", "pid")
+end
+
+--- Probe whether `pid` is a live process for this user (`kill -0`, no signal).
+-- A permission denial is reported as not alive; an unavailable probe surface or
+-- unexpected status returns an error so callers fail closed.
+-- @param pid number
+-- @return boolean alive, string? err
+function WheelHost.proc.is_alive(pid)
+  return invoke("process.spawn", "proc_is_alive", pid)
 end
 
 --- Temporary-file primitives.

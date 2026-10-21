@@ -8032,6 +8032,51 @@ run_test("WheelProvider: stdio command refusal, timeout, and output truncation a
     "successful stdio content must not include stderr diagnostics: " .. tostring(clean_err))
 end)
 
+run_test("WheelHost: private file, FIFO, and pid primitives", function()
+  local root = "/tmp/bitty/wheel-host-ctx0024-"
+    .. tostring(WheelHost.proc.pid()) .. "-" .. tostring(os.time())
+  os.execute("rm -rf " .. root)
+  assert(WheelHost.fs.mkdir_p(root) == true)
+  assert(WheelHost.fs.chmod(root, "700") == true)
+
+  local euid = WheelHost.fs.euid()
+  assert(type(euid) == "number" and euid >= 0, "euid must be readable")
+
+  local file = root .. "/private.txt"
+  assert(WheelHost.fs.create_private_file(file, "payload") == true)
+  local file_info = WheelHost.fs.stat(file)
+  assert(file_info.regular and file_info.mode == 384, "create must produce a 0600 regular file")
+  assert(WheelHost.fs.create_private_file(file, "again") == false,
+    "exclusive create must refuse an existing path")
+  os.execute("ln -s " .. file .. " " .. root .. "/private.link")
+  assert(WheelHost.fs.create_private_file(root .. "/private.link", "x") == false,
+    "exclusive create must refuse a symlink")
+
+  local fifo = root .. "/control.fifo"
+  assert(WheelHost.fs.mkfifo(fifo) == true)
+  local fifo_info = WheelHost.fs.stat(fifo)
+  assert(fifo_info.fifo and fifo_info.mode == 384, "mkfifo must produce a 0600 FIFO")
+  assert(WheelHost.fs.mkfifo(fifo) == false, "mkfifo must refuse an existing path")
+  local handle = assert(WheelHost.fs.open_fifo(fifo))
+  assert(handle:write("ping"), "write to a verified FIFO handle must succeed")
+  handle:flush()
+  assert(handle:read(4) == "ping", "a verified FIFO handle must round trip bytes")
+  handle:close()
+
+  assert(WheelHost.fs.remove_dir(root) == false, "remove_dir must not remove a non-empty directory")
+  assert(WheelHost.fs.remove_file(root .. "/private.link") == true)
+  assert(WheelHost.fs.remove_file(file) == true)
+  assert(WheelHost.fs.remove_file(fifo) == true)
+  assert(WheelHost.fs.remove_dir(root) == true)
+
+  local pid = WheelHost.proc.pid()
+  assert(type(pid) == "number" and pid > 1, "the current pid must be readable")
+  assert(WheelHost.proc.is_alive(pid) == true, "the current pid must be alive")
+  local invalid_alive, invalid_err = WheelHost.proc.is_alive(0)
+  assert(invalid_alive == false and type(invalid_err) == "string",
+    "an invalid pid must fail the liveness probe")
+end)
+
 run_test("WheelHost: context and team wall-clock sites route through time.now", function()
   local backend = WheelHost.backend
   local saved_now = backend.now

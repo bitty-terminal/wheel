@@ -8,6 +8,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Experimental local session daemon (CTX-0024 / wheel#85): a detached per-user
+  process owns one `WheelContext` and serves the bounded `wheel-session/1`
+  control plane over private POSIX FIFOs. `scripts/wheel-session` starts, probes,
+  inspects, snapshots, updates context, and stops it; requests are serialized by
+  a per-session client lock, metadata and FIFOs are user-owned `0600` inside a
+  `0700` runtime directory, frames are bounded at 64 KiB/1 MiB, snapshots omit
+  slot content, and shutdown is explicit. `just test-session` starts a real
+  daemon and covers cross-process context persistence, CAS conflicts, invalid
+  names, unsafe/symlinked paths, oversized frames, stale-pid recovery, and clean
+  shutdown. The same-user FIFO residual (no peer credentials) is recorded in
+  `SECURITY-MODEL.md`.
 - Repository scaffold generated from
   [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template):
   static manifest (`bitty-plugin.toml`), Lua entry point (`lua/wheel/init.lua`),
