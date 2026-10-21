@@ -97,7 +97,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/runner.lua
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
     bun run luaparse --quiet --file tests/test_wheel.lua
-    bun run luaparse --quiet --file tests/test_live_openrouter.lua
+    bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
@@ -157,29 +157,29 @@ shell:
     shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
     shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
 
-# Opt-in live provider test against OpenRouter. Manual only; never part of
-# `just check` or CI. It always runs the key-free redirect-policy test first
-# and fails closed if that test fails. When OPENROUTER_API_KEY is absent, only
-# the live provider portion is skipped after the redirect test succeeds. The
+# Offline gates for the live provider test: no credential, no network. The
+# key-free redirect-policy test runs first, then the provider-selection and
+# host-binding tests. Part of `check`, so CI exercises the selector without a
+# key.
+test-live-offline:
+    @command -v python3 >/dev/null 2>&1 || { echo "test-live-offline requires python3" >&2; exit 1; }
+    python3 tests/test_live_http_client_redirect.py
+    python3 tests/test_live_provider_selection.py
+
+# Opt-in live provider test. Manual only; never part of `just check` or CI.
+# WHEEL_LIVE_PROVIDER selects openrouter (default) or commandcode,
+# case-insensitively. The key-free offline gates run first; the live portion
+# skips with exit 0 after them when the selected provider's key is unset. The
 # test-only Python client reads the key from its own environment; the Lua
 # harness adapter never receives it.
-test-live:
+test-live: test-live-offline
     @set -e; \
-    if ! command -v python3 >/dev/null 2>&1; then \
-        echo "test-live requires python3 for the test-only HTTP client" >&2; \
-        exit 1; \
-    fi; \
-    python3 tests/test_live_http_client_redirect.py; \
-    if [ -z "${OPENROUTER_API_KEY:-}" ]; then \
-        echo "test-live live portion skipped: OPENROUTER_API_KEY is not set (redirect policy test passed)"; \
-        exit 0; \
-    fi; \
     if command -v lua5.1 >/dev/null 2>&1; then \
-        lua5.1 tests/test_live_openrouter.lua; \
+        lua5.1 tests/test_live_provider.lua; \
     elif command -v luajit >/dev/null 2>&1; then \
-        luajit tests/test_live_openrouter.lua; \
+        luajit tests/test_live_provider.lua; \
     elif command -v lua >/dev/null 2>&1; then \
-        lua tests/test_live_openrouter.lua; \
+        lua tests/test_live_provider.lua; \
     else \
         echo "No lua interpreter found; skipping live test execution" >&2; \
     fi
@@ -204,7 +204,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

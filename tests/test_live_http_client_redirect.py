@@ -8,14 +8,16 @@ Starts two loopback HTTP servers:
 * the target records every request and Authorization header it receives.
 
 The client must refuse each redirect without making a second request. This test
-never reads ``OPENROUTER_API_KEY`` and never reaches an external network; it is
-run by ``just test-live`` before the live key check.
+never reads a provider credential and never reaches an external network; it is
+run by ``just test-live`` (and the offline ``just check`` aggregate) before the
+live key check.
 """
 
 from __future__ import annotations
 
 import http.server
 import io
+import json
 import os
 import sys
 import threading
@@ -35,8 +37,9 @@ TARGET_HOST = "127.0.0.2"
 # Keep loopback traffic out of any inherited proxy configuration.
 os.environ["no_proxy"] = "127.0.0.1,127.0.0.2,localhost"
 os.environ["NO_PROXY"] = os.environ["no_proxy"]
-# The negative test must not depend on the real credential.
-os.environ.pop(client.API_KEY_ENV, None)
+# The negative test must not depend on a real credential.
+for _provider in client.PROVIDERS.values():
+    os.environ.pop(_provider.api_key_env, None)
 
 redirect_requests: list[dict[str, Any]] = []
 target_requests: list[dict[str, Any]] = []
@@ -117,7 +120,13 @@ def _expect_redirect_refused(path: str) -> None:
     spec = {
         "url": f"http://{INITIAL_HOST}:{redirect_server.server_port}{path}",
         "method": "POST",
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            # Caller-supplied credentials must be discarded in favor of the
+            # helper's own environment credential.
+            "Authorization": "Bearer caller-supplied-value",
+            "x-api-key": "caller-supplied-value",
+        },
         "body": "{}",
     }
     try:
@@ -162,30 +171,38 @@ finally:
     target_server.server_close()
 
 # 3. main() turns a refused redirect into a bounded, generic diagnostic that
-#    contains no URL, header, body, or credential material.
-fake_stdout = _FakeStdout()
-stderr = io.StringIO()
-with (
-    mock.patch.object(client, "fetch", side_effect=client.RedirectRefused),
-    mock.patch.dict(os.environ, {client.API_KEY_ENV: FAKE_KEY}),
-    mock.patch.object(
-        sys,
-        "stdin",
-        _FakeStdin(
-            b'{"url":"https://openrouter.ai/api/v1/chat/completions","body":"{}"}'
+#    contains no URL, header, body, or credential material. Exercise every
+#    selectable provider so the credential environment selection is covered.
+for _provider in client.PROVIDERS.values():
+    fake_stdout = _FakeStdout()
+    stderr = io.StringIO()
+    request_spec = json.dumps(
+        {
+            "url": f"https://{_provider.allowed_host}/api/v1/chat/completions",
+            "body": "{}",
+        }
+    ).encode("utf-8")
+    with (
+        mock.patch.object(client, "fetch", side_effect=client.RedirectRefused),
+        mock.patch.dict(
+            os.environ,
+            {
+                client.PROVIDER_SELECTOR_ENV: _provider.name,
+                _provider.api_key_env: FAKE_KEY,
+            },
         ),
-    ),
-    mock.patch.object(sys, "stdout", fake_stdout),
-    mock.patch.object(sys, "stderr", stderr),
-):
-    exit_code = client.main()
+        mock.patch.object(sys, "stdin", _FakeStdin(request_spec)),
+        mock.patch.object(sys, "stdout", fake_stdout),
+        mock.patch.object(sys, "stderr", stderr),
+    ):
+        exit_code = client.main()
 
-assert exit_code == 1
-message = stderr.getvalue()
-assert message == "test client refused an HTTP redirect\n"
-assert FAKE_KEY not in message
-assert "openrouter.ai" not in message and "http" not in message
-assert fake_stdout.buffer.data == b""
+    assert exit_code == 1
+    message = stderr.getvalue()
+    assert message == "test client refused an HTTP redirect\n"
+    assert FAKE_KEY not in message
+    assert _provider.allowed_host not in message and "http" not in message
+    assert fake_stdout.buffer.data == b""
 print("PASS live HTTP client redirect diagnostic is generic and key-free")
 
 print("PASS live HTTP client redirect policy")

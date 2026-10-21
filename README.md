@@ -586,9 +586,10 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                 |
 | `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                          |
 | `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                  |
-| `tests/test_live_openrouter.lua`          | Opt-in live OpenRouter test (`just test-live`): complete, tool call, SSE stream, and runner ReAct turn; runs after the key-free redirect-policy test.                                                                |
-| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the key from its inherited environment, rejects redirects, and never accepts the key through argv, files, or request JSON.                               |
+| `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
+| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
 | `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                            |
+| `tests/test_live_provider_selection.py`   | Key-free offline selector test: default/case-insensitive selection, per-provider key and host binding, HTTPS-only requests, and fail-closed diagnostics.                                                             |
 | `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                |
 | `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                       |
 | `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                |
@@ -781,31 +782,48 @@ own.
 
 `just check`, `just test`, and CI are offline: they use mock providers and never
 use a live credential for a request or reach the network. The live provider test
-is a separate, manual, opt-in target:
+is a separate, manual, opt-in target with an explicit provider selector:
 
 ```sh
-OPENROUTER_API_KEY=... just test-live
+just test-live                                  # OpenRouter (default)
+WHEEL_LIVE_PROVIDER=commandcode just test-live  # Command Code
 ```
 
-- `just test-live` is not part of `just check` or CI. It runs the key-free
-  redirect-policy test first, then skips the live portion with exit 0 and a
-  clear message when `OPENROUTER_API_KEY` is absent.
-- The live portion calls `deepseek/deepseek-v4.1-flash` through
-  `https://openrouter.ai/api/v1` and covers a non-streaming completion, a tool
-  call with parsed arguments, an SSE stream, and one runner ReAct turn with a
-  stub tool.
+- `WHEEL_LIVE_PROVIDER` is `openrouter` (default) or `commandcode` and is
+  matched case-insensitively; an unknown value fails closed with a non-zero
+  exit. The default stays OpenRouter.
+- OpenRouter uses `OPENROUTER_API_KEY`, `https://openrouter.ai/api/v1`, and
+  model `deepseek/deepseek-v4.1-flash`. Command Code uses
+  `COMMANDCODE_API_KEY`, `https://api.commandcode.ai/provider/v1`, and the same
+  model.
+- `just test-live` is not part of `just check` or CI. Its key-free offline
+  gates (`test-live-offline`: redirect policy, provider selection, host
+  binding) run first and are also part of `check`; the live portion then skips
+  with exit 0 and a clear message when the selected provider's key is absent.
+- The live portion calls the selected provider's model and covers a
+  non-streaming completion, a tool call with parsed arguments, an SSE stream,
+  and one runner ReAct turn with a stub tool.
+- Command Code serves a reasoning model, so content-bearing checks use a
+  1024-token completion budget (at least 512 is required; a 64-token budget can
+  be consumed entirely by reasoning and return empty content with
+  `finish_reason: length`). The completion, tool-call, and stream paths assert
+  non-empty content and reject `finish_reason: length`; the runner path asserts
+  the dispatched tool, iteration count, and non-empty deliverables.
 - The credential stays in the environment. The Lua adapter is constructed
   without an API key; `tests/live_http_client.py` (Python standard library,
-  test-only) reads `OPENROUTER_API_KEY` from its inherited environment and adds
-  the authorization header after receiving a key-free request JSON over stdin.
-  The key is never passed in argv, written to a request file, logged, or placed
-  in a captured artifact, and the live test asserts it never appears in its
-  captured output.
-- The client refuses every HTTP redirect without a second hop, so the
-  authorization header cannot be forwarded to another host or downgraded to
+  test-only) reads the selected provider's key variable from its inherited
+  environment and adds the authorization header after receiving a key-free
+  request JSON over stdin. The key is never passed in argv, written to a
+  request file, logged, or placed in a captured artifact, and the live test
+  asserts it never appears in its captured output.
+- The client is HTTPS-only and accepts only the selected provider host on the
+  default HTTPS port. It refuses every HTTP redirect without a second hop, so
+  the authorization header cannot be forwarded to another host or downgraded to
   plaintext HTTP. `tests/test_live_http_client_redirect.py` proves this against
   loopback servers for both a cross-host and a scheme-change 302; it requires no
-  key and no external network.
+  key and no external network. The helper sends one fixed, non-secret
+  `User-Agent` because Command Code's edge rejects Python's default urllib
+  signature with a Cloudflare 1010 response; the Lua caller cannot override it.
 - Every live request carries an explicit completion `max_tokens` from the named
   default or a validated override, so the provider's credit check cannot assume
   the model's maximum completion window.
