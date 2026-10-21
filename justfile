@@ -100,17 +100,18 @@ lua: deps
     bun run luaparse --quiet --file tests/test_live_openrouter.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
-# Run test suite when a Lua interpreter is available (lua5.1, luajit, or lua).
+# Run the test suite with the deterministic interpreter selection: lua5.1
+# first, then luajit, then lua. Lua 5.1 is the release gate; the LuaJIT
+# fallback disables the JIT for evaluated config chunks so the instruction-limit
+# test cannot hang. `just test-gate` verifies the selection branches.
 test: deps
-    @if command -v lua5.1 >/dev/null 2>&1; then \
-        lua5.1 tests/test_wheel.lua; \
-    elif command -v luajit >/dev/null 2>&1; then \
-        luajit tests/test_wheel.lua; \
-    elif command -v lua >/dev/null 2>&1; then \
-        lua tests/test_wheel.lua; \
-    else \
-        echo "No lua interpreter found; skipping runtime test execution" >&2; \
-    fi
+    bash scripts/test-gate.sh
+
+# Verify the interpreter-selection branches of `just test` without running the
+# suite: lua5.1 wins when present, luajit/lua fall back in order, and absence is
+# reported as a skip.
+test-gate: deps
+    bash scripts/test-gate.sh --self-test
 
 # Opt-in real-host activation and command-smoke fixture for the standalone
 # Option B harness. Requires lua5.1 and fails closed when it is absent instead
@@ -149,12 +150,12 @@ rollback-local prefix:
 verify-package:
     bash scripts/verify-package.sh
 
-# Shell gates for the packaging scripts (not part of `check` because the CI
-# image does not guarantee shfmt). The older workflow-*.sh scripts are outside
-# this gate; reformatting them is a separate change.
+# Shell gates for the packaging and test-gate scripts (not part of `check`
+# because the CI image does not guarantee shfmt). The older workflow-*.sh
+# scripts are outside this gate; reformatting them is a separate change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh
 
 # Opt-in live provider test against OpenRouter. Manual only; never part of
 # `just check` or CI. It always runs the key-free redirect-policy test first
@@ -203,7 +204,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test lua-control
+check: lint fmt-check manifest docs-check lua test-gate test lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

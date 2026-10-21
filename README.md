@@ -177,7 +177,10 @@ the current nor the previous version.
 ### Compatibility
 
 - **Gate interpreter:** Lua 5.1 (PUC-Rio 5.1.5 in CI and the real-host
-  fixture). LuaJIT may run the development suites but is not the release gate.
+  fixture). `just test` prefers `lua5.1`, then `luajit`, then `lua`. LuaJIT is a
+  development fallback, not the release gate; the evaluator disables the JIT for
+  the project-config chunk so the instruction limit stays enforceable and the
+  LuaJIT suite cannot hang.
 - **Platform:** POSIX hosts with GNU coreutils, util-linux `setsid`, tar, and
   gzip; Linux is tested. Windows is not supported and macOS is not verified.
 - **Bitty host:** no host version is required. Wheel is an independent
@@ -192,8 +195,9 @@ Standalone harness development does not require a Bitty host. Prerequisites:
 - [Bun](https://bun.sh/) 1.4.2, the version pinned by `package.json`
   (`packageManager`) and used by CI.
 - [just](https://github.com/casey/just) for the repository recipes.
-- Lua 5.1 or LuaJIT for the test and end-to-end recipes; a `lua` binary also
-  satisfies the recipe when neither is installed.
+- Lua 5.1 for the release gate; the test and end-to-end recipes fall back to
+  LuaJIT and then to a plain `lua` binary when `lua5.1` is absent. LuaJIT runs
+  with the JIT disabled for evaluated project-config chunks.
 - A POSIX host with standard shell utilities. Process execution additionally
   requires `env`, `sleep`, `mktemp`, `stat`, `id`, `ln`, GNU `timeout` (or
   Homebrew `gtimeout`), and util-linux `setsid` on `PATH`; without them the
@@ -686,7 +690,9 @@ exactly one location pair; update `package.json` and refresh `bun.lock` with
   point cannot pass silently.
 - `just lint` and `just fmt-check` run markdownlint-cli2 and Prettier over the
   repository.
-- `just test` runs the unit suite across `lua5.1`, `luajit`, or `lua`.
+- `just test` selects `lua5.1`, then `luajit`, then `lua`, prints the choice,
+  and runs the unit suite. `just test-gate` verifies those selection branches
+  with fake interpreters on a controlled `PATH`.
 - `just test-real-host` runs the opt-in real-host fixture with `lua5.1`; the
   fixture execution is not part of `just check` locally (the Lua gate still
   parses the file), and CI runs it after the quality gates.
@@ -710,7 +716,7 @@ invocation checks; it does not claim host-side validation evidence.
 Run the unit test suite and the cross-process end-to-end integration drill:
 
 ```sh
-just test      # runs unit tests across lua5.1, luajit, or lua
+just test      # select lua5.1, luajit, or lua and run the unit suite
 just e2e       # runs the 11-step cross-process drill with wheel_stdio_host over Unix FIFOs
 ```
 

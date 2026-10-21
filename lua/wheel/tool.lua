@@ -11,8 +11,36 @@
 -- 6. Content-addressed auto-spillover pipeline with head/tail observation preview.
 -- 7. WheelToolRegistry for extensible tool registration and safe execution dispatch.
 
+--- Load the typed error vocabulary through a rooted name.
+-- Both accepted module roots are tried (`wheel.errors` and `lua.wheel.errors`);
+-- there is deliberately no bare `require` fallback, which would drop the
+-- rooted attribution. Lua 5.1 leaves a load sentinel after a failed require,
+-- so each failed root is cleared before the next attempt or the final error.
+-- @return table WheelErrors module
+local function load_errors()
+  local rooted = "wheel.errors"
+  local ok, mod = pcall(require, rooted)
+  if ok then return mod end
+  package.loaded[rooted] = nil
+  local cause = mod
+  if type(cause) ~= "string"
+    or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+    error("wheel.tool: cannot load submodule 'wheel.errors': " .. tostring(cause), 0)
+  end
+
+  local alternate = "lua.wheel.errors"
+  ok, mod = pcall(require, alternate)
+  if ok then return mod end
+  package.loaded[alternate] = nil
+  if type(mod) == "string"
+    and mod:find("module '" .. alternate .. "' not found", 1, true) then
+    mod = cause
+  end
+  error("wheel.tool: cannot load submodule 'wheel.errors': " .. tostring(mod), 0)
+end
+
 local WheelTool = {}
-local WheelErrors = require("wheel.errors")
+local WheelErrors = load_errors()
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end

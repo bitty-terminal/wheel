@@ -335,6 +335,12 @@ authority.
   The standalone backend uses `$XDG_RUNTIME_DIR/wheel` when set, otherwise
   `$XDG_STATE_HOME/wheel/tmp`, otherwise `$HOME/.local/state/wheel/tmp`; the
   directory is created or repaired with mode 0700 before a path is returned.
+  The path is normalized first (repeated `/` separators collapse and `.`
+  segments are removed), so `.../wheel//tmp`, `.../wheel///tmp`, and
+  `.../wheel/./tmp` cannot skip the guard on the harness-owned `wheel` parent.
+  The filesystem root and all-dots segments are rejected before `mkdir`/`chmod`,
+  and a symlinked harness-owned directory or `wheel` parent is refused without
+  following or chmodding its target.
   New files are created with `mktemp` in the private `0700` directory and
   verified with `stat`/`id` as user-owned regular `0600` files with link count 1;
   exact paths use an `ln` hard-link commit so a pre-existing regular file, FIFO,

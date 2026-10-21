@@ -1828,6 +1828,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       broken = "this is not lua\n",
       marker = "near",
       location = "agent.lua",
+      retry = true,
     },
     {
       parent = "wheel.context",
@@ -1835,6 +1836,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       label = "wheel.context: cannot load submodule 'wheel.config'",
       broken = "error('config exploded', 0)\n",
       marker = "config exploded",
+      retry = true,
     },
     {
       parent = "wheel.commands",
@@ -1852,6 +1854,13 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
     write_fixture_file("wheel/" .. case.dep .. ".lua", case.broken)
     package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
     local case_ok, case_err = pcall(require, case.parent)
+    local retry_ok, retry_err
+    if case.retry then
+      -- Clear only the parent's own Lua 5.1 sentinel; the loader must have
+      -- cleared the dependency sentinel, so the retry reports the real cause.
+      package.loaded[case.parent] = nil
+      retry_ok, retry_err = pcall(require, case.parent)
+    end
     package.path = saved_path
     restore_wheel_modules(case_modules)
 
@@ -1869,6 +1878,16 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
       case.parent .. " must not report the alternate root: " .. case_err)
     assert(case_err:find("not found", 1, true) == nil,
       case.parent .. " must not report a broken module as missing: " .. case_err)
+    if case.retry then
+      assert(not retry_ok, case.parent .. " must fail again after clearing its sentinel")
+      assert(type(retry_err) == "string", case.parent .. " retry failure must be a string")
+      assert(retry_err:find(case.label, 1, true) ~= nil,
+        case.parent .. " retry must keep the rooted attribution: " .. retry_err)
+      assert(retry_err:find(case.marker, 1, true) ~= nil,
+        case.parent .. " retry must keep the original cause: " .. retry_err)
+      assert(retry_err:find("loop or previous error", 1, true) == nil,
+        case.parent .. " retry must not report the Lua 5.1 failed-require sentinel")
+    end
   end
 
   -- The typed message built by init must keep the nested cause when a broken
@@ -1919,8 +1938,15 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   -- the alternate root. The temporary tree contains only lua/wheel/<dep>.lua,
   -- so every rooted `wheel.<dep>` lookup is a real not-found result.
   local alternate_cases = {
-    { parent = "team", deps = { "agent", "context", "tool", "ui", "host" } },
-    { parent = "context", deps = { "config", "host" } },
+    { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host" } },
+    { parent = "context", deps = { "errors", "config", "host" } },
+    {
+      parent = "tool",
+      deps = { "errors", "host" },
+      -- tool.load_host consults typed-error detection, so the alternate-root
+      -- errors fixture must expose the predicate rather than an empty table.
+      fixtures = { errors = "return { is_typed = function() return false end }\n" },
+    },
     { parent = "commands", deps = { "errors", "schema" } },
   }
 
@@ -1928,7 +1954,8 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
     local case_modules = detach_wheel_modules()
     reset_module_fixture_root()
     for _, dep in ipairs(case.deps) do
-      write_fixture_file("lua/wheel/" .. dep .. ".lua", "return {}\n")
+      local content = (case.fixtures and case.fixtures[dep]) or "return {}\n"
+      write_fixture_file("lua/wheel/" .. dep .. ".lua", content)
     end
 
     local source = read_repo_source("lua/wheel/" .. case.parent .. ".lua")
@@ -2010,6 +2037,71 @@ run_test("Wheel Init: missing lazy module is attributed on first use", function(
       "broken lazy failure must not be reported as missing")
     assert(wheel ~= nil, "activation must have succeeded before the lazy failure")
   end)
+
+  os.execute("rm -rf " .. MODULE_LOAD_FIXTURE_ROOT)
+end)
+
+run_test("Wheel modules: typed loader denials stay typed and rooted", function()
+  local saved_path = package.path
+  local typed_host = [[
+error({
+  class = "runtime",
+  code = "E_CAPABILITY_DENIED",
+  message = "capability 'host.backend.standalone' is not granted",
+}, 0)
+]]
+
+  local function assert_typed_load_failure(parent, fixtures)
+    local saved_modules = detach_wheel_modules()
+    reset_module_fixture_root()
+    for relative, content in pairs(fixtures) do
+      write_fixture_file(relative, content)
+    end
+    package.path = MODULE_LOAD_FIXTURE_ROOT .. "/?.lua;" .. REPO_PACKAGE_PATH
+
+    local ok, err = pcall(require, parent)
+    -- The loader clears the dependency's Lua 5.1 sentinel. Clear the parent's
+    -- own sentinel to retry and prove the real denial is reported again.
+    package.loaded[parent] = nil
+    local retry_ok, retry_err = pcall(require, parent)
+
+    package.path = saved_path
+    restore_wheel_modules(saved_modules)
+
+    assert(not ok, parent .. " must fail when the host seam denies")
+    local denial = assert_typed_error(err, "E_CAPABILITY_DENIED")
+    assert(denial.class == "runtime", parent .. " must keep the runtime class")
+    assert(denial.message:find(parent, 1, true) ~= nil,
+      parent .. " must attribute the loading module: " .. denial.message)
+    assert(denial.message:find("wheel.host", 1, true) ~= nil,
+      parent .. " must name the rooted dependency: " .. denial.message)
+    assert(denial.message:find("host.backend.standalone", 1, true) ~= nil,
+      parent .. " must preserve the denied capability: " .. denial.message)
+    assert(denial.message:find("lua.wheel.host", 1, true) == nil,
+      parent .. " must not report the alternate root: " .. denial.message)
+    assert(denial.message:find("not found", 1, true) == nil,
+      parent .. " must not report a typed denial as missing: " .. denial.message)
+
+    assert(not retry_ok, parent .. " must fail again after clearing its sentinel")
+    local retry_denial = assert_typed_error(retry_err, "E_CAPABILITY_DENIED")
+    assert(retry_denial.message == denial.message,
+      parent .. " retry must preserve the annotated typed cause")
+    assert(retry_denial.message:find("loop or previous error", 1, true) == nil,
+      parent .. " retry must not report the Lua 5.1 failed-require sentinel")
+  end
+
+  assert_typed_load_failure("wheel.context", {
+    ["wheel/config.lua"] = "return {}\n",
+    ["wheel/host.lua"] = typed_host,
+  })
+
+  assert_typed_load_failure("wheel.team", {
+    ["wheel/agent.lua"] = "return {}\n",
+    ["wheel/context.lua"] = "return {}\n",
+    ["wheel/tool.lua"] = "return {}\n",
+    ["wheel/ui.lua"] = "return {}\n",
+    ["wheel/host.lua"] = typed_host,
+  })
 
   os.execute("rm -rf " .. MODULE_LOAD_FIXTURE_ROOT)
 end)
@@ -6484,14 +6576,66 @@ run_test("WheelHost: tmp_dir rejects a symlinked harness-owned directory", funct
   end
 
   -- The state fallback's harness-owned `wheel` component is also guarded.
+  -- Repeated separators and `.` segments must normalize before the exact
+  -- `/wheel/tmp` suffix guard; otherwise the guard is skipped and a symlinked
+  -- `wheel` parent is followed and chmodded.
   os.execute("mkdir -p " .. root .. "/state/other")
   os.execute("ln -s " .. root .. "/state/other " .. root .. "/state/wheel")
-  local state_backend = WheelHost.create_backend("standalone", {
-    tmp_root = root .. "/state/wheel/tmp",
+  local state_forms = {
+    root .. "/state/wheel/tmp",
+    root .. "/state/wheel//tmp",
+    root .. "/state/wheel///tmp",
+    root .. "/state//wheel///tmp",
+    root .. "/state/wheel/./tmp",
+    root .. "/state/wheel//./tmp",
+  }
+  for _, state_form in ipairs(state_forms) do
+    os.execute("chmod 755 " .. root .. "/state/other")
+    local state_backend = WheelHost.create_backend("standalone", {
+      tmp_root = state_form,
+    })
+    local state_ok, state_err = pcall(state_backend.tmp_dir)
+    assert(not state_ok, "a symlinked harness-owned wheel component must be rejected: " .. state_form)
+    local state_denial = assert_typed_error(state_err, "E_CAPABILITY_DENIED")
+    assert(state_denial.message == "capability 'fs.write' is not granted",
+      "the wheel-parent guard must report the typed fs.write denial: " .. state_form)
+    local state_listing = WheelHost.proc.run_command(
+      "ls -ld " .. WheelHost.proc.shell_quote(root .. "/state/other"))
+    local state_mode = state_listing.stdout:match("^(%S+)")
+    assert(string.sub(state_mode or "", 1, 10) == "drwxr-xr-x",
+      "rejecting the link must not chmod its target, got " .. tostring(state_mode)
+        .. " for '" .. state_form .. "'")
+  end
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: repeated and dot segments normalize before use", function()
+  local root = "/tmp/bitty/test_host_tmp_normalize"
+  os.execute("rm -rf " .. root)
+
+  local backend = WheelHost.create_backend("standalone", {
+    tmp_root = root .. "/nested//runtime///",
   })
-  local state_ok, state_err = pcall(state_backend.tmp_dir)
-  assert(not state_ok, "a symlinked harness-owned wheel component must be rejected")
-  assert_typed_error(state_err, "E_CAPABILITY_DENIED")
+  local dir, err = backend.tmp_dir()
+  assert(dir == root .. "/nested/runtime",
+    "repeated separators and trailing separators must collapse: " .. tostring(err))
+
+  local listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(dir))
+  local mode = listing.stdout:match("^(%S+)")
+  assert(string.sub(mode or "", 1, 10) == "drwx------",
+    "the normalized directory must be 0700, got " .. tostring(mode))
+
+  local tmp_path = backend.tmp_path()
+  assert(tmp_path:sub(1, #dir + 1) == dir .. "/",
+    "tmp_path must use the normalized private directory")
+
+  local dot_backend = WheelHost.create_backend("standalone", {
+    tmp_root = root .. "/nested/./runtime",
+  })
+  local dot_dir, dot_err = dot_backend.tmp_dir()
+  assert(dot_dir == root .. "/nested/runtime",
+    "interior dot segments must normalize to the same directory: " .. tostring(dot_err))
 
   os.execute("rm -rf " .. root)
 end)
