@@ -20,9 +20,11 @@
 --
 -- Serialization: one client lock file per session is created exclusively
 -- before the FIFOs are opened. A second client fails with `E_SESSION_BUSY`
--- instead of interleaving frames; a lock whose owner pid is dead is claimed by
--- an atomic rename before removal. The daemon never signals a client and the
--- client never signals the daemon: shutdown is an explicit method.
+-- instead of interleaving frames. Stale-lock reclamation is serialized by a
+-- short-lived per-lock mutex: the dead owner's path is renamed and verified
+-- before removal, and the replacement is created before the mutex is released.
+-- The daemon never signals a client and the client never signals the daemon:
+-- shutdown is an explicit method.
 --
 -- Same-user residual: POSIX FIFOs carry no peer credentials in pure Lua. File
 -- mode 0700/0600 prevents *other* users from reaching the control plane, but
@@ -591,6 +593,10 @@ function Session.validate_absolute_path(path)
   return true, nil
 end
 
+-- Environment lookup follows the existing WheelConfig/provider precedent: the
+-- host seam currently owns filesystem, process, temporary-file, and time
+-- primitives, not environment lookup. A missing os.getenv surface is treated as
+-- an absent variable, never as a silent empty root (validation rejects nil).
 local function getenv(name)
   if type(os) ~= "table" or type(os.getenv) ~= "function" then
     return nil
@@ -644,7 +650,7 @@ local function stat_path(path)
   return info
 end
 
-local function verify_private_directory(path, repair_mode)
+local function verify_private_directory(path)
   local info, stat_err = stat_path(path)
   if not info then
     return nil, stat_err
@@ -660,23 +666,12 @@ local function verify_private_directory(path, repair_mode)
     return nil, err_unsafe_path()
   end
   if info.mode ~= 448 then
-    if repair_mode then
-      local repaired = WheelHost.fs.chmod(path, "700")
-      if not repaired then
-        return nil, err_unsafe_path()
-      end
-      info = stat_path(path)
-      if not info or info.mode ~= 448 or info.symlink or not info.directory then
-        return nil, err_unsafe_path()
-      end
-    else
-      return nil, err_unsafe_path()
-    end
+    return nil, err_unsafe_path()
   end
   return info
 end
 
-local function ensure_directory(path, repair_mode)
+local function ensure_directory(path)
   local info, stat_err = stat_path(path)
   if not info then
     return nil, stat_err
@@ -691,13 +686,14 @@ local function ensure_directory(path, repair_mode)
       return nil, err_unsafe_path()
     end
   end
-  return verify_private_directory(path, repair_mode)
+  return verify_private_directory(path)
 end
 
 --- Ensure the session root exists and is private (mode 0700, owner only).
 -- The immediate parent is also required to be a real directory owned by the
 -- current user; a symlinked or foreign-owned parent is refused before the
--- session root is created or repaired.
+-- session root is created. An existing root with a weaker mode is refused; a
+-- newly created root is chmodded to 0700 and re-verified.
 -- @param root string
 -- @return boolean ok, table? err
 function Session.ensure_root(root)
@@ -719,7 +715,7 @@ function Session.ensure_root(root)
       end
     end
   end
-  local info, dir_err = ensure_directory(root, true)
+  local info, dir_err = ensure_directory(root)
   if not info then
     return false, dir_err
   end
@@ -755,7 +751,7 @@ function Session.ensure_session_dir(session_dir, create)
       return nil, err_unsafe_path()
     end
   end
-  return verify_private_directory(session_dir, false)
+  return verify_private_directory(session_dir)
 end
 
 -- ---------------------------------------------------------------------------
@@ -816,7 +812,8 @@ function Session.read_metadata(session_dir, expected_name)
   if not meta_info.exists then
     return nil, err_not_running()
   end
-  if meta_info.symlink or not meta_info.regular or meta_info.uid ~= euid or meta_info.mode ~= 384 then
+  if meta_info.symlink or not meta_info.regular or meta_info.uid ~= euid
+    or meta_info.mode ~= 384 or meta_info.links ~= 1 then
     return nil, err_unsafe_path()
   end
   local raw = WheelHost.fs.read_file_bounded(path, Session.MAX_METADATA_BYTES + 1)
@@ -864,7 +861,7 @@ function Session.write_metadata(session_dir, meta)
   local info = stat_path(final_path)
   local euid = WheelHost.fs.euid()
   if not info or not info.exists or info.symlink or not info.regular
-    or euid == nil or info.uid ~= euid or info.mode ~= 384 then
+    or euid == nil or info.uid ~= euid or info.mode ~= 384 or info.links ~= 1 then
     return false, err_unsafe_path()
   end
   return true, nil
@@ -918,9 +915,94 @@ local function read_lock_owner(session_dir, name)
   return pid, nil
 end
 
+--- Release one named lock file only when it is still owned by `owner_pid`.
+-- @param session_dir string
+-- @param lock_name string
+-- @param owner_pid number
+-- @return boolean released
+local function release_named_lock(session_dir, lock_name, owner_pid)
+  local owner = read_lock_owner(session_dir, lock_name)
+  if owner == owner_pid then
+    return WheelHost.fs.remove_file(lock_path(session_dir, lock_name))
+  end
+  return false
+end
+
+--- Claim one stale lock path with an atomic rename and verify the moved owner.
+-- The caller must serialize reclamation (for main locks, the per-lock mutex is
+-- held). A path that changed after inspection is restored instead of deleted;
+-- an unverified live lock is never removed.
+-- @param session_dir string
+-- @param lock_name string
+-- @param expected_owner number
+-- @return boolean reclaimed
+local function claim_stale_lock(session_dir, lock_name, expected_owner)
+  lock_sequence = lock_sequence + 1
+  local stale_name = string.format("%s.stale.%d.%d", lock_name, expected_owner, lock_sequence)
+  local stale_path = lock_path(session_dir, stale_name)
+  if not WheelHost.fs.rename(lock_path(session_dir, lock_name), stale_path) then
+    return false
+  end
+  local claimed = read_lock_owner(session_dir, stale_name)
+  if claimed == expected_owner then
+    if WheelHost.fs.remove_file(stale_path) then
+      return true
+    end
+    return false
+  end
+  -- The path changed after the caller inspected it. Restore the moved lock
+  -- rather than deleting a potentially live owner's lock.
+  if not WheelHost.fs.rename(stale_path, lock_path(session_dir, lock_name)) then
+    -- Leave the moved lock under its stale name. The caller fails closed; an
+    -- unverified owner is never deleted.
+  end
+  return false
+end
+
+--- Acquire the short-lived reclamation mutex for one lock name.
+-- Every main-lock acquisition takes this mutex first, so a stale main lock is
+-- inspected, removed, and replaced while no other client can create or reclaim
+-- it. A mutex whose owner pid is dead is reclaimed with a verified rename; a
+-- mutex whose owner is live makes the caller busy.
+-- @param session_dir string
+-- @param lock_name string main lock name
+-- @param owner_pid number
+-- @return boolean ok, table? err
+local function acquire_mutex(session_dir, lock_name, owner_pid)
+  local mutex_name = lock_name .. ".mutex"
+  local path = lock_path(session_dir, mutex_name)
+  for _ = 1, Session.MAX_LOCK_ATTEMPTS do
+    local created = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
+    if created then
+      local owner = read_lock_owner(session_dir, mutex_name)
+      if owner == owner_pid then
+        return true, nil
+      end
+      return false, err_busy()
+    end
+    local owner, read_err = read_lock_owner(session_dir, mutex_name)
+    if owner == nil then
+      return false, read_err or err_lock_unsafe()
+    end
+    if owner ~= false then
+      local alive, probe_err = WheelHost.proc.is_alive(owner)
+      if probe_err ~= nil or alive then
+        return false, err_busy()
+      end
+      if not claim_stale_lock(session_dir, mutex_name, owner) then
+        return false, err_busy()
+      end
+    end
+  end
+  return false, err_busy()
+end
+
 --- Acquire one exclusive session lock file for `owner_pid`.
--- A lock owned by a dead pid is claimed with an atomic rename before removal,
--- so two cleaners cannot both delete a freshly acquired lock.
+-- Reclamation of a dead owner is serialized by a per-lock mutex: the stale main
+-- lock is renamed and its moved owner verified before removal, and the new main
+-- lock is created before the mutex is released. A concurrent caller therefore
+-- sees either a live main lock or a busy mutex, never a freshly created live
+-- lock that another cleaner can delete.
 -- @param session_dir string
 -- @param lock_name string
 -- @param owner_pid number
@@ -930,30 +1012,47 @@ function Session.acquire_lock(session_dir, lock_name, owner_pid)
     return false, err_io()
   end
   local path = lock_path(session_dir, lock_name)
-  for attempt = 1, Session.MAX_LOCK_ATTEMPTS do
+  for _ = 1, Session.MAX_LOCK_ATTEMPTS do
+    local mutex_ok, mutex_err = acquire_mutex(session_dir, lock_name, owner_pid)
+    if not mutex_ok then
+      return false, mutex_err or err_busy()
+    end
+
     local created = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
     if created then
-      return true, nil
+      local owner = read_lock_owner(session_dir, lock_name)
+      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+      if owner == owner_pid then
+        return true, nil
+      end
+      return false, err_busy()
     end
+
     local owner, read_err = read_lock_owner(session_dir, lock_name)
     if owner == nil then
+      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
       return false, read_err or err_lock_unsafe()
     end
     if owner == false then
-      -- The lock disappeared between creation and inspection; try again.
+      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+      -- The main lock disappeared; retry under a fresh mutex.
     else
       local alive, probe_err = WheelHost.proc.is_alive(owner)
-      if probe_err ~= nil then
+      if probe_err ~= nil or alive then
+        release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
         return false, err_busy()
       end
-      if alive then
+      if not claim_stale_lock(session_dir, lock_name, owner) then
+        release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
         return false, err_busy()
       end
-      lock_sequence = lock_sequence + 1
-      local stale_path = string.format("%s.stale.%d.%d", path, owner_pid, lock_sequence)
-      if WheelHost.fs.rename(path, stale_path) then
-        WheelHost.fs.remove_file(stale_path)
+      local created_after = WheelHost.fs.create_private_file(path, tostring(owner_pid) .. "\n")
+      local owner_after = created_after and read_lock_owner(session_dir, lock_name) or nil
+      release_named_lock(session_dir, lock_name .. ".mutex", owner_pid)
+      if created_after and owner_after == owner_pid then
+        return true, nil
       end
+      return false, err_busy()
     end
   end
   return false, err_busy()
@@ -965,11 +1064,7 @@ end
 -- @param owner_pid number
 -- @return boolean released
 function Session.release_lock(session_dir, lock_name, owner_pid)
-  local owner = read_lock_owner(session_dir, lock_name)
-  if owner == owner_pid then
-    return WheelHost.fs.remove_file(lock_path(session_dir, lock_name))
-  end
-  return false
+  return release_named_lock(session_dir, lock_name, owner_pid)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1021,16 +1116,22 @@ function Session.read_frame(handle, max_bytes, max_drain)
 end
 
 --- Write one newline-framed JSON document.
+-- A Lua file handle reports I/O failure by returning nil plus an error
+-- (without raising), so pcall success alone is not enough; both the write and
+-- the flush result are inspected.
 -- @param handle file
 -- @param encoded string
 -- @return boolean ok
 function Session.write_frame(handle, encoded)
-  local ok_write, write_err = pcall(handle.write, handle, encoded .. "\n")
-  if not ok_write then
+  local ok_write, write_result, write_err = pcall(handle.write, handle, encoded .. "\n")
+  if not ok_write or write_result == nil then
     return false
   end
-  local ok_flush = pcall(handle.flush, handle)
-  return ok_flush
+  local ok_flush, flush_result = pcall(handle.flush, handle)
+  if not ok_flush or flush_result == nil then
+    return false
+  end
+  return true
 end
 
 -- ---------------------------------------------------------------------------
@@ -1235,21 +1336,30 @@ function Session.request(name, method, params, opts)
   if not valid_pid(owner_pid) then
     return nil, err_io()
   end
-  local locked, lock_err = Session.acquire_lock(session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+  local acquire_ok, locked, lock_err = pcall(
+    Session.acquire_lock, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+  if not acquire_ok then
+    pcall(Session.release_lock, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+    return nil, err_io()
+  end
   if not locked then
     return nil, lock_err
   end
 
   request_sequence = request_sequence + 1
   local request_id = string.format("%d-%d", owner_pid, request_sequence)
-  local result, rpc_err = do_request(session_dir, method, params, request_id)
-  Session.release_lock(session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+  local call_ok, result, rpc_err = pcall(
+    do_request, session_dir, method, params, request_id)
+  pcall(Session.release_lock, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+  if not call_ok then
+    return nil, err_io()
+  end
   if method == "shutdown" and result then
     -- The daemon removes its own control files; the client that received the
     -- shutdown acknowledgement makes one best-effort directory removal after
     -- releasing its lock, so the final empty directory does not depend on a
     -- cleanup race between the two processes.
-    WheelHost.fs.remove_dir(session_dir)
+    pcall(WheelHost.fs.remove_dir, session_dir)
   end
   return result, rpc_err
 end
@@ -1297,10 +1407,10 @@ local function remove_private_entry(path, expected)
   if info.symlink or info.uid ~= WheelHost.fs.euid() then
     return false, err_unsafe_path()
   end
-  if expected == "fifo" and not info.fifo then
+  if expected == "fifo" and (not info.fifo or info.links ~= 1) then
     return false, err_unsafe_path()
   end
-  if expected == "file" and not info.regular then
+  if expected == "file" and (not info.regular or info.links ~= 1) then
     return false, err_unsafe_path()
   end
   local removed = WheelHost.fs.remove_file(path)
@@ -1326,7 +1436,8 @@ function Session.verify_control_files(session_dir)
     if not info.exists then
       return false, err_not_running()
     end
-    if info.symlink or not info.fifo or info.uid ~= euid or info.mode ~= 384 then
+    if info.symlink or not info.fifo or info.uid ~= euid or info.mode ~= 384
+      or info.links ~= 1 then
       return false, err_unsafe_path()
     end
   end

@@ -377,7 +377,8 @@ or multi-user surface.
   root and directory are user-owned `0700`; metadata and both FIFOs are
   user-owned, singly linked `0600` entries. A symlinked, foreign-owned, or
   weaker-mode root, directory, metadata file, or FIFO must be refused before it
-  is read or opened.
+  is read or opened. A missing root is created and chmodded to `0700`; an
+  existing weaker-mode root is refused rather than repaired.
 - A client-supplied runtime root override is an absolute path with no control
   bytes and no `.`/`..` segments. The final root, its immediate parent, and the
   session directory are revalidated by both client and daemon; neither trusts
@@ -396,9 +397,11 @@ or multi-user surface.
   version. Snapshots contain slot names, kinds, hashes, versions, and sizes;
   they never contain slot content or secret values. `context.get` returns slot
   content only because the caller explicitly requested it.
-- One client lock file serialises each request/response exchange; a concurrent
-  caller fails with a typed busy error. The daemon is single-threaded and
-  processes one frame at a time.
+- One client lock file serialises each request/response exchange; a per-lock
+  mutex serialises stale-lock reclamation, so a concurrent caller sees a live
+  main lock or a busy mutex, never a freshly acquired live lock that another
+  cleaner can delete. A concurrent caller fails with a typed busy error. The
+  daemon is single-threaded and processes one frame at a time.
 - Shutdown is an explicit `shutdown` method. Clients never signal a pid they did
   not read from validated metadata, and `pkill`, `killall`, and name- or
   pattern-based kills are forbidden. A stale pid is detected with `kill -0` and
@@ -938,11 +941,11 @@ that the policy relies on, and they remain unverified until the gates pass:
 - an experimental local session daemon (`lua/wheel/session.lua`,
   `lua/wheel/daemon.lua`, `scripts/wheel-session`): a detached per-user process
   owns one `WheelContext`, publishes metadata only after both FIFOs open, and
-  serves bounded `wheel-session/1` requests. The client lock, stale-lock claim,
-  private `0700`/`0600` paths, symlink/ownership refusals, `kill -0`-only stale
-  detection, explicit shutdown, and static errors are implemented and covered
-  by `tests/test_session.lua`. It is not a task executor, provider caller, or
-  multi-user service.
+  serves bounded `wheel-session/1` requests. The client lock and the
+  mutex-serialized stale-lock claim, private `0700`/`0600` paths,
+  symlink/ownership refusals, `kill -0`-only stale detection, explicit shutdown,
+  and static errors are implemented and covered by `tests/test_session.lua`. It
+  is not a task executor, provider caller, or multi-user service.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
 backend, the standalone POSIX surface, selected explicitly with

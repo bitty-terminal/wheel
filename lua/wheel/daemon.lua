@@ -286,6 +286,23 @@ local function method_result(state, method, params)
   return nil, err_unknown()
 end
 
+--- Dispatch one method inside the daemon's typed failure boundary.
+-- A host-primitive denial or an unexpected context failure is caught and
+-- converted to a static session error, so the daemon can answer and keep
+-- serving instead of exiting through an unhandled Lua error.
+-- @param state table daemon state
+-- @param method string
+-- @param params table?
+-- @return table? result, table? err
+local function dispatch(state, method, params)
+  local ok, result, failure = pcall(method_result, state, method, params)
+  if not ok then
+    return nil, daemon_error("E_SESSION_CONTEXT_ERROR", "session method failed closed")
+  end
+  return result, failure
+end
+Daemon.dispatch = dispatch
+
 local function build_response(request, result, failure)
   local response = {
     protocol = PROTOCOL,
@@ -326,23 +343,21 @@ local function log_daemon_error(code, message)
 end
 
 local function cleanup(state)
-  local meta, meta_err = Session.read_metadata(state.session_dir, state.name)
-  local owns_metadata = meta ~= nil and meta.pid == state.pid
-  if not owns_metadata then
-    if meta_err and meta_err.code ~= "E_SESSION_NOT_RUNNING" then
-      -- Leave an unsafe metadata path in place; the next start refuses it.
-      return
-    end
-    -- Metadata is already gone or replaced. Another starter may own the
-    -- directory now, so this daemon must not unlink FIFOs it no longer owns.
-    Session.release_start_lock(state.session_dir, state.start_owner)
+  -- Only the holder of the start lock may unlink control files. A concurrent
+  -- starter that already holds it will abort on the still-live metadata, and
+  -- this daemon leaves the directory intact for that starter (or the next one
+  -- after it exits) instead of racing it with unlinks.
+  local locked = Session.acquire_lock(state.session_dir, Session.FILE_START_LOCK, state.pid)
+  if not locked then
     return
   end
 
-  -- Holding the start lock keeps a new starter from creating FIFOs while this
-  -- daemon removes its own. If a live starter already holds it, it will abort
-  -- on the still-live metadata; clean our files and leave the directory for it.
-  local locked = Session.acquire_lock(state.session_dir, Session.FILE_START_LOCK, state.pid)
+  local meta = Session.read_metadata(state.session_dir, state.name)
+  if not meta or meta.pid ~= state.pid then
+    Session.release_start_lock(state.session_dir, state.pid)
+    return
+  end
+
   for _, fifo in ipairs({ Session.FILE_REQUEST, Session.FILE_RESPONSE }) do
     local path = state.session_dir .. "/" .. fifo
     local info = WheelHost.fs.stat(path)
@@ -354,14 +369,13 @@ local function cleanup(state)
   if meta_info and meta_info.exists and meta_info.regular and not meta_info.symlink then
     WheelHost.fs.remove_file(state.session_dir .. "/" .. Session.FILE_META)
   end
-  if locked then
-    Session.release_start_lock(state.session_dir, state.pid)
-    local info = WheelHost.fs.stat(state.session_dir)
-    if info and info.exists and info.directory and not info.symlink then
-      WheelHost.fs.remove_dir(state.session_dir)
-    end
+  Session.release_start_lock(state.session_dir, state.pid)
+  local info = WheelHost.fs.stat(state.session_dir)
+  if info and info.exists and info.directory and not info.symlink then
+    WheelHost.fs.remove_dir(state.session_dir)
   end
 end
+Daemon.cleanup = cleanup
 
 local function read_valid_meta(state)
   local meta, meta_err = Session.read_metadata(state.session_dir, state.name)
@@ -389,6 +403,11 @@ function Daemon.run(opts)
   if not root_ok then
     log_daemon_error(root_err.code, root_err.message)
     return 2
+  end
+  local root_ready, root_ensure_err = Session.ensure_root(opts.root)
+  if not root_ready then
+    log_daemon_error(root_ensure_err.code, root_ensure_err.message)
+    return 3
   end
   local version = opts.wheel_version
   if type(version) ~= "string" or not version:match("^%d+%.%d+%.%d+$") then
@@ -423,15 +442,15 @@ function Daemon.run(opts)
     end
   end
 
-  local request, request_err = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_REQUEST)
+  local request = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_REQUEST)
   if not request then
-    log_daemon_error("E_SESSION_IO", tostring(request_err or "cannot open the request FIFO"))
+    log_daemon_error("E_SESSION_IO", "cannot open the session request FIFO")
     return 3
   end
-  local response, response_err = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_RESPONSE)
+  local response = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_RESPONSE)
   if not response then
     pcall(request.close, request)
-    log_daemon_error("E_SESSION_IO", tostring(response_err or "cannot open the response FIFO"))
+    log_daemon_error("E_SESSION_IO", "cannot open the session response FIFO")
     return 3
   end
 
@@ -442,7 +461,20 @@ function Daemon.run(opts)
     log_daemon_error("E_SESSION_START_FAILED", "cannot determine the daemon pid")
     return 3
   end
-  local started_at = WheelHost.time.now()
+  local time_ok, started_at = pcall(WheelHost.time.now)
+  if not time_ok then
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "the host time primitive is unavailable")
+    return 3
+  end
+  local context_ok, context = pcall(WheelContext.new, {})
+  if not context_ok then
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "cannot initialize the session context")
+    return 3
+  end
   local state = {
     name = name,
     pid = pid,
@@ -450,67 +482,84 @@ function Daemon.run(opts)
     wheel_version = version,
     session_dir = session_dir,
     start_owner = opts.start_owner,
-    context = WheelContext.new({}),
+    context = context,
     requests = 0,
     request = request,
     response = response,
     running = true,
   }
 
-  local wrote, write_err = Session.write_metadata(session_dir, {
+  local wrote_ok, wrote, write_err = pcall(Session.write_metadata, session_dir, {
     protocol = PROTOCOL,
     name = name,
     pid = pid,
     started_at = started_at,
     wheel_version = version,
   })
-  if not wrote then
+  if not wrote_ok or not wrote then
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error(write_err and write_err.code or "E_SESSION_IO", "cannot publish session metadata")
     return 3
   end
-  Session.release_start_lock(session_dir, state.start_owner)
+  local released_ok, released = pcall(Session.release_start_lock, session_dir, state.start_owner)
+  if not released_ok or released == false then
+    pcall(cleanup, state)
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "cannot release the session start lock")
+    return 3
+  end
 
-  while state.running do
-    local line, status = Session.read_frame(state.request, MAX_REQUEST_BYTES)
-    if not line then
-      if status == "too_large" then
-        write_response(state.response, build_response(nil, nil, Session.err_frame_too_large()))
-      elseif status == "oversized" then
-        write_response(state.response, build_response(nil, nil, Session.err_frame_too_large()))
-        state.running = false
-      elseif status == "io" then
-        state.running = false
-      else
-        state.running = false
-      end
-    else
-      local decoded_ok, request_value = pcall(Session.json_decode, line)
-      if not decoded_ok or type(request_value) ~= "table" then
-        write_response(state.response, build_response(
-          { id = "", method = "" }, nil, Session.err_protocol()))
-      else
-        local valid, request_err = Session.validate_request(request_value)
-        if not valid then
-          write_response(state.response, build_response(request_value, nil, request_err))
+  local loop_ok = pcall(function()
+    while state.running do
+      local line, status = Session.read_frame(state.request, MAX_REQUEST_BYTES)
+      if not line then
+        if status == "too_large" then
+          write_response(state.response, build_response(nil, nil, Session.err_frame_too_large()))
+        elseif status == "oversized" then
+          write_response(state.response, build_response(nil, nil, Session.err_frame_too_large()))
+          state.running = false
+        elseif status == "io" then
+          state.running = false
         else
-          state.requests = state.requests + 1
-          local result, method_err = method_result(state, request_value.method, request_value.params)
-          local response_value = build_response(request_value, result, method_err)
-          if not write_response(state.response, response_value) then
-            state.running = false
-          elseif request_value.method == "shutdown" and method_err == nil then
-            state.running = false
+          state.running = false
+        end
+      else
+        local decoded_ok, request_value = pcall(Session.json_decode, line)
+        if not decoded_ok or type(request_value) ~= "table" then
+          write_response(state.response, build_response(
+            { id = "", method = "" }, nil, Session.err_protocol()))
+        else
+          local valid, request_err = Session.validate_request(request_value)
+          if not valid then
+            write_response(state.response, build_response(request_value, nil, request_err))
+          else
+            state.requests = state.requests + 1
+            local result, method_err = dispatch(state, request_value.method, request_value.params)
+            local response_value = build_response(request_value, result, method_err)
+            if not write_response(state.response, response_value) then
+              state.running = false
+            elseif request_value.method == "shutdown" and method_err == nil then
+              state.running = false
+            end
           end
         end
       end
     end
-  end
+  end)
 
-  cleanup(state)
+  local cleanup_ok = pcall(cleanup, state)
   pcall(response.close, response)
   pcall(request.close, request)
+  if not loop_ok then
+    log_daemon_error("E_SESSION_CONTEXT_ERROR", "session loop failed closed")
+    return 1
+  end
+  if not cleanup_ok then
+    log_daemon_error("E_SESSION_IO", "session cleanup failed closed")
+    return 1
+  end
   return 0
 end
 

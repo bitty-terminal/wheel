@@ -723,9 +723,11 @@ and never embed the runtime.
   existing `expected_version` compare-and-swap; a conflict returns
   `E_SESSION_CAS_CONFLICT`. The daemon bounds the context store at 1024 slots
   and 16 MiB total, and a value is at most 48 KiB per request.
-- **Serialization**: a client lock file makes concurrent CLI calls fail with
-  `E_SESSION_BUSY` instead of interleaving frames. A lock owned by a dead pid is
-  claimed atomically and removed.
+- **Serialization**: a per-session client lock file serializes requests; a
+  concurrent CLI call fails with `E_SESSION_BUSY`. A per-lock mutex serializes
+  stale-lock reclamation: the dead owner's path is renamed and verified before
+  removal, and the new main lock is created before the mutex is released, so a
+  concurrent caller never deletes a freshly acquired live lock.
 - **Lifecycle**: `start` rejects a live duplicate, cleans only a dead session's
   metadata/FIFOs, and publishes metadata after readiness. `stop` sends the
   explicit `shutdown` method and waits for the recorded pid; it never signals an

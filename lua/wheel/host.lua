@@ -965,7 +965,7 @@ function standalone.new(opts)
   -- A probe that cannot run fails closed with the typed denial, so an
   -- unavailable surface is never read as "not a symlink" or "not a file".
   -- @param path string
-  -- @return table { exists, symlink, regular, directory, fifo, uid?, mode? }
+  -- @return table { exists, symlink, regular, directory, fifo, uid?, mode?, links? }
   function backend.stat(path)
     require_surface(type(io) == "table" and type(io.popen) == "function", "fs.read")
 
@@ -995,7 +995,7 @@ function standalone.new(opts)
     end
 
     local symlink, exists = false, false
-    local uid, mode
+    local uid, mode, links
     for line in tostring(output or ""):gmatch("[^\n]+") do
       if line == "LINK" then
         symlink = true
@@ -1004,10 +1004,11 @@ function standalone.new(opts)
       elseif line == "UNREADABLE" then
         error(WheelErrors.capability_denied("fs.read"), 0)
       else
-        local owner, permissions, links, kind = line:match("^(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
-        if owner and permissions and links and kind then
+        local owner, permissions, link_count, kind = line:match("^(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+        if owner and permissions and link_count and kind then
           uid = tonumber(owner)
           mode = tonumber(permissions, 8)
+          links = tonumber(link_count)
           exists = true
           local normalized = kind:lower()
           if normalized:find("regular", 1, true) then
@@ -1019,6 +1020,7 @@ function standalone.new(opts)
               fifo = false,
               uid = uid,
               mode = mode,
+              links = links,
             }
           elseif normalized:find("directory", 1, true) then
             return {
@@ -1029,6 +1031,7 @@ function standalone.new(opts)
               fifo = false,
               uid = uid,
               mode = mode,
+              links = links,
             }
           elseif normalized:find("fifo", 1, true) then
             return {
@@ -1039,6 +1042,7 @@ function standalone.new(opts)
               fifo = true,
               uid = uid,
               mode = mode,
+              links = links,
             }
           end
         end
@@ -1053,6 +1057,7 @@ function standalone.new(opts)
       fifo = false,
       uid = uid,
       mode = mode,
+      links = links,
     }
   end
 
@@ -1080,39 +1085,54 @@ function standalone.new(opts)
   end
 
   --- Create a new regular file with mode 0600 at <path> and write <content>.
-  -- The path must not exist; POSIX noclobber (`set -C`) makes creation
-  -- exclusive, so a pre-existing file, FIFO, device, or symbolic link is
-  -- refused rather than followed or truncated. The caller owns removal.
+  -- The content is written to a verified private temporary file in the same
+  -- directory and published with an atomic hard link, so a crash cannot leave
+  -- an empty half-created lock or metadata path. A pre-existing file, FIFO,
+  -- device, or symbolic link is refused rather than followed or truncated. The
+  -- caller owns removal.
   -- @param path string
   -- @param content string?
   -- @return boolean ok, string? err
   function backend.create_private_file(path, content)
     require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
     if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
       return false, "invalid private file path"
     end
     if content ~= nil and type(content) ~= "string" then
       return false, "private file content must be a string"
     end
-    local exists = normalized_exit_status(os.execute(
-      "test -e " .. shell_quote(path) .. " || test -L " .. shell_quote(path))) == 0
-    if exists then
-      return false, "private file path already exists"
+    local parent = path:match("^(.*)/[^/]+$")
+    if parent == nil then
+      return false, "private file path must be absolute or contain a directory"
     end
-    local created = normalized_exit_status(os.execute(
-      "umask 077; set -C; : > " .. shell_quote(path) .. " 2>/dev/null"))
-    if created ~= 0 then
-      return false, "private file path already exists or cannot be created"
+    if parent == "" then
+      parent = "/"
+    end
+    local temp, temp_err = create_private_temp(parent)
+    if not temp then
+      return false, temp_err or "cannot create a private temporary file"
+    end
+    local wrote, write_err = write_private_file(temp, content or "")
+    if not wrote then
+      os.remove(temp)
+      return false, write_err or "cannot write the private temporary file"
+    end
+    local linked = normalized_exit_status(os.execute(
+      "ln -- " .. shell_quote(temp) .. " " .. shell_quote(path) .. " 2>/dev/null"))
+    if linked ~= 0 then
+      os.remove(temp)
+      return false, "private file path already exists or cannot be linked"
+    end
+    local removed, remove_err = os.remove(temp)
+    if not removed then
+      os.remove(path)
+      return false, "temporary-link cleanup failed: " .. tostring(remove_err or temp)
     end
     local verified, verify_err = verify_private_file(path)
     if not verified then
       os.remove(path)
       return false, verify_err
-    end
-    local wrote, write_err = write_private_file(path, content or "")
-    if not wrote then
-      os.remove(path)
-      return false, write_err
     end
     return true
   end
@@ -1984,7 +2004,7 @@ end
 
 --- Return lstat-style metadata and type probes for a path.
 -- @param path string
--- @return table { exists, symlink, regular, directory, fifo, uid?, mode? }
+-- @return table { exists, symlink, regular, directory, fifo, uid?, mode?, links? }
 function WheelHost.fs.stat(path)
   return invoke("fs.read", "stat", path)
 end

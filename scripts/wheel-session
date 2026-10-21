@@ -39,7 +39,7 @@ usage() {
 Usage: wheel-session [--root DIR] <command> [arguments]
 
 Commands:
-  start NAME [--root DIR]        start a detached local session daemon
+  start NAME                     start a detached local session daemon
   stop NAME                      request explicit shutdown and wait for exit
   ping NAME                      protocol/pid/uptime probe
   status NAME                    session and context status

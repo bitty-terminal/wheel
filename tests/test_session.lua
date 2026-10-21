@@ -13,6 +13,7 @@ package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local WheelHost = require("wheel.host")
 local Session = require("wheel.session")
+local Daemon = require("wheel.daemon")
 
 local script_path = type(arg) == "table" and arg[0] or "tests/test_session.lua"
 local repo_root = script_path:match("^(.*)/tests/[^/]+$") or "."
@@ -24,7 +25,7 @@ local test_base = (os.getenv("TMPDIR") or "/tmp")
   .. "-"
   .. tostring(os.time())
 local session_root = test_base .. "/sessions"
-local started_pids = {}
+local started_sessions = {}
 local cleanup
 
 local function run_test(name, fn)
@@ -125,6 +126,17 @@ local function wait_until_dead(pid)
   return false
 end
 
+local function wait_for_meta(name)
+  for _ = 1, 100 do
+    local meta = Session.read_metadata(session_dir(name), name)
+    if meta then
+      return meta
+    end
+    os.execute("sleep 0.02")
+  end
+  return nil
+end
+
 -- Isolation: the whole test tree is private and disposable.
 remove_tree(test_base)
 assert(WheelHost.fs.mkdir_p(test_base) == true)
@@ -132,12 +144,15 @@ assert(WheelHost.fs.chmod(test_base, "700") == true)
 assert(WheelHost.fs.mkdir_p(session_root) == true)
 assert(WheelHost.fs.chmod(session_root, "700") == true)
 
-local function cleanup()
-  for _, pid in ipairs(started_pids) do
-    local alive = WheelHost.proc.is_alive(pid)
-    if alive then
-      os.execute("kill -TERM " .. tostring(pid) .. " 2>/dev/null")
-      wait_until_dead(pid)
+cleanup = function()
+  for _, record in ipairs(started_sessions) do
+    local meta_ok, meta = pcall(Session.read_metadata, session_dir(record.name), record.name)
+    local alive = WheelHost.proc.is_alive(record.pid)
+    if meta_ok and meta and meta.pid == record.pid and alive then
+      -- The metadata still names the pid this test started. Signal only that
+      -- recorded pid; never a name/pattern and never an unverified one.
+      os.execute("kill -TERM " .. tostring(record.pid) .. " 2>/dev/null")
+      wait_until_dead(record.pid)
     end
   end
   remove_tree(test_base)
@@ -187,9 +202,243 @@ run_test("Session: session name and path validation", function()
   assert(not Session.validate_absolute_path("/tmp/a\nb"))
 end)
 
+run_test("Session: write_frame rejects nil write and flush results", function()
+  local function handle(write_result, flush_result)
+    return {
+      write = function() return write_result end,
+      flush = function() return flush_result end,
+    }
+  end
+  assert(Session.write_frame(handle(nil), "x") == false,
+    "a nil write result must fail the frame")
+  assert(Session.write_frame(handle(true, nil), "x") == false,
+    "a nil flush result must fail the frame")
+  assert(Session.write_frame(handle(true, true), "x") == true,
+    "successful write and flush results must pass")
+end)
+
+run_test("Session: stale-lock reclamation is serialized", function()
+  local saved = {
+    euid = WheelHost.fs.euid,
+    stat = WheelHost.fs.stat,
+    read = WheelHost.fs.read_file_bounded,
+    create = WheelHost.fs.create_private_file,
+    rename = WheelHost.fs.rename,
+    remove = WheelHost.fs.remove_file,
+    alive = WheelHost.proc.is_alive,
+  }
+  local store = { ["/fake/client.lock"] = "111111\n" }
+  local fixed_euid = 1000
+  local ok, err = pcall(function()
+    WheelHost.fs.euid = function() return fixed_euid end
+    WheelHost.fs.stat = function(path)
+      if store[path] == nil then
+        return { exists = false }
+      end
+      return {
+        exists = true,
+        regular = true,
+        symlink = false,
+        uid = fixed_euid,
+        mode = 384,
+        links = 1,
+      }
+    end
+    WheelHost.fs.read_file_bounded = function(path) return store[path] end
+    WheelHost.fs.create_private_file = function(path, content)
+      if store[path] ~= nil then
+        return false, "exists"
+      end
+      store[path] = content
+      return true
+    end
+    WheelHost.fs.rename = function(from, to)
+      if store[from] == nil then
+        return false
+      end
+      store[to] = store[from]
+      store[from] = nil
+      return true
+    end
+    WheelHost.fs.remove_file = function(path)
+      store[path] = nil
+      return true
+    end
+    WheelHost.proc.is_alive = function(pid)
+      coroutine.yield("probe:" .. tostring(pid))
+      return pid ~= 111111
+    end
+
+    local function contender(pid)
+      return coroutine.create(function()
+        local acquired, acquire_err = Session.acquire_lock("/fake", "client.lock", pid)
+        return acquired, acquire_err
+      end)
+    end
+    local contenders = { contender(222222), contender(333333) }
+    local results = {}
+    for _ = 1, 64 do
+      for index, co in ipairs(contenders) do
+        if coroutine.status(co) == "suspended" then
+          local resume_ok, result, acquire_err = coroutine.resume(co)
+          assert(resume_ok, tostring(result))
+          if coroutine.status(co) == "dead" then
+            results[index] = { ok = result, err = acquire_err }
+          end
+        end
+      end
+      local all_done = true
+      for _, co in ipairs(contenders) do
+        if coroutine.status(co) ~= "dead" then
+          all_done = false
+        end
+      end
+      if all_done then
+        break
+      end
+    end
+    assert(results[1] and results[2], "both lock contenders must finish")
+    assert(not (results[1].ok and results[2].ok),
+      "two contenders must not both acquire the same session lock")
+    assert(results[1].ok or results[2].ok, "one contender must acquire the lock")
+  end)
+  WheelHost.fs.euid = saved.euid
+  WheelHost.fs.stat = saved.stat
+  WheelHost.fs.read_file_bounded = saved.read
+  WheelHost.fs.create_private_file = saved.create
+  WheelHost.fs.rename = saved.rename
+  WheelHost.fs.remove_file = saved.remove
+  WheelHost.proc.is_alive = saved.alive
+  if not ok then
+    error(err)
+  end
+end)
+
+run_test("Daemon: dispatch converts a context exception into a static error", function()
+  local state = {
+    name = "dispatch-test",
+    pid = 424242,
+    started_at = 1,
+    wheel_version = "0.1.0",
+    requests = 0,
+    context = {
+      get_slot = function() error("injected context failure") end,
+    },
+  }
+  local result, err = Daemon.dispatch(state, "context.get", { name = "scratch/value" })
+  assert(result == nil, "a context exception must not produce a result")
+  assert(err and err.code == "E_SESSION_CONTEXT_ERROR",
+    "a context exception must become a typed session error")
+  assert(err.message == "session method failed closed", "the error message must be static")
+end)
+
+run_test("Daemon: cleanup leaves files while another starter owns the start lock", function()
+  local name = "cleanup-lock"
+  local dir = session_dir(name)
+  local meta_pid = 424242
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(Session.write_metadata(dir, {
+    protocol = Session.PROTOCOL,
+    name = name,
+    pid = meta_pid,
+    started_at = WheelHost.time.now(),
+    wheel_version = "0.1.0",
+  }))
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+
+  local owner = WheelHost.proc.pid()
+  assert(Session.acquire_lock(dir, Session.FILE_START_LOCK, owner) == true)
+  local state = { session_dir = dir, name = name, pid = meta_pid, start_owner = nil }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_META).exists == true,
+    "cleanup must not remove metadata while a newer starter owns the start lock")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
+    "cleanup must not remove FIFOs while a newer starter owns the start lock")
+
+  assert(Session.release_lock(dir, Session.FILE_START_LOCK, owner) == true)
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_META).exists == false,
+    "cleanup must remove metadata once it owns the start lock")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
+  assert(WheelHost.fs.stat(dir).exists == false, "cleanup must remove the empty session directory")
+end)
+
 -- ---------------------------------------------------------------------------
 -- Integration: lifecycle, context persistence, snapshots
 -- ---------------------------------------------------------------------------
+
+run_test("Daemon: an injected dispatch exception is typed and shutdown still cleans up", function()
+  local name = "dispatch-live"
+  local owner_pid = WheelHost.proc.pid()
+  local prepared, prepare_err = Session.prepare_start(name, {
+    root = session_root,
+    owner_pid = owner_pid,
+  })
+  assert(prepared, "session preparation failed: " .. tostring(prepare_err and prepare_err.message))
+
+  local lua_root = repo_root .. "/lua"
+  local driver_path = test_base .. "/injected-session-driver.lua"
+  local driver = assert(io.open(driver_path, "w"))
+  driver:write(string.format([[
+package.path = %q .. "/?.lua;" .. %q .. "/?/init.lua;" .. package.path
+local WheelContext = require("wheel.context")
+local original_new = WheelContext.new
+WheelContext.new = function(...)
+  local context = original_new(...)
+  context.get_slot = function() error("injected context failure") end
+  return context
+end
+local Daemon = require("wheel.daemon")
+os.exit(Daemon.run({
+  root = arg[1],
+  name = arg[2],
+  wheel_version = "0.1.0",
+  start_owner = tonumber(arg[3]),
+}))
+]], lua_root, lua_root))
+  driver:close()
+
+  local lua_bin = os.getenv("WHEEL_TEST_LUA")
+    or (type(arg) == "table" and arg[-1])
+    or "lua5.1"
+  local driver_log = test_base .. "/injected-driver.log"
+  local launch_command = table.concat({
+    "setsid",
+    shell_quote(lua_bin),
+    shell_quote(driver_path),
+    shell_quote(session_root),
+    shell_quote(name),
+    tostring(owner_pid),
+    "< /dev/null > /dev/null 2>" .. shell_quote(driver_log) .. " &",
+  }, " ")
+  local launch_status = os.execute(launch_command)
+  assert(launch_status == true or launch_status == 0, "the injected daemon launch failed")
+
+  local meta = wait_for_meta(name)
+  if not meta then
+    local log = WheelHost.fs.read_file(driver_log) or ""
+    error("the injected daemon did not publish metadata; lua="
+      .. tostring(lua_bin) .. " driver_log=" .. tostring(log))
+  end
+  started_sessions[#started_sessions + 1] = { name = name, pid = meta.pid }
+
+  local result, err = Session.request(name, "context.get", { name = "scratch/value" }, {
+    root = session_root,
+  })
+  assert(result == nil, "the injected dispatch exception must not return a result")
+  assert(err and err.code == "E_SESSION_CONTEXT_ERROR",
+    "the daemon must return a typed error for a dispatch exception")
+  assert(Session.pid_alive(meta) == true, "the daemon must remain alive after the typed error")
+
+  local stopped = Session.shutdown(name, { root = session_root })
+  assert(stopped and stopped.shutting_down == true, "the daemon must still accept shutdown")
+  assert(wait_until_dead(meta.pid), "the daemon must exit after the explicit shutdown")
+  assert(WheelHost.fs.stat(session_dir(name)).exists == false,
+    "shutdown after a dispatch exception must remove the session directory")
+end)
 
 run_test("Session: start publishes private metadata and a live control plane", function()
   local output = expect_ok("start", { "start", "demo" })
@@ -197,7 +446,7 @@ run_test("Session: start publishes private metadata and a live control plane", f
   assert(meta.protocol == "wheel-session/1", "start must report the protocol marker")
   assert(meta.name == "demo")
   assert(type(meta.pid) == "number" and meta.pid > 1)
-  started_pids[#started_pids + 1] = meta.pid
+  started_sessions[#started_sessions + 1] = { name = "demo", pid = meta.pid }
 
   local stored = read_meta("demo")
   assert(stored.pid == meta.pid, "start output must match published metadata")
@@ -343,11 +592,41 @@ run_test("Session: unsafe session paths fail closed", function()
   assert(WheelHost.fs.chmod(badfifo .. "/" .. Session.FILE_RESPONSE, "600"))
   expect_error("weaker FIFO mode", "E_SESSION_UNSAFE_PATH", { "status", "badfifo" })
 
+  local badlink = session_dir("badfifosymlink")
+  assert(WheelHost.fs.mkdir_p(badlink) == true)
+  assert(WheelHost.fs.chmod(badlink, "700") == true)
+  local target = badlink .. "/target"
+  assert(WheelHost.fs.create_private_file(target, "not a fifo"))
+  assert(Session.write_metadata(badlink, {
+    protocol = Session.PROTOCOL,
+    name = "badfifosymlink",
+    pid = meta.pid,
+    started_at = meta.started_at,
+    wheel_version = meta.wheel_version,
+  }))
+  os.execute("ln -s " .. shell_quote(target) .. " " .. shell_quote(badlink .. "/" .. Session.FILE_REQUEST))
+  assert(WheelHost.fs.mkfifo(badlink .. "/" .. Session.FILE_RESPONSE))
+  expect_error("symlinked FIFO", "E_SESSION_UNSAFE_PATH", { "status", "badfifosymlink" })
+
   local broken = session_dir("brokenmeta")
   assert(WheelHost.fs.mkdir_p(broken) == true)
   assert(WheelHost.fs.chmod(broken, "700") == true)
   assert(WheelHost.fs.create_private_file(broken .. "/" .. Session.FILE_META, "{"))
   expect_error("invalid metadata", "E_SESSION_METADATA_INVALID", { "start", "brokenmeta" })
+
+  local hardmeta = session_dir("hardmeta")
+  assert(WheelHost.fs.mkdir_p(hardmeta) == true)
+  assert(WheelHost.fs.chmod(hardmeta, "700") == true)
+  assert(Session.write_metadata(hardmeta, {
+    protocol = Session.PROTOCOL,
+    name = "hardmeta",
+    pid = meta.pid,
+    started_at = meta.started_at,
+    wheel_version = meta.wheel_version,
+  }))
+  os.execute("ln " .. shell_quote(hardmeta .. "/" .. Session.FILE_META) .. " "
+    .. shell_quote(hardmeta .. "/second-link"))
+  expect_error("hard-linked metadata", "E_SESSION_UNSAFE_PATH", { "status", "hardmeta" })
 end)
 
 run_test("Session: malformed and oversized frames fail closed", function()
@@ -358,6 +637,18 @@ run_test("Session: malformed and oversized frames fail closed", function()
   local unknown = raw_exchange("demo",
     '{"protocol":"wheel-session/1","id":"raw-2","method":"bogus","params":{}}')
   assert(unknown.ok == false and unknown.error.code == "E_SESSION_METHOD_UNKNOWN")
+
+  local scalar_params = raw_exchange("demo",
+    '{"protocol":"wheel-session/1","id":"raw-p1","method":"ping","params":"not-an-object"}')
+  assert(scalar_params.ok == false and scalar_params.error.code == "E_SESSION_ARGS_INVALID")
+
+  local bad_get = raw_exchange("demo",
+    '{"protocol":"wheel-session/1","id":"raw-p2","method":"context.get","params":{}}')
+  assert(bad_get.ok == false and bad_get.error.code == "E_SESSION_ARGS_INVALID")
+
+  local bad_put = raw_exchange("demo",
+    '{"protocol":"wheel-session/1","id":"raw-p3","method":"context.put","params":{"name":123,"content":"x"}}')
+  assert(bad_put.ok == false and bad_put.error.code == "E_SESSION_ARGS_INVALID")
 
   local oversized = raw_exchange("demo", Session.json_encode({
     protocol = "wheel-session/1",
@@ -388,7 +679,10 @@ run_test("Session: a live client lock serializes requests", function()
   assert(WheelHost.fs.remove_file(lock_path))
 
   -- A dead owner is claimed by rename and the request proceeds.
-  assert(WheelHost.fs.create_private_file(lock_path, "999999\n"))
+  local dead_pid = 2147483647
+  assert(WheelHost.proc.is_alive(dead_pid) ~= true,
+    "the stale-lock test requires a pid above the host pid limit")
+  assert(WheelHost.fs.create_private_file(lock_path, tostring(dead_pid) .. "\n"))
   decode_stdout("ping after stale lock", expect_ok("ping after stale lock", { "ping", "demo" }))
 end)
 
@@ -403,7 +697,7 @@ run_test("Session: a pid dead daemon is reported without being signalled", funct
 
   local restart = decode_stdout("restart", expect_ok("restart after stale metadata", { "start", "demo" }))
   assert(restart.pid ~= meta.pid, "a restart must publish a new daemon pid")
-  started_pids[#started_pids + 1] = restart.pid
+  started_sessions[#started_sessions + 1] = { name = "demo", pid = restart.pid }
   local ping = decode_stdout("ping", expect_ok("ping after restart", { "ping", "demo" }))
   assert(ping.pid == restart.pid)
 end)
@@ -444,6 +738,13 @@ run_test("Session: invalid roots are refused before any write", function()
   local linked_ok, linked_err = Session.prepare_start("x", { root = root_link })
   assert(linked_ok == nil and linked_err and linked_err.code == "E_SESSION_UNSAFE_PATH",
     "a symlinked session root must be refused")
+
+  local bad_root = test_base .. "/bad-root"
+  assert(WheelHost.fs.mkdir_p(bad_root) == true)
+  assert(WheelHost.fs.chmod(bad_root, "755") == true)
+  local mode_ok, mode_err = Session.prepare_start("x", { root = bad_root })
+  assert(mode_ok == nil and mode_err and mode_err.code == "E_SESSION_UNSAFE_PATH",
+    "a weaker-mode session root must be refused")
 end)
 
 print("\n==========================================")
