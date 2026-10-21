@@ -16,33 +16,35 @@ local WheelCommands = require("wheel.commands")
 -- Every filesystem fixture in this suite lives under one private per-run root.
 -- Concurrent worktrees therefore never share a directory, and each process
 -- deletes only the root it created. `WHEEL_TEST_TMP` may name a caller-owned
--- base; the run still creates its own unique child beneath it so two calls that
--- share a base cannot collide.
+-- base; it must be an absolute path made of shell-safe characters, and the run
+-- still creates its own unique child beneath it so two calls that share a base
+-- cannot collide.
 local function shell_quote(value)
   return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
 end
 
-local TEST_RUN_ROOT = (function()
-  local placeholder = os.tmpname()
-  local unique = placeholder:match("([^/]+)$") or placeholder
-  local base = os.getenv("WHEEL_TEST_TMP")
-  local root
-  -- Some Lua 5.1 builds create the placeholder file; never leave it behind.
-  os.remove(placeholder)
-  if type(base) == "string" and base ~= "" then
-    root = base .. "/wheel-test-" .. unique
-    assert(os.execute("mkdir -p -- " .. shell_quote(base)
-      .. " && mkdir -- " .. shell_quote(root)) == 0,
-      "cannot create the Wheel test root")
-  else
-    -- Reuse the unique os.tmpname path as this run's private root.
-    root = placeholder
-    assert(os.execute("mkdir -- " .. shell_quote(root)) == 0,
-      "cannot create the Wheel test root")
-  end
-  return root
-end)()
+-- Lua 5.1 and LuaJIT return a numeric status; Lua 5.2+ return true on success.
+local function execute_succeeded(status)
+  return status == true or status == 0
+end
 
+-- Fixture commands interpolate derived paths into shell strings. Reject a
+-- caller base that could split a command or inject shell syntax before any
+-- directory is created or removed.
+local function validate_test_base(path, label)
+  if type(path) ~= "string" or path == "" then
+    error(label .. " must be a non-empty absolute path", 0)
+  end
+  if path:sub(1, 1) ~= "/" then
+    error(label .. " must be an absolute path", 0)
+  end
+  if path == "/" or not path:match("^/[A-Za-z0-9._/-]+$") then
+    error(label .. " must not contain whitespace or shell metacharacters", 0)
+  end
+  return path
+end
+
+local TEST_RUN_ROOT = nil
 local TEST_RUN_ROOT_REMOVED = false
 
 local function cleanup_test_run_root()
@@ -52,6 +54,51 @@ local function cleanup_test_run_root()
   TEST_RUN_ROOT_REMOVED = true
   os.execute("rm -rf -- " .. shell_quote(TEST_RUN_ROOT))
 end
+
+local function bootstrap_test_run_root()
+  local placeholder = os.tmpname()
+  local unique = placeholder:match("([^/]+)$")
+  local base = os.getenv("WHEEL_TEST_TMP")
+  local root
+
+  local ok, bootstrap_err = pcall(function()
+    if not unique or unique == "" then
+      error("os.tmpname returned an unusable path", 0)
+    end
+    if type(base) == "string" and base ~= "" then
+      validate_test_base(base, "WHEEL_TEST_TMP")
+      root = base .. "/wheel-test-" .. unique
+    else
+      -- Reuse the unique os.tmpname path as this run's private root.
+      root = placeholder
+    end
+    validate_test_base(root, "Wheel test root")
+  end)
+
+  -- Some Lua 5.1 builds create the os.tmpname placeholder file; never leave it
+  -- behind, including on validation failure.
+  os.remove(placeholder)
+  if not ok then
+    error(bootstrap_err, 0)
+  end
+
+  -- Assign before mkdir so the failure path removes any partial root.
+  TEST_RUN_ROOT = root
+  local command
+  if type(base) == "string" and base ~= "" then
+    command = "mkdir -p -- " .. shell_quote(base)
+      .. " && mkdir -- " .. shell_quote(root)
+  else
+    command = "mkdir -- " .. shell_quote(root)
+  end
+  if not execute_succeeded(os.execute(command)) then
+    cleanup_test_run_root()
+    error("cannot create the Wheel test root", 0)
+  end
+  return root
+end
+
+TEST_RUN_ROOT = bootstrap_test_run_root()
 
 local function test_path(name)
   return TEST_RUN_ROOT .. "/" .. name
@@ -67,6 +114,24 @@ local function run_test(name, fn)
     os.exit(1)
   end
 end
+
+run_test("Wheel test harness: unsafe WHEEL_TEST_TMP bases are rejected", function()
+  validate_test_base(TEST_RUN_ROOT .. "/safe-base", "test base")
+  local unsafe = {
+    "relative/base",
+    TEST_RUN_ROOT .. "/with space",
+    TEST_RUN_ROOT .. "/with;meta",
+    TEST_RUN_ROOT .. "/with$dollar",
+    TEST_RUN_ROOT .. "/with'quote",
+    TEST_RUN_ROOT .. "/with\nnewline",
+    "/",
+    "",
+  }
+  for _, candidate in ipairs(unsafe) do
+    local ok = pcall(validate_test_base, candidate, "test base")
+    assert(not ok, "unsafe base must be rejected: " .. tostring(candidate):gsub("\n", "\\n"))
+  end
+end)
 
 -- ===========================================================================
 -- 1. WheelKernel Tests
@@ -6744,21 +6809,27 @@ run_test("WheelHost: temp roots reject root, dot-only, and symlink traversal", f
 
   -- Legitimate relative roots still normalize (trailing separator and `/.`).
   -- The name carries this run's unique suffix so concurrent runs sharing a
-  -- working directory cannot remove each other's relative fixture.
+  -- working directory cannot remove each other's relative fixture. The body is
+  -- guarded so a mid-test failure still removes that CWD-local directory.
   local relative = "wheel-test-relative-"
     .. (TEST_RUN_ROOT:match("([^/]+)$") or "run")
   os.execute("rm -rf " .. relative)
-  local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
-  local slash_dir, slash_err = with_slash.tmp_dir()
-  assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
-  local slash_listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(relative))
-  local slash_mode = slash_listing.stdout:match("^(%S+)")
-  assert(string.sub(slash_mode or "", 1, 10) == "drwx------",
-    "relative trailing-slash root must be 0700, got " .. tostring(slash_mode))
-  local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
-  local dot_dir, dot_err = with_dot.tmp_dir()
-  assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
+  local body_ok, body_err = pcall(function()
+    local with_slash = WheelHost.create_backend("standalone", { tmp_root = relative .. "/" })
+    local slash_dir, slash_err = with_slash.tmp_dir()
+    assert(slash_dir == relative, "trailing slash must normalize to " .. relative .. ": " .. tostring(slash_err))
+    local slash_listing = WheelHost.proc.run_command("ls -ld " .. WheelHost.proc.shell_quote(relative))
+    local slash_mode = slash_listing.stdout:match("^(%S+)")
+    assert(string.sub(slash_mode or "", 1, 10) == "drwx------",
+      "relative trailing-slash root must be 0700, got " .. tostring(slash_mode))
+    local with_dot = WheelHost.create_backend("standalone", { tmp_root = relative .. "/." })
+    local dot_dir, dot_err = with_dot.tmp_dir()
+    assert(dot_dir == relative, "trailing /. must normalize to " .. relative .. ": " .. tostring(dot_err))
+  end)
   os.execute("rm -rf " .. relative .. " " .. root)
+  if not body_ok then
+    error(body_err, 0)
+  end
 end)
 
 run_test("WheelHost: non-string tmp_root fails typed", function()

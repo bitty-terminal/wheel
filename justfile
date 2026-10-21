@@ -152,6 +152,11 @@ test-gate: deps
 test-concurrent: deps
     bash scripts/test-concurrency.sh
 
+# Prove an unsafe WHEEL_TEST_TMP base is rejected before the suite creates or
+# removes anything. Cheap; local guard for the shell-safe base contract.
+test-roots: deps
+    bash scripts/test-root-guard.sh
+
 # Unit tests for the benchmark statistics, argument parsing, JSON encoding, and
 # fail-closed CLI behavior, plus one short context-scenario run. Uses the same
 # interpreter selection as `just test` and stays offline.
@@ -223,8 +228,8 @@ verify-package:
 # workflow-*.sh scripts are outside this gate; reformatting them is a separate
 # change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh bench/run.sh scripts/wheel-session
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh bench/run.sh scripts/wheel-session
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and

@@ -14,6 +14,7 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 readonly REPO_ROOT
 SCRATCH_BASE="${WHEEL_TEST_CONCURRENCY_SCRATCH:-${TMPDIR:-/tmp}/bitty}"
+readonly SUITE_TIMEOUT_SECONDS=1500
 
 work=""
 
@@ -38,15 +39,39 @@ mkdir -p -- "$shared_base"
 
 (
   cd -- "$REPO_ROOT"
-  WHEEL_TEST_TMP="$shared_base" "$interpreter" tests/test_wheel.lua
+  WHEEL_TEST_TMP="$shared_base" timeout "$SUITE_TIMEOUT_SECONDS" \
+    "$interpreter" tests/test_wheel.lua
 ) >"$work/a.log" 2>&1 &
 pid_a=$!
 
 (
   cd -- "$REPO_ROOT"
-  WHEEL_TEST_TMP="$shared_base" "$interpreter" tests/test_wheel.lua
+  WHEEL_TEST_TMP="$shared_base" timeout "$SUITE_TIMEOUT_SECONDS" \
+    "$interpreter" tests/test_wheel.lua
 ) >"$work/b.log" 2>&1 &
 pid_b=$!
+
+# Both suites must be running under distinct per-run roots while they overlap;
+# one shared root would produce a single directory here.
+roots_distinct=0
+for ((attempt = 0; attempt < 100; attempt++)); do
+  root_count="$(find "$shared_base" -mindepth 1 -maxdepth 1 -type d -print | wc -l | tr -d ' ')"
+  if [ "$root_count" -eq 2 ]; then
+    roots_distinct=1
+    break
+  fi
+  if [ "$root_count" -gt 2 ]; then
+    break
+  fi
+  sleep 0.1
+done
+if [ "$roots_distinct" -ne 1 ]; then
+  printf '[FAIL] expected two distinct per-run roots under the shared base (saw %s)\n' "$root_count" >&2
+  kill "$pid_a" "$pid_b" 2>/dev/null || true
+  wait "$pid_a" 2>/dev/null || true
+  wait "$pid_b" 2>/dev/null || true
+  exit 1
+fi
 
 status=0
 wait "$pid_a" || status=1

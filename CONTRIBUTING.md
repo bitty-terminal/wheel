@@ -70,12 +70,19 @@ the suite removes only its own root, so concurrent worktrees cannot delete each
 other's data. `just test` adds an outer temporary base and removes it when the
 suite exits, even before the suite's own cleanup hook runs.
 
+`WHEEL_TEST_TMP` must be an absolute path built from `A-Z`, `a-z`, `0-9`, `.`,
+`_`, `-`, and `/`. Whitespace, shell metacharacters, and relative paths are
+rejected before the suite creates or removes anything, because fixture commands
+embed derived paths in shell strings. Run `just test-roots` to verify an unsafe
+base is rejected without touching a sentinel file outside the run root.
+
 Run `just test-concurrent` to prove the isolation: it starts two suites
-concurrently against one shared scratch base and fails if either suite fails or
-if the base is not empty afterwards. The check roughly doubles the suite
-runtime, so it is a local gate rather than part of `just check`. The
-cross-process drill in `tests/e2e_cross_process.lua` also creates its own
-per-run FIFO/database directory.
+concurrently against one shared scratch base, asserts that two distinct per-run
+roots exist while both run, and fails if either suite fails or if the base is
+not empty afterwards. The check roughly doubles the suite runtime, so it is a
+local gate rather than part of `just check`. The cross-process drill in
+`tests/e2e_cross_process.lua` also creates its own per-run FIFO/database
+directory and cleans recorded host processes and the directory on failure.
 
 ## Delivery lifecycle
 
