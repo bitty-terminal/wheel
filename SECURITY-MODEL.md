@@ -183,35 +183,41 @@ not receive it.
   audit stream exists yet, so this remains a known gap.
 - Each invocation has a finite timeout, bounded output, and a process group
   recorded through a `setsid` session leader. GNU `timeout` (or `gtimeout`)
-  enforces expiry, signals the command group, and escalates to SIGKILL after a
-  bounded grace. After the direct command exits for any reason, a supervisor
-  sends TERM then KILL to the recorded PGID, preserving the command's exit
-  status; this removes background grandchildren that outlive normal completion.
-  The supervisor validates the PGID file as a user-owned `0600` regular file
-  with link count 1, rejects non-numeric/`<=1` values, and checks the group
-  exists before signaling. The harness never sends a name- or pattern-based kill
-  and never deliberately signals an unrecorded group. It cannot prove PGID
-  identity after the leader exits: same-user PGID reuse between leader exit and
-  the signal remains an accepted residual. `setsid`, `sleep`, `env`,
-  `timeout`/`gtimeout`, and `sh` must be resolvable or the primitive fails
-  closed as `unavailable`.
+  runs with `--foreground`, so expiry signals only the direct child, and a
+  bounded kill-after escalates to SIGKILL. The session leader is retained until
+  the bounded TERM/grace/KILL sweep of its own group completes: it waits for
+  the direct command, writes the command's exit status to a private `0600` file
+  before sending any signal, ignores TERM, sends TERM to the recorded PGID,
+  waits the bounded grace, records a sweep marker, and sends KILL to the group
+  (which includes the leader). Because the leader's PID remains allocated until
+  that final KILL, the recorded PGID cannot be reused while the sweep signals
+  it; the harness therefore signals only the recorded group and never sends a
+  name- or pattern-based kill. The recorded PGID is written to the exclusive
+  user-owned `0600` file created by the host and is returned as `pgid`, but it
+  is not the signal selector. If the leader exits before the sweep (for example
+  it is killed externally), no signal is sent, the result is a typed failure
+  with `cleanup = unverified`, and descendants may survive; the harness does
+  not guess an identity. `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and
+  `sh` must be resolvable or the primitive fails closed as `unavailable`.
   stdout and stderr are captured to private `0600` files and read back through
   a fixed cap of 256 KiB per stream; the result carries `timed_out`,
-  `truncated`, `exit_code`, and a typed `outcome`. GNU maps expiry to 124 and
-  kill-after escalation to 137, so a child that itself exits 124/137 is
-  indistinguishable and is reported as a timeout.
+  `truncated`, `exit_code`, a typed `outcome`, `cleanup`
+  (`swept`/`unverified`/`not_run`), and the recorded `pgid`. GNU maps expiry to
+  124 (kill-after escalation may surface 137 on some hosts), so a child that
+  itself exits 124/137 is indistinguishable and is reported as a timeout.
 - There is no asynchronous cancellation hook in the single-threaded Lua
-  runtime yet. Timeout expiry and the post-exit group sweep are the termination
-  triggers; a caller cannot interrupt an in-flight invocation. This is a known
-  limitation, not a claim that the policy's recorded-PID cancellation
+  runtime yet. Timeout expiry and the retained-leader group sweep are the
+  termination triggers; a caller cannot interrupt an in-flight invocation. This
+  is a known limitation, not a claim that the policy's recorded-PID cancellation
   requirement is complete.
 - Interactive stdin and TTY allocation are off by default. stdin is
   `/dev/null` unless the caller supplies bytes, which are staged in an
   exclusive `0600` file inside the private runtime directory. No TTY is
   allocated for a child.
 - Detached execution, daemonization, and reparenting out of the recorded process
-  tree are denied; the post-exit sweep terminates background members of the
-  recorded group. A child that calls `setsid` itself can still escape group
+  tree are denied; the retained-leader sweep terminates background members of
+  the recorded group after the direct command exits. A child that calls
+  `setsid` or otherwise joins another process group can still escape group
   termination; that remains an orphan risk and is recorded below.
 - Executing setuid/setgid binaries and invoking privilege-transition tools
   (`sudo`, `su`, `doas`, `pkexec`) is denied.
@@ -249,7 +255,7 @@ controls are mandatory:
    or interpreter is denied. The content must be fetched, inspected, and
    executed as a separate recorded step.
 10. **Bounded execution.** The same timeout, 256 KiB-per-stream capture bound,
-    setsid-recorded group, and post-exit TERM/KILL sweep as argv apply.
+    setsid-recorded group, and retained-leader TERM/KILL sweep as argv apply.
     Asynchronous cancellation by recorded PID is not exposed by the current
     runtime; timeout expiry and normal-exit group cleanup are the in-flight
     termination triggers.
@@ -728,25 +734,25 @@ secret environment reads.
 
 ### Threats and controls
 
-| Threat                                            | Control                                                                                                      | Residual risk                                                         |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                                          | A legitimate-looking destructive command can still pass               |
-| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval                       | The model can be persuaded within its granted authority               |
-| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget                          | Trusted code can still consume CPU/memory and shape policy            |
-| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors                        | TOCTOU races the runtime cannot fully close                           |
-| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests                        | Novel secret shapes may evade heuristic redaction                     |
-| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification                      | Compromised harness or user-level malware can exfiltrate              |
-| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in                                                       | Shell can write anywhere the user can; no OS confinement              |
-| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                     | Upstream compromise remains possible                                  |
-| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                  | Same-user processes can rewrite it                                    |
-| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                | Same-user processes can tamper with the log                           |
-| Orphaned or daemonized processes                  | setsid-recorded PGID, metadata validation, existence check, post-exit TERM/KILL sweep, no detach             | A child that calls setsid escapes; same-user PGID reuse is possible   |
-| Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration | Disk capture during a run has no file-size quota; CPU is not budgeted |
-| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                   | A reader may still assume plugin semantics                            |
-| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                               | Not designed or implemented in 0.1.0                                  |
-| Update-channel compromise                         | Signed artifacts and verified updates are required before release                                            | No signing or update channel exists yet                               |
-| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                            | A tool with a root grant can reach that whole root                    |
-| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                             | Runtime-level dumps are outside harness control                       |
+| Threat                                            | Control                                                                                                                                      | Residual risk                                                                                                                                           |
+| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                                                                          | A legitimate-looking destructive command can still pass                                                                                                 |
+| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval                                                       | The model can be persuaded within its granted authority                                                                                                 |
+| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget                                                          | Trusted code can still consume CPU/memory and shape policy                                                                                              |
+| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors                                                        | TOCTOU races the runtime cannot fully close                                                                                                             |
+| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests                                                        | Novel secret shapes may evade heuristic redaction                                                                                                       |
+| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification                                                      | Compromised harness or user-level malware can exfiltrate                                                                                                |
+| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in                                                                                       | Shell can write anywhere the user can; no OS confinement                                                                                                |
+| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                                                     | Upstream compromise remains possible                                                                                                                    |
+| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                                                  | Same-user processes can rewrite it                                                                                                                      |
+| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                                                | Same-user processes can tamper with the log                                                                                                             |
+| Orphaned or daemonized processes                  | setsid-recorded PGID held by a retained leader through TERM/grace/KILL, status written before signaling, typed unverified cleanup, no detach | A child that calls setsid or joins another group escapes; an externally killed leader leaves descendants unswept but unsignaled (reported `unverified`) |
+| Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration                                 | Disk capture during a run has no file-size quota; CPU is not budgeted                                                                                   |
+| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                                                   | A reader may still assume plugin semantics                                                                                                              |
+| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                                                               | Not designed or implemented in 0.1.0                                                                                                                    |
+| Update-channel compromise                         | Signed artifacts and verified updates are required before release                                                                            | No signing or update channel exists yet                                                                                                                 |
+| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                                                            | A tool with a root grant can reach that whole root                                                                                                      |
+| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                                                             | Runtime-level dumps are outside harness control                                                                                                         |
 
 ### Residual risks accepted for 0.1.0
 
@@ -864,7 +870,8 @@ that the policy relies on, and they remain unverified until the gates pass:
   POSIX surface, selected explicitly with `select_backend("standalone")`;
   unsupported platforms and unavailable primitives fail closed with typed
   denials. The process primitive runs under GNU timeout with a
-  `setsid`-recorded process group, a post-exit TERM/KILL sweep, a 256 KiB
+  `setsid`-recorded process group, a retained-leader TERM/grace/KILL sweep
+  whose status is written before signaling, a 256 KiB
   per-stream capture cap, a rebuilt allowlist environment, and an explicit
   stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
   `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
@@ -914,19 +921,20 @@ Known gaps relative to this policy (not claims of compliance):
   and Commander Custom-mutating and the full matrix are not enforced.
 - The process primitive enforces a finite timeout (default 120 s, maximum
   10 min), a 256 KiB capture cap per stream, `/dev/null` stdin unless bytes are
-  supplied, a `setsid`-recorded process group, timeout SIGKILL escalation, and
-  a post-exit TERM/KILL sweep (250 ms grace) on success, error, and timeout.
-  Remaining gaps: there is no asynchronous cancellation hook, so timeout expiry
-  and the post-exit sweep are the only termination triggers; GNU timeout maps
-  expiry to 124 and kill-after to 137, so a child that itself exits 124/137 is
-  indistinguishable; `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh`
-  must be resolvable or the primitive fails closed as `unavailable`; timeout
-  enforcement is not a real-time guarantee; disk capture has no per-file quota,
-  only the timeout bound; a child that calls `setsid` itself escapes the
-  recorded group; the supervisor checks that the recorded PGID exists but cannot
-  prove its identity after the leader exits, so same-user PGID reuse is an
-  accepted residual; and there is no rlimit, cgroup, seccomp, or OS confinement
-  for spawned programs.
+  supplied, a `setsid`-recorded process group held by a retained leader through
+  the TERM/grace/KILL sweep (CTX-0021 / wheel#81), timeout SIGKILL escalation,
+  and a direct-command status written before any signal. Remaining gaps: there
+  is no asynchronous cancellation hook, so timeout expiry and the sweep are the
+  only termination triggers; GNU timeout maps expiry to 124 and kill-after may
+  surface 137, so a child that itself exits 124/137 is indistinguishable;
+  `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh` must be resolvable or
+  the primitive fails closed as `unavailable`; timeout enforcement is not a
+  real-time guarantee; disk capture has no per-file quota, only the timeout
+  bound; a child that calls `setsid` itself (or joins another process group)
+  escapes the recorded group; if the leader is killed before the sweep (for
+  example an external same-user kill or an OOM kill), no signal is sent,
+  `cleanup` is `unverified`, and descendants may survive; and there is no
+  rlimit, cgroup, seccomp, or OS confinement for spawned programs.
 - Temporary-file creation and the subsequent content write are separate
   operations. The directory is `0700`, so another OS user cannot substitute a
   path, but a same-user process could replace the freshly created path before
