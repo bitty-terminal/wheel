@@ -296,23 +296,25 @@ WheelHost.LIMITS = {
   READ_CHUNK_BYTES = READ_CHUNK_BYTES,
 }
 
---- Process-group supervisor wrapper. It redirects the command's streams to
---- private files and runs the launch under `setsid -w`; its own stderr is
---- redirected to a separate diagnostics file by the caller, because the shell
---- reports the expected SIGKILL of the retained leader. The leader performs the
+--- Process-group supervisor wrapper. It runs the launch under `setsid -w` and
+--- leaves stdout/stderr to the outer diagnostics redirection; the leader owns
+--- the command's capture files. Its own stderr, including the shell's expected
+--- SIGKILL report for the retained leader, therefore lands in the wrapper
+--- diagnostics, never in the command's captured stderr. The leader performs the
 --- group sweep, so the wrapper never signals anything and always exits 0.
-local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > "$out" 2> "$err"; exit 0'
+local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > /dev/null; exit 0'
 
 --- Session leader and group-identity holder. It records its own PID/PGID, runs
---- the scrubbed command in the same group, writes the direct command's status
---- before any signal, then holds the group identity through TERM, the bounded
---- grace, and the final KILL. The KILL targets the whole recorded group and
---- therefore takes the leader with it; the status and sweep files are already
---- written. After recording status, the leader sends its own stderr to
---- `/dev/null`, so the shell's expected `Killed` diagnostic for the self-KILL
---- cannot pollute the command's captured stderr. A leader that exits early never
---- signals anything. No caller value is interpolated into this script.
-local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; grace="$4"; sleep_bin="$5"; shift 5; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; exec 2>/dev/null; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
+--- the scrubbed command in the same group with explicit private capture files,
+--- writes the direct command's status before any signal, then holds the group
+--- identity through TERM, the bounded grace, and the final KILL. The KILL
+--- targets the whole recorded group and therefore takes the leader with it; the
+--- status and sweep files are already written. After recording status, the
+--- leader sends its own stderr to `/dev/null`, so any shell diagnostic for the
+--- self-KILL cannot leak into the wrapper's command stream. A leader that exits
+--- early never signals anything. No caller value is interpolated into the
+--- script.
+local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; shift 7; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; exec 2>/dev/null; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the exit
@@ -1263,6 +1265,7 @@ function standalone.new(opts)
       shell_quote(sh_bin), "-c", shell_quote(LEADER_SCRIPT),
       shell_quote("wheel-leader"),
       shell_quote(pgid_path), shell_quote(status_path), shell_quote(sweep_path),
+      shell_quote(out_path), shell_quote(err_path),
       shell_quote(format_sleep(SWEEP_GRACE_MS)),
       shell_quote(sleep_bin),
       shell_quote(env_bin), "-i",
@@ -1283,12 +1286,13 @@ function standalone.new(opts)
       pieces[#pieces + 1] = shell_quote(arg)
     end
 
-    -- The supervisor redirects the command's streams and always exits 0; the
-    -- outer redirection keeps the wrapper shell's own diagnostics (including the
-    -- expected SIGKILL of the retained leader) out of the command's stderr. The
-    -- retained leader is the only process that signals the group and the only
-    -- authority for the command status; the status, sweep marker, and recorded
-    -- PGID are read back below.
+    -- The supervisor always exits 0 and leaves its stderr to the outer diag
+    -- file; the retained leader redirects the command into the private capture
+    -- files itself. The expected SIGKILL of the leader therefore stays in the
+    -- wrapper diagnostics, never in the command's captured stderr. The leader is
+    -- the only process that signals the group and the only authority for the
+    -- command status; the status, sweep marker, and recorded PGID are read back
+    -- below.
     local command = table.concat(pieces, " ")
       .. " 2> " .. shell_quote(diag_path)
 
