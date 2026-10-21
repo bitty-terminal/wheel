@@ -7106,7 +7106,7 @@ run_test("WheelHost: the retained leader holds the PGID through the sweep", func
   local script = "sh -c 'set -- $(ps -o pgid= -p $$); pgid=$1; "
     .. "trap \"if kill -0 \\\"$pgid\\\" 2>/dev/null; then echo \\\"$pgid\\\" > $WHEEL_TEST_MARKER; "
     .. "else echo gone > $WHEEL_TEST_MARKER; fi; sleep 30\" TERM; "
-    .. ": > $WHEEL_TEST_READY; sleep 30' & echo $! > " .. quote(pid_file) .. "; "
+    .. ": > $WHEEL_TEST_READY; sleep 30' 2>/dev/null & echo $! > " .. quote(pid_file) .. "; "
     .. "i=0; while [ ! -f \"$WHEEL_TEST_READY\" ] && [ $i -lt 300 ]; do sleep 0.01; i=$((i+1)); done"
 
   local res = backend.run_program("sh", { "-c", script }, {
