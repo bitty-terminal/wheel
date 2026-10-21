@@ -1,17 +1,73 @@
--- tests/test_live_openrouter.lua
+-- tests/test_live_provider.lua
 -- Opt-in live provider test for Wheel's OpenAIAdapter and runner.
 --
 -- Manual only: run with `just test-live`. The recipe is deliberately absent
--- from `just check` and CI. The test skips with exit 0 when OPENROUTER_API_KEY
--- is absent. The key is read from the inherited environment by the test-only
--- Python transport (tests/live_http_client.py); it is never passed through
--- argv, a request file, the Lua adapter, or captured output.
+-- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default)
+-- or `commandcode`, case-insensitively. The test skips with exit 0 when the
+-- selected provider's key environment variable is absent, and fails closed on
+-- an unknown selector. The key is read from the inherited environment by the
+-- test-only Python transport (tests/live_http_client.py); it is never passed
+-- through argv, a request file, the Lua adapter, or captured output.
 
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
-local api_key = os.getenv("OPENROUTER_API_KEY")
+local PROVIDER_SELECTOR_ENV = "WHEEL_LIVE_PROVIDER"
+local DEFAULT_PROVIDER = "openrouter"
+
+local PROVIDERS = {
+  openrouter = {
+    name = "openrouter",
+    api_key_env = "OPENROUTER_API_KEY",
+    base_url = "https://openrouter.ai/api/v1",
+    model = "deepseek/deepseek-v4.1-flash",
+    smoke_max_completion_tokens = 256,
+    runner_max_completion_tokens = 512,
+  },
+  commandcode = {
+    name = "commandcode",
+    api_key_env = "COMMANDCODE_API_KEY",
+    base_url = "https://api.commandcode.ai/provider/v1",
+    model = "deepseek/deepseek-v4.1-flash",
+    -- The model is a reasoning model: a small budget can be consumed entirely
+    -- by reasoning and return empty content with finish_reason=length. Keep
+    -- content-bearing checks well above the 512-token minimum.
+    smoke_max_completion_tokens = 1024,
+    runner_max_completion_tokens = 1024,
+  },
+}
+
+local function trim(value)
+  return (value:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function select_provider()
+  local raw = os.getenv(PROVIDER_SELECTOR_ENV)
+  local name = DEFAULT_PROVIDER
+  if raw then
+    local trimmed = trim(raw)
+    if trimmed ~= "" then
+      name = string.lower(trimmed)
+    end
+  end
+  local config = PROVIDERS[name]
+  if not config then
+    io.stderr:write(string.format(
+      "test-live: unsupported %s value; expected openrouter or commandcode\n",
+      PROVIDER_SELECTOR_ENV
+    ))
+    os.exit(2)
+  end
+  return config
+end
+
+local provider = select_provider()
+local api_key = os.getenv(provider.api_key_env)
 if not api_key or api_key == "" then
-  print("SKIP test-live: OPENROUTER_API_KEY is not set")
+  print(string.format(
+    "SKIP test-live: %s is not set for provider %s",
+    provider.api_key_env,
+    provider.name
+  ))
   os.exit(0)
 end
 
@@ -22,12 +78,12 @@ local WheelKernel = require("wheel.kernel")
 local WheelContext = require("wheel.context")
 local WheelTool = require("wheel.tool")
 
-local MODEL = "deepseek/deepseek-v4.1-flash"
-local BASE_URL = "https://openrouter.ai/api/v1"
+local MODEL = provider.model
+local BASE_URL = provider.base_url
 local PYTHON = "python3"
 local CLIENT_SCRIPT = "tests/live_http_client.py"
-local SMOKE_MAX_COMPLETION_TOKENS = 256
-local RUNNER_MAX_COMPLETION_TOKENS = 512
+local SMOKE_MAX_COMPLETION_TOKENS = provider.smoke_max_completion_tokens
+local RUNNER_MAX_COMPLETION_TOKENS = provider.runner_max_completion_tokens
 local STREAM_CHUNK_SIZE = 64
 
 local captured_outputs = {}
@@ -162,8 +218,9 @@ do
     max_completion_tokens = SMOKE_MAX_COMPLETION_TOKENS,
   }))
   assert(type(res.content) == "string" and #res.content > 0, "complete must return content")
+  assert(res.finish_reason ~= "length", "complete must not exhaust the completion budget")
   assert(res.content:upper():find("OK", 1, true) ~= nil, "complete response should contain OK")
-  print("LIVE complete OK")
+  print("LIVE " .. provider.name .. " complete OK")
 end
 
 -- 2. Tool call request with parsed arguments.
@@ -193,7 +250,7 @@ do
   assert(call.name == "get_time", "tool call name must be parsed")
   assert(type(call.arguments) == "table", "tool arguments must be decoded into a table")
   assert(type(call.arguments.timezone) == "string", "tool argument timezone must be parsed")
-  print("LIVE tool call OK (" .. call.name .. ")")
+  print("LIVE " .. provider.name .. " tool call OK (" .. call.name .. ")")
 end
 
 -- 3. SSE streaming through the adapter parser.
@@ -211,9 +268,10 @@ do
   end))
   assert(chunks > 0, "stream must deliver chunks")
   assert(type(res.content) == "string" and #res.content > 0, "stream must accumulate content")
+  assert(res.finish_reason ~= "length", "stream must not exhaust the completion budget")
   assert(res.content:find("1", 1, true) ~= nil and res.content:find("3", 1, true) ~= nil,
     "stream response should contain the requested sequence")
-  print("LIVE stream OK")
+  print("LIVE " .. provider.name .. " stream OK")
 end
 
 -- 4. One runner ReAct turn with a stub tool.
@@ -283,7 +341,7 @@ do
   assert(report.iterations >= 2, "runner must complete a tool turn and a final turn")
   assert(#tools_called >= 1 and tools_called[1] == "get_time", "runner must dispatch the stub tool")
   assert(type(report.artifacts) == "string" and #report.artifacts > 0, "runner must produce deliverables")
-  print("LIVE runner OK (" .. tostring(report.iterations) .. " iterations)")
+  print("LIVE " .. provider.name .. " runner OK (" .. tostring(report.iterations) .. " iterations)")
 end
 
 assert(#observed_budgets >= 4, "every live request path must carry a bounded max_tokens")
@@ -297,4 +355,8 @@ for index, output in ipairs(captured_outputs) do
   assert_no_key(output, "captured output " .. tostring(index))
 end
 
-print(string.format("LIVE tests passed (%d bounded requests)", helper_calls))
+print(string.format(
+  "LIVE %s tests passed (%d bounded requests)",
+  provider.name,
+  helper_calls
+))

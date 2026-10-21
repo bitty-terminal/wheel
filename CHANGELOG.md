@@ -97,6 +97,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Opt-in live provider selector (CTX-0023 / wheel#82):
+  `WHEEL_LIVE_PROVIDER=openrouter|commandcode` (default `openrouter`, matched
+  case-insensitively) selects the credential environment, host, and completion
+  budgets for `just test-live`. Command Code uses `COMMANDCODE_API_KEY` and a
+  1024-token budget for its reasoning model; the key-free redirect-policy and
+  selector tests remain offline and now run in `just check`.
 - CTX-0022 local gate: `just test` selects `lua5.1`, then `luajit`, then `lua`
   through `scripts/test-gate.sh`; `just test-gate` self-tests the selection
   branches, and LuaJIT disables the JIT for the evaluated config chunk so the
