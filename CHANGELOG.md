@@ -60,10 +60,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   file is the single version source, and `just package` builds the deterministic
   `dist/wheel-0.1.0.tar.gz` with a SHA-256 sidecar and a manifest record. The
   archive contains `lua/`, `LICENSE`, `README.md`, `SECURITY-MODEL.md`,
-  `repo.toml`, and `VERSION`, and excludes tests, recording, dependencies, Git
-  metadata, CI, scripts, the justfile, and `dist/`. The release build refuses a
-  dirty worktree, a missing input, or an unsupported version; `--allow-dirty`
-  and `--version` are local test-build options only.
+  `CONTEXT-SNAPSHOT.md`, `repo.toml`, and `VERSION`, and excludes tests,
+  recording, dependencies, Git metadata, CI, scripts, the justfile, and
+  `dist/`. The release build refuses a dirty worktree, a missing input, or an
+  unsupported version; `--allow-dirty` and `--version` are local test-build
+  options only.
 - Local install, upgrade, and rollback path (`just install-local`,
   `just rollback-local`): installed versions live at
   `<prefix>/wheel/<version>/`, `current` is a relative symlink, and the outgoing
@@ -105,6 +106,28 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pinning, cardinality, sample count, and min/median/p95/max/IQR, with no host
   paths or committed host baseline. `just check` now runs the benchmark unit
   tests and one short context-scenario run.
+- Versioned `WheelContext` snapshots (CTX-0026 / wheel#87):
+  `WheelContext:export_snapshot`, `WheelContext.import_snapshot`,
+  `WheelContext.validate_snapshot`, and `WheelContext.canonical_snapshot`
+  export and restore working slots, the Merkle `tree_hash`, `HEAD`, refs,
+  commits, the bounded reflog, and the bounded bus history. Restore validates
+  the `wheel-context-snapshot/1` format, required and unknown fields, slot
+  names/kinds/content hashes, slot-version and reflog-index maxima, 16 MiB
+  content and 64 MiB total bounds, bounded keys, 64-hex hashes, tree-hash and
+  commit-hash consistency, branch refs, commit-parent closure and cycles, and
+  reflog references before constructing an object. Reflog indexes advance from
+  the last retained index across the ring; an exhausted index is renumbered
+  deterministically, and a slot at its version bound fails with
+  `version_exhausted` instead of overflowing. Snapshot validation failures use
+  the typed `E_SNAPSHOT_INVALID` cause; invalid options use `E_ARGS_INVALID`.
+  Import deep-copies the snapshot and never exposes a partial context. Stash
+  slot payloads are redacted from preserved `stash_pushed`/`stash_popped` bus
+  events; a caller-supplied import bus keeps its subscribers but has its history
+  replaced by the snapshot history. `canonical_snapshot` provides
+  hash-table-order-independent bytes for round-trip comparison. Snapshot v1
+  deliberately excludes stash entries, bus subscribers, the kernel link,
+  `config` directives, and local budget configuration; daemon transport
+  integration remains a follow-up.
 
 ### Changed
 

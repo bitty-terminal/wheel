@@ -91,6 +91,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/agent.lua
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
+    bun run luaparse --quiet --file lua/wheel/context_snapshot.lua
     bun run luaparse --quiet --file lua/wheel/ui.lua
     bun run luaparse --quiet --file lua/wheel/tool.lua
     bun run luaparse --quiet --file lua/wheel/provider.lua
@@ -110,6 +111,7 @@ lua: deps
     bun run luaparse --quiet --file tests/e2e_cross_process.lua
     bun run luaparse --quiet --file tests/test_bench.lua
     bun run luaparse --quiet --file tests/test_wheel.lua
+    bun run luaparse --quiet --file tests/test_context_snapshot.lua
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 

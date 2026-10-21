@@ -30,7 +30,7 @@ readonly PACKAGE_NAME="wheel"
 readonly VERSION_FILE="$REPO_ROOT/VERSION"
 readonly DEFAULT_OUTPUT_DIR="$REPO_ROOT/dist"
 readonly VERSION_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+$'
-readonly ARTIFACT_INPUTS=(LICENSE README.md SECURITY-MODEL.md repo.toml VERSION lua)
+readonly ARTIFACT_INPUTS=(LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml VERSION lua)
 readonly TMP_BASE="${WHEEL_PACKAGE_SCRATCH:-${TMPDIR:-/tmp}/bitty}"
 
 version=""
@@ -221,7 +221,7 @@ package_dir="$PACKAGE_NAME-$version"
 package_root="$stage/$package_dir"
 mkdir -p -- "$package_root/lua"
 
-for file in LICENSE README.md SECURITY-MODEL.md repo.toml; do
+for file in LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml; do
   install -m 0644 -- "$REPO_ROOT/$file" "$package_root/$file"
 done
 printf '%s\n' "$version" >"$package_root/VERSION"

@@ -82,14 +82,14 @@ assert_previous() {
 
 assert_tree() {
   local tree=$1 expected_version=$2
-  local allowed=" VERSION LICENSE README.md SECURITY-MODEL.md repo.toml lua "
+  local allowed=" VERSION LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml lua "
   local required path name
 
   [ -d "$tree" ] || fail "installed tree is missing: $tree"
   [ -f "$tree/VERSION" ] || fail "installed tree is missing VERSION"
   [ "$(<"$tree/VERSION")" = "$expected_version" ] ||
     fail "installed VERSION does not match $expected_version"
-  for required in LICENSE README.md SECURITY-MODEL.md repo.toml lua/wheel/init.lua; do
+  for required in LICENSE README.md SECURITY-MODEL.md CONTEXT-SNAPSHOT.md repo.toml lua/wheel/init.lua; do
     [ -f "$tree/$required" ] || fail "installed tree is missing $required"
   done
   [ -z "$(find "$tree" -type l -print -quit)" ] ||
