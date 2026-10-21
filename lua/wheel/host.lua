@@ -329,12 +329,15 @@ local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > /dev/null; exit 0
 local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; shift 7; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; exec 2>/dev/null; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
--- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the exit
--- code in the second result. Both shapes become a plain integer.
+-- Lua 5.1 reports the raw wait status (exit 1 -> 256); Lua 5.2+ reports
+-- `nil, "exit", code` (or `nil, "signal", signal`). All returns must be
+-- captured; otherwise the string reason would be mistaken for a code and a
+-- probe failure would look like exit status 1.
 -- @param ok boolean|number|nil
+-- @param reason string|nil
 -- @param code number|nil
--- @return number
-local function normalized_exit_status(ok, code)
+-- @return number? status
+local function normalized_exit_status(ok, reason, code)
   if ok == true then
     return 0
   end
@@ -344,10 +347,16 @@ local function normalized_exit_status(ok, code)
     end
     return ok
   end
+  if ok == nil and reason == "exit" and type(code) == "number" then
+    return code
+  end
+  if ok == nil and reason == "signal" and type(code) == "number" then
+    return 128 + code
+  end
   if type(code) == "number" then
     return code
   end
-  return 1
+  return nil
 end
 
 --- Build a typed process result for a launch/validation failure.

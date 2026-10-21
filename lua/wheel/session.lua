@@ -95,6 +95,7 @@ Session.ERROR_CODES = {
   E_SESSION_ARGS_INVALID = true,
   E_SESSION_IO = true,
   E_SESSION_START_FAILED = true,
+  E_SESSION_START_MISMATCH = true,
   E_SESSION_CAS_CONFLICT = true,
   E_SESSION_CONTEXT_ERROR = true,
   E_SESSION_CONTEXT_LIMIT = true,
@@ -215,6 +216,10 @@ end
 
 local function err_start_failed()
   return session_error("E_SESSION_START_FAILED", "session daemon did not become ready")
+end
+
+local function err_start_mismatch()
+  return session_error("E_SESSION_START_MISMATCH", "session belongs to a different starter")
 end
 
 local function err_cas_conflict(expected, current)
@@ -829,6 +834,9 @@ local function validate_metadata(meta, expected_name)
   if type(meta.wheel_version) ~= "string" or not meta.wheel_version:match("^%d+%.%d+%.%d+$") then
     return false
   end
+  if meta.start_owner ~= nil and not valid_pid(meta.start_owner) then
+    return false
+  end
   return true
 end
 
@@ -1116,6 +1124,15 @@ end
 -- @return boolean released
 function Session.release_lock(session_dir, lock_name, owner_pid)
   return release_named_lock(session_dir, lock_name, owner_pid)
+end
+
+--- Test whether a named lock is currently owned by `owner_pid`.
+-- @param session_dir string
+-- @param lock_name string
+-- @param owner_pid number
+-- @return boolean
+function Session.lock_owned_by(session_dir, lock_name, owner_pid)
+  return read_lock_owner(session_dir, lock_name) == owner_pid
 end
 
 -- ---------------------------------------------------------------------------
@@ -1417,6 +1434,7 @@ function Session.request(name, method, params, opts)
     Session.acquire_lock, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
   if not acquire_ok then
     pcall(Session.release_lock, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+    pcall(Session.release_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
     return nil, err_io()
   end
   if not locked then
@@ -1470,6 +1488,14 @@ local function inspect_impl(name, opts)
   if not meta then
     return nil, nil, meta_err
   end
+  if opts.start_owner ~= nil then
+    if not valid_pid(opts.start_owner) then
+      return nil, nil, err_args_invalid()
+    end
+    if meta.start_owner ~= opts.start_owner then
+      return nil, nil, err_start_mismatch()
+    end
+  end
   local alive, alive_err = Session.pid_alive(meta)
   if alive_err then
     return nil, nil, alive_err
@@ -1479,7 +1505,7 @@ end
 
 --- Read metadata/liveness with a final typed host-failure boundary.
 -- @param name string
--- @param opts table?
+-- @param opts table? { root = string?, start_owner = number? }
 -- @return table? meta, boolean? alive, table? err
 function Session.inspect(name, opts)
   local ok, meta, alive, err = pcall(inspect_impl, name, opts)
@@ -1559,14 +1585,63 @@ function Session.remove_control_files(session_dir)
   return true, nil
 end
 
---- Remove known stale lock/temp files from a session directory.
--- The caller must hold the start lock. Canonical client/start mutexes are
--- reclaimed only when their owner is dead; stale tails and metadata temp files
--- are removed only after an owned-regular-file check. Unknown files are left
--- alone and can keep the directory from being removed, which fails closed.
+--- Reap one named dead lock or stale tail, optionally with canonical claim.
 -- @param session_dir string
+-- @param name string
+-- @param canonical boolean
+-- @param euid number
 -- @return boolean ok, table? err
-function Session.prune_stale_files(session_dir)
+local function prune_dead_lock(session_dir, name, canonical, euid)
+  local owner, read_err = read_lock_owner(session_dir, name)
+  if owner == nil then
+    return false, read_err or err_lock_unsafe()
+  end
+  if owner == false then
+    return true, nil
+  end
+  local alive, probe_err = WheelHost.proc.is_alive(owner)
+  if probe_err ~= nil then
+    return false, err_busy()
+  end
+  if alive then
+    if not canonical then
+      local base = name:match("^(.-)%.stale%.")
+      local client_aux = Session.FILE_CLIENT_LOCK .. ".mutex"
+      local start_aux = Session.FILE_START_LOCK .. ".mutex"
+      if base == Session.FILE_CLIENT_LOCK or base == Session.FILE_START_LOCK
+        or base == client_aux or base == start_aux then
+        local canonical_path = lock_path(session_dir, base)
+        local canonical_info = stat_path(canonical_path)
+        if canonical_info and not canonical_info.exists then
+          if WheelHost.fs.link_exclusive(lock_path(session_dir, name), canonical_path) then
+            WheelHost.fs.remove_file(lock_path(session_dir, name))
+          end
+        end
+      end
+    end
+    return true, nil
+  end
+  if canonical then
+    if not claim_stale_lock(session_dir, name, owner) then
+      return false, err_busy()
+    end
+    return true, nil
+  end
+  local path = lock_path(session_dir, name)
+  local info = stat_path(path)
+  if info and info.exists then
+    if info.symlink or not info.regular or info.uid ~= euid
+      or info.mode ~= Session.PRIVATE_FILE_MODE or info.links ~= 1 then
+      return false, err_unsafe_path()
+    end
+    if not WheelHost.fs.remove_file(path) then
+      return false, err_io()
+    end
+  end
+  return true, nil
+end
+
+local function prune_body(session_dir, client_mutex_held)
   local listing = WheelHost.fs.list_dir(session_dir)
   if not listing or listing.ok ~= true then
     return false, err_io()
@@ -1577,47 +1652,32 @@ function Session.prune_stale_files(session_dir)
   end
   local client_aux = Session.FILE_CLIENT_LOCK .. ".mutex"
   local start_aux = Session.FILE_START_LOCK .. ".mutex"
+  local client_prefix = Session.FILE_CLIENT_LOCK:gsub("%.", "%%.")
+  local start_prefix = Session.FILE_START_LOCK:gsub("%.", "%%.")
+  local client_aux_prefix = client_aux:gsub("%.", "%%.")
+  local start_aux_prefix = start_aux:gsub("%.", "%%.")
   for _, line in ipairs(listing.entries or {}) do
     local name = line:match("%s([^%s]+)$")
     if name and name ~= "." and name ~= ".." and name ~= Session.FILE_START_LOCK
-      and name ~= Session.FILE_META then
+      and name ~= Session.FILE_META and name ~= client_aux then
       local path = session_dir .. "/" .. name
-      local is_lock = name == Session.FILE_CLIENT_LOCK
-        or name == client_aux
-        or name == start_aux
-        or name:match("^" .. Session.FILE_CLIENT_LOCK:gsub("%.", "%%.") .. "%.stale%.")
-        or name:match("^" .. Session.FILE_START_LOCK:gsub("%.", "%%.") .. "%.stale%.")
-        or name:match("^" .. client_aux:gsub("%.", "%%.") .. "%.stale%.")
-        or name:match("^" .. start_aux:gsub("%.", "%%.") .. "%.stale%.")
-      if is_lock then
-        local owner, read_err = read_lock_owner(session_dir, name)
-        if owner == nil then
-          return false, read_err or err_lock_unsafe()
+      local ok, prune_err
+      if name == Session.FILE_CLIENT_LOCK then
+        -- Canonical client locks are reclaimed only while the client mutex is
+        -- held; otherwise a concurrent client could have just created a live
+        -- lock after the dead-owner observation.
+        if client_mutex_held then
+          ok, prune_err = prune_dead_lock(session_dir, name, true, euid)
+        else
+          ok, prune_err = true, nil
         end
-        if owner ~= false then
-          local alive, probe_err = WheelHost.proc.is_alive(owner)
-          if probe_err ~= nil then
-            return false, err_busy()
-          end
-          if not alive then
-            if name == Session.FILE_CLIENT_LOCK or name == client_aux or name == start_aux then
-              if not claim_stale_lock(session_dir, name, owner) then
-                return false, err_busy()
-              end
-            else
-              local info = stat_path(path)
-              if info and info.exists then
-                if info.symlink or not info.regular or info.uid ~= euid
-                  or info.mode ~= Session.PRIVATE_FILE_MODE or info.links ~= 1 then
-                  return false, err_unsafe_path()
-                end
-                if not WheelHost.fs.remove_file(path) then
-                  return false, err_io()
-                end
-              end
-            end
-          end
-        end
+      elseif name == start_aux then
+        ok, prune_err = prune_dead_lock(session_dir, name, true, euid)
+      elseif name:match("^" .. client_prefix .. "%.stale%.")
+        or name:match("^" .. start_prefix .. "%.stale%.")
+        or name:match("^" .. client_aux_prefix .. "%.stale%.")
+        or name:match("^" .. start_aux_prefix .. "%.stale%.") then
+        ok, prune_err = prune_dead_lock(session_dir, name, false, euid)
       elseif name:match("^meta%.json%..*%.tmp$") then
         local info = stat_path(path)
         if info and info.exists then
@@ -1629,11 +1689,46 @@ function Session.prune_stale_files(session_dir)
             return false, err_io()
           end
         end
+        ok, prune_err = true, nil
+      else
+        ok, prune_err = true, nil
+      end
+      if not ok then
+        return false, prune_err or err_io()
       end
     end
   end
   return true, nil
 end
+
+--- Remove known stale lock/temp files from a session directory.
+-- Canonical client locks are reclaimed only while the client-lock mutex is
+-- held; stale tails and metadata temp files are removed after an owned-regular
+-- check. Unknown files are left alone and can keep the directory from being
+-- removed, which fails closed.
+-- @param session_dir string
+-- @param owner_pid number? identity for the client-lock mutex
+-- @return boolean ok, table? err
+function Session.prune_stale_files(session_dir, owner_pid)
+  local client_mutex_held = false
+  if valid_pid(owner_pid) then
+    local acquired_ok, acquired = pcall(
+      acquire_mutex, session_dir, Session.FILE_CLIENT_LOCK, owner_pid)
+    client_mutex_held = acquired_ok and acquired == true
+    if not acquired_ok then
+      pcall(release_named_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
+    end
+  end
+  local ok, result, err = pcall(prune_body, session_dir, client_mutex_held)
+  if client_mutex_held then
+    pcall(release_named_lock, session_dir, Session.FILE_CLIENT_LOCK .. ".mutex", owner_pid)
+  end
+  if not ok then
+    return false, err_io()
+  end
+  return result, err
+end
+
 
 --- Prepare a session runtime directory and FIFOs for a daemon start.
 -- The caller must hold the start lock for the whole spawn+readiness window.
@@ -1674,7 +1769,13 @@ local function prepare_start_impl(name, opts)
     return nil, err_start_failed()
   end
 
-  local locked, lock_err = Session.acquire_lock(session_dir, Session.FILE_START_LOCK, owner_pid)
+  local acquire_ok, locked, lock_err = pcall(
+    Session.acquire_lock, session_dir, Session.FILE_START_LOCK, owner_pid)
+  if not acquire_ok then
+    pcall(Session.release_lock, session_dir, Session.FILE_START_LOCK, owner_pid)
+    pcall(Session.release_lock, session_dir, Session.FILE_START_LOCK .. ".mutex", owner_pid)
+    return nil, err_io()
+  end
   if not locked then
     return nil, lock_err
   end
@@ -1701,7 +1802,7 @@ local function prepare_start_impl(name, opts)
   if not cleaned then
     return abort(clean_err)
   end
-  local pruned, prune_err = Session.prune_stale_files(session_dir)
+  local pruned, prune_err = Session.prune_stale_files(session_dir, owner_pid)
   if not pruned then
     return abort(prune_err)
   end
@@ -1743,7 +1844,12 @@ function Session.handoff_start_lock(session_dir, from_pid, to_pid)
   if not valid_pid(from_pid) or not valid_pid(to_pid) then
     return false, err_io()
   end
-  local mutex_ok, mutex_err = acquire_mutex(session_dir, Session.FILE_START_LOCK, to_pid)
+  local mutex_call_ok, mutex_ok, mutex_err = pcall(
+    acquire_mutex, session_dir, Session.FILE_START_LOCK, to_pid)
+  if not mutex_call_ok then
+    pcall(release_named_lock, session_dir, Session.FILE_START_LOCK .. ".mutex", to_pid)
+    return false, err_io()
+  end
   if not mutex_ok then
     return false, mutex_err or err_busy()
   end
@@ -1949,6 +2055,10 @@ local function main_impl(argv)
     local name = args[2]
     if name == nil or args[3] ~= nil then
       return cli_fail(err_args_invalid())
+    end
+    local expected_start_owner = tonumber(getenv("WHEEL_SESSION_START_OWNER") or "")
+    if valid_pid(expected_start_owner) then
+      opts.start_owner = expected_start_owner
     end
     local meta, alive, inspect_err = Session.inspect(name, opts)
     if not meta then

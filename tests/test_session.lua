@@ -353,6 +353,15 @@ run_test("Daemon: dispatch converts a context exception into a static error", fu
   assert(err and err.code == "E_SESSION_CONTEXT_ERROR",
     "a context exception must become a typed session error")
   assert(err.message == "session method failed closed", "the error message must be static")
+  assert(err.class == "runtime", "a context exception is a runtime failure")
+
+  local _, args_err = Daemon.dispatch(state, "context.get", {})
+  assert(args_err and args_err.code == "E_SESSION_ARGS_INVALID")
+  assert(args_err.class == "validation", "daemon argument errors must keep the validation class")
+
+  local _, unknown_err = Daemon.dispatch(state, "bogus.method", {})
+  assert(unknown_err and unknown_err.code == "E_SESSION_METHOD_UNKNOWN")
+  assert(unknown_err.class == "validation", "daemon unknown-method errors must keep the validation class")
 end)
 
 run_test("Daemon: cleanup leaves files while another starter owns the start lock", function()
@@ -410,6 +419,22 @@ end)
 -- ---------------------------------------------------------------------------
 -- Integration: lifecycle, context persistence, snapshots
 -- ---------------------------------------------------------------------------
+
+run_test("Daemon: cleanup treats its own start lock as held", function()
+  local name = "cleanup-owned"
+  local dir = session_dir(name)
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+  assert(Session.acquire_lock(dir, Session.FILE_START_LOCK, owner) == true)
+  local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
+  assert(WheelHost.fs.stat(dir).exists == false)
+end)
 
 run_test("Daemon: an injected dispatch exception is typed and shutdown still cleans up", function()
   local name = "dispatch-live"
@@ -494,6 +519,7 @@ run_test("Daemon: a delayed old daemon loses the start-lock handoff and cannot c
   local lua_root = repo_root .. "/lua"
   local driver_path = test_base .. "/late-publication-driver.lua"
   local marker_path = test_base .. "/late-handoff-marker"
+  local barrier_path = test_base .. "/late-handoff-barrier"
   local driver_log = test_base .. "/late-publication.log"
   local driver = assert(io.open(driver_path, "w"))
   driver:write(string.format([[
@@ -505,7 +531,14 @@ Session.handoff_start_lock = function(...)
   local marker = assert(io.open(%q, "w"))
   marker:write(tostring(WheelHost.proc.pid()))
   marker:close()
-  os.execute("sleep 1.0")
+  for _ = 1, 1500 do
+    local barrier = io.open(%q, "r")
+    if barrier then
+      barrier:close()
+      break
+    end
+    os.execute("sleep 0.02")
+  end
   return original_handoff(...)
 end
 local Daemon = require("wheel.daemon")
@@ -515,7 +548,7 @@ os.exit(Daemon.run({
   wheel_version = "0.1.0",
   start_owner = tonumber(arg[3]),
 }))
-]], lua_root, lua_root, marker_path))
+]], lua_root, lua_root, marker_path, barrier_path))
   driver:close()
 
   local lua_bin = os.getenv("WHEEL_TEST_LUA")
@@ -542,8 +575,12 @@ os.exit(Daemon.run({
   end
   local old_pid = tonumber(marker or "")
   assert(old_pid and old_pid > 1, "the delayed daemon did not reach the handoff barrier")
+  started_sessions[#started_sessions + 1] = { name = name, pid = old_pid }
 
   local new_ok, new_output, new_error = cli_direct({ "start", name })
+  -- Release the old handoff only after the real start has completed (or
+  -- failed), so the test cannot depend on a wall-clock sleep under load.
+  WheelHost.fs.create_private_file(barrier_path, "go")
   assert(new_ok, "the late start failed: " .. tostring(new_error))
   local new_meta = decode_stdout("late start", new_output)
   assert(new_meta.name == name)
@@ -575,6 +612,19 @@ run_test("Session: start publishes private metadata and a live control plane", f
   assert(stored.pid == meta.pid, "start output must match published metadata")
   assert(stored.started_at == meta.started_at)
   assert(stored.wheel_version:match("^%d+%.%d+%.%d+$"))
+  assert(type(stored.start_owner) == "number", "metadata must bind the starter pid")
+  local inspected, inspected_alive, inspect_err = Session.inspect("demo", {
+    root = session_root,
+    start_owner = stored.start_owner,
+  })
+  assert(inspected and inspected_alive == true,
+    "metadata must match the recording starter: " .. tostring(inspect_err and inspect_err.message))
+  local mismatched, _, mismatch_err = Session.inspect("demo", {
+    root = session_root,
+    start_owner = stored.start_owner + 1,
+  })
+  assert(mismatched == nil and mismatch_err and mismatch_err.code == "E_SESSION_START_MISMATCH",
+    "a metadata record from another starter must be rejected")
 
   local dir_info = WheelHost.fs.stat(session_dir("demo"))
   assert(dir_info.directory and not dir_info.symlink and dir_info.mode == 448,
@@ -847,6 +897,37 @@ run_test("Session: a stale mutex is reclaimed", function()
     dir .. "/" .. Session.FILE_CLIENT_LOCK .. ".mutex", tostring(dead_pid) .. "\n"))
   local owner = WheelHost.proc.pid()
   assert(Session.acquire_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(Session.release_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(WheelHost.fs.remove_dir(dir) == true)
+end)
+
+run_test("Session: prune does not remove a live client lock", function()
+  local dir = session_dir("prune-live-client")
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(Session.acquire_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  local ok, err = Session.prune_stale_files(dir, owner)
+  assert(ok, "prune must tolerate a live client: " .. tostring(err and err.code))
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_CLIENT_LOCK).exists == true,
+    "prune must not remove a live canonical client lock")
+  assert(Session.release_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(WheelHost.fs.remove_dir(dir) == true)
+end)
+
+run_test("Session: prune restores a live stale tail when canonical is absent", function()
+  local dir = session_dir("prune-live-tail")
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.create_private_file(
+    dir .. "/client.lock.stale.1.1", tostring(owner) .. "\n"))
+  local ok, err = Session.prune_stale_files(dir, owner + 1)
+  assert(ok, "prune must restore a live tail: " .. tostring(err and err.code))
+  assert(WheelHost.fs.stat(dir .. "/client.lock").exists == true,
+    "a live stale tail must be restored to the canonical lock")
+  assert(WheelHost.fs.stat(dir .. "/client.lock.stale.1.1").exists == false,
+    "the restored tail must be removed")
   assert(Session.release_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
   assert(WheelHost.fs.remove_dir(dir) == true)
 end)

@@ -119,6 +119,8 @@ start)
   command -v setsid >/dev/null 2>&1 || die "setsid is required to detach the daemon"
   WHEEL_SESSION_CALLER_PID=$$
   export WHEEL_SESSION_CALLER_PID
+  WHEEL_SESSION_START_OWNER=$$
+  export WHEEL_SESSION_START_OWNER
   run_client prepare "$session_name" >/dev/null || exit $?
   setsid "$LUA_BIN" "$DAEMON_SCRIPT" \
     --root "$session_root" --name "$session_name" --version "$VERSION" \

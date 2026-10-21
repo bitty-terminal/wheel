@@ -8032,6 +8032,38 @@ run_test("WheelProvider: stdio command refusal, timeout, and output truncation a
     "successful stdio content must not include stderr diagnostics: " .. tostring(clean_err))
 end)
 
+run_test("WheelHost: Lua 5.2+ os.execute liveness probes fail closed", function()
+  local saved_execute = os.execute
+  local ok, err = pcall(function()
+    os.execute = function() return 0 end
+    assert(WheelHost.proc.is_alive(123) == true, "exit 0 must be alive")
+
+    os.execute = function() return 256 end
+    local alive, probe_err = WheelHost.proc.is_alive(123)
+    assert(alive == false and probe_err == nil,
+      "a Lua 5.1 exit status of 1 is a definite non-live probe")
+
+    os.execute = function() return nil, "exit", 127 end
+    alive, probe_err = WheelHost.proc.is_alive(123)
+    assert(alive == false and type(probe_err) == "string",
+      "a Lua 5.2+ probe failure must fail closed, not report a dead process")
+
+    os.execute = function() return nil, "signal", 9 end
+    alive, probe_err = WheelHost.proc.is_alive(123)
+    assert(alive == false and type(probe_err) == "string",
+      "a signalled probe must fail closed")
+
+    os.execute = saved_execute
+    local pid = WheelHost.proc.pid()
+    assert(type(pid) == "number" and WheelHost.proc.is_alive(pid) == true,
+      "a real liveness probe of the current process must succeed")
+  end)
+  os.execute = saved_execute
+  if not ok then
+    error(err)
+  end
+end)
+
 run_test("WheelHost: private file, FIFO, and pid primitives", function()
   local root = "/tmp/bitty/wheel-host-ctx0024-"
     .. tostring(WheelHost.proc.pid()) .. "-" .. tostring(os.time())

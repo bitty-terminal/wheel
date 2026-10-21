@@ -396,10 +396,10 @@ or multi-user surface.
   cannot exceed the frame after encoding. Snapshot and list responses are
   capped at 1024 entries and report truncation instead of growing without
   bound.
-- Metadata contains only protocol, session name, pid, start time, and harness
-  version. Snapshots contain slot names, kinds, hashes, versions, and sizes;
-  they never contain slot content or secret values. `context.get` returns slot
-  content only because the caller explicitly requested it.
+- Metadata contains only protocol, session name, pid, starter pid, start time,
+  and harness version. Snapshots contain slot names, kinds, hashes, versions,
+  and sizes; they never contain slot content or secret values. `context.get`
+  returns slot content only because the caller explicitly requested it.
 - One client lock file serialises each request/response exchange; a per-lock
   mutex serialises stale-lock reclamation. A moved lock whose owner changed is
   restored with a non-replacing hard link instead of deleted, and a concurrent
@@ -1025,10 +1025,13 @@ Known gaps relative to this policy (not claims of compliance):
   single-threaded daemon, and pure Lua has no client read timeout (the shell
   CLI bounds its own calls with `timeout` when available). Lock and metadata
   liveness is PID-only; a reused PID can be misclassified as live and require
-  manual stale-state cleanup. Removing a live session directory leaves an
-  unreachable daemon; the harness refuses to guess a pid and requires an
-  explicit stop by the recorded pid. No provider, task DAG, agent execution,
-  remote access, or multi-user authentication is claimed for this slice.
+  manual stale-state cleanup. A reaper that dies after renaming a live lock to
+  a `.stale` tail can leave the canonical path absent; cleanup restores a live
+  tail when canonical is absent, but a client in the crash window may require
+  manual recovery. Removing a live session directory leaves an unreachable
+  daemon; the harness refuses to guess a pid and requires an explicit stop by
+  the recorded pid. No provider, task DAG, agent execution, remote access, or
+  multi-user authentication is claimed for this slice.
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
   host, shows escaped full content plus a pure-Lua change diff under a per-run

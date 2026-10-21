@@ -28,8 +28,8 @@ local PROTOCOL = Session.PROTOCOL
 local MAX_REQUEST_BYTES = Session.MAX_REQUEST_BYTES
 local MAX_RESPONSE_BYTES = Session.MAX_RESPONSE_BYTES
 
-local function daemon_error(code, message)
-  return Session.error(code, message)
+local function daemon_error(code, message, class)
+  return Session.error(code, message, class)
 end
 
 local function err_args()
@@ -343,17 +343,30 @@ local function log_daemon_error(code, message)
 end
 
 local function cleanup(state)
-  -- Only the holder of the start lock may unlink control files. A concurrent
-  -- starter that already holds it will abort on the still-live metadata, and
-  -- this daemon leaves the directory intact for that starter (or the next one
-  -- after it exits) instead of racing it with unlinks.
-  local locked = Session.acquire_lock(state.session_dir, Session.FILE_START_LOCK, state.pid)
+  -- Only the holder of the start lock may unlink control files. If this daemon
+  -- still owns the start lock from a failed post-handoff startup, treat it as
+  -- held instead of re-acquiring (which would see its own pid as busy). A
+  -- concurrent starter that owns it makes this cleanup a no-op.
+  local owned_ok, owned = pcall(
+    Session.lock_owned_by, state.session_dir, Session.FILE_START_LOCK, state.pid)
+  local locked = owned_ok and owned == true
+  if not locked then
+    local acquire_ok, acquired = pcall(
+      Session.acquire_lock, state.session_dir, Session.FILE_START_LOCK, state.pid)
+    if not acquire_ok then
+      pcall(Session.release_lock, state.session_dir, Session.FILE_START_LOCK, state.pid)
+      pcall(Session.release_lock, state.session_dir,
+        Session.FILE_START_LOCK .. ".mutex", state.pid)
+      return
+    end
+    locked = acquired == true
+  end
   if not locked then
     return
   end
 
   local meta = Session.read_metadata(state.session_dir, state.name)
-  if not meta or meta.pid ~= state.pid then
+  if meta and meta.pid ~= state.pid then
     Session.release_start_lock(state.session_dir, state.pid)
     return
   end
@@ -374,7 +387,7 @@ local function cleanup(state)
     and meta_info.links == 1 then
     WheelHost.fs.remove_file(state.session_dir .. "/" .. Session.FILE_META)
   end
-  local pruned = Session.prune_stale_files(state.session_dir)
+  local pruned = Session.prune_stale_files(state.session_dir, state.pid)
   if not pruned then
     Session.release_start_lock(state.session_dir, state.pid)
     return
@@ -494,41 +507,45 @@ function Daemon.run(opts)
   local handoff_ok, handoff = pcall(
     Session.handoff_start_lock, session_dir, start_owner, pid)
   if not handoff_ok or not handoff then
+    pcall(Session.release_lock, session_dir, Session.FILE_START_LOCK .. ".mutex", pid)
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error("E_SESSION_START_FAILED", "cannot take ownership of the session start lock")
     return 3
   end
 
-  local time_ok, started_at = pcall(WheelHost.time.now)
-  if not time_ok then
-    pcall(Session.release_start_lock, session_dir, pid)
-    pcall(response.close, response)
-    pcall(request.close, request)
-    log_daemon_error("E_SESSION_START_FAILED", "the host time primitive is unavailable")
-    return 3
-  end
-  local context_ok, context = pcall(WheelContext.new, {})
-  if not context_ok then
-    pcall(Session.release_start_lock, session_dir, pid)
-    pcall(response.close, response)
-    pcall(request.close, request)
-    log_daemon_error("E_SESSION_START_FAILED", "cannot initialize the session context")
-    return 3
-  end
   local state = {
     name = name,
     pid = pid,
-    started_at = started_at,
+    started_at = nil,
     wheel_version = version,
     session_dir = session_dir,
     start_owner = start_owner,
-    context = context,
+    context = nil,
     requests = 0,
     request = request,
     response = response,
     running = true,
   }
+
+  local time_ok, started_at = pcall(WheelHost.time.now)
+  if not time_ok then
+    pcall(cleanup, state)
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "the host time primitive is unavailable")
+    return 3
+  end
+  state.started_at = started_at
+  local context_ok, context = pcall(WheelContext.new, {})
+  if not context_ok then
+    pcall(cleanup, state)
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "cannot initialize the session context")
+    return 3
+  end
+  state.context = context
 
   local wrote_ok, wrote, write_err = pcall(Session.write_metadata, session_dir, {
     protocol = PROTOCOL,
@@ -536,6 +553,7 @@ function Daemon.run(opts)
     pid = pid,
     started_at = started_at,
     wheel_version = version,
+    start_owner = start_owner,
   })
   if not wrote_ok or not wrote then
     pcall(cleanup, state)
