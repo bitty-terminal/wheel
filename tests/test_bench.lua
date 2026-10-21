@@ -270,16 +270,20 @@ run_test("bench: smoke evaluation rejects missing groups and failing ceilings", 
   end
   assert(smoke.evaluate(empty_groups).passed == false,
     "present but empty smoke groups must fail")
-  local mixed_groups = {}
-  for _, name in ipairs({ "activation", "process", "runner", "orchestration", "context" }) do
-    if name == "activation" then
-      mixed_groups[#mixed_groups + 1] = record[1]
-    else
-      mixed_groups[#mixed_groups + 1] = { name = name, series = {} }
-    end
+  local passing_activation = {
+    name = "activation",
+    series = {
+      { name = "cold_cpu", cardinality = nil, stats = { median = 1000, p95 = 1000 } },
+      { name = "warm_cpu", cardinality = nil, stats = { median = 1000, p95 = 1000 } },
+      { name = "warm_instructions", cardinality = nil, stats = { median = 1000, p95 = 1000 } },
+    },
+  }
+  local mixed_groups = { passing_activation }
+  for _, name in ipairs({ "process", "runner", "orchestration", "context" }) do
+    mixed_groups[#mixed_groups + 1] = { name = name, series = {} }
   end
   assert(smoke.evaluate(mixed_groups).passed == false,
-    "a populated group plus empty groups must fail")
+    "a populated passing group plus empty groups must fail")
   local failed = 0
   for _, check in ipairs(evaluation.checks) do
     if not check.ok then failed = failed + 1 end
