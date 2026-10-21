@@ -8158,7 +8158,7 @@ run_test("WheelProvider: stdio command refusal, timeout, and output truncation a
     "successful stdio content must not include stderr diagnostics: " .. tostring(clean_err))
 end)
 
-run_test("WheelHost: Lua 5.2+ os.execute liveness probes fail closed", function()
+run_test("WheelHost: os.execute liveness probes fail closed for raw and typed statuses", function()
   local saved_execute = os.execute
   local ok, err = pcall(function()
     os.execute = function() return 0 end
@@ -8178,6 +8178,11 @@ run_test("WheelHost: Lua 5.2+ os.execute liveness probes fail closed", function(
     alive, probe_err = WheelHost.proc.is_alive(123)
     assert(alive == false and type(probe_err) == "string",
       "a signalled probe must fail closed")
+
+    os.execute = function() return 1 end
+    alive, probe_err = WheelHost.proc.is_alive(123)
+    assert(alive == false and type(probe_err) == "string",
+      "a Lua 5.1 raw signal-1 status must fail closed, not report a dead process")
 
     os.execute = saved_execute
     local pid = WheelHost.proc.pid()

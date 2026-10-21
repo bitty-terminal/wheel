@@ -337,6 +337,35 @@ run_test("Session: stale-lock reclamation is serialized", function()
   end
 end)
 
+run_test("Session: acquire_lock releases its mutex after an unexpected host exception", function()
+  local dir = session_dir("acquire-exception")
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  local saved = WheelHost.fs.create_private_file
+  local ok, err = pcall(function()
+    WheelHost.fs.create_private_file = function(path, content)
+      if path:match("start%.lock$") then
+        error("injected host failure")
+      end
+      return saved(path, content)
+    end
+    local acquired, acquire_err = Session.acquire_lock(
+      dir, Session.FILE_START_LOCK, owner)
+    assert(acquired == false and acquire_err and acquire_err.code == "E_SESSION_IO",
+      "an unexpected host exception must become a typed I/O failure")
+  end)
+  WheelHost.fs.create_private_file = saved
+  if not ok then
+    error(err)
+  end
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK).exists == false,
+    "the main lock must not be left behind")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".mutex").exists == false,
+    "the start mutex must not be left behind")
+  assert(WheelHost.fs.remove_dir(dir) == true)
+end)
+
 run_test("Daemon: dispatch converts a context exception into a static error", function()
   local state = {
     name = "dispatch-test",
@@ -434,6 +463,83 @@ run_test("Daemon: cleanup treats its own start lock as held", function()
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
   assert(WheelHost.fs.stat(dir).exists == false)
+end)
+
+run_test("Daemon: cleanup leaves control files when metadata is missing", function()
+  local name = "cleanup-missing-meta"
+  local dir = session_dir(name)
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+
+  -- A foreign live daemon can be in exactly this state after a same-user
+  -- metadata removal or a failed publish. Cleanup did not observe a self-owned
+  -- start lock and never published metadata, so it must not unlink the files.
+  local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
+    "cleanup must not remove FIFOs without attributable metadata")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == true)
+  assert(WheelHost.fs.stat(dir).exists == true,
+    "cleanup must leave the unattributable session directory")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK).exists == false,
+    "cleanup must release the start lock it acquired")
+  remove_tree(dir)
+end)
+
+run_test("Daemon: cleanup leaves control files when metadata is unreadable", function()
+  local name = "cleanup-invalid-meta"
+  local dir = session_dir(name)
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+  -- Valid JSON that fails semantic validation: the metadata belongs to a
+  -- different session name while its pid is live.
+  local invalid = string.format(
+    '{"protocol":"%s","name":"other","pid":%d,"started_at":1,"wheel_version":"0.1.0"}',
+    Session.PROTOCOL, owner)
+  assert(WheelHost.fs.create_private_file(dir .. "/" .. Session.FILE_META, invalid) == true)
+
+  local state = { session_dir = dir, name = name, pid = owner, start_owner = nil }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_META).exists == true,
+    "cleanup must not remove unreadable metadata")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
+    "cleanup must not remove FIFOs when metadata is unreadable")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == true)
+  assert(WheelHost.fs.stat(dir).exists == true)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK).exists == false,
+    "cleanup must release the start lock it acquired")
+  remove_tree(dir)
+end)
+
+run_test("Daemon: cleanup removes files when it published metadata before it vanished", function()
+  local name = "cleanup-published-meta"
+  local dir = session_dir(name)
+  local owner = WheelHost.proc.pid()
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
+  assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+
+  -- Missing metadata is still attributable when this daemon published it
+  -- successfully before the record disappeared.
+  local state = {
+    session_dir = dir,
+    name = name,
+    pid = owner,
+    start_owner = nil,
+    metadata_published = true,
+  }
+  Daemon.cleanup(state)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
+  assert(WheelHost.fs.stat(dir).exists == false,
+    "a published daemon may remove its own empty directory")
 end)
 
 run_test("Daemon: an injected dispatch exception is typed and shutdown still cleans up", function()
@@ -929,6 +1035,51 @@ run_test("Session: prune restores a live stale tail when canonical is absent", f
   assert(WheelHost.fs.stat(dir .. "/client.lock.stale.1.1").exists == false,
     "the restored tail must be removed")
   assert(Session.release_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(WheelHost.fs.remove_dir(dir) == true)
+end)
+
+run_test("Session: prune respects the start-lock mutex contract", function()
+  local dir = session_dir("prune-start-mutex")
+  local owner = WheelHost.proc.pid()
+  local dead_pid = 2147483647
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  -- Simulate an in-progress start handoff: the canonical start mutex is held by
+  -- a live process while dead start-lock tails remain in the directory.
+  assert(WheelHost.fs.create_private_file(
+    dir .. "/" .. Session.FILE_START_LOCK .. ".mutex", tostring(owner) .. "\n"))
+  assert(WheelHost.fs.create_private_file(
+    dir .. "/" .. Session.FILE_START_LOCK .. ".stale." .. dead_pid .. ".1",
+    tostring(dead_pid) .. "\n"))
+  assert(WheelHost.fs.create_private_file(
+    dir .. "/" .. Session.FILE_START_LOCK .. ".mutex.stale." .. dead_pid .. ".1",
+    tostring(dead_pid) .. "\n"))
+
+  local ok, err = Session.prune_stale_files(dir, owner)
+  assert(ok, "prune must tolerate a busy start mutex: " .. tostring(err and err.code))
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".stale."
+    .. dead_pid .. ".1").exists == true,
+    "prune must not claim start tails without holding the start mutex")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".mutex.stale."
+    .. dead_pid .. ".1").exists == true,
+    "prune must not claim start-mutex tails without holding the start mutex")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".mutex").exists == true,
+    "prune must not remove a live start mutex")
+
+  -- Once the handoff releases the mutex, a later prune may reclaim the dead
+  -- tails and removes its own acquired mutex before returning.
+  assert(Session.release_lock(dir, Session.FILE_START_LOCK .. ".mutex", owner) == true)
+  ok, err = Session.prune_stale_files(dir, owner)
+  assert(ok, "prune must succeed after the start mutex is free: "
+    .. tostring(err and err.code))
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".stale."
+    .. dead_pid .. ".1").exists == false,
+    "prune must reclaim a dead start tail while holding the start mutex")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".mutex.stale."
+    .. dead_pid .. ".1").exists == false,
+    "prune must reclaim a dead start-mutex tail while holding the start mutex")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_START_LOCK .. ".mutex").exists == false,
+    "prune must release the start mutex it acquired")
   assert(WheelHost.fs.remove_dir(dir) == true)
 end)
 

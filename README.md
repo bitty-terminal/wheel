@@ -498,8 +498,10 @@ is a bounded schema path and reason; slot content is never included (schema path
 may name caller-provided slot, ref, or event keys). Invalid snapshot options are
 argument failures and use `E_ARGS_INVALID`. Snapshot v1 does not restore stash
 entries, bus subscribers, the kernel link, `config` directives, or budget
-configuration; stash event slot payloads are redacted from preserved bus history.
-The format and bounds are documented in [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
+configuration; stash event slot payloads are redacted on export and again by
+validation on import, so a crafted or pre-fix unredacted snapshot cannot restore
+them. The format and bounds are documented in
+[CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 
 `E_MODULE_LOAD_FAILED` is raised at activation when a required Wheel submodule
 cannot be loaded, or on first use when an optional lazy submodule fails. The
@@ -580,10 +582,11 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   failed closed. A not-running code means no live metadata/FIFO pair; a busy
   code means another client holds the per-session lock; an unsafe-path code
   means the session directory, metadata, or FIFO is a symlink, foreign-owned,
-  or not `0700`/`0600`; a frame-too-large code means a request exceeded 64 KiB.
-  A start-failed code usually means `setsid`, `mkfifo`, `kill`, or a Lua
-  interpreter is unavailable. The daemon writes no log content; diagnose with
-  probe/status and correct the path.
+  or not `0700`/`0600`; a frame-too-large code means a request exceeded 64 KiB;
+  a start-mismatch code means the live metadata belongs to a different starter
+  and was not adopted. A start-failed code usually means `setsid`, `mkfifo`,
+  `kill`, or a Lua interpreter is unavailable. The daemon writes no log content;
+  diagnose with probe/status and correct the path.
 - a session daemon is unreachable but its pid still exists — the control plane
   never force-kills an unverified pid. Confirm the recorded pid in
   `meta.json`, then stop it explicitly with `wheel-session stop` or, after
@@ -736,6 +739,20 @@ and never embed the runtime.
   starter aborts instead of clobbering a newer session. `stop` sends the explicit
   `shutdown` method and waits for the recorded pid; it never signals an
   unrecorded process.
+- **Errors**: session failures use the same static three-field shape as command
+  failures. The lifecycle codes are:
+
+  | `code`                       | Meaning                                                                                    |
+  | ---------------------------- | ------------------------------------------------------------------------------------------ |
+  | `E_SESSION_NOT_RUNNING`      | No live metadata/FIFO pair exists for the session.                                         |
+  | `E_SESSION_ALREADY_RUNNING`  | A live daemon already owns the session.                                                    |
+  | `E_SESSION_START_FAILED`     | The daemon did not become ready; a required host primitive is usually unavailable.         |
+  | `E_SESSION_START_MISMATCH`   | Live metadata belongs to a different starter and was not adopted by the waiting start.     |
+  | `E_SESSION_BUSY`             | Another client holds the per-session lock or a start-lock mutex is held by a live process. |
+  | `E_SESSION_METADATA_INVALID` | Metadata is present but fails protocol, name, pid, or version validation.                  |
+  | `E_SESSION_UNSAFE_PATH`      | A session path, metadata, or FIFO is symlinked, foreign-owned, or not `0700`/`0600`.       |
+  | `E_SESSION_CAS_CONFLICT`     | `context.put` expected a different slot version.                                           |
+
 - **Private state**: the session root and directory are `0700`; metadata and
   FIFOs are `0600`; symlinked or foreign-owned paths are refused. Snapshots
   contain slot names, kinds, hashes, versions, and sizes, never slot content.

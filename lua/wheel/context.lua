@@ -1433,7 +1433,9 @@ end
 
 -- Stash entries are intentionally outside snapshot v1, but their bus events
 -- carry the full slot map. Replace that payload with bounded metadata so a
--- snapshot never smuggles stash content through the event history.
+-- snapshot never smuggles stash content through the event history. Import
+-- applies the same sanitizer through snapshot validation, so a crafted or
+-- pre-fix unredacted snapshot cannot restore stash content either.
 local SNAPSHOT_STASH_EVENT_TYPES = {
   stash_pushed = true,
   stash_popped = true,
@@ -1473,7 +1475,8 @@ end
 -- commits, the bounded reflog, and the bounded bus history. Stash entries,
 -- bus subscribers, the kernel link, `config` directives, and local budget
 -- configuration are not part of snapshot v1. Stash event slot payloads are
--- redacted from the preserved bus history.
+-- redacted from the preserved bus history on export and again by validation on
+-- import, so a crafted or pre-fix unredacted snapshot cannot restore them.
 -- @param opts table|nil Reserved; must be a table when provided
 -- @return table|nil snapshot, or nil and a typed cause
 function WheelContext:export_snapshot(opts)

@@ -77,6 +77,17 @@ local REFLOG_FIELDS = {
   "index", "from_hash", "to_hash", "ref", "action", "message", "timestamp_ms",
 }
 
+-- Stash entries are outside snapshot v1, but their bus events carry the whole
+-- slot map. Validation sanitizes those events on every path (export, import,
+-- and canonical encoding), so a crafted or pre-fix unredacted snapshot cannot
+-- restore stash content through bus history.
+local STASH_EVENT_TYPES = {
+  stash_pushed = true,
+  stash_popped = true,
+}
+
+local STASH_METADATA_STRING_FIELDS = { "id", "message", "head_hash", "branch" }
+
 -- A private sentinel keeps validation failures separate from programming
 -- errors caught by the public pcall boundary.
 local REJECTION_KEY = {}
@@ -680,6 +691,31 @@ local function copy_reflog(value, path, commits, deps, state)
   return reflog
 end
 
+local function sanitize_stash_event(event, path, deps)
+  local stash = rawget(event, "stash")
+  if stash == nil then
+    return event
+  end
+  if type(stash) ~= "table" then
+    reject(path .. ".stash", "must be a table")
+  end
+  local redacted = { redacted = true }
+  for _, field in ipairs(STASH_METADATA_STRING_FIELDS) do
+    local value = rawget(stash, field)
+    if value ~= nil then
+      redacted[field] = check_string(value, path .. ".stash." .. field,
+        deps.max_metadata_bytes, true)
+    end
+  end
+  local timestamp_ms = rawget(stash, "timestamp_ms")
+  if timestamp_ms ~= nil then
+    redacted.timestamp_ms = check_timestamp(timestamp_ms,
+      path .. ".stash.timestamp_ms")
+  end
+  event.stash = redacted
+  return event
+end
+
 local function copy_bus_history(value, path, deps, state)
   local count = check_array(value, path, deps.max_bus_history)
   local history = {}
@@ -699,6 +735,9 @@ local function copy_bus_history(value, path, deps, state)
 
     local copied = copy_plain(event, event_path, deps, state, 0, {}, {})
     check_timestamp(copied.timestamp_ms, event_path .. ".timestamp_ms")
+    if STASH_EVENT_TYPES[copied.type] then
+      sanitize_stash_event(copied, event_path, deps)
+    end
     history[index] = copied
   end
   return history
