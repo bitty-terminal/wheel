@@ -162,6 +162,21 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- CTX-0021 / wheel#81 process-group identity: the `setsid` session leader is
+  now retained through the bounded TERM/grace/KILL sweep, writes the direct
+  command's exit status to the private status file before sending any signal,
+  and signals only its own recorded PGID, so the PGID cannot be reused while
+  the sweep runs. GNU `timeout` now runs with `--foreground`, which signals only
+  the direct child on expiry; the leader then sweeps background grandchildren.
+  Process results add `cleanup` (`swept`/`unverified`/`not_run`) and the
+  recorded `pgid`; if the leader is lost before the sweep, no signal is sent,
+  the run fails with `cleanup = unverified`, and the failure says the group was
+  not swept. Tests add status preservation with a swept background child, a
+  retained-leader liveness check at TERM time, a decoy group that survives, and
+  an identity-loss fixture. The accepted "same-user PGID reuse after leader
+  exit" residual is removed; a child that calls `setsid` or joins another
+  process group still escapes, and an externally killed leader can leave
+  descendants unswept (reported, never guessed).
 - CTX-0022 typed loader diagnostics: `team`, `context`, and `tool` load
   `wheel.errors` first, clear Lua 5.1 failed-require sentinels, preserve the
   typed `E_CAPABILITY_DENIED` class/code and rooted cause, keep present-but-

@@ -29,9 +29,9 @@
 -- Limitations (documented in README.md):
 --   * offline; no network, credentials, release claim, or plugin-VM evidence.
 --   * no asynchronous cancellation, OS sandbox, or Bitty panel/terminal
---     presentation run. Timeout, process-group, stdin, and scrubbed-environment
---     bounds are covered below; a child that calls setsid can still escape the
---     recorded group.
+--     presentation run. Timeout, retained-leader process-group identity,
+--     stdin, and scrubbed-environment bounds are covered below; a child that
+--     calls setsid or joins another group can still escape the recorded group.
 --   * single host and one interpreter per run; CPU frequency is not pinned.
 
 -- WHEEL_ROOT points the fixture at an installed artifact tree instead of the
@@ -564,9 +564,13 @@ local function build_evidence(status, failure)
   lines[#lines + 1] = "  environment read."
   lines[#lines + 1] = "- No release artifact, compatibility claim, or released-host"
   lines[#lines + 1] = "  integration is claimed."
-  lines[#lines + 1] = "- Process timeout, normal-exit process-group sweep, stdin, and"
-  lines[#lines + 1] = "  scrubbed-environment bounds are covered; asynchronous cancellation"
-  lines[#lines + 1] = "  and a child that calls setsid are not covered."
+  lines[#lines + 1] = "- Process timeout, the retained-leader process-group sweep (the"
+  lines[#lines + 1] = "  recorded PGID is held until the final KILL), stdin, and"
+  lines[#lines + 1] = "  scrubbed-environment bounds are covered. If the leader dies"
+  lines[#lines + 1] = "  early, cleanup is reported `unverified` and no signal is sent."
+  lines[#lines + 1] = "  Asynchronous cancellation and a child that leaves the"
+  lines[#lines + 1] = "  recorded group (setsid or another process group) are"
+  lines[#lines + 1] = "  not covered."
   lines[#lines + 1] = "- No OS sandbox/containment evidence and no Bitty panel/terminal"
   lines[#lines + 1] = "  presentation run; the host table is a presentation double only."
   lines[#lines + 1] = "- `os.clock()` is process CPU time, not elapsed wall clock; CPU"
@@ -831,6 +835,10 @@ local function main()
     "a timed-out process must report the typed timeout outcome")
   check(timed.code == 124 or timed.code == 137,
     "GNU timeout must map expiry to 124/137, got " .. tostring(timed.code))
+  check(timed.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "the retained leader must complete the timeout sweep, got " .. tostring(timed.cleanup))
+  check(type(timed.pgid) == "number" and timed.pgid > 1,
+    "the recorded PGID must be reported on a timeout")
   local grandchild = WheelHost.fs.read_file(group_pid_file)
   grandchild = grandchild and trim(grandchild) or ""
   check(grandchild:match("^%d+$") ~= nil, "the child must record its grandchild PID")
@@ -846,13 +854,20 @@ local function main()
   local normal_pid_file = BASE .. "/normal-exit.pid"
   local normal = WheelHost.proc.run_program("sh", {
     "-c",
-    "sleep 30 & echo $! > " .. shell_quote(normal_pid_file),
+    "sleep 30 & echo \"$! $(ps -o pgid= -p $!)\" > " .. shell_quote(normal_pid_file)
+      .. "; exit 9",
   })
-  check(normal.ok and normal.code == 0,
-    "a normal command with a background child must return success")
-  local normal_pid = WheelHost.fs.read_file(normal_pid_file)
-  normal_pid = normal_pid and trim(normal_pid) or ""
-  check(normal_pid:match("^%d+$") ~= nil, "the child must record its background PID")
+  check(normal.ok and normal.code == 9,
+    "a normal command with a background child must preserve its exit status")
+  check(normal.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "normal completion must report a completed sweep, got " .. tostring(normal.cleanup))
+  local normal_record = WheelHost.fs.read_file(normal_pid_file)
+  normal_record = normal_record and trim(normal_record) or ""
+  local normal_pid, normal_pgid = normal_record:match("^(%d+)%s+(%d+)$")
+  check(normal_pid ~= nil, "the child must record its background PID and PGID")
+  check(tonumber(normal_pgid) == normal.pgid,
+    "the recorded PGID must be the background child's group, got "
+      .. tostring(normal_pgid) .. " vs " .. tostring(normal.pgid))
   local normal_probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", normal_pid },
     { discard_stderr = true })
   local normal_state = normal_probe.code == 0 and trim(normal_probe.stdout) or ""
@@ -870,7 +885,9 @@ local function main()
   state.coverage[#state.coverage + 1] =
     "WheelHost.proc: timeout terminated the recorded process group (child and grandchild)"
   state.coverage[#state.coverage + 1] =
-    "WheelHost.proc: normal completion swept the recorded process group (background child)"
+    "WheelHost.proc: normal completion preserved status 9 and swept the recorded process group (background child)"
+  state.coverage[#state.coverage + 1] =
+    "WheelHost.proc: retained session leader holds the recorded PGID through the sweep"
   state.coverage[#state.coverage + 1] =
     "WheelHost.time: real wall-clock and CPU-time reads"
 

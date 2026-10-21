@@ -65,13 +65,18 @@
 --
 -- Process bounds and environment:
 -- A supervisor starts a `setsid -w` session leader that records its own
--- PID/PGID, then executes the scrubbed command under GNU `timeout` (or
--- `gtimeout`). On expiry timeout signals the command group and a bounded
--- kill-after escalates to SIGKILL. After the direct command exits for any
--- reason, the supervisor terminates any remaining members of the recorded PGID
--- with TERM and a bounded KILL, then preserves the direct command's status; a
--- child that calls `setsid` on its own can still escape. stdout and stderr are
--- redirected to private 0600 files and read back through a fixed cap
+-- PID/PGID, then runs the scrubbed command under GNU `timeout` (or `gtimeout`)
+-- with `--foreground`, so timeout signals only the direct child on expiry. The
+-- session leader is retained through the bounded group sweep: it waits for the
+-- command, writes the direct command's status to a private 0600 file before
+-- signaling anything, ignores TERM, sends TERM to its own process group, waits
+-- the sweep grace, records the sweep marker, and sends KILL to the group (which
+-- includes the leader). Because the leader holds the recorded PGID until that
+-- final KILL, the PGID cannot be reused while signals are sent, so the sweep
+-- can only target the recorded group. If the leader dies before the sweep, no
+-- signal is sent and the result reports `cleanup = "unverified"`. A child that
+-- calls `setsid` or joins another process group can still escape. stdout and
+-- stderr are redirected to private 0600 files and read back through a fixed cap
 -- (`WheelHost.LIMITS.MAX_CAPTURE_BYTES`, 256 KiB) so output cannot exhaust
 -- harness memory. The child environment is rebuilt from the allowlist in
 -- `ENV_ALLOWLIST` (PATH, HOME, LANG/LC_ALL, TERM, TMPDIR,
@@ -88,13 +93,16 @@
 --
 -- Process result shape: every `proc.*` primitive returns
 -- { ok, code, exit_code, stdout, stderr, timed_out, truncated,
---   stdout_truncated, stderr_truncated, outcome } where `ok` reports that the
--- execution was launched by the backend (a nonzero `code` still has ok = true;
--- a timeout is a launched process), `code`/`exit_code` carry the POSIX exit
--- status recorded by the wrapper, and `outcome` is one of
--- `WheelHost.PROCESS_OUTCOME` (`exited`, `timeout`, `unavailable`, `failure`).
--- GNU timeout maps expiry to 124 and kill-after escalation to 137; a command
--- that itself exits 124/137 is indistinguishable and is reported as a timeout.
+--   stdout_truncated, stderr_truncated, outcome, cleanup, pgid? } where `ok`
+-- reports that the execution was launched by the backend (a nonzero `code`
+-- still has ok = true; a timeout is a launched process), `code`/`exit_code`
+-- carry the POSIX exit status recorded by the retained leader, and `outcome` is
+-- one of `WheelHost.PROCESS_OUTCOME` (`exited`, `timeout`, `unavailable`,
+-- `failure`). `cleanup` is one of `WheelHost.GROUP_CLEANUP` (`swept`,
+-- `unverified`, `not_run`), and `pgid` is the recorded process-group id when
+-- the retained leader wrote it. GNU timeout maps expiry to 124 (kill-after
+-- escalation may surface 137); a command that itself exits 124/137 is
+-- indistinguishable and is reported as a timeout.
 --
 -- Temporary files:
 -- `WheelHost.tmp.name()` never uses the ambient temporary-name API. It returns
@@ -168,13 +176,14 @@ end
 -- Process and temporary-file bounds
 -- ---------------------------------------------------------------------------
 --
--- These are policy bounds, not suggestions. Every child process runs with one
+-- Process bounds are enforced below. Every child process runs with one
 -- explicit wall-clock timeout, and each stream is captured to a private file
 -- and read back through a fixed byte cap, so a runaway child cannot exhaust
 -- harness memory. Timeout enforcement is delegated to GNU `timeout` (coreutils
--- or `gtimeout`): it creates the child process group, records it, and signals
--- only that group on expiry. The harness never sends a name- or pattern-based
--- kill.
+-- or `gtimeout`) with `--foreground`, which signals only the direct child on
+-- expiry. The harness retains the recorded session leader through the bounded
+-- TERM/grace/KILL group sweep, so the recorded PGID cannot be reused while it
+-- is being signaled. The harness never sends a name- or pattern-based kill.
 
 --- Maximum bytes read back from each captured stream (256 KiB).
 local MAX_CAPTURE_BYTES = 256 * 1024
@@ -191,7 +200,7 @@ local MIN_TIMEOUT_MS = 50
 --- Grace period between SIGTERM and SIGKILL for the owned process group.
 local KILL_AFTER_MS = 2000
 
---- Grace period for the post-exit group sweep (TERM, then KILL).
+--- Grace period for the retained-leader group sweep (TERM, then KILL).
 local SWEEP_GRACE_MS = 250
 
 --- Maximum bytes accepted for one stdin payload (1 MiB).
@@ -263,6 +272,17 @@ WheelHost.PROCESS_OUTCOME = {
   FAILURE = "failure",
 }
 
+--- Process-group cleanup vocabulary. `swept` means the retained session leader
+--- completed the TERM/grace/KILL sweep of its own recorded group. `unverified`
+--- means the leader did not report the sweep marker, so no signal was sent after
+--- its identity was lost; descendants may survive. `not_run` means no group was
+--- launched (validation, unavailable surface, or spawn failure).
+WheelHost.GROUP_CLEANUP = {
+  SWEPT = "swept",
+  UNVERIFIED = "unverified",
+  NOT_RUN = "not_run",
+}
+
 --- Named bounds exposed for callers, documentation, and tests.
 WheelHost.LIMITS = {
   MAX_CAPTURE_BYTES = MAX_CAPTURE_BYTES,
@@ -276,16 +296,21 @@ WheelHost.LIMITS = {
   READ_CHUNK_BYTES = READ_CHUNK_BYTES,
 }
 
---- Post-exit supervisor. It runs `setsid -w <leader>` (the leader is the
---- session/PGID leader), preserves the command status, then terminates any
---- remaining members of the recorded PGID with TERM and a bounded KILL. It never
---- uses a name or pattern; `$pgid` is validated as a numeric PGID greater than 1.
-local SUPERVISOR_SCRIPT = 'pgid_file="$1"; grace="$2"; sleep_bin="$3"; shift 3; "$@"; status=$?; if [ -s "$pgid_file" ] && [ -f "$pgid_file" ] && [ ! -L "$pgid_file" ] && [ "$(stat -c \'%u %a %h\' -- "$pgid_file" 2>/dev/null)" = "$(id -u) 600 1" ]; then read -r pgid < "$pgid_file" || pgid=""; case "$pgid" in ""|*[!0-9]*) : ;; *) if [ "$pgid" -gt 1 ] && kill -0 -"$pgid" 2>/dev/null; then kill -TERM -"$pgid" 2>/dev/null || :; if kill -0 -"$pgid" 2>/dev/null; then "$sleep_bin" "$grace" 2>/dev/null || :; kill -KILL -"$pgid" 2>/dev/null || :; fi; fi ;; esac; fi; exit "$status"'
+--- Process-group supervisor wrapper. It redirects the command's streams to
+--- private files and runs the launch under `setsid -w`; its own stderr is
+--- redirected to a separate diagnostics file by the caller, because the shell
+--- reports the expected SIGKILL of the retained leader. The leader performs the
+--- group sweep, so the wrapper never signals anything and always exits 0.
+local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > "$out" 2> "$err"; exit 0'
 
---- Session leader. It records its own PID/PGID in the exclusive file created
---- by the host, then replaces itself with the scrubbed command chain. No caller
---- value is interpolated into this script.
-local LEADER_SCRIPT = 'pgid_file="$1"; shift; printf "%s\n" "$$" > "$pgid_file" || exit 125; exec "$@"'
+--- Session leader and group-identity holder. It records its own PID/PGID, runs
+--- the scrubbed command in the same group, writes the direct command's status
+--- before any signal, then holds the group identity through TERM, the bounded
+--- grace, and the final KILL. The KILL targets the whole recorded group and
+--- therefore takes the leader with it; the status and sweep files are already
+--- written. A leader that exits early never signals anything. No caller value is
+--- interpolated into this script.
+local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; grace="$4"; sleep_bin="$5"; shift 5; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the exit
@@ -325,6 +350,7 @@ local function process_failure(message, outcome)
     stdout_truncated = false,
     stderr_truncated = false,
     outcome = outcome or WheelHost.PROCESS_OUTCOME.FAILURE,
+    cleanup = WheelHost.GROUP_CLEANUP.NOT_RUN,
   }
 end
 
@@ -1162,15 +1188,18 @@ function standalone.new(opts)
 
     local out_path = fresh_temp()
     local err_path = fresh_temp()
+    local diag_path = fresh_temp()
     local status_path = fresh_temp()
+    local sweep_path = fresh_temp()
     local pgid_path = fresh_temp()
     local stdin_path
-    if out_path and err_path and status_path and pgid_path then
+    if out_path and err_path and diag_path and status_path and sweep_path and pgid_path then
       if stdin_data ~= nil then
         stdin_path = fresh_temp()
       end
     end
-    if (not out_path) or (not err_path) or (not status_path) or (not pgid_path)
+    if (not out_path) or (not err_path) or (not diag_path) or (not status_path)
+      or (not sweep_path) or (not pgid_path)
       or (stdin_data ~= nil and not stdin_path) then
       local errors = cleanup()
       local message = "cannot create private process-capture files"
@@ -1227,18 +1256,20 @@ function standalone.new(opts)
     local pieces = {
       shell_quote(sh_bin), "-c", shell_quote(SUPERVISOR_SCRIPT),
       shell_quote("wheel-supervisor"),
-      shell_quote(pgid_path), shell_quote(format_sleep(SWEEP_GRACE_MS)),
-      shell_quote(sleep_bin),
+      shell_quote(out_path), shell_quote(err_path),
       shell_quote(setsid_bin), "-w",
       shell_quote(sh_bin), "-c", shell_quote(LEADER_SCRIPT),
       shell_quote("wheel-leader"),
-      shell_quote(pgid_path),
+      shell_quote(pgid_path), shell_quote(status_path), shell_quote(sweep_path),
+      shell_quote(format_sleep(SWEEP_GRACE_MS)),
+      shell_quote(sleep_bin),
       shell_quote(env_bin), "-i",
     }
     for _, assignment in ipairs(env_parts) do
       pieces[#pieces + 1] = shell_quote(assignment)
     end
     pieces[#pieces + 1] = shell_quote(timeout_bin)
+    pieces[#pieces + 1] = "--foreground"
     pieces[#pieces + 1] = "-k"
     pieces[#pieces + 1] = format_seconds(kill_after_ms)
     pieces[#pieces + 1] = format_seconds(timeout_ms)
@@ -1250,10 +1281,14 @@ function standalone.new(opts)
       pieces[#pieces + 1] = shell_quote(arg)
     end
 
+    -- The supervisor redirects the command's streams and always exits 0; the
+    -- outer redirection keeps the wrapper shell's own diagnostics (including the
+    -- expected SIGKILL of the retained leader) out of the command's stderr. The
+    -- retained leader is the only process that signals the group and the only
+    -- authority for the command status; the status, sweep marker, and recorded
+    -- PGID are read back below.
     local command = table.concat(pieces, " ")
-      .. " > " .. shell_quote(out_path)
-      .. " 2> " .. shell_quote(err_path)
-      .. "; printf '%s' \"$?\" > " .. shell_quote(status_path)
+      .. " 2> " .. shell_quote(diag_path)
 
     local pipe = io.popen(command, "r")
     if not pipe then
@@ -1268,20 +1303,39 @@ function standalone.new(opts)
     pipe:close()
 
     local status_raw = backend.read_file_bounded(status_path, 32) or ""
+    local sweep_raw = backend.read_file_bounded(sweep_path, 32) or ""
+    local pgid_raw = backend.read_file_bounded(pgid_path, 32) or ""
     local code = tonumber(status_raw:match("^%s*(%d+)%s*$"))
+    local pgid = tonumber(pgid_raw:match("^%s*(%d+)%s*$"))
+    if pgid ~= nil and pgid <= 1 then
+      pgid = nil
+    end
+    local swept = sweep_raw:match("^%s*swept%s*$") ~= nil
     local out_raw = backend.read_file_bounded(out_path, capture_cap + 1) or ""
     local err_raw = backend.read_file_bounded(err_path, capture_cap + 1) or ""
     local cleanup_errors = cleanup()
 
     if code == nil then
-      local message = "the process wrapper did not report an exit status"
+      local diag_raw = backend.read_file_bounded(diag_path, 512) or ""
+      local message = "the process supervisor did not report the direct command's exit status; "
+        .. (swept
+          and "the recorded process group was swept without a confirmed status"
+          or "the recorded process group was not swept because the retained leader did not complete the identity-held sweep")
       if err_raw ~= "" then
         message = message .. ": " .. err_raw:sub(1, 512)
+      end
+      if diag_raw ~= "" then
+        message = message .. "; wrapper diagnostics: " .. diag_raw:sub(1, 512)
       end
       if #cleanup_errors > 0 then
         message = message .. "; cleanup failed: " .. table.concat(cleanup_errors, "; ")
       end
-      return process_failure(message)
+      local failure = process_failure(message)
+      failure.cleanup = swept
+        and WheelHost.GROUP_CLEANUP.SWEPT
+        or WheelHost.GROUP_CLEANUP.UNVERIFIED
+      failure.pgid = pgid
+      return failure
     end
 
     local timed_out = code == 124 or code == 137
@@ -1289,6 +1343,15 @@ function standalone.new(opts)
       and WheelHost.PROCESS_OUTCOME.TIMEOUT
       or WheelHost.PROCESS_OUTCOME.EXITED
     local ok = true
+    local group_cleanup = swept
+      and WheelHost.GROUP_CLEANUP.SWEPT
+      or WheelHost.GROUP_CLEANUP.UNVERIFIED
+    if group_cleanup == WheelHost.GROUP_CLEANUP.UNVERIFIED then
+      err_raw = err_raw
+        .. (#err_raw > 0 and "\n" or "")
+        .. "process-group cleanup unverified: the retained session leader exited before the sweep completed; "
+        .. "no signal was sent after the group identity was lost"
+    end
     if #cleanup_errors > 0 then
       outcome = WheelHost.PROCESS_OUTCOME.FAILURE
       ok = false
@@ -1319,6 +1382,8 @@ function standalone.new(opts)
       stdout_truncated = stdout_truncated,
       stderr_truncated = stderr_truncated,
       outcome = outcome,
+      cleanup = group_cleanup,
+      pgid = pgid,
     }
   end
 
@@ -1326,18 +1391,19 @@ function standalone.new(opts)
   -- primitive. This is the explicit shell-string surface for Execute-intent
   -- tools; argv call sites use `run_program`.
   -- The command runs in a `setsid`-recorded process group under GNU `timeout`.
-  -- Timeout expiry signals the group and a bounded kill-after escalates to
-  -- SIGKILL; after any direct-command exit the supervisor sweeps remaining
-  -- members of the recorded PGID with TERM/KILL and preserves the command
-  -- status. stdout and stderr are redirected to private 0600 files and read
-  -- back at most `opts.max_output_bytes` (default 256 KiB) so a runaway child
-  -- cannot exhaust harness memory. The child environment is rebuilt from the
-  -- allowlist; stdin is `/dev/null` unless `opts.stdin` supplies bytes.
+  -- Timeout expiry signals the direct child; the retained session leader then
+  -- sweeps remaining members of the recorded PGID with TERM, the bounded grace,
+  -- and KILL, and the direct command's status is preserved. stdout and stderr
+  -- are redirected to private 0600 files and read back at most
+  -- `opts.max_output_bytes` (default 256 KiB) so a runaway child cannot exhaust
+  -- harness memory. The child environment is rebuilt from the allowlist; stdin
+  -- is `/dev/null` unless `opts.stdin` supplies bytes.
   --
   -- Result: `ok` reports a launched process (a timeout is still launched),
   -- `code`/`exit_code` carry the shell status (124/137 map to timeout),
-  -- `timed_out`, `truncated`, `stdout_truncated`, `stderr_truncated`, and
-  -- `outcome` (exited|timeout|unavailable|failure) are explicit.
+  -- `timed_out`, `truncated`, `stdout_truncated`, `stderr_truncated`,
+  -- `outcome` (exited|timeout|unavailable|failure), and `cleanup`
+  -- (swept|unverified|not_run) are explicit.
   -- @param shell_string string
   -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
   --                         discard_stderr, env }
@@ -1728,6 +1794,7 @@ local function normalize_runner_result(result)
     outcome = timed_out
       and WheelHost.PROCESS_OUTCOME.TIMEOUT
       or WheelHost.PROCESS_OUTCOME.EXITED,
+    cleanup = WheelHost.GROUP_CLEANUP.NOT_RUN,
   }
 end
 
@@ -1737,7 +1804,7 @@ end
 -- With `env.command_runner` set (the existing tool injection seam), the runner
 -- is invoked with { command = shell_string } and its tool-shaped result is
 -- normalized; otherwise the backend runs the command under the setsid-recorded
--- process group, timeout, post-exit group sweep, output cap, and environment
+-- process group, timeout, retained-leader group sweep, output cap, and environment
 -- allowlist.
 -- @param shell_string string
 -- @param env table? { command_runner = function? }

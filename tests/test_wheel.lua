@@ -6865,7 +6865,14 @@ run_test("WheelHost: proc primitives (run_command, run_program, command_runner)"
   local res = WheelHost.proc.run_command("echo wheel-host-ok")
   assert(res.ok == true, "run_command must launch")
   assert(res.code == 0, "echo must exit 0")
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "a launched command must report a completed sweep")
   assert(string.find(res.stdout, "wheel-host-ok", 1, true) ~= nil, "stdout must be captured")
+
+  -- A validation failure never launches a process group.
+  local invalid = WheelHost.proc.run_program("true", {}, { timeout_ms = 1 })
+  assert(invalid.ok == false and invalid.cleanup == WheelHost.GROUP_CLEANUP.NOT_RUN,
+    "a validation failure must report cleanup=not_run")
 
   -- A failing command is still launched; the wrapper records the exit status.
   local fail = WheelHost.proc.run_command("exit 7")
@@ -6889,6 +6896,8 @@ run_test("WheelHost: proc primitives (run_command, run_program, command_runner)"
   })
   assert(seen_args ~= nil and seen_args.command == "ignored-command", "runner must see the shell string")
   assert(doubled.ok == true and doubled.code == 0)
+  assert(doubled.cleanup == WheelHost.GROUP_CLEANUP.NOT_RUN,
+    "a command_runner double never launches a host group")
   assert(doubled.stdout == "runner-double", "runner output is normalized into the seam shape")
 
   local failing = WheelHost.proc.run_command("ignored-command", {
@@ -6922,6 +6931,33 @@ local function assert_test_process_gone(pid, label)
   assert(state == nil, label .. " must not leave a running process; state=" .. tostring(state))
 end
 
+local function read_test_file(path)
+  local fh = io.open(path, "r")
+  if not fh then
+    return nil
+  end
+  local data = fh:read("*a")
+  fh:close()
+  return (data:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function wait_for_test_file(path, attempts)
+  for _ = 1, attempts or 25 do
+    local value = read_test_file(path)
+    if value ~= nil and value ~= "" then
+      return value
+    end
+    os.execute("sleep 0.02")
+  end
+  return nil
+end
+
+local function kill_recorded_test_pid(pid)
+  if type(pid) == "string" and pid:match("^%d+$") then
+    os.execute("kill " .. pid .. " 2>/dev/null || :")
+  end
+end
+
 run_test("WheelHost: timeout kills only the recorded process group", function()
   local root = "/tmp/bitty/test_host_proc_group"
   os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
@@ -6937,6 +6973,10 @@ run_test("WheelHost: timeout kills only the recorded process group", function()
   assert(res.timed_out == true and (res.exit_code == 124 or res.exit_code == 137),
     "GNU timeout must map expiry to 124/137: " .. tostring(res.code))
   assert(res.outcome == WheelHost.PROCESS_OUTCOME.TIMEOUT, "timeout must be a typed outcome")
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "the retained leader must complete the timeout sweep: " .. tostring(res.cleanup))
+  assert(type(res.pgid) == "number" and res.pgid > 1,
+    "the recorded PGID must be reported on a timeout")
 
   local fh = io.open(pid_file, "r")
   local grandchild = fh and fh:read("*l") or nil
@@ -7016,6 +7056,155 @@ run_test("WheelHost: normal exit sweeps the recorded process group", function()
     "the TERM-ignoring child must record its PID")
   assert_test_process_gone(stubborn_pid, "TERM-ignoring background child")
 
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: retained leader preserves status and reports the recorded PGID", function()
+  local root = "/tmp/bitty/test_host_pgid_identity"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local record = root .. "/background.txt"
+
+  local res = backend.run_program("sh", {
+    "-c",
+    "sleep 30 & child=$!; printf '%s %s' \"$child\" \"$(ps -o pgid= -p \"$child\")\" > "
+      .. WheelHost.proc.shell_quote(record) .. "; exit 7",
+  })
+
+  assert(res.ok == true, "the command must be launched")
+  assert(res.code == 7 and res.exit_code == 7,
+    "the direct command's exit status must survive the sweep: " .. tostring(res.code))
+  assert(res.outcome == WheelHost.PROCESS_OUTCOME.EXITED)
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "a normal exit must report a completed group sweep: " .. tostring(res.cleanup))
+  assert(type(res.pgid) == "number" and res.pgid > 1,
+    "the recorded PGID must be returned: " .. tostring(res.pgid))
+  assert(res.stderr == "", "a swept normal exit must keep stderr clean: " .. tostring(res.stderr))
+
+  local child_pid, child_pgid = (read_test_file(record) or ""):match("^(%d+)%s+(%d+)$")
+  assert(child_pid ~= nil, "the child must record its PID and process group")
+  assert(tonumber(child_pgid) == res.pgid,
+    "the recorded PGID must be the background child's group: "
+      .. tostring(child_pgid) .. " vs " .. tostring(res.pgid))
+  assert_test_process_gone(child_pid, "status-preserving sweep background child")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: the retained leader holds the PGID through the sweep", function()
+  local root = "/tmp/bitty/test_host_pgid_retention"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local marker = root .. "/leader-alive"
+  local ready = root .. "/ready"
+  local pid_file = root .. "/stubborn.pid"
+  local quote = WheelHost.proc.shell_quote
+
+  -- The background shell installs a TERM trap, reports readiness, then waits.
+  -- On TERM it records whether the recorded PGID (the retained leader) is still
+  -- alive, then keeps running so the bounded KILL escalation is exercised.
+  local script = "sh -c 'set -- $(ps -o pgid= -p $$); pgid=$1; "
+    .. "trap \"if kill -0 \\\"$pgid\\\" 2>/dev/null; then echo \\\"$pgid\\\" > $WHEEL_TEST_MARKER; "
+    .. "else echo gone > $WHEEL_TEST_MARKER; fi; sleep 30\" TERM; "
+    .. ": > $WHEEL_TEST_READY; sleep 30' & echo $! > " .. quote(pid_file) .. "; "
+    .. "i=0; while [ ! -f \"$WHEEL_TEST_READY\" ] && [ $i -lt 300 ]; do sleep 0.01; i=$((i+1)); done"
+
+  local res = backend.run_program("sh", { "-c", script }, {
+    env = { WHEEL_TEST_MARKER = marker, WHEEL_TEST_READY = ready },
+  })
+
+  assert(res.ok == true and res.code == 0,
+    "a command with a TERM-ignoring background child must still exit normally")
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "the retained leader must complete the sweep: " .. tostring(res.cleanup))
+  assert(res.stderr == "", "the sweep must not add stderr: " .. tostring(res.stderr))
+
+  local observed = wait_for_test_file(marker, 25)
+  assert(observed == tostring(res.pgid),
+    "the recorded PGID must still be the live leader when the sweep sends TERM: "
+      .. tostring(observed) .. " vs " .. tostring(res.pgid))
+
+  local stubborn_pid = read_test_file(pid_file)
+  assert(stubborn_pid ~= nil and stubborn_pid:match("^%d+$") ~= nil,
+    "the TERM-ignoring child must record its PID")
+  assert_test_process_gone(stubborn_pid, "TERM-ignoring grandchild held by the leader")
+
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: an unrelated process group is never signaled", function()
+  local root = "/tmp/bitty/test_host_pgid_decoy"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local decoy_pid_file = root .. "/decoy.pid"
+  local decoy_pid = nil
+
+  -- Start a decoy in its own session and process group. It is never part of a
+  -- Wheel invocation, so no Wheel sweep may signal it. With a retained leader
+  -- the recorded PGID cannot be recycled while the sweep runs; this live decoy
+  -- is the deterministic stand-in for a reused/foreign group.
+  os.execute("setsid sh -c 'echo $$ > " .. WheelHost.proc.shell_quote(decoy_pid_file)
+    .. "; exec sleep 30' >/dev/null 2>&1 &")
+  local recorded_decoy = wait_for_test_file(decoy_pid_file, 50)
+  if recorded_decoy and recorded_decoy:match("^%d+$") then
+    decoy_pid = recorded_decoy
+  end
+  assert(decoy_pid ~= nil, "the decoy must record its session PID")
+
+  local own_pid_file = root .. "/own.pid"
+  local res = backend.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. WheelHost.proc.shell_quote(own_pid_file),
+  })
+
+  assert(res.ok == true and res.code == 0, "the swept command must exit normally")
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.SWEPT)
+  assert(res.pgid ~= tonumber(decoy_pid),
+    "the recorded PGID must not be the decoy group")
+
+  local own_pid = read_test_file(own_pid_file)
+  assert(own_pid ~= nil and own_pid:match("^%d+$") ~= nil,
+    "the swept child must record its PID")
+  assert_test_process_gone(own_pid, "swept background child")
+  local decoy_state = test_process_state(decoy_pid)
+  assert(decoy_state ~= nil and decoy_state:sub(1, 1) ~= "Z",
+    "an unrelated process group must survive the sweep: " .. tostring(decoy_state))
+
+  kill_recorded_test_pid(decoy_pid)
+  os.execute("rm -rf " .. root)
+end)
+
+run_test("WheelHost: an identity-lost leader is reported unverified and signals nothing", function()
+  local root = "/tmp/bitty/test_host_pgid_identity_loss"
+  os.execute("rm -rf " .. root .. " && mkdir -p " .. root)
+  local backend = WheelHost.create_backend("standalone", { tmp_root = root })
+  local orphan_file = root .. "/orphan.pid"
+
+  -- The command kills its own session leader before the sweep can run. The
+  -- harness cannot prove the recorded PGID identity any more, so it must not
+  -- signal the group; the failure is typed and the orphan survives.
+  local res = backend.run_program("sh", {
+    "-c",
+    "sleep 30 & echo $! > " .. WheelHost.proc.shell_quote(orphan_file)
+      .. "; set -- $(ps -o sid= -p $$); kill -9 \"$1\"; sleep 0.2",
+  })
+
+  assert(res.ok == false, "an identity-lost run must not report success")
+  assert(res.outcome == WheelHost.PROCESS_OUTCOME.FAILURE,
+    "the identity loss must be a typed failure: " .. tostring(res.outcome))
+  assert(res.cleanup == WheelHost.GROUP_CLEANUP.UNVERIFIED,
+    "the identity loss must be reported as unverified cleanup: " .. tostring(res.cleanup))
+  assert(type(res.stderr) == "string" and res.stderr:find("not swept", 1, true) ~= nil,
+    "the failure must state that the group was not swept: " .. tostring(res.stderr))
+
+  local orphan_pid = wait_for_test_file(orphan_file, 25)
+  assert(orphan_pid ~= nil and orphan_pid:match("^%d+$") ~= nil,
+    "the orphan must record its PID")
+  local orphan_state = test_process_state(orphan_pid)
+  assert(orphan_state ~= nil and orphan_state:sub(1, 1) ~= "Z",
+    "the unverified group must not be signaled: " .. tostring(orphan_state))
+
+  kill_recorded_test_pid(orphan_pid)
   os.execute("rm -rf " .. root)
 end)
 
