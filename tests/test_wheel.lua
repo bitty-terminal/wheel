@@ -7586,6 +7586,21 @@ run_test("WheelProvider: stdio command refusal, timeout, and output truncation a
   local failed = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
   local fail_res, fail_err = failed:complete({ messages = {} })
 
+  backend.run_program = function()
+    return {
+      ok = true,
+      code = 0,
+      exit_code = 0,
+      stdout = "model-answer",
+      stderr = "cli warning",
+      outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+      timed_out = false,
+      truncated = false,
+    }
+  end
+  local clean = WheelProvider.StdioAdapter.new({ command = "mock_model_cli" })
+  local clean_res, clean_err = clean:complete({ messages = {} })
+
   backend.run_program = saved_run_program
 
   assert(timeout_res == nil and type(timeout_err) == "string"
@@ -7597,6 +7612,8 @@ run_test("WheelProvider: stdio command refusal, timeout, and output truncation a
   assert(fail_res == nil and type(fail_err) == "string"
     and fail_err:find("stdio stderr detail", 1, true) ~= nil,
     "nonzero stdio exit must retain stderr diagnostics")
+  assert(clean_res ~= nil and clean_res.content == "model-answer",
+    "successful stdio content must not include stderr diagnostics: " .. tostring(clean_err))
 end)
 
 run_test("WheelHost: context and team wall-clock sites route through time.now", function()
