@@ -71,6 +71,7 @@ function M.parse(argv)
     format = "human",
     profile = "full",
     smoke = false,
+    scenario_supplied = false,
     help = false,
   }
 
@@ -96,6 +97,7 @@ function M.parse(argv)
       if type(value) ~= "string" or value == "" then
         return nil, "--scenario requires a name"
       end
+      options.scenario_supplied = true
       local scenario_error = add_scenario(options, value)
       if scenario_error then
         return nil, scenario_error
@@ -124,6 +126,12 @@ function M.parse(argv)
     index = index + 1
   end
 
+  if options.scenario_supplied and #options.scenarios == 0 then
+    return nil, "--scenario requires at least one scenario name"
+  end
+  if options.smoke and options.scenario_supplied then
+    return nil, "--smoke runs the full bounded profile; do not combine it with --scenario"
+  end
   if #options.scenarios == 0 then
     for _, name in ipairs(M.SCENARIOS) do
       options.scenarios[#options.scenarios + 1] = name

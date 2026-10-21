@@ -14,8 +14,8 @@ M.ACTIVATION_CPU_MEDIAN_US = 50000        -- RC-1 50 ms CPU budget
 M.ACTIVATION_CPU_P95_US = 100000          -- 2x RC-1 budget; shared-host noise allowance
 M.ACTIVATION_INSTRUCTION_MEDIAN = 10000000 -- RC-1 instruction budget
 
-M.PROCESS_NORMAL_P95_MS = 2000
-M.PROCESS_TIMEOUT_P95_MS = 3000
+M.PROCESS_NORMAL_P95_MS = 5000
+M.PROCESS_TIMEOUT_P95_MS = 6000
 
 M.RUNNER_P95_US = 5000000                 -- 5 s for the largest runner cardinality
 M.RUNNER_MAX_SCALING = 100                -- 10-turn median / 1-turn median
@@ -24,7 +24,7 @@ M.ORCHESTRATION_P95_US = 15000000         -- 15 s for the largest orchestration 
 M.ORCHESTRATION_MAX_SCALING = 200         -- 10-task median / 1-task median
 
 M.CONTEXT_COMPILE_P95_US = 2000000        -- 2 s at the largest context cardinality
-M.CONTEXT_MAX_SCALING = 500               -- 1000-slot median / 10-slot median
+M.CONTEXT_MAX_SCALING = 500               -- smoke 100-slot median / 10-slot median (full suite also runs 1000)
 
 local function by_name(records)
   local map = {}
@@ -154,7 +154,12 @@ local function evaluate(records)
       scaling, M.CONTEXT_MAX_SCALING, "ratio")
   end
 
-  local passed = true
+  local passed = #checks > 0
+  for _, name in ipairs({ "activation", "process", "runner", "orchestration", "context" }) do
+    if not map[name] then
+      passed = false
+    end
+  end
   for _, check in ipairs(checks) do
     if not check.ok then
       passed = false

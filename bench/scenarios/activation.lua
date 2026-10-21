@@ -149,7 +149,7 @@ function M.run(ctx)
 
   -- Warm-up activation (untimed) keeps first-use allocator effects out of the
   -- warm series. Cold samples always start a fresh process.
-  for _ = 1, math.max(1, ctx.warmup) do
+  for _ = 1, ctx.warmup do
     require_entry(false)
   end
 

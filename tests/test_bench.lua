@@ -11,6 +11,7 @@ package.path = "./lua/?.lua;./lua/?/init.lua;./?.lua;./?/init.lua;" .. package.p
 local stats = require("bench.lib.stats")
 local json = require("bench.lib.json")
 local cli = require("bench.lib.cli")
+local smoke = require("bench.lib.smoke")
 
 local function run_test(name, fn)
   local ok, err = pcall(fn)
@@ -208,7 +209,7 @@ end)
 
 run_test("bench: context scenario emits a machine-readable record", function()
   local output, code = run_bench(
-    "--smoke --scenario context --samples 1 --format json")
+    "--scenario context --samples 1 --format json")
   assert(code == 0, "expected exit 0, got " .. tostring(code) .. ": " .. output)
   assert(output:sub(1, 1) == "{", "JSON record must start with an object")
   assert(output:sub(-1) == "}", "JSON record must end with an object")
@@ -235,12 +236,35 @@ run_test("bench: activation scenario uses the fresh-process path", function()
   assert(output:find('"registrations":14', 1, true) ~= nil, "activation must register the 14 commands")
 end)
 
-run_test("bench: release smoke is bounded and emits checks", function()
+run_test("bench: empty or subset smoke invocations fail closed", function()
   local output, code = run_bench(
     "--smoke --scenario context --samples 1 --format json")
-  assert(code == 0, "release smoke must pass: " .. output)
-  assert(output:find('"smoke":{"checks"', 1, true) ~= nil, "smoke checks missing")
-  assert(output:find('"passed":true', 1, true) ~= nil, "smoke must report a pass")
+  assert(code == 2, "smoke subset must be rejected, got " .. tostring(code) .. ": " .. output)
+  local empty_output, empty_code = run_bench("--scenario , --samples 1 --format json")
+  assert(empty_code == 2,
+    "empty scenario selector must be rejected, got " .. tostring(empty_code) .. ": " .. empty_output)
+end)
+
+run_test("bench: smoke evaluation rejects missing groups and failing ceilings", function()
+  local empty = smoke.evaluate({})
+  assert(empty.passed == false, "empty smoke evidence must not pass")
+  local record = {
+    {
+      name = "activation",
+      series = {
+        { name = "cold_cpu", cardinality = nil, stats = { median = 60000, p95 = 60000 } },
+        { name = "warm_cpu", cardinality = nil, stats = { median = 60000, p95 = 60000 } },
+        { name = "warm_instructions", cardinality = nil, stats = { median = 20000000, p95 = 20000000 } },
+      },
+    },
+  }
+  local evaluation = smoke.evaluate(record)
+  assert(evaluation.passed == false, "a failing/missing smoke check must fail")
+  local failed = 0
+  for _, check in ipairs(evaluation.checks) do
+    if not check.ok then failed = failed + 1 end
+  end
+  assert(failed > 0, "expected at least one failed smoke check")
 end)
 
 print("[PASS] all benchmark harness tests")

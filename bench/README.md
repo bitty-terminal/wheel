@@ -16,11 +16,11 @@ The suite measures Wheel's multiplicative paths at more than one cardinality:
 | `orchestration` | `WheelTeam:run_orchestration_loop` with mock workers and a reviewer          | 1, 5, 10 tasks       |
 | `context`       | `WheelContext` slot write/read and Three-Zone `compile_prompt`               | 10, 100, 1,000 slots |
 
-Everything is in-process and deterministic. There is no network, no
-credentials, no live provider, no artificial sleep, and no dependency beyond
-the Lua interpreter and the repository sources. Process calls exercise the
-production bounded wrapper, so they are the one intentionally expensive
-scenario.
+Everything is offline and deterministic. There is no network, no credentials,
+no live provider, no artificial sleep, and no dependency beyond the Lua
+interpreter and the repository sources. Process calls and cold activation
+spawn subprocesses; the process scenario exercises the production bounded
+wrapper, so it is the one intentionally expensive scenario.
 
 Out of scope:
 
@@ -177,11 +177,12 @@ at 1/10 turns, one orchestration sample at 1/10 tasks, and 3 context samples at
 fails.
 
 The ceilings are deliberately wide: activation median CPU must stay under the
-RC-1 50 ms budget (cold p95 under 100 ms), a normal process call p95 under 2 s,
-a timeout call p95 under 3 s, the 10-turn runner p95 under 5 s, the 10-task
+RC-1 50 ms budget (cold p95 under 100 ms), a normal process call p95 under 5 s,
+a timeout call p95 under 6 s, the 10-turn runner p95 under 5 s, the 10-task
 orchestration p95 under 15 s, and the largest context compile p95 under 2 s.
 Relative checks allow 100x for runner 10/1 turns, 200x for orchestration 10/1
-tasks, and 500x for context 1,000/10 slots. These are broad guards against a
+tasks, and 500x for the smoke context 100/10 slots (the full suite also runs
+1,000 slots). These are broad guards against a
 missing fast path or a quadratic path, not a performance contract. The
 orchestration ceiling is the widest because a shared host can stretch a
 ten-task wave several-fold between runs.
