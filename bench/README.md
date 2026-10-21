@@ -161,8 +161,7 @@ JSON output is a single object with stable, sorted keys:
         }
       ]
     }
-  ],
-  "smoke": { "passed": true, "checks": [] }
+  ]
 }
 ```
 

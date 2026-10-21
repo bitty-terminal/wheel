@@ -111,9 +111,9 @@ function M.run(ctx)
   local reports = {}
   local counts = {}
 
-  -- One cheap warm-up at the smallest size removes first-call effects without
-  -- paying the largest cardinality twice.
-  if ctx.warmup > 0 then
+  -- Warm up at the smallest size only, honoring the requested count; this
+  -- keeps --warmup 0 honest without paying the largest cardinality twice.
+  for _ = 1, ctx.warmup do
     run_once(sizes[1])
   end
 
