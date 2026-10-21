@@ -476,19 +476,27 @@ keeps its identity so the budget failure is not misreported. The token is not
 reachable from a handler and cannot be forged with a table field; it is not part
 of the public error contract.
 
-| `code`                        | `class`      | Meaning                                                                                                            |
-| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------ |
-| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                     |
-| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability. |
-| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                               |
-| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                           |
-| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                         |
-| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.        |
-| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.         |
+| `code`                        | `class`      | Meaning                                                                                                               |
+| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                        |
+| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.    |
+| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                  |
+| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                              |
+| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                            |
+| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.           |
+| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built. |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.            |
 
 `E_COMPLETION_BUDGET_INVALID` is raised by the provider adapters and
 `WheelRunner` before a network request when a `max_completion_tokens` override
 fails validation; it is not a command argument failure.
+
+`E_SNAPSHOT_INVALID` is raised by `WheelContext.import_snapshot` and
+`WheelContext.validate_snapshot` before any object is constructed. The message
+is a bounded schema path and reason; slot content, source paths, and secrets are
+never included. Snapshot v1 does not restore stash entries, bus subscribers, the
+kernel link, or budget configuration. The format and bounds are documented in
+[CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 
 `E_MODULE_LOAD_FAILED` is raised at activation when a required Wheel submodule
 cannot be loaded, or on first use when an optional lazy submodule fails. The
@@ -546,6 +554,10 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   negative, fractional, non-numeric, or above `MAX_COMPLETION_TOKENS` (32768).
   Use a positive integer within the bound or omit the override for the named
   default.
+- `E_SNAPSHOT_INVALID` — an imported `WheelContext` snapshot is malformed,
+  tampered, oversized, partial, or cryptographically inconsistent. Re-export
+  from the live context instead of editing the snapshot table; see
+  [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 - `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
   `PATH`; these

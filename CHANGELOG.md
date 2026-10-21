@@ -105,6 +105,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pinning, cardinality, sample count, and min/median/p95/max/IQR, with no host
   paths or committed host baseline. `just check` now runs the benchmark unit
   tests and one short context-scenario run.
+- Versioned `WheelContext` snapshots (CTX-0026 / wheel#87):
+  `WheelContext:export_snapshot`, `WheelContext.import_snapshot`, and
+  `WheelContext.validate_snapshot` persist and restore working slots, the Merkle
+  `tree_hash`, `HEAD`, refs, commits, the bounded reflog, and the bounded bus
+  history. Restore validates the `wheel-context-snapshot/1` format, required and
+  unknown fields, slot names/kinds and content hashes, 16 MiB content and 64 MiB
+  total bounds, 64-hex hashes, tree-hash and commit-hash consistency, branch
+  refs, commit-parent closure and cycles, and reflog references before
+  constructing an object. Failures use the typed validation
+  `E_SNAPSHOT_INVALID` cause and never expose a partial context; the input
+  snapshot is deep-copied and never mutated. `canonical_snapshot` provides
+  hash-table-order-independent bytes for round-trip comparison. Snapshot v1
+  deliberately excludes stash entries, bus subscribers, the kernel link, and
+  local budget configuration; daemon transport integration remains a follow-up.
 
 ### Changed
 

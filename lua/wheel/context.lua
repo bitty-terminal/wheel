@@ -72,6 +72,7 @@ WheelErrors = load_submodule("errors")
 local WheelConfig = load_submodule("config")
 
 local WheelHost = load_submodule("host")
+local WheelSnapshot = load_submodule("context_snapshot")
 
 -- ---------------------------------------------------------------------------
 -- Constants & Limits
@@ -84,6 +85,10 @@ WheelContext.DEFAULT_ZONE1_MAX_BYTES = 16 * 1024 -- 16 KiB
 WheelContext.DEFAULT_ZONE2_MAX_BYTES = 32 * 1024 -- 32 KiB
 WheelContext.DEFAULT_ZONE3_MAX_BYTES = 16 * 1024 -- 16 KiB
 WheelContext.MAX_BUS_HISTORY = 64
+WheelContext.MAX_REFLOG = 256
+WheelContext.SNAPSHOT_FORMAT = "wheel-context-snapshot/1"
+WheelContext.SNAPSHOT_VERSION = 1
+WheelContext.MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024 -- 64 MiB total snapshot bound
 
 WheelContext.SlotKind = {
   WORKSPACE = "workspace",
@@ -92,6 +97,12 @@ WheelContext.SlotKind = {
   SCRATCH = "scratch",
   CUSTOM = "custom",
 }
+
+-- Membership set of accepted slot-kind values for snapshot validation.
+local SLOT_KIND_VALUES = {}
+for _, kind in pairs(WheelContext.SlotKind) do
+  SLOT_KIND_VALUES[kind] = true
+end
 
 -- ---------------------------------------------------------------------------
 -- Cryptographic Hash Utility
@@ -231,6 +242,36 @@ local function validate_slot_name(name)
     return false, "slot name contains illegal control characters"
   end
   return true, nil
+end
+
+--- Assemble the snapshot validator's dependency and bound table.
+-- Snapshot-wide bounds are read at call time so a caller can tighten them
+-- without editing the shared module. The per-slot content and total limits are
+-- the same policy constants the live context enforces.
+-- @return table
+local function snapshot_deps()
+  return {
+    format = WheelContext.SNAPSHOT_FORMAT,
+    version = WheelContext.SNAPSHOT_VERSION,
+    compute_hash = WheelContext.compute_hash,
+    classify_slot_kind = classify_slot_kind,
+    slot_kinds = SLOT_KIND_VALUES,
+    max_slots = WheelSnapshot.MAX_SLOTS,
+    max_slot_name_bytes = WheelContext.MAX_SLOT_NAME_BYTES,
+    max_slot_content_bytes = WheelContext.MAX_SLOT_CONTENT_BYTES,
+    max_total_bytes = WheelContext.MAX_SNAPSHOT_BYTES,
+    max_slot_entries = WheelSnapshot.MAX_SLOT_ENTRIES,
+    max_commits = WheelSnapshot.MAX_COMMITS,
+    max_commit_parents = WheelSnapshot.MAX_COMMIT_PARENTS,
+    max_refs = WheelSnapshot.MAX_REFS,
+    max_reflog = WheelContext.MAX_REFLOG,
+    max_bus_history = WheelContext.MAX_BUS_HISTORY,
+    max_metadata_bytes = WheelSnapshot.MAX_METADATA_BYTES,
+    max_action_bytes = WheelSnapshot.MAX_ACTION_BYTES,
+    max_ref_name_bytes = WheelSnapshot.MAX_REF_NAME_BYTES,
+    max_depth = WheelSnapshot.MAX_VALUE_DEPTH,
+    max_nodes = WheelSnapshot.MAX_VALUE_NODES,
+  }
 end
 
 -- ---------------------------------------------------------------------------
@@ -609,7 +650,7 @@ function WheelContext:_append_reflog(entry)
     timestamp_ms = entry.timestamp_ms or (WheelHost.time.now() * 1000),
   }
   table.insert(self._reflog, record)
-  if #self._reflog > 256 then
+  if #self._reflog > WheelContext.MAX_REFLOG then
     table.remove(self._reflog, 1)
   end
   return record
@@ -1298,6 +1339,99 @@ function WheelContext:diff(from_ref, to_ref)
     unchanged = unchanged,
     count = count,
   }
+end
+
+-- ---------------------------------------------------------------------------
+-- Versioned Snapshot Export and Restore
+-- ---------------------------------------------------------------------------
+
+--- Export the complete in-memory context state as a versioned snapshot.
+-- The snapshot is a deep, caller-owned copy: mutating it never changes the
+-- context. It preserves working slots, the Merkle tree hash, HEAD, refs,
+-- commits, the bounded reflog, and the bounded bus history. Stash entries,
+-- bus subscribers, the kernel link, and local budget configuration are not
+-- part of snapshot v1.
+-- @param opts table|nil Reserved; must be a table when provided
+-- @return table|nil snapshot, or nil and a typed E_SNAPSHOT_INVALID cause
+function WheelContext:export_snapshot(opts)
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, WheelErrors.snapshot_invalid("export options must be a table")
+  end
+
+  local raw = {
+    format = WheelContext.SNAPSHOT_FORMAT,
+    version = WheelContext.SNAPSHOT_VERSION,
+    slots = self._slots,
+    tree_hash = self:tree_hash(),
+    head = self._head,
+    refs = self._refs,
+    commits = self._commits,
+    reflog = self._reflog,
+    bus_history = self.bus:history(),
+  }
+  local snapshot, detail = WheelSnapshot.validate(raw, snapshot_deps())
+  if not snapshot then
+    return nil, WheelErrors.snapshot_invalid(detail)
+  end
+  return snapshot
+end
+
+--- Validate a context snapshot without constructing a WheelContext.
+-- @param snapshot table
+-- @return boolean|nil true when valid, or nil and a typed E_SNAPSHOT_INVALID cause
+function WheelContext.validate_snapshot(snapshot)
+  local normalized, detail = WheelSnapshot.validate(snapshot, snapshot_deps())
+  if not normalized then
+    return nil, WheelErrors.snapshot_invalid(detail)
+  end
+  return true
+end
+
+--- Restore a new WheelContext from a validated snapshot.
+-- Validation and deep copying complete before the new object is populated, so
+-- a failed import never exposes a partially restored context. The input table
+-- is never mutated.
+-- @param snapshot table
+-- @param opts table|nil WheelContext.new options (kernel, config, bus, budgets)
+-- @return WheelContext|nil, or nil and a typed cause
+function WheelContext.import_snapshot(snapshot, opts)
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, WheelErrors.args_invalid("context.import_snapshot",
+      "options must be a table")
+  end
+
+  local normalized, detail = WheelSnapshot.validate(snapshot, snapshot_deps())
+  if not normalized then
+    return nil, WheelErrors.snapshot_invalid(detail)
+  end
+
+  local ctx = WheelContext.new(opts)
+  ctx._slots = normalized.slots
+  ctx._tree_hash = normalized.tree_hash
+  ctx._head = normalized.head
+  ctx._refs = normalized.refs
+  ctx._commits = normalized.commits
+  ctx._reflog = normalized.reflog
+  ctx.bus._history = normalized.bus_history
+  return ctx
+end
+
+--- Canonicalize a snapshot for deterministic byte comparison.
+-- Map keys are sorted bytewise and strings are escaped to printable ASCII, so
+-- two semantically identical snapshots produce identical bytes regardless of
+-- Lua hash-table iteration order.
+-- @param snapshot table
+-- @return string|nil canonical bytes, or nil and a typed cause
+function WheelContext.canonical_snapshot(snapshot)
+  local normalized, detail = WheelSnapshot.validate(snapshot, snapshot_deps())
+  if not normalized then
+    return nil, WheelErrors.snapshot_invalid(detail)
+  end
+  local bytes, encode_detail = WheelSnapshot.canonical_encode(normalized)
+  if not bytes then
+    return nil, WheelErrors.snapshot_invalid(encode_detail)
+  end
+  return bytes
 end
 
 -- ---------------------------------------------------------------------------

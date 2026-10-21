@@ -1939,7 +1939,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   -- so every rooted `wheel.<dep>` lookup is a real not-found result.
   local alternate_cases = {
     { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host" } },
-    { parent = "context", deps = { "errors", "config", "host" } },
+    { parent = "context", deps = { "errors", "config", "host", "context_snapshot" } },
     {
       parent = "tool",
       deps = { "errors", "host" },
@@ -8097,6 +8097,11 @@ run_test("WheelHost: context and team wall-clock sites route through time.now", 
     error(err)
   end
 end)
+
+-- CTX-0026: versioned context snapshot coverage lives in a focused file that
+-- receives the shared runner, so the suite keeps one PASS/FAIL contract.
+local run_context_snapshot_tests = assert(loadfile("tests/test_context_snapshot.lua"))()
+run_context_snapshot_tests(run_test)
 
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
