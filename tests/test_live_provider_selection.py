@@ -13,6 +13,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -245,5 +247,33 @@ assert message == (
 assert FAKE_KEY not in message
 assert fake_stdout.buffer.data == b""
 print("PASS live HTTP client fails closed on an unsupported selector")
+
+# 7. The Lua selector fails closed with exit 2 before reading a key.
+lua = next(
+    (candidate for candidate in ("lua5.1", "luajit", "lua") if shutil.which(candidate)),
+    None,
+)
+if lua is None:
+    print("SKIP Lua selector exit-code check: no Lua interpreter")
+else:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    env[client.PROVIDER_SELECTOR_ENV] = "bogus"
+    env.pop(OPENROUTER.api_key_env, None)
+    env.pop(COMMANDCODE.api_key_env, None)
+    result = subprocess.run(
+        [lua, "tests/test_live_provider.lua"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2, (
+        f"Lua unknown-provider exit must be 2, got {result.returncode}"
+    )
+    assert FAKE_KEY not in result.stdout and FAKE_KEY not in result.stderr
+    assert client.PROVIDER_SELECTOR_ENV in result.stderr
+    print("PASS live provider Lua selector fails closed with exit 2")
 
 print("PASS live provider selection")

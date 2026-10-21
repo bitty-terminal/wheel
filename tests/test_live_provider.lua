@@ -246,6 +246,7 @@ do
     max_completion_tokens = SMOKE_MAX_COMPLETION_TOKENS,
   }))
   assert(type(res.tool_calls) == "table" and #res.tool_calls >= 1, "tool call must be parsed")
+  assert(res.finish_reason ~= "length", "tool call must not exhaust the completion budget")
   local call = res.tool_calls[1]
   assert(call.name == "get_time", "tool call name must be parsed")
   assert(type(call.arguments) == "table", "tool arguments must be decoded into a table")
@@ -344,6 +345,10 @@ do
   print("LIVE " .. provider.name .. " runner OK (" .. tostring(report.iterations) .. " iterations)")
 end
 
+if provider.name == "commandcode" then
+  assert(SMOKE_MAX_COMPLETION_TOKENS >= 512 and RUNNER_MAX_COMPLETION_TOKENS >= 512,
+    "Command Code reasoning checks require at least 512 completion tokens")
+end
 assert(#observed_budgets >= 4, "every live request path must carry a bounded max_tokens")
 for _, budget in ipairs(observed_budgets) do
   assert(budget > 0 and budget <= WheelProvider.MAX_COMPLETION_TOKENS,

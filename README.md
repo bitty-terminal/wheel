@@ -806,8 +806,9 @@ WHEEL_LIVE_PROVIDER=commandcode just test-live  # Command Code
 - Command Code serves a reasoning model, so content-bearing checks use a
   1024-token completion budget (at least 512 is required; a 64-token budget can
   be consumed entirely by reasoning and return empty content with
-  `finish_reason: length`). The tests assert non-empty content and reject
-  `finish_reason: length`.
+  `finish_reason: length`). The completion, tool-call, and stream paths assert
+  non-empty content and reject `finish_reason: length`; the runner path asserts
+  the dispatched tool, iteration count, and non-empty deliverables.
 - The credential stays in the environment. The Lua adapter is constructed
   without an API key; `tests/live_http_client.py` (Python standard library,
   test-only) reads the selected provider's key variable from its inherited
