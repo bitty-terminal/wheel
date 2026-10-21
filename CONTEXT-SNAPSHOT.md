@@ -90,10 +90,13 @@ field, when present, must be a string. Map keys are limited to 256 bytes. Events
 are preserved as audit history, not replayed. `stash_pushed` and `stash_popped`
 events are normalized to bounded metadata (`id`, `message`, `head_hash`,
 `branch`, `timestamp_ms`, and `redacted = true`); their `stash.slots` map is
-removed by validation on export, import, and canonical encoding, and optional
-metadata that is not a bounded string or valid timestamp is omitted rather than
-stringified or rejected, so an unredacted event cannot carry stash content
-through a snapshot.
+removed by validation on export, import, and canonical encoding. Optional
+metadata on a normal stash event that is not a bounded string or valid
+timestamp is omitted rather than stringified or rejected. An event that exposes
+its stash fields only through `__pairs`/`__index` is sanitized after plain-data
+copying; an over-bound optional field exposed that way may still fail closed on
+the plain-data bounds before sanitization. In every case an unredacted event
+cannot carry stash content through a snapshot.
 
 `head` may name a branch ref that has no commit yet (an unborn branch, including
 a force-deleted active branch). That is a valid context state; the snapshot does

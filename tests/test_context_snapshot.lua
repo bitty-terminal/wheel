@@ -947,7 +947,7 @@ return function(run_test)
         { "timestamp_ms", timestamp_ms },
         { "stash", stash_payload },
       }
-      local event = setmetatable({}, {
+      local event = setmetatable({ timestamp_ms = timestamp_ms }, {
         __pairs = function()
           local index = 0
           return function()
@@ -975,32 +975,29 @@ return function(run_test)
       assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
         "the raw event must not expose the fabricated fields")
 
-      local ctx = WheelContext.new()
-      ctx.bus:publish(event)
-      local snapshot = assert(ctx:export_snapshot())
-      local exported
-      for _, entry in ipairs(snapshot.bus_history) do
-        if entry.type == "stash_pushed" then
-          exported = entry
-        end
-      end
-      assert(exported ~= nil,
-        "the metatable event must be copied as a stash event")
-      assert(exported.stash.redacted == true and exported.stash.slots == nil,
-        "post-copy sanitization must remove metatable stash content")
-      local canonical = assert(WheelContext.canonical_snapshot(snapshot))
+      -- Feed the metatable event directly to snapshot validation. Publishing
+      -- it on a live bus would exercise the producer redaction path instead of
+      -- the post-copy sanitizer.
+      local source = assert(WheelContext.new():export_snapshot())
+      source.bus_history = { event }
+
+      local canonical = assert(WheelContext.canonical_snapshot(source))
       assert(canonical:find(marker, 1, true) == nil,
         "canonical bytes must not contain metatable stash content")
 
-      local restored = assert(WheelContext.import_snapshot(snapshot))
+      local restored = assert(WheelContext.import_snapshot(source))
+      local imported
       for _, entry in ipairs(restored.bus:history()) do
         if entry.type == "stash_pushed" then
-          assert(entry.stash.redacted == true and entry.stash.slots == nil,
-            "imported metatable stash content must remain redacted")
+          imported = entry
         end
       end
+      assert(imported ~= nil,
+        "the metatable event must be copied as a stash event")
+      assert(imported.stash.redacted == true and imported.stash.slots == nil,
+        "import must remove metatable stash content")
       assert(rawget(event, "type") == nil and rawget(event, "stash") == nil,
-        "export must not materialize fabricated fields on the live event")
+        "validation must not materialize fabricated fields on the source event")
     end)
   end
 
