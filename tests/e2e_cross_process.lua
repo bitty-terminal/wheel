@@ -10,7 +10,11 @@ local WheelKernel = require("wheel.kernel")
 local WheelAgent = require("wheel.agent")
 local WheelUI = require("wheel.ui")
 
-local E2E_DIR = "/tmp/bitty/e2e_drill"
+-- Per-run private directory: `os.tmpname` yields a unique path, and the
+-- placeholder is replaced by this run's drill directory so concurrent drills
+-- never share FIFOs, a database, or a log.
+local E2E_DIR = os.tmpname()
+os.remove(E2E_DIR)
 local FIFO_IN = E2E_DIR .. "/in.fifo"
 local FIFO_OUT = E2E_DIR .. "/out.fifo"
 local DB_PATH = E2E_DIR .. "/wheel_drill.db"

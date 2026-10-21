@@ -115,6 +115,25 @@ readonly SCRIPT_DIR
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 readonly REPO_ROOT
 
+run_scratch=""
+
+cleanup_run_scratch() {
+  if [ -n "$run_scratch" ] && [ -d "$run_scratch" ]; then
+    rm -rf -- "$run_scratch"
+  fi
+}
+
+trap cleanup_run_scratch EXIT
+
+# The suite creates its own unique child under WHEEL_TEST_TMP; this outer
+# directory is only the fallback base that guarantees cleanup when the suite
+# exits before its own cleanup hook runs.
+if [ -z "${WHEEL_TEST_TMP:-}" ]; then
+  mkdir -p -- "$SCRATCH_BASE"
+  run_scratch="$(mktemp -d -- "$SCRATCH_BASE/wheel-test-run-XXXXXX")"
+  export WHEEL_TEST_TMP="$run_scratch"
+fi
+
 interpreter="$(print_selection)"
 case "$interpreter" in
 none)
@@ -132,4 +151,6 @@ lua)
   ;;
 esac
 
-exec "$interpreter" "$REPO_ROOT/tests/test_wheel.lua"
+status=0
+"$interpreter" "$REPO_ROOT/tests/test_wheel.lua" || status=$?
+exit "$status"
