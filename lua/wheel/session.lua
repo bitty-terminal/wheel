@@ -47,13 +47,21 @@ Session.SESSIONS_DIR = "sessions"
 Session.MAX_SESSION_NAME_BYTES = 32
 Session.SESSION_NAME_PATTERN = "^[a-z0-9][a-z0-9_-]*$"
 Session.MAX_REQUEST_BYTES = 64 * 1024
+Session.MAX_REQUEST_ENVELOPE_BYTES = 4096
 Session.MAX_RESPONSE_BYTES = 1024 * 1024
 Session.MAX_DRAIN_BYTES = 1024 * 1024
 Session.MAX_METADATA_BYTES = 8 * 1024
 Session.MAX_LOCK_BYTES = 128
 Session.MAX_PATH_BYTES = 4096
+Session.PRIVATE_DIR_MODE = 448
+Session.PRIVATE_FILE_MODE = 384
+Session.PRIVATE_DIR_MODE_STRING = "700"
 Session.MAX_CONTEXT_NAME_BYTES = 256
-Session.MAX_CONTEXT_CONTENT_BYTES = 48 * 1024
+-- Worst-case JSON escaping is six bytes per input byte (`\\u00XX`). Reserving
+-- an envelope and dividing by six guarantees that any accepted content value
+-- still fits the 64 KiB request frame without a late E_SESSION_FRAME_TOO_LARGE.
+Session.MAX_CONTEXT_CONTENT_BYTES = math.floor(
+  (Session.MAX_REQUEST_BYTES - Session.MAX_REQUEST_ENVELOPE_BYTES) / 6)
 Session.MAX_CONTEXT_SLOTS = 1024
 Session.MAX_CONTEXT_TOTAL_BYTES = 16 * 1024 * 1024
 Session.MAX_LIST_SLOTS = 1024
@@ -665,7 +673,7 @@ local function verify_private_directory(path)
   if euid == nil or info.uid ~= euid then
     return nil, err_unsafe_path()
   end
-  if info.mode ~= 448 then
+  if info.mode ~= Session.PRIVATE_DIR_MODE then
     return nil, err_unsafe_path()
   end
   return info
@@ -681,12 +689,62 @@ local function ensure_directory(path)
     if not created then
       return nil, err_io()
     end
-    local chmod_ok = WheelHost.fs.chmod(path, "700")
+    local chmod_ok = WheelHost.fs.chmod(path, Session.PRIVATE_DIR_MODE_STRING)
     if not chmod_ok then
       return nil, err_unsafe_path()
     end
   end
   return verify_private_directory(path)
+end
+
+--- Verify the immediate parent of a root path.
+-- The parent must be a real, user-owned directory and must not be a symlink.
+-- @param root string
+-- @param require_exists boolean
+-- @return boolean ok, table? err
+local function verify_root_parent(root, require_exists)
+  local parent = root:match("^(.*)/[^/]+$")
+  if parent == nil or parent == "" or parent == "/" then
+    return true, nil
+  end
+  local parent_info, parent_err = stat_path(parent)
+  if not parent_info then
+    return false, parent_err
+  end
+  if not parent_info.exists then
+    if require_exists then
+      return false, err_not_running()
+    end
+    return true, nil
+  end
+  local euid = WheelHost.fs.euid()
+  if parent_info.symlink or not parent_info.directory
+    or euid == nil or parent_info.uid ~= euid then
+    return false, err_unsafe_path()
+  end
+  return true, nil
+end
+
+--- Verify an existing private session root without creating or repairing it.
+-- Client read paths use this before opening any session file, so a symlinked,
+-- foreign-owned, or weaker-mode root cannot be followed even when the daemon
+-- itself was started elsewhere.
+-- @param root string
+-- @return boolean ok, table? err
+function Session.verify_root(root)
+  local ok, err = Session.validate_absolute_path(root)
+  if not ok then
+    return false, err
+  end
+  local parent_ok, parent_err = verify_root_parent(root, true)
+  if not parent_ok then
+    return false, parent_err
+  end
+  local info, dir_err = verify_private_directory(root)
+  if not info then
+    return false, dir_err
+  end
+  return true, nil
 end
 
 --- Ensure the session root exists and is private (mode 0700, owner only).
@@ -701,19 +759,9 @@ function Session.ensure_root(root)
   if not ok then
     return false, err
   end
-  local parent = root:match("^(.*)/[^/]+$")
-  if parent and parent ~= "" and parent ~= "/" then
-    local parent_info, parent_err = stat_path(parent)
-    if not parent_info then
-      return false, parent_err
-    end
-    if parent_info.exists then
-      local euid = WheelHost.fs.euid()
-      if parent_info.symlink or not parent_info.directory
-        or euid == nil or parent_info.uid ~= euid then
-        return false, err_unsafe_path()
-      end
-    end
+  local parent_ok, parent_err = verify_root_parent(root, false)
+  if not parent_ok then
+    return false, parent_err
   end
   local info, dir_err = ensure_directory(root)
   if not info then
@@ -746,7 +794,7 @@ function Session.ensure_session_dir(session_dir, create)
     if not created then
       return nil, err_io()
     end
-    local chmod_ok = WheelHost.fs.chmod(session_dir, "700")
+    local chmod_ok = WheelHost.fs.chmod(session_dir, Session.PRIVATE_DIR_MODE_STRING)
     if not chmod_ok then
       return nil, err_unsafe_path()
     end
@@ -800,7 +848,7 @@ function Session.read_metadata(session_dir, expected_name)
     return nil, err_unsafe_path()
   end
   local euid = WheelHost.fs.euid()
-  if euid == nil or info.uid ~= euid or info.mode ~= 448 then
+  if euid == nil or info.uid ~= euid or info.mode ~= Session.PRIVATE_DIR_MODE then
     return nil, err_unsafe_path()
   end
 
@@ -813,7 +861,7 @@ function Session.read_metadata(session_dir, expected_name)
     return nil, err_not_running()
   end
   if meta_info.symlink or not meta_info.regular or meta_info.uid ~= euid
-    or meta_info.mode ~= 384 or meta_info.links ~= 1 then
+    or meta_info.mode ~= Session.PRIVATE_FILE_MODE or meta_info.links ~= 1 then
     return nil, err_unsafe_path()
   end
   local raw = WheelHost.fs.read_file_bounded(path, Session.MAX_METADATA_BYTES + 1)
@@ -861,7 +909,7 @@ function Session.write_metadata(session_dir, meta)
   local info = stat_path(final_path)
   local euid = WheelHost.fs.euid()
   if not info or not info.exists or info.symlink or not info.regular
-    or euid == nil or info.uid ~= euid or info.mode ~= 384 or info.links ~= 1 then
+    or euid == nil or info.uid ~= euid or info.mode ~= Session.PRIVATE_FILE_MODE or info.links ~= 1 then
     return false, err_unsafe_path()
   end
   return true, nil
@@ -871,8 +919,8 @@ end
 -- @param meta table
 -- @return boolean? alive, table? err
 function Session.pid_alive(meta)
-  local alive, probe_err = WheelHost.proc.is_alive(meta.pid)
-  if probe_err ~= nil then
+  local ok, alive, probe_err = pcall(WheelHost.proc.is_alive, meta.pid)
+  if not ok or probe_err ~= nil then
     return nil, err_unresponsive()
   end
   return alive, nil
@@ -901,7 +949,7 @@ local function read_lock_owner(session_dir, name)
     return nil, err_lock_unsafe()
   end
   local euid = WheelHost.fs.euid()
-  if euid == nil or info.uid ~= euid or info.mode ~= 384 then
+  if euid == nil or info.uid ~= euid or info.mode ~= Session.PRIVATE_FILE_MODE then
     return nil, err_lock_unsafe()
   end
   local raw = WheelHost.fs.read_file_bounded(path, Session.MAX_LOCK_BYTES + 1)
@@ -951,8 +999,10 @@ local function claim_stale_lock(session_dir, lock_name, expected_owner)
     return false
   end
   -- The path changed after the caller inspected it. Restore the moved lock
-  -- rather than deleting a potentially live owner's lock.
-  if not WheelHost.fs.rename(stale_path, lock_path(session_dir, lock_name)) then
+  -- with a non-replacing hard link rather than overwriting a newer live lock.
+  if WheelHost.fs.link_exclusive(stale_path, lock_path(session_dir, lock_name)) then
+    WheelHost.fs.remove_file(stale_path)
+  else
     -- Leave the moved lock under its stale name. The caller fails closed; an
     -- unverified owner is never deleted.
   end
@@ -978,6 +1028,7 @@ local function acquire_mutex(session_dir, lock_name, owner_pid)
       if owner == owner_pid then
         return true, nil
       end
+      release_named_lock(session_dir, mutex_name, owner_pid)
       return false, err_busy()
     end
     local owner, read_err = read_lock_owner(session_dir, mutex_name)
@@ -1305,15 +1356,33 @@ function Session.request(name, method, params, opts)
   if not root then
     return nil, root_err
   end
+  local root_call_ok, root_ok, root_verify_err = pcall(Session.verify_root, root)
+  if not root_call_ok then
+    return nil, err_io()
+  end
+  if not root_ok then
+    if root_verify_err and root_verify_err.code == "E_SESSION_NOT_RUNNING" then
+      return nil, err_not_running()
+    end
+    return nil, root_verify_err
+  end
   local session_dir = make_session_dir(root, name)
-  local dir_ok, dir_err = Session.ensure_session_dir(session_dir, false)
+  local dir_call_ok, dir_ok, dir_err = pcall(
+    Session.ensure_session_dir, session_dir, false)
+  if not dir_call_ok then
+    return nil, err_io()
+  end
   if not dir_ok then
     if dir_err and dir_err.code == "E_SESSION_NOT_RUNNING" then
       return nil, err_not_running()
     end
     return nil, dir_err
   end
-  local meta, meta_err = Session.read_metadata(session_dir, name)
+  local meta_call_ok, meta, meta_err = pcall(
+    Session.read_metadata, session_dir, name)
+  if not meta_call_ok then
+    return nil, err_io()
+  end
   if not meta then
     return nil, meta_err
   end
@@ -1324,14 +1393,22 @@ function Session.request(name, method, params, opts)
   if not alive then
     return nil, err_not_running()
   end
-  local files_ok, files_err = Session.verify_control_files(session_dir)
+  local files_call_ok, files_ok, files_err = pcall(
+    Session.verify_control_files, session_dir)
+  if not files_call_ok then
+    return nil, err_io()
+  end
   if not files_ok then
     return nil, files_err
   end
 
   local owner_pid = opts.owner_pid
   if owner_pid == nil then
-    owner_pid = WheelHost.proc.pid()
+    local pid_ok, client_pid = pcall(WheelHost.proc.pid)
+    if not pid_ok then
+      return nil, err_io()
+    end
+    owner_pid = client_pid
   end
   if not valid_pid(owner_pid) then
     return nil, err_io()
@@ -1374,7 +1451,7 @@ end
 -- @param name string
 -- @param opts table?
 -- @return table? meta, boolean? alive, table? err
-function Session.inspect(name, opts)
+local function inspect_impl(name, opts)
   opts = type(opts) == "table" and opts or {}
   local name_ok, name_err = Session.validate_name(name)
   if not name_ok then
@@ -1383,6 +1460,10 @@ function Session.inspect(name, opts)
   local root, root_err = Session.resolve_root(opts)
   if not root then
     return nil, nil, root_err
+  end
+  local root_ok, root_verify_err = Session.verify_root(root)
+  if not root_ok then
+    return nil, nil, root_verify_err
   end
   local session_dir = make_session_dir(root, name)
   local meta, meta_err = Session.read_metadata(session_dir, name)
@@ -1396,6 +1477,18 @@ function Session.inspect(name, opts)
   return meta, alive, nil
 end
 
+--- Read metadata/liveness with a final typed host-failure boundary.
+-- @param name string
+-- @param opts table?
+-- @return table? meta, boolean? alive, table? err
+function Session.inspect(name, opts)
+  local ok, meta, alive, err = pcall(inspect_impl, name, opts)
+  if not ok then
+    return nil, nil, err_io()
+  end
+  return meta, alive, err
+end
+
 local function remove_private_entry(path, expected)
   local info, stat_err = stat_path(path)
   if not info then
@@ -1407,10 +1500,12 @@ local function remove_private_entry(path, expected)
   if info.symlink or info.uid ~= WheelHost.fs.euid() then
     return false, err_unsafe_path()
   end
-  if expected == "fifo" and (not info.fifo or info.links ~= 1) then
+  if expected == "fifo" and (not info.fifo or info.links ~= 1
+    or info.mode ~= Session.PRIVATE_FILE_MODE) then
     return false, err_unsafe_path()
   end
-  if expected == "file" and (not info.regular or info.links ~= 1) then
+  if expected == "file" and (not info.regular or info.links ~= 1
+    or info.mode ~= Session.PRIVATE_FILE_MODE) then
     return false, err_unsafe_path()
   end
   local removed = WheelHost.fs.remove_file(path)
@@ -1436,7 +1531,7 @@ function Session.verify_control_files(session_dir)
     if not info.exists then
       return false, err_not_running()
     end
-    if info.symlink or not info.fifo or info.uid ~= euid or info.mode ~= 384
+    if info.symlink or not info.fifo or info.uid ~= euid or info.mode ~= Session.PRIVATE_FILE_MODE
       or info.links ~= 1 then
       return false, err_unsafe_path()
     end
@@ -1464,6 +1559,82 @@ function Session.remove_control_files(session_dir)
   return true, nil
 end
 
+--- Remove known stale lock/temp files from a session directory.
+-- The caller must hold the start lock. Canonical client/start mutexes are
+-- reclaimed only when their owner is dead; stale tails and metadata temp files
+-- are removed only after an owned-regular-file check. Unknown files are left
+-- alone and can keep the directory from being removed, which fails closed.
+-- @param session_dir string
+-- @return boolean ok, table? err
+function Session.prune_stale_files(session_dir)
+  local listing = WheelHost.fs.list_dir(session_dir)
+  if not listing or listing.ok ~= true then
+    return false, err_io()
+  end
+  local euid = WheelHost.fs.euid()
+  if euid == nil then
+    return false, err_unsafe_path()
+  end
+  local client_aux = Session.FILE_CLIENT_LOCK .. ".mutex"
+  local start_aux = Session.FILE_START_LOCK .. ".mutex"
+  for _, line in ipairs(listing.entries or {}) do
+    local name = line:match("%s([^%s]+)$")
+    if name and name ~= "." and name ~= ".." and name ~= Session.FILE_START_LOCK
+      and name ~= Session.FILE_META then
+      local path = session_dir .. "/" .. name
+      local is_lock = name == Session.FILE_CLIENT_LOCK
+        or name == client_aux
+        or name == start_aux
+        or name:match("^" .. Session.FILE_CLIENT_LOCK:gsub("%.", "%%.") .. "%.stale%.")
+        or name:match("^" .. Session.FILE_START_LOCK:gsub("%.", "%%.") .. "%.stale%.")
+        or name:match("^" .. client_aux:gsub("%.", "%%.") .. "%.stale%.")
+        or name:match("^" .. start_aux:gsub("%.", "%%.") .. "%.stale%.")
+      if is_lock then
+        local owner, read_err = read_lock_owner(session_dir, name)
+        if owner == nil then
+          return false, read_err or err_lock_unsafe()
+        end
+        if owner ~= false then
+          local alive, probe_err = WheelHost.proc.is_alive(owner)
+          if probe_err ~= nil then
+            return false, err_busy()
+          end
+          if not alive then
+            if name == Session.FILE_CLIENT_LOCK or name == client_aux or name == start_aux then
+              if not claim_stale_lock(session_dir, name, owner) then
+                return false, err_busy()
+              end
+            else
+              local info = stat_path(path)
+              if info and info.exists then
+                if info.symlink or not info.regular or info.uid ~= euid
+                  or info.mode ~= Session.PRIVATE_FILE_MODE or info.links ~= 1 then
+                  return false, err_unsafe_path()
+                end
+                if not WheelHost.fs.remove_file(path) then
+                  return false, err_io()
+                end
+              end
+            end
+          end
+        end
+      elseif name:match("^meta%.json%..*%.tmp$") then
+        local info = stat_path(path)
+        if info and info.exists then
+          if info.symlink or not info.regular or info.uid ~= euid
+            or info.mode ~= Session.PRIVATE_FILE_MODE or info.links ~= 1 then
+            return false, err_unsafe_path()
+          end
+          if not WheelHost.fs.remove_file(path) then
+            return false, err_io()
+          end
+        end
+      end
+    end
+  end
+  return true, nil
+end
+
 --- Prepare a session runtime directory and FIFOs for a daemon start.
 -- The caller must hold the start lock for the whole spawn+readiness window.
 -- A live metadata pid is rejected; a dead one is cleaned. Invalid metadata is
@@ -1471,7 +1642,7 @@ end
 -- @param name string
 -- @param opts table? { root = string?, owner_pid = number? }
 -- @return string? session_dir, table? err
-function Session.prepare_start(name, opts)
+local function prepare_start_impl(name, opts)
   opts = type(opts) == "table" and opts or {}
   local name_ok, name_err = Session.validate_name(name)
   if not name_ok then
@@ -1530,6 +1701,10 @@ function Session.prepare_start(name, opts)
   if not cleaned then
     return abort(clean_err)
   end
+  local pruned, prune_err = Session.prune_stale_files(session_dir)
+  if not pruned then
+    return abort(prune_err)
+  end
   for _, fifo in ipairs({ Session.FILE_REQUEST, Session.FILE_RESPONSE }) do
     local path = session_dir .. "/" .. fifo
     local info = stat_path(path)
@@ -1542,6 +1717,67 @@ function Session.prepare_start(name, opts)
     end
   end
   return session_dir, nil
+end
+
+--- Prepare a session runtime directory with a final typed host-failure boundary.
+-- @param name string
+-- @param opts table?
+-- @return string? session_dir, table? err
+function Session.prepare_start(name, opts)
+  local ok, session_dir, err = pcall(prepare_start_impl, name, opts)
+  if not ok then
+    return nil, err_io()
+  end
+  return session_dir, err
+end
+
+--- Transfer the start lock from the starter pid to the daemon pid.
+-- The transfer is serialized by the start-lock mutex. If the lock is missing or
+-- no longer owned by `from_pid` (for example a newer starter reclaimed it), the
+-- transfer fails and the daemon must abort before publishing metadata.
+-- @param session_dir string
+-- @param from_pid number
+-- @param to_pid number
+-- @return boolean ok, table? err
+function Session.handoff_start_lock(session_dir, from_pid, to_pid)
+  if not valid_pid(from_pid) or not valid_pid(to_pid) then
+    return false, err_io()
+  end
+  local mutex_ok, mutex_err = acquire_mutex(session_dir, Session.FILE_START_LOCK, to_pid)
+  if not mutex_ok then
+    return false, mutex_err or err_busy()
+  end
+
+  local function release_mutex()
+    release_named_lock(session_dir, Session.FILE_START_LOCK .. ".mutex", to_pid)
+  end
+
+  local owner, read_err = read_lock_owner(session_dir, Session.FILE_START_LOCK)
+  if owner == nil then
+    release_mutex()
+    return false, read_err or err_lock_unsafe()
+  end
+  if owner ~= from_pid then
+    release_mutex()
+    return false, err_busy()
+  end
+
+  local path = lock_path(session_dir, Session.FILE_START_LOCK)
+  if not WheelHost.fs.remove_file(path) then
+    release_mutex()
+    return false, err_io()
+  end
+  local created = WheelHost.fs.create_private_file(path, tostring(to_pid) .. "\n")
+  if not created then
+    release_mutex()
+    return false, err_io()
+  end
+  local owner_after = read_lock_owner(session_dir, Session.FILE_START_LOCK)
+  release_mutex()
+  if owner_after ~= to_pid then
+    return false, err_busy()
+  end
+  return true, nil
 end
 
 --- Remove the start lock after readiness (called by the daemon).
@@ -1683,7 +1919,7 @@ end
 -- `get`. Errors go to stderr as a static JSON error and return exit code 1.
 -- @param argv table
 -- @return number exit code
-function Session.main(argv)
+local function main_impl(argv)
   local args, root = parse_cli_args(argv)
   local command = args[1]
   local opts = { root = root }
@@ -1742,6 +1978,17 @@ function Session.main(argv)
     return cli_list(opts, args)
   end
   return cli_fail(err_method_unknown())
+end
+
+--- CLI entry point with a final typed boundary for unexpected host failures.
+-- @param argv table
+-- @return number exit code
+function Session.main(argv)
+  local ok, result = pcall(main_impl, argv)
+  if not ok then
+    return cli_fail(err_io())
+  end
+  return result or 1
 end
 
 return Session

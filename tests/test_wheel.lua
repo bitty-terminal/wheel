@@ -8053,6 +8053,16 @@ run_test("WheelHost: private file, FIFO, and pid primitives", function()
   assert(WheelHost.fs.create_private_file(root .. "/private.link", "x") == false,
     "exclusive create must refuse a symlink")
 
+  local linked = root .. "/linked.txt"
+  assert(WheelHost.fs.link_exclusive(file, linked) == true,
+    "link_exclusive must publish a new hard link")
+  assert(WheelHost.fs.link_exclusive(file, linked) == false,
+    "link_exclusive must never replace an existing target")
+  assert(WheelHost.fs.stat(file).links == 2,
+    "the restored link must share the original inode")
+  assert(WheelHost.fs.remove_file(linked) == true)
+  assert(WheelHost.fs.stat(file).links == 1)
+
   local fifo = root .. "/control.fifo"
   assert(WheelHost.fs.mkfifo(fifo) == true)
   local fifo_info = WheelHost.fs.stat(fifo)

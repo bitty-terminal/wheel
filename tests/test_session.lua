@@ -58,8 +58,31 @@ local function cli(args, opts)
   return WheelHost.proc.run_program("bash", argv, {
     stdin = opts.stdin,
     timeout_ms = 30000,
-    env = { WHEEL_SESSION_ROOT = session_root },
+    env = { WHEEL_SESSION_ROOT = opts.root or session_root },
   })
+end
+
+--- Run the CLI from the test's own shell, not the host process supervisor.
+-- `start` deliberately spawns the daemon with setsid; a supervisor group sweep
+-- can race that detach when the CLI itself is a supervised child, so the
+-- late-publication test uses the real user-facing shell path.
+local function cli_direct(args, opts)
+  opts = opts or {}
+  local output_path = test_base .. "/cli.out"
+  local error_path = test_base .. "/cli.err"
+  local words = {
+    "WHEEL_SESSION_ROOT=" .. shell_quote(opts.root or session_root),
+    shell_quote(cli_path),
+  }
+  for _, value in ipairs(args) do
+    words[#words + 1] = shell_quote(value)
+  end
+  words[#words + 1] = ">" .. shell_quote(output_path)
+  words[#words + 1] = "2>" .. shell_quote(error_path)
+  local status = os.execute(table.concat(words, " "))
+  local output = WheelHost.fs.read_file(output_path) or ""
+  local error_output = WheelHost.fs.read_file(error_path) or ""
+  return status == true or status == 0, output, error_output
 end
 
 local function expect_ok(label, args, opts)
@@ -347,6 +370,14 @@ run_test("Daemon: cleanup leaves files while another starter owns the start lock
   }))
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_REQUEST) == true)
   assert(WheelHost.fs.mkfifo(dir .. "/" .. Session.FILE_RESPONSE) == true)
+  local dead_pid = 2147483647
+  assert(WheelHost.fs.create_private_file(dir .. "/" .. Session.FILE_CLIENT_LOCK,
+    tostring(dead_pid) .. "\n"))
+  assert(WheelHost.fs.create_private_file(dir .. "/" .. Session.FILE_CLIENT_LOCK .. ".mutex",
+    tostring(dead_pid) .. "\n"))
+  assert(WheelHost.fs.create_private_file(dir .. "/client.lock.stale.1.1",
+    tostring(dead_pid) .. "\n"))
+  assert(WheelHost.fs.create_private_file(dir .. "/meta.json.1.1.tmp", "temp"))
 
   local owner = WheelHost.proc.pid()
   assert(Session.acquire_lock(dir, Session.FILE_START_LOCK, owner) == true)
@@ -356,6 +387,8 @@ run_test("Daemon: cleanup leaves files while another starter owns the start lock
     "cleanup must not remove metadata while a newer starter owns the start lock")
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == true,
     "cleanup must not remove FIFOs while a newer starter owns the start lock")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_CLIENT_LOCK).exists == true,
+    "cleanup must not prune while a newer starter owns the start lock")
 
   assert(Session.release_lock(dir, Session.FILE_START_LOCK, owner) == true)
   Daemon.cleanup(state)
@@ -363,6 +396,14 @@ run_test("Daemon: cleanup leaves files while another starter owns the start lock
     "cleanup must remove metadata once it owns the start lock")
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_REQUEST).exists == false)
   assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_RESPONSE).exists == false)
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_CLIENT_LOCK).exists == false,
+    "cleanup must prune a dead client lock")
+  assert(WheelHost.fs.stat(dir .. "/" .. Session.FILE_CLIENT_LOCK .. ".mutex").exists == false,
+    "cleanup must prune a dead client mutex")
+  assert(WheelHost.fs.stat(dir .. "/client.lock.stale.1.1").exists == false,
+    "cleanup must prune stale lock tails")
+  assert(WheelHost.fs.stat(dir .. "/meta.json.1.1.tmp").exists == false,
+    "cleanup must prune metadata temp files")
   assert(WheelHost.fs.stat(dir).exists == false, "cleanup must remove the empty session directory")
 end)
 
@@ -438,6 +479,88 @@ os.exit(Daemon.run({
   assert(wait_until_dead(meta.pid), "the daemon must exit after the explicit shutdown")
   assert(WheelHost.fs.stat(session_dir(name)).exists == false,
     "shutdown after a dispatch exception must remove the session directory")
+end)
+
+run_test("Daemon: a delayed old daemon loses the start-lock handoff and cannot clobber metadata", function()
+  local name = "late-publication"
+  local dead_owner = 2147483647
+  local prepared, prepare_err = Session.prepare_start(name, {
+    root = session_root,
+    owner_pid = dead_owner,
+  })
+  assert(prepared, "late-publication preparation failed: "
+    .. tostring(prepare_err and prepare_err.message))
+
+  local lua_root = repo_root .. "/lua"
+  local driver_path = test_base .. "/late-publication-driver.lua"
+  local marker_path = test_base .. "/late-handoff-marker"
+  local driver_log = test_base .. "/late-publication.log"
+  local driver = assert(io.open(driver_path, "w"))
+  driver:write(string.format([[
+package.path = %q .. "/?.lua;" .. %q .. "/?/init.lua;" .. package.path
+local WheelHost = require("wheel.host")
+local Session = require("wheel.session")
+local original_handoff = Session.handoff_start_lock
+Session.handoff_start_lock = function(...)
+  local marker = assert(io.open(%q, "w"))
+  marker:write(tostring(WheelHost.proc.pid()))
+  marker:close()
+  os.execute("sleep 1.0")
+  return original_handoff(...)
+end
+local Daemon = require("wheel.daemon")
+os.exit(Daemon.run({
+  root = arg[1],
+  name = arg[2],
+  wheel_version = "0.1.0",
+  start_owner = tonumber(arg[3]),
+}))
+]], lua_root, lua_root, marker_path))
+  driver:close()
+
+  local lua_bin = os.getenv("WHEEL_TEST_LUA")
+    or (type(arg) == "table" and arg[-1])
+    or "lua5.1"
+  local launch_status = os.execute(table.concat({
+    "setsid",
+    shell_quote(lua_bin),
+    shell_quote(driver_path),
+    shell_quote(session_root),
+    shell_quote(name),
+    tostring(dead_owner),
+    "< /dev/null > /dev/null 2>" .. shell_quote(driver_log) .. " &",
+  }, " "))
+  assert(launch_status == true or launch_status == 0, "the delayed daemon launch failed")
+
+  local marker
+  for _ = 1, 100 do
+    marker = WheelHost.fs.read_file(marker_path)
+    if type(marker) == "string" and marker ~= "" then
+      break
+    end
+    os.execute("sleep 0.02")
+  end
+  local old_pid = tonumber(marker or "")
+  assert(old_pid and old_pid > 1, "the delayed daemon did not reach the handoff barrier")
+
+  local new_ok, new_output, new_error = cli_direct({ "start", name })
+  assert(new_ok, "the late start failed: " .. tostring(new_error))
+  local new_meta = decode_stdout("late start", new_output)
+  assert(new_meta.name == name)
+  assert(new_meta.pid ~= old_pid, "the new start must publish a new daemon pid")
+  started_sessions[#started_sessions + 1] = { name = name, pid = new_meta.pid }
+
+  assert(wait_until_dead(old_pid), "the delayed old daemon must abort after losing the handoff")
+  local stored = read_meta(name)
+  assert(stored.pid == new_meta.pid,
+    "the delayed old daemon must not overwrite the newer metadata")
+  local ping = decode_stdout("late ping", expect_ok("late ping", { "ping", name }))
+  assert(ping.pid == new_meta.pid, "the newer daemon must remain reachable")
+
+  local stopped = decode_stdout("late stop", expect_ok("late stop", { "stop", name }))
+  assert(stopped.shutting_down == true)
+  assert(wait_until_dead(new_meta.pid))
+  assert(WheelHost.fs.stat(session_dir(name)).exists == false)
 end)
 
 run_test("Session: start publishes private metadata and a live control plane", function()
@@ -528,6 +651,22 @@ run_test("Session: snapshot is bounded and carries no slot content", function()
   end
 end)
 
+run_test("Session: content at the escaped-frame bound round trips", function()
+  local content = string.rep("\0", Session.MAX_CONTEXT_CONTENT_BYTES)
+  local put, put_err = Session.request("demo", "context.put", {
+    name = "scratch/escaped",
+    content = content,
+  }, { root = session_root })
+  assert(put, "content at the documented bound must fit the request frame: "
+    .. tostring(put_err and put_err.code))
+  assert(put.size_bytes == #content)
+  local got, get_err = Session.request("demo", "context.get", {
+    name = "scratch/escaped",
+  }, { root = session_root })
+  assert(got, "escaped content must be readable: " .. tostring(get_err and get_err.code))
+  assert(got.content == content, "escaped content must round trip byte-for-byte")
+end)
+
 run_test("Session: CAS conflicts surface a typed error and keep the slot", function()
   local update = decode_stdout("update", expect_ok("put", {
     "put", "demo", "scratch/persist", "1",
@@ -608,6 +747,19 @@ run_test("Session: unsafe session paths fail closed", function()
   assert(WheelHost.fs.mkfifo(badlink .. "/" .. Session.FILE_RESPONSE))
   expect_error("symlinked FIFO", "E_SESSION_UNSAFE_PATH", { "status", "badfifosymlink" })
 
+  local root_link = test_base .. "/client-root-link"
+  os.execute("ln -s " .. shell_quote(session_root) .. " " .. shell_quote(root_link))
+  expect_error("symlinked client root", "E_SESSION_UNSAFE_PATH", { "status", "demo" },
+    { root = root_link })
+  expect_error("symlinked client probe", "E_SESSION_UNSAFE_PATH", { "probe", "demo" },
+    { root = root_link })
+
+  local weak_root = test_base .. "/weak-client-root"
+  assert(WheelHost.fs.mkdir_p(weak_root) == true)
+  assert(WheelHost.fs.chmod(weak_root, "755") == true)
+  expect_error("weaker client root", "E_SESSION_UNSAFE_PATH", { "status", "demo" },
+    { root = weak_root })
+
   local broken = session_dir("brokenmeta")
   assert(WheelHost.fs.mkdir_p(broken) == true)
   assert(WheelHost.fs.chmod(broken, "700") == true)
@@ -684,6 +836,19 @@ run_test("Session: a live client lock serializes requests", function()
     "the stale-lock test requires a pid above the host pid limit")
   assert(WheelHost.fs.create_private_file(lock_path, tostring(dead_pid) .. "\n"))
   decode_stdout("ping after stale lock", expect_ok("ping after stale lock", { "ping", "demo" }))
+end)
+
+run_test("Session: a stale mutex is reclaimed", function()
+  local dir = session_dir("stale-mutex")
+  local dead_pid = 2147483647
+  assert(WheelHost.fs.mkdir_p(dir) == true)
+  assert(WheelHost.fs.chmod(dir, "700") == true)
+  assert(WheelHost.fs.create_private_file(
+    dir .. "/" .. Session.FILE_CLIENT_LOCK .. ".mutex", tostring(dead_pid) .. "\n"))
+  local owner = WheelHost.proc.pid()
+  assert(Session.acquire_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(Session.release_lock(dir, Session.FILE_CLIENT_LOCK, owner) == true)
+  assert(WheelHost.fs.remove_dir(dir) == true)
 end)
 
 run_test("Session: a pid dead daemon is reported without being signalled", function()

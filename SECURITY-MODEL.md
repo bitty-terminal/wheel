@@ -391,21 +391,27 @@ or multi-user surface.
   JSON depth and metadata size are bounded, and error messages are static
   (never request content, paths, or secrets).
 - The daemon bounds its context store at 1024 slots and 16 MiB total, and each
-  `context.put` value at 48 KiB. Snapshot and list responses are capped at 1024
-  entries and report truncation instead of growing without bound.
+  `context.put` value at 10 KiB. The value cap is derived from the 64 KiB
+  request frame and six-byte worst-case JSON escaping, so accepted content
+  cannot exceed the frame after encoding. Snapshot and list responses are
+  capped at 1024 entries and report truncation instead of growing without
+  bound.
 - Metadata contains only protocol, session name, pid, start time, and harness
   version. Snapshots contain slot names, kinds, hashes, versions, and sizes;
   they never contain slot content or secret values. `context.get` returns slot
   content only because the caller explicitly requested it.
 - One client lock file serialises each request/response exchange; a per-lock
-  mutex serialises stale-lock reclamation, so a concurrent caller sees a live
-  main lock or a busy mutex, never a freshly acquired live lock that another
-  cleaner can delete. A concurrent caller fails with a typed busy error. The
-  daemon is single-threaded and processes one frame at a time.
+  mutex serialises stale-lock reclamation. A moved lock whose owner changed is
+  restored with a non-replacing hard link instead of deleted, and a concurrent
+  caller fails with a typed busy error. The daemon is single-threaded and
+  processes one frame at a time.
 - Shutdown is an explicit `shutdown` method. Clients never signal a pid they did
   not read from validated metadata, and `pkill`, `killall`, and name- or
   pattern-based kills are forbidden. A stale pid is detected with `kill -0` and
-  is never signalled; only stale metadata, FIFOs, and locks are removed.
+  is never signalled; only stale metadata, FIFOs, locks, and metadata temp files
+  are removed. A daemon takes over the start lock under its mutex before writing
+  metadata; a delayed older starter that lost the handoff aborts without
+  replacing the newer metadata or FIFOs.
 - The daemon does not own a task DAG, call a provider, execute an agent, or
   expose a remote listener. Those remain outside this experimental slice.
 
@@ -942,10 +948,11 @@ that the policy relies on, and they remain unverified until the gates pass:
   `lua/wheel/daemon.lua`, `scripts/wheel-session`): a detached per-user process
   owns one `WheelContext`, publishes metadata only after both FIFOs open, and
   serves bounded `wheel-session/1` requests. The client lock and the
-  mutex-serialized stale-lock claim, private `0700`/`0600` paths,
-  symlink/ownership refusals, `kill -0`-only stale detection, explicit shutdown,
-  and static errors are implemented and covered by `tests/test_session.lua`. It
-  is not a task executor, provider caller, or multi-user service.
+  mutex-serialized stale-lock claim, start-lock handoff before metadata,
+  private `0700`/`0600` paths, symlink/ownership refusals, `kill -0`-only stale
+  detection, explicit shutdown, and static errors are implemented and covered
+  by `tests/test_session.lua`. It is not a task executor, provider caller, or
+  multi-user service.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
 backend, the standalone POSIX surface, selected explicitly with
@@ -1016,11 +1023,12 @@ Known gaps relative to this policy (not claims of compliance):
   keep other users out, but any process running as the session owner can open
   the FIFOs and send requests. A partial or stalled frame can block the
   single-threaded daemon, and pure Lua has no client read timeout (the shell
-  CLI bounds its own calls with `timeout` when available). Removing a live
-  session directory leaves an unreachable daemon; the harness refuses to guess
-  a pid and requires an explicit stop by the recorded pid. No provider, task
-  DAG, agent execution, remote access, or multi-user authentication is claimed
-  for this slice.
+  CLI bounds its own calls with `timeout` when available). Lock and metadata
+  liveness is PID-only; a reused PID can be misclassified as live and require
+  manual stale-state cleanup. Removing a live session directory leaves an
+  unreachable daemon; the harness refuses to guess a pid and requires an
+  explicit stop by the recorded pid. No provider, task DAG, agent execution,
+  remote access, or multi-user authentication is claimed for this slice.
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
   host, shows escaped full content plus a pure-Lua change diff under a per-run

@@ -722,15 +722,19 @@ and never embed the runtime.
   `context.get`, `context.list`, and `shutdown`. `context.put` honors the
   existing `expected_version` compare-and-swap; a conflict returns
   `E_SESSION_CAS_CONFLICT`. The daemon bounds the context store at 1024 slots
-  and 16 MiB total, and a value is at most 48 KiB per request.
+  and 16 MiB total, and a value is at most 10 KiB per request. The cap is
+  derived from the 64 KiB request frame and six-byte worst-case JSON escaping,
+  so any accepted value fits the frame without a late frame-too-large error.
 - **Serialization**: a per-session client lock file serializes requests; a
   concurrent CLI call fails with `E_SESSION_BUSY`. A per-lock mutex serializes
-  stale-lock reclamation: the dead owner's path is renamed and verified before
-  removal, and the new main lock is created before the mutex is released, so a
-  concurrent caller never deletes a freshly acquired live lock.
+  stale-lock reclamation: the dead owner's path is renamed, its moved owner is
+  verified before removal, and a changed owner is restored with a non-replacing
+  hard link. The replacement main lock is created while the mutex is held.
 - **Lifecycle**: `start` rejects a live duplicate, cleans only a dead session's
-  metadata/FIFOs, and publishes metadata after readiness. `stop` sends the
-  explicit `shutdown` method and waits for the recorded pid; it never signals an
+  metadata/FIFOs, and publishes metadata after readiness. The daemon takes over
+  the start lock under its mutex before publishing metadata, so a delayed stale
+  starter aborts instead of clobbering a newer session. `stop` sends the explicit
+  `shutdown` method and waits for the recorded pid; it never signals an
   unrecorded process.
 - **Private state**: the session root and directory are `0700`; metadata and
   FIFOs are `0600`; symlinked or foreign-owned paths are refused. Snapshots

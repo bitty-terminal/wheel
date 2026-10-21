@@ -361,13 +361,23 @@ local function cleanup(state)
   for _, fifo in ipairs({ Session.FILE_REQUEST, Session.FILE_RESPONSE }) do
     local path = state.session_dir .. "/" .. fifo
     local info = WheelHost.fs.stat(path)
-    if info and info.exists and info.fifo and not info.symlink then
+    local euid = WheelHost.fs.euid()
+    if info and info.exists and info.fifo and not info.symlink
+      and info.uid == euid and info.mode == Session.PRIVATE_FILE_MODE and info.links == 1 then
       WheelHost.fs.remove_file(path)
     end
   end
   local meta_info = WheelHost.fs.stat(state.session_dir .. "/" .. Session.FILE_META)
-  if meta_info and meta_info.exists and meta_info.regular and not meta_info.symlink then
+  local euid = WheelHost.fs.euid()
+  if meta_info and meta_info.exists and meta_info.regular and not meta_info.symlink
+    and meta_info.uid == euid and meta_info.mode == Session.PRIVATE_FILE_MODE
+    and meta_info.links == 1 then
     WheelHost.fs.remove_file(state.session_dir .. "/" .. Session.FILE_META)
+  end
+  local pruned = Session.prune_stale_files(state.session_dir)
+  if not pruned then
+    Session.release_start_lock(state.session_dir, state.pid)
+    return
   end
   Session.release_start_lock(state.session_dir, state.pid)
   local info = WheelHost.fs.stat(state.session_dir)
@@ -399,14 +409,21 @@ function Daemon.run(opts)
     log_daemon_error(name_err.code, name_err.message)
     return 2
   end
+  local start_owner = opts.start_owner
+  if type(start_owner) ~= "number" or start_owner % 1 ~= 0 or start_owner <= 1 then
+    log_daemon_error("E_SESSION_START_FAILED", "a valid start owner pid is required")
+    return 2
+  end
   local root_ok, root_err = Session.validate_absolute_path(opts.root)
   if not root_ok then
     log_daemon_error(root_err.code, root_err.message)
     return 2
   end
-  local root_ready, root_ensure_err = Session.ensure_root(opts.root)
-  if not root_ready then
-    log_daemon_error(root_ensure_err.code, root_ensure_err.message)
+  local root_call_ok, root_ready, root_ensure_err = pcall(Session.ensure_root, opts.root)
+  if not root_call_ok or not root_ready then
+    log_daemon_error(
+      root_ensure_err and root_ensure_err.code or "E_SESSION_START_FAILED",
+      root_ensure_err and root_ensure_err.message or "cannot verify the session root")
     return 3
   end
   local version = opts.wheel_version
@@ -416,23 +433,30 @@ function Daemon.run(opts)
   end
 
   local session_dir = opts.root .. "/" .. name
-  local dir_info, dir_err = Session.ensure_session_dir(session_dir, false)
-  if not dir_info then
-    log_daemon_error(dir_err.code, dir_err.message)
+  local dir_call_ok, dir_info, dir_err = pcall(
+    Session.ensure_session_dir, session_dir, false)
+  if not dir_call_ok or not dir_info then
+    log_daemon_error(
+      dir_err and dir_err.code or "E_SESSION_START_FAILED",
+      dir_err and dir_err.message or "cannot verify the session directory")
     return 3
   end
 
-  local existing, existing_err = read_valid_meta({
+  local meta_ok, existing, existing_err = pcall(read_valid_meta, {
     session_dir = session_dir,
     name = name,
   })
+  if not meta_ok then
+    log_daemon_error("E_SESSION_START_FAILED", "cannot read existing session metadata")
+    return 3
+  end
   if existing_err then
     log_daemon_error(existing_err.code, existing_err.message)
     return 3
   end
   if existing then
-    local alive, probe_err = WheelHost.proc.is_alive(existing.pid)
-    if probe_err ~= nil then
+    local alive_ok, alive, probe_err = pcall(WheelHost.proc.is_alive, existing.pid)
+    if not alive_ok or probe_err ~= nil then
       log_daemon_error("E_SESSION_UNRESPONSIVE", "cannot verify the recorded daemon pid")
       return 3
     end
@@ -442,27 +466,43 @@ function Daemon.run(opts)
     end
   end
 
-  local request = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_REQUEST)
-  if not request then
+  local request_ok, request = pcall(
+    WheelHost.fs.open_fifo, session_dir .. "/" .. Session.FILE_REQUEST)
+  if not request_ok or not request then
     log_daemon_error("E_SESSION_IO", "cannot open the session request FIFO")
     return 3
   end
-  local response = WheelHost.fs.open_fifo(session_dir .. "/" .. Session.FILE_RESPONSE)
-  if not response then
+  local response_ok, response = pcall(
+    WheelHost.fs.open_fifo, session_dir .. "/" .. Session.FILE_RESPONSE)
+  if not response_ok or not response then
     pcall(request.close, request)
     log_daemon_error("E_SESSION_IO", "cannot open the session response FIFO")
     return 3
   end
 
-  local pid = WheelHost.proc.pid()
-  if pid == nil then
+  local pid_ok, pid = pcall(WheelHost.proc.pid)
+  if not pid_ok or pid == nil then
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error("E_SESSION_START_FAILED", "cannot determine the daemon pid")
     return 3
   end
+
+  -- Take ownership of the start lock before publishing metadata. A delayed
+  -- starter whose lock was reclaimed by a newer start loses this handoff and
+  -- aborts without touching meta.json or the new FIFOs.
+  local handoff_ok, handoff = pcall(
+    Session.handoff_start_lock, session_dir, start_owner, pid)
+  if not handoff_ok or not handoff then
+    pcall(response.close, response)
+    pcall(request.close, request)
+    log_daemon_error("E_SESSION_START_FAILED", "cannot take ownership of the session start lock")
+    return 3
+  end
+
   local time_ok, started_at = pcall(WheelHost.time.now)
   if not time_ok then
+    pcall(Session.release_start_lock, session_dir, pid)
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error("E_SESSION_START_FAILED", "the host time primitive is unavailable")
@@ -470,6 +510,7 @@ function Daemon.run(opts)
   end
   local context_ok, context = pcall(WheelContext.new, {})
   if not context_ok then
+    pcall(Session.release_start_lock, session_dir, pid)
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error("E_SESSION_START_FAILED", "cannot initialize the session context")
@@ -481,7 +522,7 @@ function Daemon.run(opts)
     started_at = started_at,
     wheel_version = version,
     session_dir = session_dir,
-    start_owner = opts.start_owner,
+    start_owner = start_owner,
     context = context,
     requests = 0,
     request = request,
@@ -497,12 +538,13 @@ function Daemon.run(opts)
     wheel_version = version,
   })
   if not wrote_ok or not wrote then
+    pcall(cleanup, state)
     pcall(response.close, response)
     pcall(request.close, request)
     log_daemon_error(write_err and write_err.code or "E_SESSION_IO", "cannot publish session metadata")
     return 3
   end
-  local released_ok, released = pcall(Session.release_start_lock, session_dir, state.start_owner)
+  local released_ok, released = pcall(Session.release_start_lock, session_dir, pid)
   if not released_ok or released == false then
     pcall(cleanup, state)
     pcall(response.close, response)
@@ -564,7 +606,7 @@ function Daemon.run(opts)
 end
 
 local function usage()
-  io.stderr:write("usage: wheel-session-daemon --root <dir> --name <name> --version <x.y.z>\n")
+  io.stderr:write("usage: wheel-session-daemon --root <dir> --name <name> --version <x.y.z> --start-owner <pid>\n")
 end
 
 --- Daemon entry point. Arguments are script-style (`arg[1]` is the first flag).

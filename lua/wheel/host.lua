@@ -17,6 +17,7 @@
 --   WheelHost.fs.write_file(path, content)  write a whole file
 --   WheelHost.fs.create_private_file(path, content)
 --                                           exclusive 0600 regular file at a path
+--   WheelHost.fs.link_exclusive(from, to)   create a hard link without replacing
 --   WheelHost.fs.mkfifo(path)               exclusive 0600 FIFO
 --   WheelHost.fs.open_fifo(path)            open a verified 0600 FIFO read/write
 --   WheelHost.fs.remove_dir(path)           remove one empty directory
@@ -192,6 +193,9 @@ end
 -- expiry. The harness retains the recorded session leader through the bounded
 -- TERM/grace/KILL group sweep, so the recorded PGID cannot be reused while it
 -- is being signaled. The harness never sends a name- or pattern-based kill.
+
+--- Private file/FIFO mode required by the host-owned paths (0600).
+local PRIVATE_FILE_MODE = 384
 
 --- Maximum bytes read back from each captured stream (256 KiB).
 local MAX_CAPTURE_BYTES = 256 * 1024
@@ -606,7 +610,7 @@ local function verify_private_file(path)
   if info.uid ~= euid then
     return false, "private path is not owned by the current user"
   end
-  if info.mode ~= 384 then
+  if info.mode ~= PRIVATE_FILE_MODE then
     return false, "private path is not mode 0600"
   end
   if info.links ~= 1 then
@@ -639,7 +643,7 @@ local function verify_private_fifo(path)
   if info.uid ~= euid then
     return false, "private FIFO is not owned by the current user"
   end
-  if info.mode ~= 384 then
+  if info.mode ~= PRIVATE_FILE_MODE then
     return false, "private FIFO is not mode 0600"
   end
   if info.links ~= 1 then
@@ -1135,6 +1139,27 @@ function standalone.new(opts)
       return false, verify_err
     end
     return true
+  end
+
+  --- Create a hard link at <to> pointing at <from>; never replace <to>.
+  -- POSIX `ln` fails atomically when the target exists, so this is the
+  -- non-replacing restore primitive for a claimed lock. Both paths must be
+  -- caller-controlled and already validated.
+  -- @param from string
+  -- @param to string
+  -- @return boolean ok, string? err
+  function backend.link_exclusive(from, to)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    if type(from) ~= "string" or from == "" or from:find("[%z\n\r]")
+      or type(to) ~= "string" or to == "" or to:find("[%z\n\r]") then
+      return false, "invalid link path"
+    end
+    local status = normalized_exit_status(os.execute(
+      "ln -- " .. shell_quote(from) .. " " .. shell_quote(to) .. " 2>/dev/null"))
+    if status == 0 then
+      return true
+    end
+    return false, "link target exists or cannot be linked"
   end
 
   --- Create a new FIFO with mode 0600 at <path>.
@@ -2030,6 +2055,14 @@ end
 -- @return boolean ok, string? err
 function WheelHost.fs.mkfifo(path)
   return invoke("fs.write", "mkfifo", path)
+end
+
+--- Create a hard link at `to` pointing at `from`; never replace `to`.
+-- @param from string
+-- @param to string
+-- @return boolean ok, string? err
+function WheelHost.fs.link_exclusive(from, to)
+  return invoke("fs.write", "link_exclusive", from, to)
 end
 
 --- Open a verified private FIFO read/write (O_RDWR; never blocks on a peer).

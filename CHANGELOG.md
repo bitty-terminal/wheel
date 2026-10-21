@@ -20,7 +20,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   oversized frames, stale-pid recovery, and clean shutdown, plus deterministic
   regression tests for concurrent stale-lock reclamation, write failures, and
   cleanup ownership. The same-user FIFO residual (no peer credentials) is
-  recorded in `SECURITY-MODEL.md`.
+  recorded in `SECURITY-MODEL.md`. Follow-up hardening adds start-lock handoff
+  before metadata publication, client-side root revalidation, non-replacing
+  lock restore, stale-state pruning, and a 10 KiB worst-case-safe content cap.
 - Repository scaffold generated from
   [bitty-plugin-template](https://github.com/bitty-terminal/bitty-plugin-template):
   static manifest (`bitty-plugin.toml`), Lua entry point (`lua/wheel/init.lua`),
