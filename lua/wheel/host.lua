@@ -662,24 +662,34 @@ local function has_dot_only_segment(path)
 end
 
 --- Normalize a temporary-directory path for the symlink guard and filesystem
--- calls. Trailing separators and `/.` segments are stripped so `test -L` sees
--- the harness-owned directory itself rather than a path that follows a link.
+-- calls. The path is rebuilt from its non-empty segments: repeated `/`
+-- separators collapse, `.` segments are dropped everywhere (not only at the
+-- end), and trailing separators disappear. The filesystem resolves
+-- `.../wheel//tmp` and `.../wheel/./tmp` to `.../wheel/tmp`, so every guard
+-- below must inspect that same collapsed form; otherwise the exact
+-- `.../wheel/tmp` suffix check is skipped and a symlinked `wheel` parent is
+-- followed. All-dots segments (`..`, `...`, ...) are preserved so
+-- `has_dot_only_segment` can reject them before any mkdir/chmod.
 -- @param path string
 -- @return string
 local function normalize_tmp_dir(path)
   if type(path) ~= "string" then
     return path
   end
-  local normalized = path
-  while true do
-    local next_path = normalized:gsub("/+$", "")
-    next_path = next_path:gsub("/%.$", "")
-    if next_path == normalized then
-      break
+  local absolute = path:sub(1, 1) == "/"
+  local segments = {}
+  for segment in path:gmatch("[^/]+") do
+    if segment ~= "." then
+      table.insert(segments, segment)
     end
-    normalized = next_path
+  end
+  local normalized = table.concat(segments, "/")
+  if absolute then
+    return "/" .. normalized
   end
   if normalized == "" then
+    -- A relative path made only of separators and `.` segments is the process
+    -- root once resolved; return `/` so the caller rejects it before use.
     return "/"
   end
   return normalized
@@ -1379,7 +1389,9 @@ function standalone.new(opts)
   end
 
   --- Resolve, create, and repair the private temporary directory.
-  -- The path is normalized (trailing `/`, `/.` stripped) before inspection.
+  -- The path is normalized before inspection: repeated `/` separators collapse
+  -- and `.` segments are removed, so `.../wheel//tmp` and `.../wheel/./tmp`
+  -- cannot skip the exact `.../wheel/tmp` suffix guard.
   -- The filesystem root and any all-dots segment (`.`, `..`, `...`, ...) are
   -- rejected before mkdir/chmod, so an all-dots symlink component cannot be
   -- followed. The harness-owned directory (and the `wheel` component of the

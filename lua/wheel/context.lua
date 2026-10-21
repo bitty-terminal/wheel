@@ -7,13 +7,48 @@
 local WheelContext = {}
 WheelContext.__index = WheelContext
 
+local WheelErrors
+
+--- Treat only the interpreter's exact rooted not-found wording as a missing
+-- module. A present-but-broken module or a typed denial keeps its own cause
+-- instead of being reported as absent.
+-- @param module_name string
+-- @param err any
+-- @return boolean
+local function is_not_found(module_name, err)
+  return type(err) == "string"
+    and err:find("module '" .. module_name .. "' not found", 1, true) ~= nil
+end
+
+--- Annotate a typed cause with the loading parent and rooted dependency while
+-- preserving its class and code. The bridge message bound is owned by
+-- `wheel.errors`, so the annotated message is clamped to the same limit.
+-- @param parent string
+-- @param rooted string
+-- @param cause table typed bridge error
+-- @return table
+local function annotated_typed_error(parent, rooted, cause)
+  local message = string.format("%s: cannot load submodule '%s': %s",
+    parent, rooted, cause.message):gsub("[\r\n]", " ")
+  local limit = WheelErrors.MESSAGE_MAX_LENGTH
+  if #message > limit then
+    message = message:sub(1, limit - 3) .. "..."
+  end
+  return { class = cause.class, code = cause.code, message = message }
+end
+
 local function load_submodule(subpath)
   local rooted = "wheel." .. subpath
   local ok, mod = pcall(require, rooted)
   if ok then return mod end
+  -- Lua 5.1 leaves a load sentinel after a failed require. Clear it so a
+  -- repeated load reports the real cause instead of "loop or previous error".
+  package.loaded[rooted] = nil
   local cause = mod
-  if type(cause) ~= "string"
-    or not cause:find("module '" .. rooted .. "' not found", 1, true) then
+  if WheelErrors and type(WheelErrors.is_typed) == "function" and WheelErrors.is_typed(cause) then
+    error(annotated_typed_error("wheel.context", rooted, cause), 0)
+  end
+  if not is_not_found(rooted, cause) then
     error(string.format("wheel.context: cannot load submodule '%s': %s",
       rooted, tostring(cause)), 0)
   end
@@ -21,8 +56,11 @@ local function load_submodule(subpath)
   local alternate = "lua.wheel." .. subpath
   ok, mod = pcall(require, alternate)
   if ok then return mod end
-  if type(mod) == "string"
-    and mod:find("module '" .. alternate .. "' not found", 1, true) then
+  package.loaded[alternate] = nil
+  if WheelErrors and type(WheelErrors.is_typed) == "function" and WheelErrors.is_typed(mod) then
+    error(annotated_typed_error("wheel.context", rooted, mod), 0)
+  end
+  if is_not_found(alternate, mod) then
     mod = cause
   end
 
@@ -30,6 +68,7 @@ local function load_submodule(subpath)
     rooted, tostring(mod)), 0)
 end
 
+WheelErrors = load_submodule("errors")
 local WheelConfig = load_submodule("config")
 
 local WheelHost = load_submodule("host")

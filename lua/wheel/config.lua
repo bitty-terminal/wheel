@@ -1906,6 +1906,15 @@ local function eval_config_chunk(content, chunk_name)
     return false, "syntax error in " .. chunk_name .. ": " .. tostring(err)
   end
 
+  -- LuaJIT does not run debug count hooks inside JIT-compiled traces, so a hot
+  -- loop in the evaluated chunk would bypass the instruction limit and hang
+  -- the evaluation. Disable the JIT for this chunk (and every subfunction it
+  -- creates) before it runs; the flag is attached to the discarded chunk, so
+  -- the host's own code keeps its JIT state.
+  if type(jit) == "table" and type(jit.off) == "function" then
+    pcall(jit.off, chunk, true)
+  end
+
   -- Method syntax such as `("x"):rep(n)` resolves the real string table through
   -- the string metatable. Patch the real tables for the duration of the chunk,
   -- not just the sandbox copies, and restore them on every path.

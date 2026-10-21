@@ -35,7 +35,8 @@ or linters by name):
   `just install` and invoked through the justfile.
 - `bitty-plugin-lint` and `bitty-plugin-docs-check` (bitty-plugin-sdk,
   commit-pinned) plus `luaparse` — transitional manifest, README contract, and
-  Lua parse gates; a Lua 5.1/LuaJIT interpreter runs the behavior suite.
+  Lua parse gates; `just test` prefers Lua 5.1, then falls back to LuaJIT and
+  then `lua` for the behavior suite.
 
 ## Development setup
 
