@@ -367,6 +367,64 @@ authority.
   closed with a surfaced warning. No execution audit log exists yet; see
   [Relationship to current code](#relationship-to-current-code).
 
+### Local session control plane (experimental)
+
+The local session daemon is a runtime boundary, not a new authority class. It
+holds the same user-owned authority as the harness and adds no network, remote,
+or multi-user surface.
+
+- The control plane is two POSIX FIFOs in a per-session directory. The session
+  root and directory are user-owned `0700`; metadata and both FIFOs are
+  user-owned, singly linked `0600` entries. A symlinked, foreign-owned, or
+  weaker-mode root, directory, metadata file, or FIFO must be refused before it
+  is read or opened. A missing root is created and chmodded to `0700`; an
+  existing weaker-mode root is refused rather than repaired.
+- A client-supplied runtime root override is an absolute path with no control
+  bytes and no `.`/`..` segments. The final root, its immediate parent, and the
+  session directory are revalidated by both client and daemon; neither trusts
+  the other's preparation. A root placed directly under a shared world-writable
+  directory (for example `/tmp`) is refused because its immediate parent is not
+  user-owned.
+- Requests are one JSON document per line, at most 64 KiB. Responses are at most
+  1 MiB. The reader bounds a frame before parsing, drains a bounded oversized
+  frame to resynchronise, and fails closed when the drain bound is exceeded.
+  JSON depth and metadata size are bounded, and error messages are static
+  (never request content, paths, or secrets).
+- The daemon bounds its context store at 1024 slots and 16 MiB total, and each
+  `context.put` value at 10 KiB. The value cap is derived from the 64 KiB
+  request frame and six-byte worst-case JSON escaping, so accepted content
+  cannot exceed the frame after encoding. Snapshot and list responses are
+  capped at 1024 entries and report truncation instead of growing without
+  bound.
+- Metadata contains only protocol, session name, pid, starter pid, start time,
+  and harness version. Snapshots contain slot names, kinds, hashes, versions,
+  and sizes; they never contain slot content or secret values. `context.get`
+  returns slot content only because the caller explicitly requested it.
+- One client lock file serialises each request/response exchange; a per-lock
+  mutex serialises stale-lock reclamation. A moved lock whose owner changed is
+  restored with a non-replacing hard link instead of deleted, and a concurrent
+  caller fails with a typed busy error. The daemon is single-threaded and
+  processes one frame at a time.
+- Shutdown is an explicit `shutdown` method. Clients never signal a pid they did
+  not read from validated metadata, and `pkill`, `killall`, and name- or
+  pattern-based kills are forbidden. A stale pid is detected with `kill -0` and
+  is never signalled; only stale metadata, FIFOs, locks, and metadata temp files
+  are removed. A daemon takes over the start lock under its mutex before writing
+  metadata; a delayed older starter that lost the handoff aborts without
+  replacing the newer metadata or FIFOs.
+- The daemon does not own a task DAG, call a provider, execute an agent, or
+  expose a remote listener. Those remain outside this experimental slice.
+
+Same-user residual: POSIX FIFOs carry no peer credentials in pure Lua. The
+`0700`/`0600` modes keep _other_ users out, but any process running as the
+session owner can open the FIFOs and send requests. The control plane therefore
+grants no authority beyond what that user already has, and it must not be
+described as multi-user authentication. A same-user process that writes a
+partial frame can also stall the daemon; there is no in-process read timeout in
+pure Lua, and the CLI bounds its own client calls with `timeout` when available.
+Removing a live session directory leaves the daemon unreachable; it must be
+stopped by its recorded pid after manual verification.
+
 ## Path sandbox and role gates
 
 ### Path sandbox
@@ -750,6 +808,7 @@ secret environment reads.
 | Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration                                 | Disk capture during a run has no file-size quota; CPU is not budgeted                                                                                   |
 | Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                                                   | A reader may still assume plugin semantics                                                                                                              |
 | Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                                                               | Not designed or implemented in 0.1.0                                                                                                                    |
+| Local session control-plane abuse                 | Private 0700/0600 paths, ownership/symlink refusal, bounded frames, static errors, explicit shutdown, no client signals                      | Same-user processes can open the FIFO; no peer credentials; a partial frame can stall the daemon                                                        |
 | Update-channel compromise                         | Signed artifacts and verified updates are required before release                                                                            | No signing or update channel exists yet                                                                                                                 |
 | Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                                                            | A tool with a root grant can reach that whole root                                                                                                      |
 | Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                                                             | Runtime-level dumps are outside harness control                                                                                                         |
@@ -758,6 +817,10 @@ secret environment reads.
 
 - The harness is trusted software running as the user. There is no OS sandbox,
   privilege drop, or per-agent isolation.
+- The local session control plane is same-user only: FIFO mode bits are not peer
+  authentication, any process running as the user can send requests, and a
+  partial or stalled frame can make the daemon unresponsive until it is stopped
+  by its recorded pid.
 - Shell strings and argv can reach anything the user can reach. The workspace
   path policy governs harness-mediated file tools, not arbitrary programs.
 - Project configuration is code after consent. The restricted environment
@@ -796,7 +859,11 @@ Deterministic tests, no real host required, covering at minimum:
   environment, timeout and output bounds;
 - network: endpoint allowlist, redirect refusal, TLS verification, no project
   base-URL override;
-- process ownership: timeout, cancellation by recorded PID only, orphan cleanup.
+- process ownership: timeout, cancellation by recorded PID only, orphan cleanup;
+- local session control plane: invalid names, private-path and symlink refusal,
+  frame bounds and resynchronisation, client-lock serialisation, stale-pid
+  reporting without a signal, clean explicit shutdown, and content-free
+  snapshots.
 
 ### Gate 2: real host fixture evidence
 
@@ -821,10 +888,12 @@ denials, a real process timeout with a child-plus-grandchild process-group
 check, a normal-exit background-child sweep, a scrubbed-environment probe, stdin
 round-trip, exclusive `0600` temporary creation with a symlink refusal, and the trust
 approval/content-change/re-approval/revocation-across-restart flow against a
-private XDG state directory. Cancellation (as distinct from timeout) is not
-implemented, and the fixture does not cover a provider stub, audit output, or a
-Bitty panel presentation, so Gate 2 remains open and this is not a security
-approval.
+private XDG state directory. `tests/test_session.lua` additionally starts a real
+detached daemon under a temporary runtime root and exercises the real FIFO
+control plane across separate client processes. Cancellation (as distinct from
+timeout) is not implemented, and the fixture does not cover a provider stub,
+audit output, or a Bitty panel presentation, so Gate 2 remains open and this is
+not a security approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
@@ -875,6 +944,15 @@ that the policy relies on, and they remain unverified until the gates pass:
   per-stream capture cap, a rebuilt allowlist environment, and an explicit
   stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
   `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
+- an experimental local session daemon (`lua/wheel/session.lua`,
+  `lua/wheel/daemon.lua`, `scripts/wheel-session`): a detached per-user process
+  owns one `WheelContext`, publishes metadata only after both FIFOs open, and
+  serves bounded `wheel-session/1` requests. The client lock and the
+  mutex-serialized stale-lock claim, start-lock handoff before metadata,
+  private `0700`/`0600` paths, symlink/ownership refusals, `kill -0`-only stale
+  detection, explicit shutdown, and static errors are implemented and covered
+  by `tests/test_session.lua`. It is not a task executor, provider caller, or
+  multi-user service.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
 backend, the standalone POSIX surface, selected explicitly with
@@ -941,6 +1019,19 @@ Known gaps relative to this policy (not claims of compliance):
   the writer opens it; pure Lua 5.1 has no `O_NOFOLLOW`/`O_EXCL` write handle.
   This narrows to the same-user boundary already accepted elsewhere, not an OS
   guarantee.
+- The experimental session control plane has no peer credentials: FIFO modes
+  keep other users out, but any process running as the session owner can open
+  the FIFOs and send requests. A partial or stalled frame can block the
+  single-threaded daemon, and pure Lua has no client read timeout (the shell
+  CLI bounds its own calls with `timeout` when available). Lock and metadata
+  liveness is PID-only; a reused PID can be misclassified as live and require
+  manual stale-state cleanup. A reaper that dies after renaming a live lock to
+  a `.stale` tail can leave the canonical path absent; cleanup restores a live
+  tail when canonical is absent, but a client in the crash window may require
+  manual recovery. Removing a live session directory leaves an unreachable
+  daemon; the harness refuses to guess a pid and requires an explicit stop by
+  the recorded pid. No provider, task DAG, agent execution, remote access, or
+  multi-user authentication is claimed for this slice.
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
   host, shows escaped full content plus a pure-Lua change diff under a per-run

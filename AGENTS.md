@@ -135,6 +135,11 @@
   processes. Redaction applies before every persistence sink.
 - High-risk operations (shell strings, secret reads, trust approval, new
   network destinations) fail closed when audit cannot record them.
+- The experimental local session daemon (`scripts/wheel-session`) is
+  same-user-only, adds no network listener or capability class, keeps runtime
+  paths at `0700`/`0600`, and never signals a pid it did not read from validated
+  metadata. Its FIFO peer-credential residual is documented in
+  [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
 
 ## Verification and handoff
 

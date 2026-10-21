@@ -576,6 +576,20 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   recorded process group is held by a retained session leader through the
   TERM/grace/KILL sweep; if that leader is lost, the result reports
   `cleanup = unverified` and no signal is sent.
+- session control-plane failures from `scripts/wheel-session` — the request
+  failed closed. A not-running code means no live metadata/FIFO pair; a busy
+  code means another client holds the per-session lock; an unsafe-path code
+  means the session directory, metadata, or FIFO is a symlink, foreign-owned,
+  or not `0700`/`0600`; a frame-too-large code means a request exceeded 64 KiB.
+  A start-failed code usually means `setsid`, `mkfifo`, `kill`, or a Lua
+  interpreter is unavailable. The daemon writes no log content; diagnose with
+  probe/status and correct the path.
+- a session daemon is unreachable but its pid still exists — the control plane
+  never force-kills an unverified pid. Confirm the recorded pid in
+  `meta.json`, then stop it explicitly with `wheel-session stop` or, after
+  manual verification, signal that exact pid. Deleting a live session
+  directory leaves the daemon unreachable; it must be stopped by its recorded
+  pid.
 - `just manifest` rejects `bitty-plugin.toml` — the transitional manifest is
   unchanged by the harness position; fix the manifest or the SDK pin rather than
   widening it.
@@ -598,6 +612,9 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                         |
 | `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                   |
 | `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                           |
+| `lua/wheel/session.lua`                   | Local session control plane (client/shared): bounded strict JSON framing, session-name and private-path validation, metadata, serialization lock, and RPC.                                                           |
+| `lua/wheel/daemon.lua`                    | Detached session daemon: owns one WheelContext, serves the `wheel-session/1` methods over private FIFOs, and shuts down explicitly.                                                                                  |
+| `lua/wheel/session_cli.lua`               | Script entry point used by `scripts/wheel-session`; bootstraps the module path and prints structured results.                                                                                                        |
 | `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                         |
 | `lua/wheel/provider.lua`                  | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                       |
 | `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                 |
@@ -605,6 +622,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                  |
 | `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                       |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
+| `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                               |
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
 | `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                         |
 | `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                           |
@@ -614,6 +632,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                       |
 | `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                |
 | `scripts/install-local.sh`                | Offline install/upgrade/rollback under `<prefix>/wheel/<version>` with digest, prefix, ownership, and symlink checks.                                                                                                |
+| `scripts/wheel-session`                   | POSIX shell CLI for the experimental local session daemon: start/stop, ping/status/snapshot, context put/get/list, and bounded client calls.                                                                         |
 | `scripts/verify-package.sh`               | Builds, installs, runs the real-host fixture on the installed tree, upgrades, rolls back, and tests refusals.                                                                                                        |
 | `dist/`                                   | Gitignored package output (`wheel-<version>.tar.gz`, `.sha256`, `.manifest.json`).                                                                                                                                   |
 | `package.json`                            | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                     |
@@ -683,6 +702,59 @@ Wheel models agent context as an immutable, content-addressed versioned DAG insp
 - **3-Way Semantic Merge & Fast-Forward**: Merges branches semantically by computing the lowest common ancestor (LCA) in the commit DAG; non-conflicting slot deltas merge automatically, while conflicting slots are preserved with structured diagnostics in `decisions/conflicts/*`.
 - **Cherry-Pick**: Imports specific findings, artifacts, or decisions from foreign branches (`cherry_pick`) without pulling along entire branch histories or transcripts ("parents absorb conclusions, never transcripts").
 - **Task-Isolated Workflows**: Multi-agent wave orchestration supports running worker tasks in dedicated task branches (`task/<id>`), merging deliverables into `main` upon reviewer acceptance.
+
+### Local Session Daemon (Experimental)
+
+A Wheel runtime can outlive one client. `scripts/wheel-session start NAME`
+prepares a private per-session runtime directory, launches
+`lua/wheel/daemon.lua` detached with `setsid`, and waits for metadata that is
+published only after both control FIFOs are open. The daemon owns one
+`WheelContext` plus session metadata; clients use a local-only control plane
+and never embed the runtime.
+
+- **Transport**: two POSIX FIFOs (`request.fifo`, `response.fifo`) under
+  `$XDG_RUNTIME_DIR/wheel/sessions/<name>`, with an XDG state fallback. No TCP,
+  Unix socket library, or remote listener is involved.
+- **Protocol**: one bounded JSON document per line with the marker
+  `wheel-session/1`. Requests are capped at 64 KiB and responses at 1 MiB;
+  framing is bounded before parsing, and errors are static.
+- **Methods**: `ping`, `session.status`, `session.snapshot`, `context.put`,
+  `context.get`, `context.list`, and `shutdown`. `context.put` honors the
+  existing `expected_version` compare-and-swap; a conflict returns
+  `E_SESSION_CAS_CONFLICT`. The daemon bounds the context store at 1024 slots
+  and 16 MiB total, and a value is at most 10 KiB per request. The cap is
+  derived from the 64 KiB request frame and six-byte worst-case JSON escaping,
+  so any accepted value fits the frame without a late frame-too-large error.
+- **Serialization**: a per-session client lock file serializes requests; a
+  concurrent CLI call fails with `E_SESSION_BUSY`. A per-lock mutex serializes
+  stale-lock reclamation: the dead owner's path is renamed, its moved owner is
+  verified before removal, and a changed owner is restored with a non-replacing
+  hard link. The replacement main lock is created while the mutex is held.
+- **Lifecycle**: `start` rejects a live duplicate, cleans only a dead session's
+  metadata/FIFOs, and publishes metadata after readiness. The daemon takes over
+  the start lock under its mutex before publishing metadata, so a delayed stale
+  starter aborts instead of clobbering a newer session. `stop` sends the explicit
+  `shutdown` method and waits for the recorded pid; it never signals an
+  unrecorded process.
+- **Private state**: the session root and directory are `0700`; metadata and
+  FIFOs are `0600`; symlinked or foreign-owned paths are refused. Snapshots
+  contain slot names, kinds, hashes, versions, and sizes, never slot content.
+
+```sh
+# WHEEL_SESSION_ROOT is optional; unset uses the XDG runtime directory.
+scripts/wheel-session start demo
+scripts/wheel-session put demo scratch/note < note.txt
+scripts/wheel-session get demo scratch/note
+scripts/wheel-session snapshot demo
+scripts/wheel-session stop demo
+```
+
+This slice is a runtime boundary foundation, not an agent executor: it does not
+own a task DAG, call a provider, run an agent, authenticate multiple users, or
+expose a network service. The same-user FIFO residual is recorded in
+[SECURITY-MODEL.md](SECURITY-MODEL.md). The `scripts/wheel-session` CLI is
+repository-local developer tooling; it is not part of the 0.1.0 library
+artifact.
 
 ## Development
 

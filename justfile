@@ -96,6 +96,9 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/tool.lua
     bun run luaparse --quiet --file lua/wheel/provider.lua
     bun run luaparse --quiet --file lua/wheel/runner.lua
+    bun run luaparse --quiet --file lua/wheel/session.lua
+    bun run luaparse --quiet --file lua/wheel/daemon.lua
+    bun run luaparse --quiet --file lua/wheel/session_cli.lua
     bun run luaparse --quiet --file bench/run.lua
     bun run luaparse --quiet --file bench/lib/cli.lua
     bun run luaparse --quiet --file bench/lib/env.lua
@@ -113,6 +116,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_wheel.lua
     bun run luaparse --quiet --file tests/test_context_snapshot.lua
     bun run luaparse --quiet --file tests/test_live_provider.lua
+    bun run luaparse --quiet --file tests/test_session.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
@@ -121,6 +125,20 @@ lua: deps
 # test cannot hang. `just test-gate` verifies the selection branches.
 test: deps
     bash scripts/test-gate.sh
+
+# Local session-daemon integration gate: starts a real detached daemon in a
+# temporary runtime root and drives it from separate client processes. POSIX
+# FIFOs, setsid, and the usual userland tools are required; Lua 5.1 is the gate.
+test-session: deps
+    @if command -v lua5.1 >/dev/null 2>&1; then \
+        lua5.1 tests/test_session.lua; \
+    elif command -v luajit >/dev/null 2>&1; then \
+        luajit tests/test_session.lua; \
+    elif command -v lua >/dev/null 2>&1; then \
+        lua tests/test_session.lua; \
+    else \
+        echo "No lua interpreter found; skipping session-daemon tests" >&2; \
+    fi
 
 # Verify the interpreter-selection branches of `just test` without running the
 # suite: lua5.1 wins when present, luajit/lua fall back in order, and absence is
@@ -199,8 +217,8 @@ verify-package:
 # workflow-*.sh scripts are outside this gate; reformatting them is a separate
 # change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh scripts/wheel-session
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh bench/run.sh scripts/wheel-session
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and
@@ -249,7 +267,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test test-bench lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test test-bench test-session lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

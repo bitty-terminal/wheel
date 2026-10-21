@@ -1,0 +1,188 @@
+#!/bin/sh
+# Wheel local session daemon CLI (experimental).
+#
+# Commands:
+#   wheel-session [--root DIR] start NAME
+#   wheel-session [--root DIR] stop NAME
+#   wheel-session [--root DIR] ping|status|snapshot NAME
+#   wheel-session [--root DIR] list NAME [PREFIX]
+#   wheel-session [--root DIR] put NAME SLOT [EXPECTED_VERSION]   (content on stdin)
+#   wheel-session [--root DIR] get NAME SLOT
+#   wheel-session [--root DIR] probe NAME
+#
+# `start` prepares the private runtime directory and FIFOs, launches the
+# daemon detached with `setsid`, and waits for the published metadata. `stop`
+# sends the explicit `shutdown` method and waits for the recorded pid to exit;
+# it never sends a signal to a pid it did not read from the daemon metadata.
+#
+# The runtime root defaults to the XDG runtime directory. `--root` is an
+# explicit local override used by tests and embedding; it must be an absolute
+# path and is revalidated by the Lua client and daemon.
+set -eu
+
+umask 077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+CLI_SCRIPT="$REPO_ROOT/lua/wheel/session_cli.lua"
+DAEMON_SCRIPT="$REPO_ROOT/lua/wheel/daemon.lua"
+VERSION=$(cat "$REPO_ROOT/VERSION")
+
+START_ATTEMPTS=100
+START_INTERVAL_SECONDS=0.1
+STOP_ATTEMPTS=50
+STOP_INTERVAL_SECONDS=0.1
+CLIENT_TIMEOUT_SECONDS=20
+
+usage() {
+  cat <<'EOF'
+Usage: wheel-session [--root DIR] <command> [arguments]
+
+Commands:
+  start NAME                     start a detached local session daemon
+  stop NAME                      request explicit shutdown and wait for exit
+  ping NAME                      protocol/pid/uptime probe
+  status NAME                    session and context status
+  snapshot NAME                  bounded context snapshot (no slot content)
+  list NAME [PREFIX]             list context slots
+  put NAME SLOT [VERSION]        store stdin as slot content
+  get NAME SLOT                  print slot content
+  probe NAME                     exit 0 when metadata reports a live daemon
+  -h, --help                     show this help
+
+The runtime root defaults to the XDG runtime directory; --root overrides it
+with an absolute path. The control plane is local-only and same-user.
+EOF
+}
+
+select_interpreter() {
+  for candidate in lua5.1 luajit lua; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+die() {
+  printf 'wheel-session: %s\n' "$*" >&2
+  exit 1
+}
+
+LUA_BIN=$(select_interpreter) || die "no Lua interpreter found (lua5.1, luajit, lua)"
+if [ ! -f "$CLI_SCRIPT" ] || [ ! -f "$DAEMON_SCRIPT" ]; then
+  die "session sources are missing under $REPO_ROOT/lua/wheel"
+fi
+
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=$(command -v timeout)
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN=$(command -v gtimeout)
+fi
+
+run_client() {
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" "$CLIENT_TIMEOUT_SECONDS" "$LUA_BIN" "$CLI_SCRIPT" "$@"
+  else
+    "$LUA_BIN" "$CLI_SCRIPT" "$@"
+  fi
+}
+
+ROOT_OVERRIDE=""
+if [ "${1:-}" = "--root" ]; then
+  [ "$#" -ge 3 ] || die "--root requires a directory and a command"
+  ROOT_OVERRIDE=$2
+  shift 2
+fi
+
+command=${1:-}
+[ -n "$command" ] || {
+  usage >&2
+  exit 2
+}
+shift
+
+if [ -n "$ROOT_OVERRIDE" ]; then
+  WHEEL_SESSION_ROOT=$ROOT_OVERRIDE
+  export WHEEL_SESSION_ROOT
+fi
+
+case "$command" in
+start)
+  [ "$#" -eq 1 ] || die "start requires exactly one session name"
+  session_name=$1
+  session_root=$(run_client root) || exit $?
+  WHEEL_SESSION_ROOT=$session_root
+  export WHEEL_SESSION_ROOT
+  command -v setsid >/dev/null 2>&1 || die "setsid is required to detach the daemon"
+  WHEEL_SESSION_CALLER_PID=$$
+  export WHEEL_SESSION_CALLER_PID
+  WHEEL_SESSION_START_OWNER=$$
+  export WHEEL_SESSION_START_OWNER
+  run_client prepare "$session_name" >/dev/null || exit $?
+  setsid "$LUA_BIN" "$DAEMON_SCRIPT" \
+    --root "$session_root" --name "$session_name" --version "$VERSION" \
+    --start-owner "$$" \
+    </dev/null >/dev/null 2>&1 &
+  meta_path="$session_root/$session_name/meta.json"
+  attempt=0
+  while [ "$attempt" -lt "$START_ATTEMPTS" ]; do
+    if [ -f "$meta_path" ]; then
+      if ready=$(run_client probe "$session_name" 2>/dev/null); then
+        printf '%s\n' "$ready"
+        exit 0
+      fi
+    fi
+    attempt=$((attempt + 1))
+    sleep "$START_INTERVAL_SECONDS"
+  done
+  printf 'wheel-session: E_SESSION_START_FAILED: session daemon did not become ready\n' >&2
+  exit 1
+  ;;
+stop)
+  [ "$#" -eq 1 ] || die "stop requires exactly one session name"
+  session_name=$1
+  response=$(run_client stop "$session_name") || exit $?
+  printf '%s\n' "$response"
+  daemon_pid=$(printf '%s' "$response" | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p')
+  [ -n "$daemon_pid" ] || die "shutdown acknowledgement did not record a pid"
+  attempt=0
+  while kill -0 "$daemon_pid" 2>/dev/null && [ "$attempt" -lt "$STOP_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    sleep "$STOP_INTERVAL_SECONDS"
+  done
+  if kill -0 "$daemon_pid" 2>/dev/null; then
+    die "daemon pid $daemon_pid did not exit after the explicit shutdown"
+  fi
+  ;;
+ping | status | snapshot | probe)
+  [ "$#" -eq 1 ] || die "$command requires exactly one session name"
+  run_client "$command" "$1"
+  ;;
+list)
+  [ "$#" -eq 1 ] || [ "$#" -eq 2 ] || die "list requires a session name and an optional prefix"
+  run_client list "$@"
+  ;;
+get)
+  [ "$#" -eq 2 ] || die "get requires a session name and a slot name"
+  run_client get "$@"
+  ;;
+put)
+  [ "$#" -ge 2 ] && [ "$#" -le 3 ] || die "put requires a session name, a slot name, and an optional expected version"
+  run_client put "$@"
+  ;;
+root)
+  [ "$#" -eq 0 ] || die "root takes no arguments"
+  run_client root
+  ;;
+-h | --help | help)
+  usage
+  ;;
+*)
+  printf 'wheel-session: unknown command: %s\n' "$command" >&2
+  usage >&2
+  exit 2
+  ;;
+esac
