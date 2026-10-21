@@ -308,9 +308,11 @@ local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > "$out" 2> "$err";
 --- before any signal, then holds the group identity through TERM, the bounded
 --- grace, and the final KILL. The KILL targets the whole recorded group and
 --- therefore takes the leader with it; the status and sweep files are already
---- written. A leader that exits early never signals anything. No caller value is
---- interpolated into this script.
-local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; grace="$4"; sleep_bin="$5"; shift 5; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
+--- written. After recording status, the leader sends its own stderr to
+--- `/dev/null`, so the shell's expected `Killed` diagnostic for the self-KILL
+--- cannot pollute the command's captured stderr. A leader that exits early never
+--- signals anything. No caller value is interpolated into this script.
+local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; grace="$4"; sleep_bin="$5"; shift 5; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; exec 2>/dev/null; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); 5.2+ reports the exit
