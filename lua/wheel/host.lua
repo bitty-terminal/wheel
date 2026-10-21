@@ -1530,8 +1530,12 @@ function standalone.new(opts)
     end
     local wrote, write_err = write_private_file(path, content or "")
     if not wrote then
-      os.remove(path)
-      return nil, write_err
+      local removed, remove_err = os.remove(path)
+      if not removed then
+        return nil, tostring(write_err)
+          .. "; cleanup failed: " .. tostring(remove_err or path)
+      end
+      return nil, tostring(write_err)
     end
     return path
   end
