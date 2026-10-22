@@ -298,6 +298,122 @@ local function run_tests()
     end
   end)
 
+  test("WheelAudit: Authorization variants redact the complete value", function()
+    local dir = base .. "/auth-headers"
+    local values = {
+      token = "opaque-token-4d1f9a",
+      apikey = "opaque-apikey-71c2e8",
+      ssws = "opaque-ssws-9b3a55",
+      digest = "opaque-digest-response-2c7f10",
+      aws4 = "opaque-aws4-signature-6e8d43",
+      proxy = "opaque-proxy-apikey-1a9c77",
+      json = "opaque-json-ssws-5f2b90",
+      quoted = "opaque-shell-quoted-3e6d18",
+      argv = "opaque-argv-digest-8a4c21",
+      unquoted = "opaque-unquoted-tail-0d7e62",
+    }
+
+    local shell = table.concat({
+      "curl -H 'Authorization: Token " .. values.token .. "'",
+      " -H 'Authorization: ApiKey " .. values.apikey .. "'",
+      " -H 'Authorization: SSWS " .. values.ssws .. "'",
+      " -H 'Authorization: Digest username=\"operator\", realm=\"audit\", "
+        .. "nonce=\"n-1\", response=\"" .. values.digest .. "\"'",
+      " -H 'Authorization: AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/20261022, "
+        .. "SignedHeaders=host, Signature=" .. values.aws4 .. "'",
+      " -H 'Proxy-Authorization: ApiKey " .. values.proxy .. "'",
+      " -H 'Authorization: Token " .. values.quoted .. "'",
+      " -d '{\"Authorization\":\"SSWS " .. values.json .. "\",\"keep\":\"json-keep\"}'",
+      " target",
+    }, "")
+
+    local ok, err = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "shell",
+      shell = shell,
+      decision = "allow",
+      reason = "authorization header probe",
+    }, { dir = dir })
+    check(ok == true, "the header probe must be recorded: " .. tostring(err))
+
+    local argv_ok = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "argv",
+      program = "curl",
+      args = { "-H", "Authorization: Digest username=\"u\", response=\""
+        .. values.argv .. "\"", "target" },
+      decision = "allow",
+    }, { dir = dir })
+    check(argv_ok == true, "the argv header probe must be recorded")
+
+    local unquoted_ok = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "shell",
+      shell = "curl -H Authorization: Token " .. values.unquoted,
+      decision = "allow",
+    }, { dir = dir })
+    check(unquoted_ok == true, "the unquoted tail probe must be recorded")
+
+    local raw = read_file(dir .. "/audit.jsonl") or ""
+    for name, secret in pairs(values) do
+      assert_no_secret(raw, secret, "the audit stream (" .. name .. ")")
+    end
+    check(raw:find("Authorization", 1, true) == nil,
+      "no Authorization header line may be recorded")
+    check(raw:find("Proxy-Authorization", 1, true) == nil,
+      "no Proxy-Authorization header line may be recorded")
+    check(raw:find("Digest", 1, true) == nil, "no Digest scheme may be recorded")
+    check(raw:find("AWS4-HMAC-SHA256", 1, true) == nil,
+      "no AWS4 scheme may be recorded")
+    check(raw:find("SSWS", 1, true) == nil, "no SSWS scheme may be recorded")
+    check(raw:find("ApiKey", 1, true) == nil, "no ApiKey scheme may be recorded")
+    check(raw:find("json-keep", 1, true) ~= nil,
+      "the JSON body outside the authorization value must remain")
+    check(raw:find("[redacted:" .. WheelConfig.compute_hash(
+      "Token " .. values.token):sub(1, 16) .. "]", 1, true) ~= nil,
+      "the full authorization value must keep a stable marker")
+
+    -- A denied real command carrying the same headers must not echo them in
+    -- its result or typed error, and its audit record must remain redacted.
+    local denied = WheelHost.proc.run_command(shell, nil, {
+      audit = {
+        dir = dir,
+        decision = "deny",
+        reason = "authorization probe denial",
+        high_risk = true,
+      },
+    })
+    check(denied.ok == false and denied.denied == true,
+      "the probe command must be denied without executing")
+    check(denied.stdout == "" and denied.stderr:find(values.token, 1, true) == nil,
+      "the denial result must not carry a credential")
+    check(denied.audit_error == nil or type(denied.audit_error.message) ~= "string"
+      or denied.audit_error.message == "the audit record could not be written",
+      "the denial error must stay static")
+
+    -- A write failure must not copy a credential into the typed error.
+    local blocked = base .. "/auth-blocked"
+    write_file(blocked, "not a directory")
+    local failed, failed_err = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "shell",
+      shell = shell,
+      decision = "allow",
+    }, { dir = blocked .. "/audit" })
+    check(failed == nil and type(failed_err) == "table",
+      "the blocked audit write must fail with a typed error")
+    for name, secret in pairs(values) do
+      assert_no_secret(failed_err.message, secret, "the typed error (" .. name .. ")")
+      assert_no_secret(tostring(failed_err), secret, "the typed error string (" .. name .. ")")
+    end
+
+    local records = parse_records(dir)
+    local last = records[#records]
+    for name, secret in pairs(values) do
+      assert_no_secret(last.shell or "", secret, "the denied record (" .. name .. ")")
+    end
+  end)
+
   test("WheelAudit: records stay within 16 KiB and command previews are bounded", function()
     local dir = base .. "/bounds"
     local record_ok = WheelAudit.record({
@@ -400,6 +516,42 @@ local function run_tests()
     check(reason == "audit_corrupt", "a tampered record must report corruption")
   end)
 
+  test("WheelAudit: middle corruption does not block append but verify detects it", function()
+    local dir = base .. "/middle-corrupt"
+    local sink = assert(WheelAudit.new({ dir = dir }))
+    for index = 1, 3 do
+      local ok, err = sink:record({
+        event = "test.middle",
+        kind = "shell",
+        shell = "printf middle-" .. tostring(index),
+        decision = "allow",
+      })
+      check(ok == true, "the baseline record must write: " .. tostring(err))
+    end
+
+    local content = read_file(dir .. "/audit.jsonl") or ""
+    local edited, replacements = content:gsub('"decision":"allow"', '"decision":"deny"', 1)
+    check(replacements == 1, "the middle fixture must contain one decision field")
+    write_file(dir .. "/audit.jsonl", edited)
+
+    -- Open-time recovery inspects only the tail, so the intact last line lets
+    -- the next append proceed. The full verifier must still report the edited
+    -- middle line.
+    local restarted = assert(WheelAudit.new({ dir = dir }))
+    local appended, append_err = restarted:record({
+      event = "test.middle",
+      kind = "shell",
+      shell = "printf middle-4",
+      decision = "allow",
+    })
+    check(appended == true, "an intact tail must allow the next append: " .. tostring(append_err))
+    local verified, verify_err, reason = WheelAudit.verify({ dir = dir })
+    check(verified == nil, "middle corruption must fail full verification")
+    check(type(verify_err) == "table" and verify_err.code == WheelErrors.E_AUDIT_UNAVAILABLE,
+      "middle corruption must return the typed audit failure")
+    check(reason == "audit_corrupt", "middle corruption must report corruption")
+  end)
+
   test("WheelAudit: a torn tail or corrupt line fails closed", function()
     local dir = base .. "/corrupt"
     local sink = assert(WheelAudit.new({ dir = dir }))
@@ -445,6 +597,65 @@ local function run_tests()
       "the sink must not write through the symlink")
   end)
 
+  test("WheelAudit: an unsafe active audit file is refused", function()
+    local mode_dir = base .. "/unsafe-mode"
+    local mode_ok = WheelAudit.record({
+      event = "test.unsafe",
+      kind = "shell",
+      shell = "printf unsafe",
+      decision = "allow",
+    }, { dir = mode_dir })
+    check(mode_ok == true, "the mode baseline must write")
+    local mode_file = mode_dir .. "/audit.jsonl"
+    check(normalize_exit(os.execute("chmod 644 -- " .. shell_quote(mode_file))) == 0,
+      "cannot weaken the audit file mode")
+
+    local mode_sink = assert(WheelAudit.new({ dir = mode_dir }))
+    local mode_written, mode_err, mode_reason = mode_sink:record({
+      event = "test.unsafe",
+      kind = "shell",
+      shell = "printf refused",
+      decision = "allow",
+    })
+    check(mode_written == nil, "a mode-0644 audit file must be refused")
+    check(type(mode_err) == "table" and mode_err.code == WheelErrors.E_AUDIT_UNAVAILABLE,
+      "the mode refusal must be the typed audit failure")
+    check(mode_reason == "audit_file", "the mode refusal must name the file reason")
+
+    local link_dir = base .. "/unsafe-link"
+    local link_ok = WheelAudit.record({
+      event = "test.unsafe",
+      kind = "shell",
+      shell = "printf link",
+      decision = "allow",
+    }, { dir = link_dir })
+    check(link_ok == true, "the symlink baseline must write")
+    local target = link_dir .. "/target.jsonl"
+    local active = link_dir .. "/audit.jsonl"
+    check(WheelHost.fs.write_file(target, "target-content"), "cannot create the link target")
+    check(normalize_exit(os.execute("chmod 600 -- " .. shell_quote(target))) == 0,
+      "cannot set the link target mode")
+    check(normalize_exit(os.execute("rm -- " .. shell_quote(active))) == 0,
+      "cannot remove the active audit file")
+    check(normalize_exit(os.execute(
+      "ln -s -- " .. shell_quote(target) .. " " .. shell_quote(active))) == 0,
+      "cannot create the active audit symlink")
+
+    local link_sink = assert(WheelAudit.new({ dir = link_dir }))
+    local link_written, link_err, link_reason = link_sink:record({
+      event = "test.unsafe",
+      kind = "shell",
+      shell = "printf refused",
+      decision = "allow",
+    })
+    check(link_written == nil, "a symlinked audit file must be refused")
+    check(type(link_err) == "table" and link_err.code == WheelErrors.E_AUDIT_UNAVAILABLE,
+      "the symlink refusal must be the typed audit failure")
+    check(link_reason == "audit_file", "the symlink refusal must name the file reason")
+    check(read_file(target) == "target-content",
+      "the sink must not write through the active symlink")
+  end)
+
   test("WheelAudit: explicit and environment directory resolution is strict", function()
     check(WheelAudit.resolve_dir({ dir = "relative/audit" }) == nil,
       "a relative override must be refused")
@@ -480,8 +691,8 @@ local function run_tests()
       },
     })
     check(result.ok == false, "a high-risk spawn must fail closed")
-    check(result.spawned == false or result.spawned == nil,
-      "a refused high-risk spawn must not report a spawn")
+    check(result.spawned == false,
+      "a refused high-risk spawn must report spawned=false")
     check(WheelHost.fs.exists(marker) == false,
       "the high-risk command must not run when its audit record cannot be written")
     check(type(result.audit_error) == "table"
@@ -513,6 +724,34 @@ local function run_tests()
       and result.audit_warning:find("continuing", 1, true) ~= nil,
       "the result must carry a visible audit warning")
     check(result.audit_error == nil, "a continued command must not carry a fatal audit error")
+  end)
+
+  test("WheelHost: a completion audit failure warns without failing a launched command", function()
+    local dir = base .. "/completion-failure"
+    local saved_record = WheelAudit.record
+    local calls = 0
+    WheelAudit.record = function(event, opts)
+      calls = calls + 1
+      if calls == 2 then
+        return nil, WheelErrors.audit_unavailable(), "write_failed"
+      end
+      return saved_record(event, opts)
+    end
+    local ok, result = pcall(WheelHost.proc.run_program, "true", {}, {
+      audit = { dir = dir, decision = "allow", high_risk = true },
+    })
+    WheelAudit.record = saved_record
+
+    check(ok, "the launched command must return a result: " .. tostring(result))
+    check(result.ok == true and result.code == 0,
+      "a completion audit failure must not change a successful command result")
+    check(type(result.audit_warning) == "string"
+      and result.audit_warning:find("completion", 1, true) ~= nil,
+      "the result must warn about the completion record")
+    check(type(result.audit_error) == "table"
+      and result.audit_error.code == WheelErrors.E_AUDIT_UNAVAILABLE,
+      "the result must carry the typed completion failure")
+    check(calls == 2, "the seam must attempt exactly one pre-spawn and one completion record")
   end)
 
   test("WheelHost: a deny decision is recorded and never spawns", function()
@@ -569,12 +808,18 @@ local function run_tests()
   end)
 
   test("WheelHost: audit is opt-in and an invalid audit table fails before spawn", function()
-    local opt_in = base .. "/opt-in"
     local marker = base .. "/opt-in-marker"
-    local plain = WheelHost.proc.run_program("true", {}, {})
-    check(plain.ok == true, "a command without opts.audit must run")
-    check(WheelHost.fs.exists(opt_in) == false,
-      "a command without opts.audit must not create an audit directory")
+    local audit_calls = 0
+    local saved_record = WheelAudit.record
+    WheelAudit.record = function(...)
+      audit_calls = audit_calls + 1
+      return saved_record(...)
+    end
+    local plain_ok, plain = pcall(WheelHost.proc.run_program, "true", {}, {})
+    WheelAudit.record = saved_record
+    check(plain_ok and plain.ok == true, "a command without opts.audit must run")
+    check(audit_calls == 0,
+      "a command without opts.audit must not attempt an audit write")
 
     local invalid = WheelHost.proc.run_command("touch " .. shell_quote(marker), nil, {
       audit = "not-a-table",
@@ -582,6 +827,21 @@ local function run_tests()
     check(invalid.ok == false, "a malformed audit option must fail closed")
     check(WheelHost.fs.exists(marker) == false,
       "a malformed audit option must fail before spawn")
+
+    local runner_calls = 0
+    local runner_audit = base .. "/runner-audit"
+    local rejected = WheelHost.proc.run_command("ignored-command", {
+      command_runner = function()
+        runner_calls = runner_calls + 1
+        return { success = true, exit_code = 0, stdout = "runner-double", stderr = "" }
+      end,
+    }, {
+      audit = { dir = runner_audit },
+    })
+    check(rejected.ok == false, "audit with an injected command_runner must be rejected")
+    check(runner_calls == 0, "the injected runner must not run when audit is requested")
+    check(WheelHost.fs.exists(runner_audit) == false,
+      "a rejected runner audit must not create an audit directory")
   end)
 
   test("WheelHost: completion records exit, duration, truncation, and cleanup", function()

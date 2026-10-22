@@ -25,9 +25,13 @@
 --
 -- Redaction: only the allowlisted fields below are recorded. Command strings,
 -- argv elements, metadata, and reasons pass through the secret-name, header,
--- query, flag, token-shape, and URL-userinfo passes. A removed value becomes
--- `[redacted:<16 hex of SHA-256(value)>]`; the same value yields the same
--- marker, so an operator can correlate events without recovering the secret.
+-- query, flag, token-shape, and URL-userinfo passes. A credential-bearing
+-- header is removed as a whole value (name, scheme, and every parameter),
+-- through its enclosing quote or the end of the preview, so a Digest/AWS4
+-- parameter list cannot leave a value after the first token. A removed value
+-- becomes `[redacted:<16 hex of SHA-256(value)>]`; the same value yields the
+-- same marker, so an operator can correlate events without recovering the
+-- secret.
 -- Prompts, file contents, provider responses, output, environment values, and
 -- authorization header values are never accepted as record fields. Pattern
 -- redaction remains heuristic for values Wheel did not load itself.
@@ -236,6 +240,158 @@ local function clean_text(value)
   return value
 end
 
+--- Return the shell quote state at a position, scanning from the start.
+-- The audit preview is bounded, so the quadratic worst case over a handful of
+-- header names is acceptable. Backslash escapes are honored inside double
+-- quotes only, matching the shell forms the harness sees.
+-- @param text string
+-- @param limit number
+-- @return string? '"', "'", or nil
+local function quote_state_at(text, limit)
+  local state = nil
+  local index = 1
+  while index < limit do
+    local char = text:sub(index, index)
+    if state == '"' then
+      if char == "\\" then
+        index = index + 2
+      else
+        if char == '"' then
+          state = nil
+        end
+        index = index + 1
+      end
+    elseif state == "'" then
+      if char == "'" then
+        state = nil
+      end
+      index = index + 1
+    else
+      if char == '"' or char == "'" then
+        state = char
+      end
+      index = index + 1
+    end
+  end
+  return state
+end
+
+--- Find the closing quote for a quoted value, or the end of the preview.
+-- @param text string
+-- @param start number index of the opening quote
+-- @param quote string '"' or "'"
+-- @return number end index
+local function quoted_end(text, start, quote)
+  local index = start + 1
+  local length = #text
+  while index <= length do
+    local char = text:sub(index, index)
+    if quote == '"' and char == "\\" then
+      index = index + 2
+    elseif char == quote then
+      return index
+    else
+      index = index + 1
+    end
+  end
+  return length
+end
+
+--- Replace every secret-shaped header's complete value with one marker.
+-- Authorization and Proxy-Authorization are redacted regardless of scheme
+-- (Bearer, Basic, Token, ApiKey, SSWS, Digest, AWS4-HMAC-SHA256, ...). The
+-- scanner consumes the whole value through the enclosing quote or the end of
+-- the preview, so a Digest/AWS4 parameter list cannot leave a credential after
+-- the first token. Header names are dropped as well; only the stable value
+-- marker remains. Quoted shell headers and JSON forms are handled by the same
+-- quote-state pass.
+-- @param text string
+-- @param counter table { n = number }
+-- @return string
+local function redact_secret_headers(text, counter)
+  local out = {}
+  local cursor = 1
+  local index = 1
+  local length = #text
+
+  while index <= length do
+    local char = text:sub(index, index)
+    local previous = index > 1 and text:sub(index - 1, index - 1) or ""
+    local at_boundary = previous == "" or previous:match("[%w%-_]") == nil
+
+    if char:match("[%a]") and at_boundary then
+      local name = text:sub(index):match("^([%a][%w%-_]*)")
+      local after_name = index + #name
+      local colon = after_name
+      -- A JSON key closes its quote before the colon: `"Authorization":"..."`.
+      local closing = text:sub(colon, colon)
+      if closing == '"' or closing == "'" then
+        colon = colon + 1
+      end
+      while text:sub(colon, colon) == " " or text:sub(colon, colon) == "\t" do
+        colon = colon + 1
+      end
+
+      if text:sub(colon, colon) == ":" and is_secret_name(name) then
+        local value_start = colon + 1
+        while text:sub(value_start, value_start) == " "
+          or text:sub(value_start, value_start) == "\t" do
+          value_start = value_start + 1
+        end
+
+        local value_end = nil
+        local first = text:sub(value_start, value_start)
+        if first == '"' then
+          value_end = quoted_end(text, value_start, '"')
+        elseif first == "'" then
+          value_end = quoted_end(text, value_start, "'")
+        else
+          local state = quote_state_at(text, index)
+          if state == '"' then
+            value_end = quoted_end(text, value_start, '"')
+          elseif state == "'" then
+            value_end = quoted_end(text, value_start, "'")
+          else
+            value_end = length
+          end
+        end
+
+        if value_end ~= nil and value_end >= value_start then
+          local credential
+          local first_char = text:sub(value_start, value_start)
+          if first_char == '"' or first_char == "'" then
+            credential = text:sub(value_start + 1, value_end - 1)
+          elseif text:sub(value_end, value_end) == '"'
+            or text:sub(value_end, value_end) == "'" then
+            credential = text:sub(value_start, value_end - 1)
+          else
+            credential = text:sub(value_start, value_end)
+          end
+          local marker = redaction_marker(credential)
+          if marker then
+            counter.n = counter.n + 1
+            out[#out + 1] = text:sub(cursor, index - 1)
+            out[#out + 1] = marker
+            cursor = value_end + 1
+            index = cursor
+          else
+            index = index + 1
+          end
+        else
+          index = index + 1
+        end
+      else
+        index = index + 1
+      end
+    else
+      index = index + 1
+    end
+  end
+
+  out[#out + 1] = text:sub(cursor)
+  return table.concat(out)
+end
+
 --- Apply the redaction passes to one free-form string.
 -- @param text string
 -- @param counter table { n = number }
@@ -245,6 +401,7 @@ local function redact_text(text, counter)
     return nil
   end
   text = clean_text(text)
+  text = redact_secret_headers(text, counter)
 
   local function span(prefix, value)
     local marker = redaction_marker(value)
@@ -264,30 +421,9 @@ local function redact_text(text, counter)
     return marker
   end
 
-  -- Authorization headers, bearer/basic credentials, and secret-shaped
-  -- headers are replaced whole (name, scheme, and value) so no header line is
-  -- recorded; only the stable value marker remains.
-  text = text:gsub(
-    "([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]%s*:%s*[Bb][Ee][Aa][Rr][Ee][Rr]%s+)([^%s'\"]+)",
-    function(_, value)
-      return whole(value)
-    end)
-  text = text:gsub(
-    "([Aa][Uu][Tt][Hh][Oo][Rr][Ii][Zz][Aa][Tt][Ii][Oo][Nn]%s*:%s*[Bb][Aa][Ss][Ii][Cc]%s+)([^%s'\"]+)",
-    function(_, value)
-      return whole(value)
-    end)
+  -- Bare bearer tokens outside a header still need the shape pass.
   text = text:gsub("([Bb][Ee][Aa][Rr][Ee][Rr]%s+)([%w%-%._~%+/=]+)", function(_, value)
     return whole(value)
-  end)
-
-  text = text:gsub("([%a][%w%-_]*%s*:%s*)([^%s'\"]+)", function(name, value)
-    if is_secret_name(name)
-      and value ~= "Bearer" and value ~= "Basic"
-      and value:sub(1, 10) ~= "[redacted:" then
-      return whole(value)
-    end
-    return nil
   end)
 
   text = text:gsub("([%a_][%w_]*)(=)([^%s]+)", function(name, separator, value)

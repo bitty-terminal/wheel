@@ -92,7 +92,8 @@ Production provider adapters are unchanged: they keep HTTPS and the live test
 
 - This provider-stub test does not inspect execution audit output. The
   `tests/real_host_fixture.lua` audit section (CTX-0030) does inspect the local
-  JSONL, but independent reviewer inspection remains open.
+  JSONL, and the CTX-0030 review inspected that evidence. A later default-on
+  widening needs fresh audit review; asynchronous cancellation remains open.
 - Asynchronous cancellation is not implemented; only timeout and process-group
   cleanup are covered elsewhere. Gate 2 cancellation evidence remains open.
 - No Bitty panel or terminal presentation run was performed. Gate 2 remains

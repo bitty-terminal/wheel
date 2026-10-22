@@ -25,9 +25,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `result.audit_warning`. `just test-audit` covers append, rotation, private
   modes, chain, redaction, bounds, fail-closed, and warning behavior; the
   real-host fixture reads the JSONL after a real permitted and denied command.
-  The sink is intentionally opt-in in this slice: tool and trust call sites do
-  not yet supply audit metadata, and default-on wiring plus cross-process
-  append serialization remain follow-ups.
+  Review hardening consumes the complete Authorization and Proxy-Authorization
+  value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, refuses an
+  unsafe active audit file (symlink or weak mode), rejects `opts.audit` with an
+  injected `command_runner`, reports `spawned = false` on a high-risk refusal,
+  and documents that only a torn/corrupt tail blocks append while
+  `WheelAudit.verify` scans earlier corruption. The sink is intentionally
+  opt-in in this slice: tool and trust call sites do not yet supply audit
+  metadata, and default-on wiring plus cross-process append serialization
+  remain follow-ups.
 - Offline Gate 2 provider-stub evidence (CTX-0029 / wheel#95): `just
 test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   (`tests/provider_stub.py`), performs one completion through the real

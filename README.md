@@ -510,14 +510,22 @@ cannot be loaded, or on first use when an optional lazy submodule fails. The
 message names the rooted module (for example `wheel.agent`) and keeps only a
 bounded, path-free cause; no stack trace, host path, or secret is included.
 
-`E_AUDIT_UNAVAILABLE` is returned by the process seam when a high-risk
-operation's pre-spawn audit record cannot be written (the command is not
-launched) or attached to a lower-risk result as `audit_error` while
-`audit_warning` is set. Its message is the fixed
-`the audit record could not be written`; the sink's reason code
-(`audit_directory`, `audit_file`, `audit_corrupt`, `rotation_failed`,
-`write_failed`, `record_too_large`, `hash_unavailable`, `invalid_event`) is the
-static failure class and never a path or value.
+`E_AUDIT_UNAVAILABLE` is returned or attached by the process seam when the
+local audit sink cannot write:
+
+- a high-risk pre-spawn failure returns the typed failure with
+  `spawned = false`, no `audit_warning`, and the command is not launched;
+- a lower-risk pre-spawn failure runs the command, sets `audit_warning`, and
+  leaves `audit_error` unset;
+- a completion-record failure after a launched command sets both
+  `audit_error` and `audit_warning` (the command already ran);
+- a denied command whose deny record cannot be written returns `denied = true`,
+  `spawned = false`, and sets both fields, but still does not launch.
+
+Its message is the fixed `the audit record could not be written`; the sink's
+reason code (`no_state_dir`, `audit_directory`, `audit_file`, `audit_corrupt`,
+`rotation_failed`, `write_failed`, `record_too_large`, `hash_unavailable`,
+`invalid_event`) is the static failure class and never a path or value.
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family
@@ -575,12 +583,16 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   context instead of editing the snapshot table; see
   [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
 - `E_AUDIT_UNAVAILABLE` — the local audit sink could not write a record. A
-  high-risk spawn was refused before launch; a lower-risk result carries the
-  error with `audit_warning` and may still have run. Check that
+  high-risk spawn is refused before launch; a lower-risk pre-spawn failure runs
+  the command with `audit_warning` and no `audit_error`; a completion failure
+  after launch sets both fields; a denied command whose record cannot be
+  written remains denied with both fields. Check that
   `$XDG_STATE_HOME/wheel/audit` (or the explicit override) is a real,
   user-owned `0700` directory with no symlink, and that the active `0600`
-  JSONL file has a complete last line. The sink never repairs a torn or
-  corrupt tail silently.
+  JSONL file has a complete last line. A torn or corrupt tail blocks the next
+  append; corruption in an earlier retained line does not block appends and is
+  reported by `WheelAudit.verify`. The sink never repairs a torn or corrupt
+  tail silently.
 - `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
   `PATH`; these
@@ -1050,8 +1062,11 @@ owner, or weaker mode is refused.
   responses, and authorization header values are never record fields.
 - **Bounds.** A record is at most 16 KiB. The active file rotates at 1 MiB and
   four files are retained (`audit.jsonl` plus `audit.1.jsonl` through
-  `audit.3.jsonl`), so the stream is bounded at 4 MiB. A torn tail or corrupt
-  line fails the next append closed instead of being repaired silently.
+  `audit.3.jsonl`), so the stream is bounded at 4 MiB. A torn or corrupt
+  **tail** fails the next append closed instead of being repaired silently.
+  Opening the sink reads only the tail, so corruption in an earlier retained
+  line does not block appends; `WheelAudit.verify` scans the retained files and
+  reports the first broken line.
 - **Chain.** Each record carries a monotonic `seq` and the previous record's
   `hash`; `hash` is the SHA-256 of the canonical record without that field.
   `WheelAudit.verify` walks the retained files and reports the first broken

@@ -1722,6 +1722,7 @@ function standalone.new(opts)
         cleanup()
         local refused = process_failure(
           "audit record could not be written; refusing a high-risk spawn")
+        refused.spawned = false
         refused.audit_error = audit_err
         return refused
       else
@@ -2348,6 +2349,14 @@ end
 -- @return table process result
 function WheelHost.proc.run_command(shell_string, env, opts)
   if env and type(env.command_runner) == "function" then
+    -- The injected runner is a test seam that never crosses the host process
+    -- boundary, so it cannot produce the real pre-spawn/completion records. An
+    -- audit request is rejected rather than silently producing incomplete
+    -- evidence.
+    if type(opts) == "table" and opts.audit ~= nil then
+      return process_failure(
+        "audit is not supported with an injected command_runner")
+    end
     return normalize_runner_result(env.command_runner({ command = shell_string }, env))
   end
   return invoke("process.spawn", "run_command", shell_string, opts)

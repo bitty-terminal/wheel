@@ -179,8 +179,11 @@ not receive it.
   ordinary build tools require it; that still grants the child the user's
   ambient file access, which is a residual risk, not a sandbox claim.
 - The harness is required to record the resolved executable path, argv, cwd,
-  exit status, and duration before the process is allowed to run. No execution
-  audit stream exists yet, so this remains a known gap.
+  exit status, and duration before the process is allowed to run. An opt-in
+  execution audit sink (`lua/wheel/audit.lua`) now writes pre-spawn and
+  completion records when `WheelHost.proc` receives `opts.audit`; default-on
+  invocation wiring for tool and trust call sites is not complete, so this
+  remains a known gap for callers that do not pass the metadata.
 - Each invocation has a finite timeout, bounded output, and a process group
   recorded through a `setsid` session leader. GNU `timeout` (or `gtimeout`)
   runs with `--foreground`, so expiry signals only the direct child, and a
@@ -364,7 +367,9 @@ authority.
   temporary file is renamed over the target. The store has no `/tmp` or other
   predictable fallback, and a symlinked, non-regular, foreign-owned,
   group/world-writable, oversized, corrupt, or foreign-version store fails
-  closed with a surfaced warning. No execution audit log exists yet; see
+  closed with a surfaced warning. The opt-in execution audit log exists under
+  `$XDG_STATE_HOME/wheel/audit/`; trust approval does not write to it yet, so
+  the default-on fail-closed requirement remains open. See
   [Relationship to current code](#relationship-to-current-code).
 
 ### Local session control plane (experimental)
@@ -761,7 +766,10 @@ total). Each record carries a monotonic `seq`, the previous record's `hash`,
 and its own pure-Lua SHA-256 hash, so an edited or reordered line is detectable
 within the retained files. Command previews, argv, metadata, and reasons pass
 the redaction passes; removed values keep a stable
-`[redacted:<SHA-256 prefix>]` marker. `WheelHost.proc.run_program` and
+`[redacted:<SHA-256 prefix>]` marker. A credential-bearing header is removed as
+a complete value (name, scheme, and every parameter), through its enclosing
+quote or the end of the preview, so Digest and AWS4 parameter lists cannot
+leave a value after the first token. `WheelHost.proc.run_program` and
 `run_command` accept an optional `opts.audit` table and write a pre-spawn
 record before the wrapper launches and a completion record after the bounded
 sweep. A `deny` decision is a recorded refusal and never launches. A high-risk
@@ -956,12 +964,15 @@ the sink cannot be written, with no marker file created. The sink remains
 opt-in at the process seam, so this is evidence for the mechanism, not for
 mandatory audit on every tool invocation.
 
-Cancellation (as distinct from timeout) is not implemented, no Bitty panel
-presentation was run, and audit output has not yet been inspected by an
-independent reviewer (the fixture writes evidence; the reviewer step remains).
-Audit output inspection by the reviewer, asynchronous cancellation, and panel
-presentation with recorded host and tool versions therefore remain open, so
-Gate 2 remains open and this is not a security approval.
+Cancellation (as distinct from timeout) is not implemented and no Bitty panel
+presentation was run. The CTX-0030 review inspected the Gate 1 suite and the
+Gate 2 audit JSONL, including the pre-spawn/completion fields, the deny record,
+redaction of synthetic credentials, private modes, the chain, and the
+high-risk refusal. Independent reviewer inspection is therefore satisfied for
+this opt-in slice; a later widening that makes audit default-on requires fresh
+review. Asynchronous cancellation and panel presentation with recorded host and
+tool versions remain open, so Gate 2 remains open and this is not a security
+approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
