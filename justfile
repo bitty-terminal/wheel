@@ -116,6 +116,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_wheel.lua
     bun run luaparse --quiet --file tests/test_context_snapshot.lua
     bun run luaparse --quiet --file tests/test_live_provider.lua
+    bun run luaparse --quiet --file tests/test_provider_stub.lua
     bun run luaparse --quiet --file tests/test_session.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
@@ -240,6 +241,21 @@ test-live-offline:
     python3 tests/test_live_http_client_redirect.py
     python3 tests/test_live_provider_selection.py
 
+# Offline Gate 2 provider-stub evidence: starts a real loopback OpenAI stub,
+# performs a completion through the real OpenAIAdapter and the test-only Python
+# transport, and audits every captured channel for the synthetic key. Wrong and
+# missing keys must fail closed. No credential and no external network; part of
+# the `check` aggregate and CI.
+test-provider-stub:
+    @command -v python3 >/dev/null 2>&1 || { echo "test-provider-stub requires python3" >&2; exit 1; }
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-provider-stub requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_provider_stub.lua
+
 # Opt-in live provider test. Manual only; never part of `just check` or CI.
 # WHEEL_LIVE_PROVIDER selects openrouter (default) or commandcode,
 # case-insensitively. The key-free offline gates run first; the live portion
@@ -278,7 +294,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test test-bench test-session lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test test-bench test-session lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

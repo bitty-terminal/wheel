@@ -894,10 +894,25 @@ round-trip, exclusive `0600` temporary creation with a symlink refusal, and the 
 approval/content-change/re-approval/revocation-across-restart flow against a
 private XDG state directory. `tests/test_session.lua` additionally starts a real
 detached daemon under a temporary runtime root and exercises the real FIFO
-control plane across separate client processes. Cancellation (as distinct from
-timeout) is not implemented, and the fixture does not cover a provider stub,
-audit output, or a Bitty panel presentation, so Gate 2 remains open and this is
-not a security approval.
+control plane across separate client processes. `tests/test_provider_stub.lua`
+(`just test-provider-stub`) adds the loopback provider item: a real
+`ThreadingHTTPServer` on `127.0.0.1:0` with an atomically published readiness
+record, a deterministic OpenAI-compatible completion through the real
+`OpenAIAdapter`, and a real Python `http.client` hop. A wrong key returns 401
+and a missing key fails before any request; the stub records only path, method,
+status, and authorization presence/validity (never the header value or the
+key). The test audits stdout, stderr, errors, the adapter description, request
+and response captures, and every file it creates for the synthetic key, and
+checks the launched stub's `/proc/<pid>/cmdline` for key-free argv. The
+synthetic key travels only in child environments, exported over an anonymous
+`sh -s` pipe rather than an `env` argv. See `tests/PROVIDER-STUB.md` for the
+trust boundary and reproduction steps.
+
+Cancellation (as distinct from timeout) is not implemented, the fixture does not
+cover audit output, and no Bitty panel presentation was run. Audit output
+inspection by the reviewer, asynchronous cancellation, and panel presentation
+with recorded host and tool versions therefore remain open, so Gate 2 remains
+open and this is not a security approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
@@ -937,7 +952,10 @@ that the policy relies on, and they remain unverified until the gates pass:
   plus alias revocation, a versioned `0700`/`0600` atomically replaced store,
   and a restricted evaluation environment with no `pcall`/`xpcall` and
   per-call/aggregate string and table caps;
-- a provider adapter boundary that reads named environment variables;
+- a provider adapter boundary that reads named environment variables, with
+  offline loopback-stub evidence (`tests/test_provider_stub.lua`) that a
+  synthetic key reaches only the stub and is absent from captured channels; the
+  live provider test remains manual and opt-in;
 - a `WheelHost` seam that concentrates filesystem, process, temporary-file,
   wall-clock, and CPU-time calls. The production backend is the standalone
   POSIX surface, selected explicitly with `select_backend("standalone")`;
