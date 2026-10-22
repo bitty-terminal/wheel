@@ -27,11 +27,13 @@
 -- argv elements, metadata, and reasons pass through the secret-name, header,
 -- query, flag, token-shape, and URL-userinfo passes. A credential-bearing
 -- header is removed as a whole value (name, scheme, and every parameter),
--- through its enclosing quote or the end of the preview, so a Digest/AWS4
--- parameter list cannot leave a value after the first token. A removed value
--- becomes `[redacted:<16 hex of SHA-256(value)>]`; the same value yields the
--- same marker, so an operator can correlate events without recovering the
--- secret.
+-- through its enclosing quote or the end of the preview, including escaped
+-- JSON keys/values and shell-quoted forms, so a Digest/AWS4 parameter list
+-- cannot leave a value after the first token. Secret-shaped environment
+-- assignments and flags replace their complete quoted or unquoted shell value.
+-- A removed value becomes `[redacted:<16 hex of SHA-256(value)>]`; the same
+-- value yields the same marker, so an operator can correlate events without
+-- recovering the secret.
 -- Prompts, file contents, provider responses, output, environment values, and
 -- authorization header values are never accepted as record fields. Pattern
 -- redaction remains heuristic for values Wheel did not load itself.
@@ -194,6 +196,7 @@ local SECRET_SUFFIXES = {
   "passwd",
   "credential",
   "credentials",
+  "authorization",
 }
 
 --- Test whether a name looks like a credential-bearing field or flag.
@@ -297,6 +300,47 @@ local function quoted_end(text, start, quote)
   return length
 end
 
+--- Find the closing escaped quote in a shell-escaped JSON value.
+-- `\"Authorization\":\"Token value\"` reaches the sink after the shell folds
+-- its outer quoting, so both the key and the value quotes carry a backslash.
+-- The closing delimiter is the next `\"` followed by a JSON/structural end
+-- (`,`/`}`/`]`/whitespace) or the end of the preview. Inner escaped quotes are
+-- skipped so a Digest/AWS4 parameter list can be consumed as one value.
+-- @param text string
+-- @param start number index of the backslash before the opening quote
+-- @param quote string '"' or "'"
+-- @return number index of the closing quote
+local function escaped_quoted_end(text, start, quote)
+  local index = start + 2
+  local length = #text
+  while index <= length do
+    if text:sub(index, index) == "\\" and text:sub(index + 1, index + 1) == quote then
+      local after = text:sub(index + 2, index + 2)
+      if after == "" or after == "," or after == "}" or after == "]"
+        or after:match("%s") then
+        return index + 1
+      end
+      index = index + 2
+    else
+      index = index + 1
+    end
+  end
+  return length
+end
+
+--- Strip one pair of matching outer quotes from a retained value.
+-- @param value string
+-- @return string
+local function unquote_value(value)
+  local first = value:sub(1, 1)
+  local last = value:sub(-1)
+  if #value >= 2 and ((first == '"' and last == '"')
+    or (first == "'" and last == "'")) then
+    return value:sub(2, -2)
+  end
+  return value
+end
+
 --- Replace every secret-shaped header's complete value with one marker.
 -- Authorization and Proxy-Authorization are redacted regardless of scheme
 -- (Bearer, Basic, Token, ApiKey, SSWS, Digest, AWS4-HMAC-SHA256, ...). The
@@ -323,7 +367,12 @@ local function redact_secret_headers(text, counter)
       local name = text:sub(index):match("^([%a][%w%-_]*)")
       local after_name = index + #name
       local colon = after_name
-      -- A JSON key closes its quote before the colon: `"Authorization":"..."`.
+      -- A JSON key closes its quote before the colon: `"Authorization":"..."`;
+      -- a shell-escaped JSON key carries backslashes before that quote:
+      -- `\"Authorization\":\"..."`.
+      while text:sub(colon, colon) == "\\" do
+        colon = colon + 1
+      end
       local closing = text:sub(colon, colon)
       if closing == '"' or closing == "'" then
         colon = colon + 1
@@ -341,7 +390,11 @@ local function redact_secret_headers(text, counter)
 
         local value_end = nil
         local first = text:sub(value_start, value_start)
-        if first == '"' then
+        local second = text:sub(value_start + 1, value_start + 1)
+        local escaped_quote = first == "\\" and (second == '"' or second == "'")
+        if escaped_quote then
+          value_end = escaped_quoted_end(text, value_start, second)
+        elseif first == '"' then
           value_end = quoted_end(text, value_start, '"')
         elseif first == "'" then
           value_end = quoted_end(text, value_start, "'")
@@ -358,8 +411,9 @@ local function redact_secret_headers(text, counter)
 
         if value_end ~= nil and value_end >= value_start then
           local credential
-          local first_char = text:sub(value_start, value_start)
-          if first_char == '"' or first_char == "'" then
+          if escaped_quote then
+            credential = text:sub(value_start + 2, value_end - 2)
+          elseif first == '"' or first == "'" then
             credential = text:sub(value_start + 1, value_end - 1)
           elseif text:sub(value_end, value_end) == '"'
             or text:sub(value_end, value_end) == "'" then
@@ -426,22 +480,64 @@ local function redact_text(text, counter)
     return whole(value)
   end)
 
-  text = text:gsub("([%a_][%w_]*)(=)([^%s]+)", function(name, separator, value)
+  -- Environment assignments keep the secret-shaped name for correlation, but
+  -- replace the complete shell value (quoted or unquoted), not just the first
+  -- whitespace-delimited fragment. Quoted passes run first so a value such as
+  -- AUTHORIZATION='Token opaque' is removed as one unit.
+  text = text:gsub("([%a_][%w_]*)(=)('[^']*')", function(name, separator, value)
     if is_secret_name(name) then
+      return span(name .. separator, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub('([%a_][%w_]*)(=)("[^"]*")', function(name, separator, value)
+    if is_secret_name(name) then
+      return span(name .. separator, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub("([%a_][%w_]*)(=)([^%s]+)", function(name, separator, value)
+    if is_secret_name(name) and value:sub(1, 10) ~= "[redacted:" then
       return span(name .. separator, value)
     end
     return nil
   end)
 
-  text = text:gsub("(%-%-?[%w%-_]+)(=)([^%s]+)", function(flag, separator, value)
+  -- Long and short flags use the same complete-value rule for `--flag=value`
+  -- and `--flag value` forms.
+  text = text:gsub("(%-%-?[%w%-_]+)(=)('[^']*')", function(flag, separator, value)
     if is_secret_name(flag) then
+      return span(flag .. separator, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub('(%-%-?[%w%-_]+)(=)("[^"]*")', function(flag, separator, value)
+    if is_secret_name(flag) then
+      return span(flag .. separator, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub("(%-%-?[%w%-_]+)(=)([^%s]+)", function(flag, separator, value)
+    if is_secret_name(flag) and value:sub(1, 10) ~= "[redacted:" then
       return span(flag .. separator, value)
     end
     return nil
   end)
 
-  text = text:gsub("(%-%-?[%w%-_]+)(%s+)([^%s%-][^%s]*)", function(flag, space, value)
+  text = text:gsub("(%-%-?[%w%-_]+)(%s+)('[^']*')", function(flag, space, value)
     if is_secret_name(flag) then
+      return span(flag .. space, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub('(%-%-?[%w%-_]+)(%s+)("[^"]*")', function(flag, space, value)
+    if is_secret_name(flag) then
+      return span(flag .. space, unquote_value(value))
+    end
+    return nil
+  end)
+  text = text:gsub("(%-%-?[%w%-_]+)(%s+)([^%s%-][^%s]*)", function(flag, space, value)
+    if is_secret_name(flag) and value:sub(1, 10) ~= "[redacted:" then
       return span(flag .. space, value)
     end
     return nil

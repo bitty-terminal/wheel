@@ -768,8 +768,10 @@ within the retained files. Command previews, argv, metadata, and reasons pass
 the redaction passes; removed values keep a stable
 `[redacted:<SHA-256 prefix>]` marker. A credential-bearing header is removed as
 a complete value (name, scheme, and every parameter), through its enclosing
-quote or the end of the preview, so Digest and AWS4 parameter lists cannot
-leave a value after the first token. `WheelHost.proc.run_program` and
+quote or the end of the preview, including escaped JSON keys/values, so Digest
+and AWS4 parameter lists cannot leave a value after the first token.
+Secret-shaped environment assignments and flags replace their complete quoted
+or unquoted shell value. `WheelHost.proc.run_program` and
 `run_command` accept an optional `opts.audit` table and write a pre-spawn
 record before the wrapper launches and a completion record after the bounded
 sweep. A `deny` decision is a recorded refusal and never launches. A high-risk
@@ -967,7 +969,8 @@ mandatory audit on every tool invocation.
 Cancellation (as distinct from timeout) is not implemented and no Bitty panel
 presentation was run. The CTX-0030 review inspected the Gate 1 suite and the
 Gate 2 audit JSONL, including the pre-spawn/completion fields, the deny record,
-redaction of synthetic credentials, private modes, the chain, and the
+redaction of synthetic credentials (escaped JSON headers, authorization
+environment assignments, and flags), private modes, the chain, and the
 high-risk refusal. Independent reviewer inspection is therefore satisfied for
 this opt-in slice; a later widening that makes audit default-on requires fresh
 review. Asynchronous cancellation and panel presentation with recorded host and

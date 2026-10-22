@@ -1074,7 +1074,11 @@ owner, or weaker mode is refused.
   not a same-user boundary, and the stream is not externally anchored.
 - **Redaction.** Command previews, argv elements, metadata, and reasons pass
   header, flag, environment-assignment, query, token-shape, and URL-userinfo
-  passes. A removed value becomes `[redacted:<16 hex of its SHA-256>]`, so the
+  passes. A credential-bearing header is removed as a complete value (name,
+  scheme, and every parameter), including escaped JSON keys/values and shell
+  quotes; secret-shaped environment assignments and flags replace their
+  complete quoted or unquoted shell value. A removed value becomes
+  `[redacted:<16 hex of its SHA-256>]`, so the
   same value correlates across events without being recoverable from the
   record. Pattern redaction is heuristic for a value Wheel did not load itself.
 - **Process boundary.** `WheelHost.proc.run_program` and `run_command` accept an

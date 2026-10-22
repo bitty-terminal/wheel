@@ -26,10 +26,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   modes, chain, redaction, bounds, fail-closed, and warning behavior; the
   real-host fixture reads the JSONL after a real permitted and denied command.
   Review hardening consumes the complete Authorization and Proxy-Authorization
-  value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, refuses an
-  unsafe active audit file (symlink or weak mode), rejects `opts.audit` with an
-  injected `command_runner`, reports `spawned = false` on a high-risk refusal,
-  and documents that only a torn/corrupt tail blocks append while
+  value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, including
+  shell-escaped JSON keys/values, and replaces complete quoted or unquoted
+  values for authorization environment assignments and flags. It also refuses
+  an unsafe active audit file (symlink or weak mode), rejects `opts.audit` with
+  an injected `command_runner`, reports `spawned = false` on a high-risk
+  refusal, and documents that only a torn/corrupt tail blocks append while
   `WheelAudit.verify` scans earlier corruption. The sink is intentionally
   opt-in in this slice: tool and trust call sites do not yet supply audit
   metadata, and default-on wiring plus cross-process append serialization

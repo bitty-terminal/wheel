@@ -414,6 +414,133 @@ local function run_tests()
     end
   end)
 
+  test("WheelHost: escaped JSON Authorization headers do not leak", function()
+    local dir = base .. "/escaped-json"
+    local escaped_auth_value = "opaque-escaped-json-value-6c1a"
+    local escaped_proxy_value = "opaque-escaped-json-proxy-4b9d"
+    local auth_shell = string.format(
+      [[true -d "{\"Authorization\":\"Token %s\"}"]], escaped_auth_value)
+    local proxy_shell = string.format(
+      [[true -d "{\"Proxy-Authorization\":\"ApiKey %s\"}"]], escaped_proxy_value)
+
+    local permitted = WheelHost.proc.run_command(auth_shell, nil, {
+      audit = { dir = dir, decision = "allow", high_risk = true },
+    })
+    check(permitted.ok == true and permitted.code == 0,
+      "the escaped JSON command must run: " .. tostring(permitted.stderr))
+    assert_no_secret(permitted.stdout, escaped_auth_value, "the permitted stdout")
+    assert_no_secret(permitted.stderr, escaped_auth_value, "the permitted stderr")
+
+    local proxy_result = WheelHost.proc.run_command(proxy_shell, nil, {
+      audit = { dir = dir, decision = "allow", high_risk = true },
+    })
+    check(proxy_result.ok == true and proxy_result.code == 0,
+      "the escaped proxy command must run: " .. tostring(proxy_result.stderr))
+
+    local denied = WheelHost.proc.run_command(auth_shell, nil, {
+      audit = {
+        dir = dir,
+        decision = "deny",
+        reason = "escaped JSON probe",
+        high_risk = true,
+      },
+    })
+    check(denied.ok == false and denied.denied == true,
+      "the escaped JSON command must be denied")
+    assert_no_secret(denied.stdout, escaped_auth_value, "the denial stdout")
+    assert_no_secret(denied.stderr, escaped_auth_value, "the denial stderr")
+
+    local raw = read_file(dir .. "/audit.jsonl") or ""
+    assert_no_secret(raw, escaped_auth_value, "the audit stream")
+    assert_no_secret(raw, escaped_proxy_value, "the audit stream")
+    check(raw:find("Authorization", 1, true) == nil,
+      "the escaped Authorization key must not be recorded")
+    check(raw:find("Proxy-Authorization", 1, true) == nil,
+      "the escaped Proxy-Authorization key must not be recorded")
+    check(raw:find("[redacted:" .. WheelConfig.compute_hash(
+      "Token " .. escaped_auth_value):sub(1, 16) .. "]", 1, true) ~= nil,
+      "the escaped JSON value must keep a stable marker")
+
+    for _, record in ipairs(parse_records(dir)) do
+      assert_no_secret(record.shell or "", escaped_auth_value, "a pre-spawn/completion record")
+      assert_no_secret(record.shell or "", escaped_proxy_value, "a pre-spawn/completion record")
+    end
+
+    local blocked = base .. "/escaped-json-blocked"
+    write_file(blocked, "not a directory")
+    local failed, failed_err = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "shell",
+      shell = auth_shell,
+      decision = "allow",
+    }, { dir = blocked .. "/audit" })
+    check(failed == nil and type(failed_err) == "table",
+      "the blocked escaped-JSON write must fail with a typed error")
+    assert_no_secret(failed_err.message, escaped_auth_value, "the typed error")
+    assert_no_secret(tostring(failed_err), escaped_auth_value, "the typed error string")
+  end)
+
+  test("WheelHost: authorization env assignments and flags redact complete values", function()
+    local dir = base .. "/auth-env-flags"
+    local env_auth_value = "opaque-env-auth-value-2f7c"
+    local http_auth_value = "opaque-http-auth-value-9d4a"
+    local flag_auth_value = "opaque-flag-auth-value-5b8e"
+    local shell = "true AUTHORIZATION='Token " .. env_auth_value .. "'"
+      .. " HTTP_AUTHORIZATION='Token " .. http_auth_value .. "'"
+      .. " --authorization 'Token " .. flag_auth_value .. "'"
+
+    local permitted = WheelHost.proc.run_command(shell, nil, {
+      audit = { dir = dir, decision = "allow", high_risk = true },
+    })
+    check(permitted.ok == true and permitted.code == 0,
+      "the env/flag audit command must run: " .. tostring(permitted.stderr))
+    check(permitted.stdout == "", "the audit probe must not echo its arguments")
+
+    local denied = WheelHost.proc.run_command(shell, nil, {
+      audit = {
+        dir = dir,
+        decision = "deny",
+        reason = "env/flag probe",
+        high_risk = true,
+      },
+    })
+    check(denied.ok == false and denied.denied == true,
+      "the env/flag command must be denied")
+    assert_no_secret(denied.stdout, env_auth_value, "the denial stdout")
+    assert_no_secret(denied.stderr, env_auth_value, "the denial stderr")
+    assert_no_secret(denied.stderr, flag_auth_value, "the denial stderr")
+
+    local raw = read_file(dir .. "/audit.jsonl") or ""
+    for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+      assert_no_secret(raw, secret, "the audit stream")
+    end
+    for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+      check(raw:find("[redacted:" .. WheelConfig.compute_hash(
+        "Token " .. secret):sub(1, 16) .. "]", 1, true) ~= nil,
+        "the complete env/flag value must keep a stable marker")
+    end
+    for _, record in ipairs(parse_records(dir)) do
+      for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+        assert_no_secret(record.shell or "", secret, "a pre-spawn/completion record")
+      end
+    end
+
+    local blocked = base .. "/auth-env-flags-blocked"
+    write_file(blocked, "not a directory")
+    local failed, failed_err = WheelAudit.record({
+      event = "process.pre_spawn",
+      kind = "shell",
+      shell = shell,
+      decision = "allow",
+    }, { dir = blocked .. "/audit" })
+    check(failed == nil and type(failed_err) == "table",
+      "the blocked env/flag write must fail with a typed error")
+    for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+      assert_no_secret(failed_err.message, secret, "the typed error")
+      assert_no_secret(tostring(failed_err), secret, "the typed error string")
+    end
+  end)
+
   test("WheelAudit: records stay within 16 KiB and command previews are bounded", function()
     local dir = base .. "/bounds"
     local record_ok = WheelAudit.record({
