@@ -88,6 +88,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/config.lua
     bun run luaparse --quiet --file lua/wheel/host.lua
+    bun run luaparse --quiet --file lua/wheel/audit.lua
     bun run luaparse --quiet --file lua/wheel/agent.lua
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
@@ -118,6 +119,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/test_provider_stub.lua
     bun run luaparse --quiet --file tests/test_session.lua
+    bun run luaparse --quiet --file tests/test_audit.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
@@ -140,6 +142,18 @@ test-session: deps
     else \
         echo "No lua interpreter found; skipping session-daemon tests" >&2; \
     fi
+
+# Run the execution-audit suite: private modes, bounded records, rotation,
+# hash chain, redaction, fail-closed high-risk spawns, and non-high-risk
+# warning behavior. Real host files and processes; no network.
+test-audit: deps
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-audit requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_audit.lua
 
 # Verify the interpreter-selection branches of `just test` without running the
 # suite: lua5.1 wins when present, luajit/lua fall back in order, and absence is
@@ -294,7 +308,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test test-bench test-session lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-audit test test-bench test-session lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

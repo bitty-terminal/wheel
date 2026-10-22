@@ -751,6 +751,34 @@ runs with the user's authority.
 - The user can inspect and export the audit stream without exposing redacted
   values.
 
+Current slice (CTX-0030): `lua/wheel/audit.lua` implements the local sink.
+It resolves `dir` from an explicit embedding/test override or
+`$XDG_STATE_HOME/wheel/audit` (fallback `$HOME/.local/state/wheel/audit`),
+repairs the directory to `0700`, refuses symlinked or non-private paths, and
+appends one JSON object per line to an owned `0600` file. A record is bounded
+at 16 KiB, the active file rotates at 1 MiB, and four files are retained (4 MiB
+total). Each record carries a monotonic `seq`, the previous record's `hash`,
+and its own pure-Lua SHA-256 hash, so an edited or reordered line is detectable
+within the retained files. Command previews, argv, metadata, and reasons pass
+the redaction passes; removed values keep a stable
+`[redacted:<SHA-256 prefix>]` marker. `WheelHost.proc.run_program` and
+`run_command` accept an optional `opts.audit` table and write a pre-spawn
+record before the wrapper launches and a completion record after the bounded
+sweep. A `deny` decision is a recorded refusal and never launches. A high-risk
+spawn (`opts.audit.high_risk = true`) fails closed with the typed
+`E_AUDIT_UNAVAILABLE` failure when the pre-spawn write cannot complete;
+lower-risk commands continue with `result.audit_warning`.
+
+This slice is deliberately opt-in. No tool call site supplies `opts.audit` yet,
+so the default harness does not create an audit file and the mandatory
+pre-spawn record is not yet applied to every tool invocation. Default-on
+wiring is a follow-up: the tool and trust call sites must pass their identity,
+decision, and risk class, and CI must prove no existing test writes ambient
+state. Until that lands, this section describes an available control, not a
+completed policy check. Cross-process append serialization, exact-value
+redaction for values the harness did not load, and external anchoring are not
+implemented; same-user tampering remains outside the boundary.
+
 ## Secret handling and redaction
 
 The secret path is treated as a data-flow problem, not a string-filter problem:
@@ -858,7 +886,8 @@ Deterministic tests, no real host required, covering at minimum:
   production paths;
 - secret handling: synthetic secrets absent from stdout, stderr, errors, audit,
   blobs, checkpoints, context slots, and child environments;
-- audit: pre-spawn record, required fields, redaction, fail-closed behavior;
+- audit: pre-spawn record, required fields, redaction, fail-closed behavior
+  (`tests/test_audit.lua`);
 - shell: unattended default, explicit opt-in, non-login invocation, scrubbed
   environment, timeout and output bounds;
 - network: endpoint allowlist, redirect refusal, TLS verification, no project
@@ -916,11 +945,23 @@ travels only in child environments, exported over an anonymous `sh -s` pipe
 rather than an `env` argv. See `tests/PROVIDER-STUB.md` for the trust boundary
 and reproduction steps.
 
-Cancellation (as distinct from timeout) is not implemented, the fixture does not
-cover audit output, and no Bitty panel presentation was run. Audit output
-inspection by the reviewer, asynchronous cancellation, and panel presentation
-with recorded host and tool versions therefore remain open, so Gate 2 remains
-open and this is not a security approval.
+The audit slice (CTX-0030) adds `just test-audit`
+(`tests/test_audit.lua`) for Gate 1 and extends `tests/real_host_fixture.lua`
+with a Gate 2 audit section. The fixture runs a real permitted command and a
+real denied command with the audit sink enabled, then reads the JSONL itself
+and checks the pre-spawn and completion fields, the deny record, the absent
+denied side effect, the sequence/hash chain, redaction of a synthetic secret,
+and the `0700`/`0600` modes. It also proves a high-risk spawn is refused when
+the sink cannot be written, with no marker file created. The sink remains
+opt-in at the process seam, so this is evidence for the mechanism, not for
+mandatory audit on every tool invocation.
+
+Cancellation (as distinct from timeout) is not implemented, no Bitty panel
+presentation was run, and audit output has not yet been inspected by an
+independent reviewer (the fixture writes evidence; the reviewer step remains).
+Audit output inspection by the reviewer, asynchronous cancellation, and panel
+presentation with recorded host and tool versions therefore remain open, so
+Gate 2 remains open and this is not a security approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
@@ -974,6 +1015,14 @@ that the policy relies on, and they remain unverified until the gates pass:
   per-stream capture cap, a rebuilt allowlist environment, and an explicit
   stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
   `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
+- a local execution audit sink (`lua/wheel/audit.lua`) with a 16 KiB record
+  bound, 1 MiB x 4 rotation, `0700`/`0600` paths, an append-only JSONL file, a
+  monotonic sequence and SHA-256 previous-hash chain, static
+  `E_AUDIT_UNAVAILABLE` failures, and redaction markers. `WheelHost.proc`
+  writes pre-spawn and completion records when `opts.audit` is supplied,
+  refuses a `deny` decision, and fails a high-risk spawn closed when the
+  pre-spawn record cannot be written. The sink is opt-in in this slice; tool
+  and trust call sites do not yet supply metadata;
 - an experimental local session daemon (`lua/wheel/session.lua`,
   `lua/wheel/daemon.lua`, `scripts/wheel-session`): a detached per-user process
   owns one `WheelContext`, publishes metadata only after both FIFOs open, and
@@ -1084,16 +1133,21 @@ Known gaps relative to this policy (not claims of compliance):
   `sleep`, `timeout`/`gtimeout`, and `sh` through `PATH`. A same-user attacker
   who controls the environment or `PATH` can influence those tools; the checks
   are not a privilege boundary. Trust approval is a high-risk operation, and the
-  policy requires it to fail closed when audit cannot record it; no execution
-  audit stream exists yet, so that control is not implemented.
+  policy requires it to fail closed when audit cannot record it; the execution
+  audit sink exists, but trust approval does not route through it yet, so that
+  control is not implemented end to end.
 - The trust store is a same-user file, so a same-user process can still rewrite
   it; ownership and permission checks narrow accidental or cross-user misuse,
   not a compromised account. The atomic rename orders the replacement but the
   store is not fsynced, and the format has no signature or hash chain.
   Temporarily unresolvable project records are preserved by the write path
   rather than dropped, but they remain untrusted until their root resolves.
-- There is no append-only execution audit stream with pre-spawn records and
-  fail-closed behavior, and no exact-value secret redaction across every sink.
+- The execution audit stream is opt-in at the process seam: tool call sites and
+  trust approval do not yet pass audit metadata, so mandatory pre-spawn records
+  and fail-closed trust approval are not enforced by default. Two same-user
+  processes can interleave appends, the chain is not externally anchored, and
+  exact-value redaction is limited to values the caller marks or the pattern
+  passes recognize.
 - Project configuration is merged as an unvalidated table; field validation and
   narrowing-only enforcement are absent. Multi-root operation is not
   implemented (one `workspace_root` per session).
@@ -1116,7 +1170,8 @@ These gaps are blockers for release evidence, not for recording the policy.
 
 - OS confinement for spawned programs: Landlock, cgroups, seccomp, or an
   equivalent, and whether it becomes a prerequisite for shell authority.
-- Audit format, rotation bounds, retention, and optional hash-chain integrity.
+- Default-on audit wiring for every high-risk tool and trust call site, plus
+  cross-process append serialization and external anchoring of the hash chain.
 - Redaction coverage for provider-specific key shapes and streamed fragments.
 - Default shell mode for unattended and scheduled sessions.
 - Instruction, time, and memory budgets for project-configuration evaluation.

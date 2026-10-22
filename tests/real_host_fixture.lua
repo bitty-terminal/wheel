@@ -28,10 +28,12 @@
 --
 -- Limitations (documented in README.md):
 --   * offline; no network, credentials, release claim, or plugin-VM evidence.
---   * no asynchronous cancellation, OS sandbox, or Bitty panel/terminal
---     presentation run. Timeout, retained-leader process-group identity,
---     stdin, and scrubbed-environment bounds are covered below; a child that
---     calls setsid or joins another group can still escape the recorded group.
+--   * opt-in audit JSONL is inspected after a permitted and a denied command;
+--     default-on audit wiring, asynchronous cancellation, OS sandbox, and Bitty
+--     panel/terminal presentation are not covered. Timeout, retained-leader
+--     process-group identity, stdin, and scrubbed-environment bounds are
+--     covered below; a child that calls setsid or joins another group can still
+--     escape the recorded group.
 --   * single host and one interpreter per run; CPU frequency is not pinned.
 
 -- WHEEL_ROOT points the fixture at an installed artifact tree instead of the
@@ -571,14 +573,20 @@ local function build_evidence(status, failure)
   lines[#lines + 1] = "  Asynchronous cancellation and a child that leaves the"
   lines[#lines + 1] = "  recorded group (setsid or another process group) are"
   lines[#lines + 1] = "  not covered."
+  lines[#lines + 1] = "- The audit section wrote a permitted pre-spawn/completion pair and a"
+  lines[#lines + 1] = "  denied pre-spawn record into a private state directory, then read"
+  lines[#lines + 1] = "  the JSONL back and checked fields, chain, modes, the absent denied"
+  lines[#lines + 1] = "  side effect, redaction of a synthetic value, and a high-risk refusal."
+  lines[#lines + 1] = "  The sink is opt-in at the process seam; default-on tool wiring is"
+  lines[#lines + 1] = "  not covered and remains a follow-up."
   lines[#lines + 1] = "- No OS sandbox/containment evidence and no Bitty panel/terminal"
   lines[#lines + 1] = "  presentation run; the host table is a presentation double only."
   lines[#lines + 1] = "- `os.clock()` is process CPU time, not elapsed wall clock; CPU"
   lines[#lines + 1] = "  frequency is not pinned; the record covers one host and one"
   lines[#lines + 1] = "  interpreter per run."
   lines[#lines + 1] = "- SECURITY-MODEL.md Gate 2 requires broader evidence; this fixture"
-  lines[#lines + 1] = "  is partial evidence for the standalone activation and command-smoke"
-  lines[#lines + 1] = "  surface only."
+  lines[#lines + 1] = "  is partial evidence for the standalone activation, command-smoke,"
+  lines[#lines + 1] = "  and opt-in audit surfaces only."
   lines[#lines + 1] = ""
   lines[#lines + 1] = "The ephemeral base and workspace were removed on success; no"
   lines[#lines + 1] = "absolute host path is recorded in this file."
@@ -890,6 +898,163 @@ local function main()
     "WheelHost.proc: retained session leader holds the recorded PGID through the sweep"
   state.coverage[#state.coverage + 1] =
     "WheelHost.time: real wall-clock and CPU-time reads"
+
+  -- 6b. Execution audit (CTX-0030 Gate 2): a real permitted command, a real
+  -- denied command that must not spawn, and a high-risk write failure that
+  -- must refuse the spawn. The test itself reads the JSONL and checks the
+  -- private modes, pre-spawn fields, chain, redaction, and denied side effect.
+  local audit_state = os.getenv("XDG_STATE_HOME")
+  check(type(audit_state) == "string" and audit_state ~= "",
+    "the audit fixture requires a private XDG_STATE_HOME")
+  local audit_dir = audit_state .. "/wheel/audit"
+  check(audit_dir:sub(1, #BASE + 1) == BASE .. "/",
+    "the audit directory must live under the fixture base")
+  local cleared = WheelHost.proc.run_program("rm", { "-rf", audit_dir })
+  check(cleared.ok and cleared.code == 0, "cannot clear the audit fixture directory")
+
+  local synthetic_secret = "sk-wheel-audit-synthetic-gate2-4c1d9e7a"
+  local audit_identity = {
+    role = "coding",
+    agent = "gate2-audit-agent",
+    task = "CTX-0030",
+    tool = "run_command",
+  }
+
+  local permitted_audit = {}
+  for key, value in pairs(audit_identity) do
+    permitted_audit[key] = value
+  end
+  permitted_audit.intent = "Gate 2 permitted command"
+  permitted_audit.decision = "allow"
+  permitted_audit.high_risk = true
+
+  local permitted = WheelHost.proc.run_command(
+    "printf '%s' audit-permitted", nil, {
+      cwd = workspace,
+      audit = permitted_audit,
+    })
+  check(permitted.ok and permitted.code == 0,
+    "the audited permitted command must run: " .. tostring(permitted.stderr))
+  check(permitted.stdout == "audit-permitted",
+    "the audited permitted command must preserve its output")
+  check(permitted.audit_warning == nil, "the permitted audit must not warn")
+  check(permitted.spawned == true, "the permitted result must report a spawn")
+
+  local denied_marker = workspace .. "/audit-denied-marker"
+  check(WheelHost.fs.write_file(denied_marker, "must survive a denied command"),
+    "cannot create the audit denial marker")
+  local denied_command = "rm -f " .. shell_quote(denied_marker)
+    .. " --token=" .. synthetic_secret
+    .. " # Authorization: Bearer " .. synthetic_secret
+  local denied = WheelHost.proc.run_command(denied_command, nil, {
+    cwd = workspace,
+    audit = {
+      role = "coding",
+      agent = "gate2-audit-agent",
+      task = "CTX-0030",
+      tool = "run_command",
+      intent = "Gate 2 denied command",
+      decision = "deny",
+      reason = "destructive_command_blocked",
+      high_risk = true,
+    },
+  })
+  check(denied.ok == false and denied.denied == true,
+    "the audited deny decision must return a denial")
+  check(WheelHost.fs.exists(denied_marker),
+    "the denied command must not delete its marker")
+
+  local blocked_audit = BASE .. "/audit-blocked"
+  check(WheelHost.fs.write_file(blocked_audit, "not a directory"),
+    "cannot create the blocked audit path")
+  local refused_marker = workspace .. "/audit-refused-marker"
+  local refused = WheelHost.proc.run_command("touch " .. shell_quote(refused_marker), nil, {
+    audit = {
+      dir = blocked_audit .. "/audit",
+      high_risk = true,
+      decision = "allow",
+    },
+  })
+  check(refused.ok == false, "a high-risk spawn without an audit sink must fail closed")
+  check(type(refused.audit_error) == "table"
+    and refused.audit_error.code == "E_AUDIT_UNAVAILABLE",
+    "the high-risk refusal must carry the typed audit error")
+  check(not WheelHost.fs.exists(refused_marker),
+    "the high-risk refused command must not spawn")
+
+  local audit_file = audit_dir .. "/audit.jsonl"
+  check(WheelHost.fs.exists(audit_file), "the audit stream must exist after the runs")
+  local audit_dir_mode = WheelHost.proc.run_program("stat", { "-c", "%a", audit_dir })
+  check(audit_dir_mode.ok and trim(audit_dir_mode.stdout) == "700",
+    "the audit directory must be mode 0700: " .. tostring(audit_dir_mode.stdout))
+  local audit_file_mode = WheelHost.proc.run_program("stat", { "-c", "%a", audit_file })
+  check(audit_file_mode.ok and trim(audit_file_mode.stdout) == "600",
+    "the audit file must be mode 0600: " .. tostring(audit_file_mode.stdout))
+
+  local audit_raw = WheelHost.fs.read_file(audit_file)
+  check(type(audit_raw) == "string" and audit_raw ~= "",
+    "the audit file must not be empty")
+  check(audit_raw:find(synthetic_secret, 1, true) == nil,
+    "the synthetic secret must not appear in the audit stream")
+  check(audit_raw:find("Bearer " .. synthetic_secret, 1, true) == nil,
+    "the authorization header value must not appear in the audit stream")
+
+  local AuditJSON = require("wheel.kernel").JSON
+  local audit_records = {}
+  for line in audit_raw:gmatch("([^\n]+)") do
+    check(#line <= 16 * 1024, "every audit record must stay within 16 KiB")
+    local record = AuditJSON.decode(line)
+    check(type(record) == "table", "every audit line must decode as JSON")
+    audit_records[#audit_records + 1] = record
+  end
+  check(#audit_records >= 3, "the audit stream must contain pre-spawn records")
+
+  local permitted_pre = nil
+  local denied_pre = nil
+  local completed = 0
+  for _, record in ipairs(audit_records) do
+    if record.event == "process.completed" then
+      completed = completed + 1
+    elseif record.event == "process.pre_spawn" and record.decision == "deny" then
+      denied_pre = record
+    elseif record.event == "process.pre_spawn" then
+      permitted_pre = record
+    end
+  end
+  check(permitted_pre ~= nil, "the permitted command must have a pre-spawn record")
+  check(denied_pre ~= nil, "the denied command must have a pre-spawn record")
+  check(completed == 1, "only the permitted command may write a completion record")
+  check(permitted_pre.decision == "allow", "the permitted pre-spawn decision must be allow")
+  check(permitted_pre.kind == "shell" and type(permitted_pre.shell) == "string",
+    "the permitted record must carry the redacted shell command")
+  check(permitted_pre.cwd == workspace, "the permitted record must carry its cwd")
+  check(permitted_pre.role == "coding" and permitted_pre.agent == "gate2-audit-agent"
+    and permitted_pre.task == "CTX-0030" and permitted_pre.tool == "run_command",
+    "the permitted record must carry its identity fields")
+  check(permitted_pre.intent == "Gate 2 permitted command",
+    "the permitted record must carry its intent label")
+  check(permitted_pre.high_risk == true, "the permitted record must carry its risk class")
+  check(type(permitted_pre.command_hash) == "string"
+    and #permitted_pre.command_hash == 64,
+    "the permitted record must carry a 64-hex command hash")
+  check(denied_pre.reason == "destructive_command_blocked",
+    "the denied record must carry the policy reason")
+  check(denied_pre.spawned == false, "the denied record must not claim a spawn")
+
+  for index, record in ipairs(audit_records) do
+    check(record.seq == index, "audit sequence must be monotonic")
+    if index == 1 then
+      check(record.prev == string.rep("0", 64),
+        "the first audit record must start from the zero hash")
+    else
+      check(record.prev == audit_records[index - 1].hash,
+        "each audit record must name the previous hash")
+    end
+  end
+  state.coverage[#state.coverage + 1] =
+    "audit: permitted pre-spawn/completion records, denied record without a spawn, private modes, chain, and redaction inspected from JSONL"
+  state.coverage[#state.coverage + 1] =
+    "audit: a high-risk spawn with an unwritable sink failed closed before launch"
 
   -- 7. Tool paths with real files and commands.
   local WheelTool = require("wheel.tool")
@@ -1224,7 +1389,7 @@ os.exit(1)
   check(write_ok == true, "cannot write the real-host evidence: " .. tostring(write_err))
 
   print(string.format(
-    "[PASS] real-host fixture: %d checks; 14/14 commands; hello; fs/proc/tmp/tool smoke; four denial classes",
+    "[PASS] real-host fixture: %d checks; 14/14 commands; hello; fs/proc/tmp/tool smoke; four denial classes; opt-in audit JSONL",
     state.checks))
   if cpu_cold and instr_cold then
     print(string.format("[INFO] cold: %s ms CPU, %d instructions",

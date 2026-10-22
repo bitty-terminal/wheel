@@ -414,10 +414,11 @@ function classes.
   Evaluation remains in-process with best-effort instruction and string/table
   bounds; direct and method forms of `string.rep`/`table.concat` are capped,
   but `string.format`, patterns, concatenation, sort comparators, and other
-  C-library allocations are not metered. There is no wall-clock kill, memory
-  cgroup, or append-only audit stream, so trust approval cannot yet fail closed
-  on an audit write. The store is not tamper-proof against same-user processes
-  and is not fsynced or signed. Native hashing and host primitives resolve
+  C-library allocations are not metered. The execution audit sink exists, but
+  trust approval does not yet write through it, so approval cannot yet fail
+  closed on an audit write. The store is not tamper-proof against same-user
+  processes and is not fsynced or signed. Native hashing and host primitives
+  resolve
   `sha256sum`/`shasum`/`openssl`, `realpath`/`readlink`, `stat`, `test`, `id`,
   and `mktemp` through `PATH`, which is same-user authority. `trust_file` and
   `global_path` are internal call-site/test overrides, not command or
@@ -476,16 +477,17 @@ keeps its identity so the budget failure is not misreported. The token is not
 reachable from a handler and cannot be forged with a table field; it is not part
 of the public error contract.
 
-| `code`                        | `class`      | Meaning                                                                                                               |
-| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                        |
-| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.    |
-| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                  |
-| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                              |
-| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                            |
-| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.           |
-| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built. |
-| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.            |
+| `code`                        | `class`      | Meaning                                                                                                                      |
+| ----------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                               |
+| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.           |
+| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                         |
+| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                     |
+| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                   |
+| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                  |
+| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.        |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                   |
+| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic. |
 
 `E_COMPLETION_BUDGET_INVALID` is raised by the provider adapters and
 `WheelRunner` before a network request when a `max_completion_tokens` override
@@ -507,6 +509,15 @@ them. The format and bounds are documented in
 cannot be loaded, or on first use when an optional lazy submodule fails. The
 message names the rooted module (for example `wheel.agent`) and keeps only a
 bounded, path-free cause; no stack trace, host path, or secret is included.
+
+`E_AUDIT_UNAVAILABLE` is returned by the process seam when a high-risk
+operation's pre-spawn audit record cannot be written (the command is not
+launched) or attached to a lower-risk result as `audit_error` while
+`audit_warning` is set. Its message is the fixed
+`the audit record could not be written`; the sink's reason code
+(`audit_directory`, `audit_file`, `audit_corrupt`, `rotation_failed`,
+`write_failed`, `record_too_large`, `hash_unavailable`, `invalid_event`) is the
+static failure class and never a path or value.
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family
@@ -563,6 +574,13 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   oversized, partial, or cryptographically inconsistent. Re-export from the live
   context instead of editing the snapshot table; see
   [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
+- `E_AUDIT_UNAVAILABLE` — the local audit sink could not write a record. A
+  high-risk spawn was refused before launch; a lower-risk result carries the
+  error with `audit_warning` and may still have run. Check that
+  `$XDG_STATE_HOME/wheel/audit` (or the explicit override) is a real,
+  user-owned `0700` directory with no symlink, and that the active `0600`
+  JSONL file has a complete last line. The sink never repairs a torn or
+  corrupt tail silently.
 - `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
   `PATH`; these
@@ -610,6 +628,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/commands.lua`                  | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                    |
 | `lua/wheel/config.lua`                    | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                     |
 | `lua/wheel/host.lua`                      | WheelHost authority seam: explicitly selected standalone POSIX backend for filesystem, process, temporary-file, wall-clock, and CPU-time primitives; typed denials on unsupported platforms or unavailable surfaces. |
+| `lua/wheel/audit.lua`                     | Local append-only execution audit sink: `0700`/`0600` JSONL, 16 KiB records, 1 MiB x 4 rotation, SHA-256 previous-hash chain, redaction markers, and typed `E_AUDIT_UNAVAILABLE` failures.                           |
 | `lua/wheel/kernel.lua`                    | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                   |
 | `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                              |
 | `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                         |
@@ -626,6 +645,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                       |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
 | `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                               |
+| `tests/test_audit.lua`                    | Execution-audit suite (`just test-audit`): append/rotation, private modes, hash chain, redaction, 16 KiB bounds, high-risk fail-closed, non-high-risk warning, and denied no-spawn behavior.                         |
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
 | `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                         |
 | `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                           |
@@ -951,8 +971,9 @@ a CRLF-bearing key is reported only as a static exception type; non-loopback
 hosts, userinfo, query strings, fragments, other paths, other methods, and
 redirects are refused. The key reaches only child environments (never argv or a
 request file). The gate runs in `just check` and CI; `tests/PROVIDER-STUB.md`
-records the trust boundary and limits. Audit output, asynchronous cancellation,
-and Bitty panel presentation remain open Gate 2 items.
+records the trust boundary and limits. The real-host fixture also reads the
+execution audit JSONL after a permitted and a denied command; asynchronous
+cancellation and Bitty panel presentation remain open Gate 2 items.
 
 ## Benchmarks
 
@@ -1009,6 +1030,56 @@ fixture evidence (owner D7).
 The in-tree `bitty-plugin.toml` still requests only `platform.notify` and is
 unchanged by the position record. It is transitional, must not be widened, and
 does not describe harness authority; removal is a follow-up task.
+
+## Audit and logging
+
+Wheel has a local, append-only execution audit stream in
+`lua/wheel/audit.lua`. The default location is
+`$XDG_STATE_HOME/wheel/audit/`, falling back to
+`$HOME/.local/state/wheel/audit/`; an explicit directory override exists only
+for tests and embedders. The directory is repaired to `0700`, every record file
+is an owned, singly linked `0600` regular file, and a symbolic link, foreign
+owner, or weaker mode is refused.
+
+- **Format.** One JSON object per line (`wheel-audit/1`). Recorded fields are
+  the event name, sequence number, previous and current SHA-256 hash, wall-clock
+  time, role/agent/task/tool/intent when supplied, redacted argv or shell
+  command, cwd, allow/deny decision and reason, risk class, and, for a
+  completion, exit status, duration, truncation, outcome, and process-group
+  cleanup. Prompts, output, environment values, file contents, provider
+  responses, and authorization header values are never record fields.
+- **Bounds.** A record is at most 16 KiB. The active file rotates at 1 MiB and
+  four files are retained (`audit.jsonl` plus `audit.1.jsonl` through
+  `audit.3.jsonl`), so the stream is bounded at 4 MiB. A torn tail or corrupt
+  line fails the next append closed instead of being repaired silently.
+- **Chain.** Each record carries a monotonic `seq` and the previous record's
+  `hash`; `hash` is the SHA-256 of the canonical record without that field.
+  `WheelAudit.verify` walks the retained files and reports the first broken
+  line. This raises the cost of silent edits within the retained files; it is
+  not a same-user boundary, and the stream is not externally anchored.
+- **Redaction.** Command previews, argv elements, metadata, and reasons pass
+  header, flag, environment-assignment, query, token-shape, and URL-userinfo
+  passes. A removed value becomes `[redacted:<16 hex of its SHA-256>]`, so the
+  same value correlates across events without being recoverable from the
+  record. Pattern redaction is heuristic for a value Wheel did not load itself.
+- **Process boundary.** `WheelHost.proc.run_program` and `run_command` accept an
+  optional `opts.audit` table. When supplied, a pre-spawn record is written
+  before the wrapper launches and a completion record after the bounded sweep.
+  A `deny` decision is a recorded refusal and never launches. When
+  `opts.audit.high_risk` is true, a failed pre-spawn write returns the typed
+  `E_AUDIT_UNAVAILABLE` failure and the command is not launched. A lower-risk
+  write failure continues with `result.audit_warning`.
+- **Current scope.** The sink is opt-in. No tool or trust call site supplies
+  `opts.audit` yet, so a normal run does not create an audit directory and the
+  policy's mandatory pre-spawn record is not yet applied to every invocation.
+  Default-on wiring, cross-process append serialization, and trust-approval
+  records are follow-ups. This is implemented evidence, not a completed Gate 1
+  or Gate 2 claim.
+
+Inspect the stream with an ordinary line reader, for example
+`tail -n 20 "$XDG_STATE_HOME/wheel/audit/audit.jsonl"`. `just test-audit` covers
+the sink and `tests/real_host_fixture.lua` reads the JSONL after a real
+permitted and denied command as Gate 2 evidence.
 
 ## Plugin API surface (transitional)
 

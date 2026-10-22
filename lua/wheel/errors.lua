@@ -35,6 +35,7 @@ WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
+WheelErrors.E_AUDIT_UNAVAILABLE = "E_AUDIT_UNAVAILABLE"
 WheelErrors.MESSAGE_MAX_LENGTH = 160
 
 local CLASSES = {
@@ -203,6 +204,21 @@ function WheelErrors.snapshot_invalid(detail)
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_SNAPSHOT_INVALID,
     "invalid context snapshot: " .. reason
+  )
+end
+
+--- Build a typed audit-sink failure.
+-- The message is deliberately static: an audit path, a filesystem diagnostic,
+-- or an event value could embed a secret, so the caller receives only the
+-- stable code and a fixed explanation. The sink's separate reason code names
+-- the failure class (directory, permissions, corruption, write) without any
+-- recorded value.
+-- @return table
+function WheelErrors.audit_unavailable()
+  return typed(
+    WheelErrors.CLASS_RUNTIME,
+    WheelErrors.E_AUDIT_UNAVAILABLE,
+    "the audit record could not be written"
   )
 end
 
