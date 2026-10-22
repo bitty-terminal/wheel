@@ -302,7 +302,7 @@ local function run_tests()
     local dir = base .. "/auth-headers"
     local values = {
       token = "opaque-token-4d1f9a",
-      apikey = "opaque-apikey-71c2e8",
+      api_scheme = "opaque-scheme-71c2e8",
       ssws = "opaque-ssws-9b3a55",
       digest = "opaque-digest-response-2c7f10",
       aws4 = "opaque-aws4-signature-6e8d43",
@@ -315,7 +315,7 @@ local function run_tests()
 
     local shell = table.concat({
       "curl -H 'Authorization: Token " .. values.token .. "'",
-      " -H 'Authorization: ApiKey " .. values.apikey .. "'",
+      " -H 'Authorization: ApiKey " .. values.api_scheme .. "'",
       " -H 'Authorization: SSWS " .. values.ssws .. "'",
       " -H 'Authorization: Digest username=\"operator\", realm=\"audit\", "
         .. "nonce=\"n-1\", response=\"" .. values.digest .. "\"'",
