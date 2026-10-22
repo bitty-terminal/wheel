@@ -8,6 +8,26 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Offline Gate 2 provider-stub evidence (CTX-0029 / wheel#95): `just
+test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
+  (`tests/provider_stub.py`), performs one completion through the real
+  `OpenAIAdapter` and a test-only Python `http.client` transport
+  (`tests/provider_stub_client.py`), and audits stdout, stderr, errors, the
+  adapter description, request/response captures, and every file the run
+  creates for the fixed synthetic key. A wrong key returns 401 and a missing
+  key fails before any request; non-loopback destinations, userinfo, other
+  paths, and other methods are refused locally. The key reaches only child
+  environments through an anonymous `sh -s` pipe, never argv or a request file,
+  and the stub records only path, method, status, and authorization
+  presence/validity. Review hardening adds static transport diagnostics that
+  report only the exception type (`http.client` embeds rejected header values
+  in its `ValueError` message), a CRLF-key regression, an ambient-value
+  missing-key probe backed by an explicit `unset`, a key-bearing-argv guard
+  before `argparse`, missing-authorization 401, query/fragment and redirect
+  refusal, a graceful SIGTERM shutdown marker, and a non-vacuous `/proc`
+  cmdline check. The gate is part of `just check` and CI; audit output,
+  asynchronous cancellation, and panel presentation remain open Gate 2 items
+  (`SECURITY-MODEL.md`, `tests/PROVIDER-STUB.md`).
 - Experimental local session daemon (CTX-0024 / wheel#85): a detached per-user
   process owns one `WheelContext` and serves the bounded `wheel-session/1`
   control plane over private POSIX FIFOs. `scripts/wheel-session` starts, probes,
