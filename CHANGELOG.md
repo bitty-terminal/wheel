@@ -8,6 +8,36 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Local append-only execution audit stream (CTX-0030 / wheel#98):
+  `lua/wheel/audit.lua` writes one JSON object per line under
+  `$XDG_STATE_HOME/wheel/audit/` (fallback
+  `$HOME/.local/state/wheel/audit/`), repairs the directory to `0700`, keeps
+  every record file an owned `0600` regular file, bounds records at 16 KiB,
+  rotates at 1 MiB with four retained files, and carries a monotonic sequence
+  plus a SHA-256 previous-hash chain. Command previews, argv, metadata, and
+  reasons are redacted with stable `[redacted:<SHA-256 prefix>]` markers;
+  prompts, output, environment values, file contents, provider responses, and
+  authorization header values are never record fields. `WheelHost.proc`
+  accepts an optional `opts.audit` table and writes pre-spawn and completion
+  records; a `deny` decision never launches, and a high-risk spawn whose
+  pre-spawn record cannot be written returns the typed `E_AUDIT_UNAVAILABLE`
+  failure without spawning. Lower-risk failures continue with a visible
+  `result.audit_warning`. `just test-audit` covers append, rotation, private
+  modes, chain, redaction, bounds, fail-closed, and warning behavior; the
+  real-host fixture reads the JSONL after a real permitted and denied command.
+  Review hardening consumes the complete Authorization and Proxy-Authorization
+  value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, including
+  shell-escaped JSON keys/values (ambiguous escaped values are over-redacted
+  through the end of the preview), and replaces complete quoted or unquoted
+  values for authorization environment assignments and flags, including
+  escaped inner quotes. It also refuses
+  an unsafe active audit file (symlink or weak mode), rejects `opts.audit` with
+  an injected `command_runner`, reports `spawned = false` on a high-risk
+  refusal, and documents that only a torn/corrupt tail blocks append while
+  `WheelAudit.verify` scans earlier corruption. The sink is intentionally
+  opt-in in this slice: tool and trust call sites do not yet supply audit
+  metadata, and default-on wiring plus cross-process append serialization
+  remain follow-ups.
 - Offline Gate 2 provider-stub evidence (CTX-0029 / wheel#95): `just
 test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   (`tests/provider_stub.py`), performs one completion through the real

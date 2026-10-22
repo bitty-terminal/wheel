@@ -15,6 +15,7 @@
 --   WheelHost.fs.read_file(path)            read a whole file
 --   WheelHost.fs.read_file_bounded(path, n) read at most n bytes, chunked
 --   WheelHost.fs.write_file(path, content)  write a whole file
+--   WheelHost.fs.append_file(path, content) append to a private 0600 file
 --   WheelHost.fs.create_private_file(path, content)
 --                                           exclusive 0600 regular file at a path
 --   WheelHost.fs.link_exclusive(from, to)   create a hard link without replacing
@@ -100,6 +101,24 @@
 -- `WheelHost.backend` is the documented swap point for tests; call sites never
 -- touch it directly.
 --
+-- Execution audit (CTX-0030):
+-- `proc.run_program(program, args, opts)` and `proc.run_command(shell, env,
+-- opts)` accept an optional `opts.audit` table. The sink is opt-in: omitting it
+-- never resolves, creates, or writes an audit directory, so existing call
+-- sites and tests are unchanged. When supplied, the table may carry `dir` (an
+-- explicit test/embedding override), `role`, `agent`, `task`, `tool`, `intent`,
+-- `decision` (`"allow"` or `"deny"`), `reason`, and `high_risk`. A pre-spawn
+-- record with the redacted argv or shell command, cwd, decision, reason, and a
+-- stable command hash is written before the wrapper launches; a completion
+-- record carries exit status, duration, truncation, and group cleanup. A
+-- `"deny"` decision is a recorded refusal and never launches. When
+-- `high_risk` is true and the pre-spawn write fails, the command is not
+-- launched and the result carries the typed `E_AUDIT_UNAVAILABLE` error; a
+-- lower-risk write failure continues with `result.audit_warning` set. The
+-- process result therefore may also carry `spawned`, `denied`, `audit_error`,
+-- and `audit_warning`. Full prompts, output, environment values, file
+-- contents, and provider responses are never passed to the sink.
+--
 -- Process result shape: every `proc.*` primitive returns
 -- { ok, code, exit_code, stdout, stderr, timed_out, truncated,
 --   stdout_truncated, stderr_truncated, outcome, cleanup, pgid? } where `ok`
@@ -135,6 +154,7 @@
 
 local WheelHost = {}
 local WheelErrors = require("wheel.errors")
+local WheelAudit = require("wheel.audit")
 
 -- ---------------------------------------------------------------------------
 -- Shared helpers
@@ -949,6 +969,43 @@ function standalone.new(opts)
     return true
   end
 
+  --- Append <content> to the existing private file at <path>.
+  -- The path is verified as an owned, singly linked, mode-0600 regular file
+  -- immediately before the append; a symbolic link, foreign owner, weaker
+  -- mode, FIFO, device, or missing path is refused. The open uses append mode,
+  -- so an existing record is never truncated. The audit sink creates the file
+  -- with `create_private_file` before its first append.
+  -- @param path string
+  -- @param content string
+  -- @return boolean ok, string? err
+  function backend.append_file(path, content)
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
+    if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
+      return false, "invalid appended file path"
+    end
+    if type(content) ~= "string" then
+      return false, "appended content must be a string"
+    end
+    local verified, verify_err = verify_private_file(path)
+    if not verified then
+      return false, verify_err
+    end
+    local file, open_err = io.open(path, "a")
+    if not file then
+      return false, tostring(open_err)
+    end
+    local wrote, write_err = file:write(content)
+    if not wrote then
+      file:close()
+      return false, tostring(write_err or "write failed")
+    end
+    local close_ok, close_err = file:close()
+    if not close_ok then
+      return false, tostring(close_err or "close failed")
+    end
+    return true
+  end
+
   --- Remove the file at <path>.
   -- @param path string
   -- @return boolean ok, string? err
@@ -1354,6 +1411,133 @@ function standalone.new(opts)
       end
     end
 
+    -- Optional execution audit (CTX-0030). The sink is opt-in: a call without
+    -- opts.audit never resolves or creates an audit directory, so existing
+    -- tests and embedders keep their behavior. When supplied, the metadata is
+    -- an allowlisted identity/decision table; command values and metadata are
+    -- redacted by the sink, and no output, environment value, prompt, or file
+    -- content is passed to it.
+    local audit_meta = opts.audit
+    if audit_meta ~= nil and type(audit_meta) ~= "table" then
+      return process_failure("audit metadata must be a table")
+    end
+    local audit_decision = "allow"
+    if audit_meta ~= nil then
+      audit_decision = audit_meta.decision
+      if audit_decision == nil then
+        audit_decision = "allow"
+      end
+      if audit_decision ~= "allow" and audit_decision ~= "deny" then
+        return process_failure("audit decision must be 'allow' or 'deny'")
+      end
+      if audit_meta.high_risk ~= nil and type(audit_meta.high_risk) ~= "boolean" then
+        local failure = process_failure("audit high_risk must be a boolean")
+        failure.audit_error = WheelErrors.args_invalid(
+          "host.proc", "audit high_risk must be a boolean")
+        return failure
+      end
+    end
+
+    local function audit_clock_ms()
+      local ok, now = pcall(WheelHost.time.now)
+      if ok and type(now) == "number" and now >= 0 then
+        return math.floor(now * 1000)
+      end
+      return nil
+    end
+
+    local function audit_event(name, extra)
+      if audit_meta == nil then
+        return nil
+      end
+      local event = {
+        event = name,
+        kind = mode,
+        cwd = cwd,
+        role = audit_meta.role,
+        agent = audit_meta.agent,
+        task = audit_meta.task,
+        tool = audit_meta.tool,
+        intent = audit_meta.intent,
+        decision = audit_decision,
+        reason = audit_meta.reason,
+        high_risk = audit_meta.high_risk == true,
+      }
+      if mode == "argv" then
+        event.program = payload
+        event.args = payload_args
+      else
+        event.shell = payload
+      end
+      for key, value in pairs(extra or {}) do
+        event[key] = value
+      end
+      return event
+    end
+
+    local audit_started = nil
+    local audit_recorded = false
+    local audit_warning = nil
+
+    local function write_audit(event)
+      local ok, recorded, audit_err =
+        pcall(WheelAudit.record, event, { dir = audit_meta.dir })
+      if not ok then
+        return nil, WheelErrors.audit_unavailable()
+      end
+      return recorded, audit_err
+    end
+
+    local function finish_audit(result, spawned)
+      if audit_meta == nil then
+        return result
+      end
+      result.spawned = spawned
+      if audit_warning then
+        result.audit_warning = audit_warning
+      end
+      if not audit_recorded then
+        return result
+      end
+      local finished = audit_clock_ms()
+      local extra = {
+        spawned = spawned,
+        exit_code = result.exit_code,
+        truncated = result.truncated == true,
+        timed_out = result.timed_out == true,
+        cleanup = result.cleanup,
+        outcome = result.outcome,
+      }
+      if audit_started ~= nil and finished ~= nil then
+        extra.duration_ms = math.max(0, finished - audit_started)
+      end
+      local recorded, audit_err = write_audit(
+        audit_event(spawned and "process.completed" or "process.aborted", extra))
+      if not recorded then
+        result.audit_warning = result.audit_warning
+          or "audit completion record could not be written"
+        result.audit_error = result.audit_error or audit_err
+      end
+      return result
+    end
+
+    -- A caller-supplied deny decision is a recorded refusal, not a launch. The
+    -- pre-spawn record is attempted first so a denial is auditable; either way
+    -- the command never reaches the wrapper. A high-risk denial is still a
+    -- denial even when the audit write fails.
+    if audit_meta ~= nil and audit_decision == "deny" then
+      local recorded, audit_err = write_audit(
+        audit_event("process.pre_spawn", { spawned = false }))
+      local denied = process_failure("process denied by policy")
+      denied.denied = true
+      denied.spawned = false
+      if not recorded then
+        denied.audit_error = audit_err
+        denied.audit_warning = "audit record could not be written for a denied command"
+      end
+      return denied
+    end
+
     local env_parts, env_err, env_outcome =
       build_child_environment(os.getenv, opts.env)
     if not env_parts then
@@ -1529,6 +1713,30 @@ function standalone.new(opts)
     local command = table.concat(pieces, " ")
       .. " 2> " .. shell_quote(diag_path)
 
+    -- The pre-spawn record is written after every argument, environment, and
+    -- temporary-file check but immediately before the launch. A high-risk
+    -- operation fails closed when that write cannot complete; a lower-risk one
+    -- continues with a visible result warning. Existing capture files are
+    -- removed on the refusal path.
+    if audit_meta ~= nil then
+      audit_started = audit_clock_ms()
+      local recorded, audit_err = write_audit(
+        audit_event("process.pre_spawn", { spawned = false }))
+      if recorded then
+        audit_recorded = true
+      elseif audit_meta.high_risk == true then
+        cleanup()
+        local refused = process_failure(
+          "audit record could not be written; refusing a high-risk spawn")
+        refused.spawned = false
+        refused.audit_error = audit_err
+        return refused
+      else
+        audit_warning =
+          "audit record could not be written; continuing because the command is not marked high risk"
+      end
+    end
+
     local pipe = io.popen(command, "r")
     if not pipe then
       local errors = cleanup()
@@ -1536,7 +1744,7 @@ function standalone.new(opts)
       if #errors > 0 then
         message = message .. "; cleanup failed: " .. table.concat(errors, "; ")
       end
-      return process_failure(message)
+      return finish_audit(process_failure(message), false)
     end
     pipe:read("*a")
     pipe:close()
@@ -1574,7 +1782,7 @@ function standalone.new(opts)
         and WheelHost.GROUP_CLEANUP.SWEPT
         or WheelHost.GROUP_CLEANUP.UNVERIFIED
       failure.pgid = pgid
-      return failure
+      return finish_audit(failure, true)
     end
 
     local timed_out = code == 124 or code == 137
@@ -1610,7 +1818,7 @@ function standalone.new(opts)
       stderr = ""
     end
 
-    return {
+    return finish_audit({
       ok = ok,
       code = code,
       exit_code = code,
@@ -1623,7 +1831,7 @@ function standalone.new(opts)
       outcome = outcome,
       cleanup = group_cleanup,
       pgid = pgid,
-    }
+    }, true)
   end
 
   --- Execute a shell command line inside the bounded, scrubbed process
@@ -1645,7 +1853,7 @@ function standalone.new(opts)
   -- (swept|unverified|not_run) are explicit.
   -- @param shell_string string
   -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
-  --                         discard_stderr, env }
+  --                         discard_stderr, env, audit }
   -- @return table process result
   function backend.run_command(shell_string, opts)
     if type(shell_string) ~= "string" then
@@ -1667,7 +1875,7 @@ function standalone.new(opts)
   -- @param program string
   -- @param args string[]?
   -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
-  --                      discard_stderr, env }
+  --                      discard_stderr, env, audit }
   -- @return table process result
   function backend.run_program(program, args, opts)
     if type(program) ~= "string" or program == "" then
@@ -2011,6 +2219,14 @@ function WheelHost.fs.write_file(path, content)
   return invoke("fs.write", "write_file", path, content)
 end
 
+--- Append to an existing private 0600 regular file without truncating it.
+-- @param path string
+-- @param content string
+-- @return boolean ok, string? err
+function WheelHost.fs.append_file(path, content)
+  return invoke("fs.write", "append_file", path, content)
+end
+
 --- Set a file mode.
 -- @param path string
 -- @param mode string|number
@@ -2135,10 +2351,18 @@ end
 -- allowlist.
 -- @param shell_string string
 -- @param env table? { command_runner = function? }
--- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, env }
+-- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, env, audit }
 -- @return table process result
 function WheelHost.proc.run_command(shell_string, env, opts)
   if env and type(env.command_runner) == "function" then
+    -- The injected runner is a test seam that never crosses the host process
+    -- boundary, so it cannot produce the real pre-spawn/completion records. An
+    -- audit request is rejected rather than silently producing incomplete
+    -- evidence.
+    if type(opts) == "table" and opts.audit ~= nil then
+      return process_failure(
+        "audit is not supported with an injected command_runner")
+    end
     return normalize_runner_result(env.command_runner({ command = shell_string }, env))
   end
   return invoke("process.spawn", "run_command", shell_string, opts)
@@ -2153,7 +2377,7 @@ end
 -- @param program string
 -- @param args string[]?
 -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
---                      discard_stderr, env }
+--                      discard_stderr, env, audit }
 -- @return table process result
 function WheelHost.proc.run_program(program, args, opts)
   return invoke("process.spawn", "run_program", program, args, opts)
