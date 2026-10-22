@@ -1,0 +1,4 @@
+# Synthetic audit-fixture values are not credentials. This fingerprint is the
+# pre-rename ApiKey scheme label committed in 1984ffb; the current fixture value
+# no longer matches the generic-api-key rule, but history keeps the old commit.
+1984ffbefa7344899cb7609ddc33df7f4d8b3271:tests/test_audit.lua:generic-api-key:305
