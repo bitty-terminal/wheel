@@ -418,10 +418,14 @@ local function run_tests()
     local dir = base .. "/escaped-json"
     local escaped_auth_value = "opaque-escaped-json-value-6c1a"
     local escaped_proxy_value = "opaque-escaped-json-proxy-4b9d"
+    local digest_value = "opaque-digest-value-8e2f"
     local auth_shell = string.format(
       [[true -d "{\"Authorization\":\"Token %s\"}"]], escaped_auth_value)
     local proxy_shell = string.format(
       [[true -d "{\"Proxy-Authorization\":\"ApiKey %s\"}"]], escaped_proxy_value)
+    local digest_shell = string.format(
+      [[true -d "{\"Authorization\":\"Digest username=\\\"u\\\", response=\\\"%s\\\"\"}"]],
+      digest_value)
 
     local permitted = WheelHost.proc.run_command(auth_shell, nil, {
       audit = { dir = dir, decision = "allow", high_risk = true },
@@ -437,6 +441,13 @@ local function run_tests()
     check(proxy_result.ok == true and proxy_result.code == 0,
       "the escaped proxy command must run: " .. tostring(proxy_result.stderr))
 
+    local digest_result = WheelHost.proc.run_command(digest_shell, nil, {
+      audit = { dir = dir, decision = "allow", high_risk = true },
+    })
+    check(digest_result.ok == true and digest_result.code == 0,
+      "the escaped Digest command must run: " .. tostring(digest_result.stderr))
+    assert_no_secret(digest_result.stdout, digest_value, "the Digest stdout")
+
     local denied = WheelHost.proc.run_command(auth_shell, nil, {
       audit = {
         dir = dir,
@@ -450,34 +461,58 @@ local function run_tests()
     assert_no_secret(denied.stdout, escaped_auth_value, "the denial stdout")
     assert_no_secret(denied.stderr, escaped_auth_value, "the denial stderr")
 
+    local digest_denied = WheelHost.proc.run_command(digest_shell, nil, {
+      audit = {
+        dir = dir,
+        decision = "deny",
+        reason = "escaped Digest probe",
+        high_risk = true,
+      },
+    })
+    check(digest_denied.ok == false and digest_denied.denied == true,
+      "the escaped Digest command must be denied")
+    assert_no_secret(digest_denied.stderr, digest_value, "the Digest denial stderr")
+
     local raw = read_file(dir .. "/audit.jsonl") or ""
     assert_no_secret(raw, escaped_auth_value, "the audit stream")
     assert_no_secret(raw, escaped_proxy_value, "the audit stream")
+    assert_no_secret(raw, digest_value, "the audit stream")
+    check(raw:find("response", 1, true) == nil,
+      "the escaped Digest parameter name must not survive over-redaction")
     check(raw:find("Authorization", 1, true) == nil,
       "the escaped Authorization key must not be recorded")
     check(raw:find("Proxy-Authorization", 1, true) == nil,
       "the escaped Proxy-Authorization key must not be recorded")
-    check(raw:find("[redacted:" .. WheelConfig.compute_hash(
-      "Token " .. escaped_auth_value):sub(1, 16) .. "]", 1, true) ~= nil,
-      "the escaped JSON value must keep a stable marker")
+    check(raw:find("[redacted:", 1, true) ~= nil,
+      "the escaped JSON values must produce stable markers")
 
     for _, record in ipairs(parse_records(dir)) do
       assert_no_secret(record.shell or "", escaped_auth_value, "a pre-spawn/completion record")
       assert_no_secret(record.shell or "", escaped_proxy_value, "a pre-spawn/completion record")
+      assert_no_secret(record.shell or "", digest_value, "a pre-spawn/completion record")
+      check((record.shell or ""):find("response", 1, true) == nil,
+        "the Digest parameter name must not survive in a record")
+      check((record.shell or ""):find("Digest", 1, true) == nil,
+        "the Digest scheme must not survive in a record")
+      check((record.shell or ""):find("username", 1, true) == nil,
+        "the Digest username parameter must not survive over-redaction")
     end
 
     local blocked = base .. "/escaped-json-blocked"
     write_file(blocked, "not a directory")
-    local failed, failed_err = WheelAudit.record({
-      event = "process.pre_spawn",
-      kind = "shell",
-      shell = auth_shell,
-      decision = "allow",
-    }, { dir = blocked .. "/audit" })
-    check(failed == nil and type(failed_err) == "table",
-      "the blocked escaped-JSON write must fail with a typed error")
-    assert_no_secret(failed_err.message, escaped_auth_value, "the typed error")
-    assert_no_secret(tostring(failed_err), escaped_auth_value, "the typed error string")
+    for _, candidate in ipairs({ auth_shell, digest_shell }) do
+      local failed, failed_err = WheelAudit.record({
+        event = "process.pre_spawn",
+        kind = "shell",
+        shell = candidate,
+        decision = "allow",
+      }, { dir = blocked .. "/audit" })
+      check(failed == nil and type(failed_err) == "table",
+        "the blocked escaped-JSON write must fail with a typed error")
+      assert_no_secret(failed_err.message, escaped_auth_value, "the typed error")
+      assert_no_secret(tostring(failed_err), escaped_auth_value, "the typed error string")
+      assert_no_secret(failed_err.message, digest_value, "the typed error")
+    end
   end)
 
   test("WheelHost: authorization env assignments and flags redact complete values", function()
@@ -485,9 +520,15 @@ local function run_tests()
     local env_auth_value = "opaque-env-auth-value-2f7c"
     local http_auth_value = "opaque-http-auth-value-9d4a"
     local flag_auth_value = "opaque-flag-auth-value-5b8e"
+    local inner_env_value = "opaque-env-inner-value-7c3a"
+    local inner_flag_value = "opaque-flag-inner-value-1e6b"
     local shell = "true AUTHORIZATION='Token " .. env_auth_value .. "'"
       .. " HTTP_AUTHORIZATION='Token " .. http_auth_value .. "'"
       .. " --authorization 'Token " .. flag_auth_value .. "'"
+    local inner_env_shell = string.format(
+      [[true AUTHORIZATION="Token \"%s\""]], inner_env_value)
+    local inner_flag_shell = string.format(
+      [[true --authorization "Token \"%s\""]], inner_flag_value)
 
     local permitted = WheelHost.proc.run_command(shell, nil, {
       audit = { dir = dir, decision = "allow", high_risk = true },
@@ -495,6 +536,16 @@ local function run_tests()
     check(permitted.ok == true and permitted.code == 0,
       "the env/flag audit command must run: " .. tostring(permitted.stderr))
     check(permitted.stdout == "", "the audit probe must not echo its arguments")
+
+    for _, candidate in ipairs({ inner_env_shell, inner_flag_shell }) do
+      local result = WheelHost.proc.run_command(candidate, nil, {
+        audit = { dir = dir, decision = "allow", high_risk = true },
+      })
+      check(result.ok == true and result.code == 0,
+        "the escaped inner-quote command must run: " .. tostring(result.stderr))
+      assert_no_secret(result.stdout, inner_env_value, "the inner-quote stdout")
+      assert_no_secret(result.stdout, inner_flag_value, "the inner-quote stdout")
+    end
 
     local denied = WheelHost.proc.run_command(shell, nil, {
       audit = {
@@ -511,7 +562,8 @@ local function run_tests()
     assert_no_secret(denied.stderr, flag_auth_value, "the denial stderr")
 
     local raw = read_file(dir .. "/audit.jsonl") or ""
-    for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+    for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value,
+      inner_env_value, inner_flag_value }) do
       assert_no_secret(raw, secret, "the audit stream")
     end
     for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
@@ -519,8 +571,11 @@ local function run_tests()
         "Token " .. secret):sub(1, 16) .. "]", 1, true) ~= nil,
         "the complete env/flag value must keep a stable marker")
     end
+    check(raw:find("[redacted:", 1, true) ~= nil,
+      "the escaped inner-quote values must produce markers")
     for _, record in ipairs(parse_records(dir)) do
-      for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value }) do
+      for _, secret in ipairs({ env_auth_value, http_auth_value, flag_auth_value,
+        inner_env_value, inner_flag_value }) do
         assert_no_secret(record.shell or "", secret, "a pre-spawn/completion record")
       end
     end
@@ -969,6 +1024,34 @@ local function run_tests()
     check(runner_calls == 0, "the injected runner must not run when audit is requested")
     check(WheelHost.fs.exists(runner_audit) == false,
       "a rejected runner audit must not create an audit directory")
+  end)
+
+  test("WheelHost: non-boolean high_risk fails closed before audit or spawn", function()
+    local blocked = base .. "/high-risk-type-blocked"
+    write_file(blocked, "not a directory")
+    for index, value in ipairs({ "true", 1 }) do
+      local marker = base .. "/high-risk-type-marker-" .. tostring(index)
+      local result = WheelHost.proc.run_command("touch " .. shell_quote(marker), nil, {
+        audit = {
+          dir = blocked .. "/audit",
+          high_risk = value,
+          decision = "allow",
+        },
+      })
+      check(result.ok == false,
+        "high_risk=" .. tostring(value) .. " must be rejected before spawn")
+      check(result.spawned == false or result.spawned == nil,
+        "a rejected high_risk value must not report a spawn")
+      check(WheelHost.fs.exists(marker) == false,
+        "a rejected high_risk value must not run the command")
+      check(type(result.audit_error) == "table"
+        and result.audit_error.code == WheelErrors.E_ARGS_INVALID,
+        "the rejection must carry the typed E_ARGS_INVALID error")
+      check(result.audit_error.message:find("high_risk", 1, true) ~= nil,
+        "the typed error must name the high_risk field")
+    end
+    check(WheelHost.fs.exists(blocked .. "/audit") == false,
+      "the rejected metadata must not create an audit directory")
   end)
 
   test("WheelHost: completion records exit, duration, truncation, and cleanup", function()

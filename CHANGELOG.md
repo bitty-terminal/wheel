@@ -27,8 +27,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   real-host fixture reads the JSONL after a real permitted and denied command.
   Review hardening consumes the complete Authorization and Proxy-Authorization
   value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, including
-  shell-escaped JSON keys/values, and replaces complete quoted or unquoted
-  values for authorization environment assignments and flags. It also refuses
+  shell-escaped JSON keys/values (ambiguous escaped values are over-redacted
+  through the end of the preview), and replaces complete quoted or unquoted
+  values for authorization environment assignments and flags, including
+  escaped inner quotes. It also refuses
   an unsafe active audit file (symlink or weak mode), rejects `opts.audit` with
   an injected `command_runner`, reports `spawned = false` on a high-risk
   refusal, and documents that only a torn/corrupt tail blocks append while

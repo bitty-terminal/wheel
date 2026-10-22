@@ -1430,6 +1430,12 @@ function standalone.new(opts)
       if audit_decision ~= "allow" and audit_decision ~= "deny" then
         return process_failure("audit decision must be 'allow' or 'deny'")
       end
+      if audit_meta.high_risk ~= nil and type(audit_meta.high_risk) ~= "boolean" then
+        local failure = process_failure("audit high_risk must be a boolean")
+        failure.audit_error = WheelErrors.args_invalid(
+          "host.proc", "audit high_risk must be a boolean")
+        return failure
+      end
     end
 
     local function audit_clock_ms()

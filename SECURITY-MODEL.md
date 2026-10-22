@@ -368,8 +368,10 @@ authority.
   predictable fallback, and a symlinked, non-regular, foreign-owned,
   group/world-writable, oversized, corrupt, or foreign-version store fails
   closed with a surfaced warning. The opt-in execution audit log exists under
-  `$XDG_STATE_HOME/wheel/audit/`; trust approval does not write to it yet, so
-  the default-on fail-closed requirement remains open. See
+  `$XDG_STATE_HOME/wheel/audit/`, with the
+  `$HOME/.local/state/wheel/audit/` fallback when `XDG_STATE_HOME` is unset;
+  trust approval does not write to it yet, so the default-on fail-closed
+  requirement remains open. See
   [Relationship to current code](#relationship-to-current-code).
 
 ### Local session control plane (experimental)
@@ -769,9 +771,11 @@ the redaction passes; removed values keep a stable
 `[redacted:<SHA-256 prefix>]` marker. A credential-bearing header is removed as
 a complete value (name, scheme, and every parameter), through its enclosing
 quote or the end of the preview, including escaped JSON keys/values, so Digest
-and AWS4 parameter lists cannot leave a value after the first token.
-Secret-shaped environment assignments and flags replace their complete quoted
-or unquoted shell value. `WheelHost.proc.run_program` and
+and AWS4 parameter lists cannot leave a value after the first token. An
+ambiguous escaped JSON value is over-redacted through the end of the preview
+instead of guessing a closing delimiter. Secret-shaped environment assignments
+and flags replace their complete quoted or unquoted shell value.
+`WheelHost.proc.run_program` and
 `run_command` accept an optional `opts.audit` table and write a pre-spawn
 record before the wrapper launches and a completion record after the bounded
 sweep. A `deny` decision is a recorded refusal and never launches. A high-risk

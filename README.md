@@ -1076,8 +1076,10 @@ owner, or weaker mode is refused.
   header, flag, environment-assignment, query, token-shape, and URL-userinfo
   passes. A credential-bearing header is removed as a complete value (name,
   scheme, and every parameter), including escaped JSON keys/values and shell
-  quotes; secret-shaped environment assignments and flags replace their
-  complete quoted or unquoted shell value. A removed value becomes
+  quotes; an ambiguous escaped JSON value is over-redacted through the end of
+  the preview rather than guessing a closing delimiter. Secret-shaped
+  environment assignments and flags replace their complete quoted or unquoted
+  shell value. A removed value becomes
   `[redacted:<16 hex of its SHA-256>]`, so the
   same value correlates across events without being recoverable from the
   record. Pattern redaction is heuristic for a value Wheel did not load itself.

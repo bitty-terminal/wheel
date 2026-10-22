@@ -29,8 +29,10 @@
 -- header is removed as a whole value (name, scheme, and every parameter),
 -- through its enclosing quote or the end of the preview, including escaped
 -- JSON keys/values and shell-quoted forms, so a Digest/AWS4 parameter list
--- cannot leave a value after the first token. Secret-shaped environment
--- assignments and flags replace their complete quoted or unquoted shell value.
+-- cannot leave a value after the first token. When an escaped JSON value makes
+-- the closing quote ambiguous, redaction consumes the rest of the preview
+-- (over-redaction) instead of guessing. Secret-shaped environment assignments
+-- and flags replace their complete quoted or unquoted shell value.
 -- A removed value becomes `[redacted:<16 hex of SHA-256(value)>]`; the same
 -- value yields the same marker, so an operator can correlate events without
 -- recovering the secret.
@@ -300,27 +302,30 @@ local function quoted_end(text, start, quote)
   return length
 end
 
---- Find the closing escaped quote in a shell-escaped JSON value.
--- `\"Authorization\":\"Token value\"` reaches the sink after the shell folds
--- its outer quoting, so both the key and the value quotes carry a backslash.
--- The closing delimiter is the next `\"` followed by a JSON/structural end
--- (`,`/`}`/`]`/whitespace) or the end of the preview. Inner escaped quotes are
--- skipped so a Digest/AWS4 parameter list can be consumed as one value.
+--- Find the end of one shell token, honoring single/double quotes and
+-- backslash escapes.
 -- @param text string
--- @param start number index of the backslash before the opening quote
--- @param quote string '"' or "'"
--- @return number index of the closing quote
-local function escaped_quoted_end(text, start, quote)
-  local index = start + 2
+-- @param start number
+-- @return number end index
+local function shell_token_end(text, start)
+  local first = text:sub(start, start)
+  if first == "" then
+    return start - 1
+  end
+  if first == "'" then
+    return quoted_end(text, start, "'")
+  end
+  if first == '"' then
+    return quoted_end(text, start, '"')
+  end
+  local index = start
   local length = #text
   while index <= length do
-    if text:sub(index, index) == "\\" and text:sub(index + 1, index + 1) == quote then
-      local after = text:sub(index + 2, index + 2)
-      if after == "" or after == "," or after == "}" or after == "]"
-        or after:match("%s") then
-        return index + 1
-      end
+    local char = text:sub(index, index)
+    if char == "\\" then
       index = index + 2
+    elseif char:match("%s") then
+      return index - 1
     else
       index = index + 1
     end
@@ -393,7 +398,10 @@ local function redact_secret_headers(text, counter)
         local second = text:sub(value_start + 1, value_start + 1)
         local escaped_quote = first == "\\" and (second == '"' or second == "'")
         if escaped_quote then
-          value_end = escaped_quoted_end(text, value_start, second)
+          -- Escaped JSON is ambiguous once inner parameter quotes are also
+          -- escaped. Do not guess a closing delimiter: consume the rest of the
+          -- preview so a later Digest/AWS4 parameter cannot survive.
+          value_end = length
         elseif first == '"' then
           value_end = quoted_end(text, value_start, '"')
         elseif first == "'" then
@@ -412,7 +420,7 @@ local function redact_secret_headers(text, counter)
         if value_end ~= nil and value_end >= value_start then
           local credential
           if escaped_quote then
-            credential = text:sub(value_start + 2, value_end - 2)
+            credential = text:sub(value_start)
           elseif first == '"' or first == "'" then
             credential = text:sub(value_start + 1, value_end - 1)
           elseif text:sub(value_end, value_end) == '"'
@@ -446,6 +454,93 @@ local function redact_secret_headers(text, counter)
   return table.concat(out)
 end
 
+--- Replace secret-shaped environment assignments and flags with one marker.
+-- The retained value is the complete shell token: single/double quoted text
+-- (including escaped inner quotes) or an unquoted word with backslash escapes.
+-- This runs after header redaction and before the bare-token shape passes.
+-- @param text string
+-- @param counter table { n = number }
+-- @return string
+local function redact_secret_assignments(text, counter)
+  local out = {}
+  local cursor = 1
+  local index = 1
+  local length = #text
+
+  while index <= length do
+    local char = text:sub(index, index)
+    local previous = index > 1 and text:sub(index - 1, index - 1) or ""
+    local boundary = previous == "" or previous:match("[%w_]") == nil
+    local handled = false
+
+    if boundary and (char:match("%a") or char == "_") then
+      local name = text:sub(index):match("^([%a_][%w_]*)")
+      local equals = index + #name
+      if text:sub(equals, equals) == "=" and is_secret_name(name) then
+        local value_start = equals + 1
+        while text:sub(value_start, value_start) == " " do
+          value_start = value_start + 1
+        end
+        local value_end = shell_token_end(text, value_start)
+        if value_end >= value_start then
+          local marker = redaction_marker(
+            unquote_value(text:sub(value_start, value_end)))
+          if marker then
+            counter.n = counter.n + 1
+            out[#out + 1] = text:sub(cursor, index - 1) .. name .. "=" .. marker
+            cursor = value_end + 1
+            index = cursor
+            handled = true
+          end
+        end
+      end
+    elseif boundary and char == "-" then
+      local flag = text:sub(index):match("^(%-%-?[%w%-_]+)")
+      if flag then
+        local after_flag = index + #flag
+        local value_start = nil
+        local prefix = nil
+        local scan = after_flag
+        while text:sub(scan, scan) == " " or text:sub(scan, scan) == "\t" do
+          scan = scan + 1
+        end
+        if text:sub(scan, scan) == "=" then
+          value_start = scan + 1
+          while text:sub(value_start, value_start) == " " do
+            value_start = value_start + 1
+          end
+          prefix = flag .. "="
+        elseif scan > after_flag then
+          value_start = scan
+          prefix = text:sub(index, scan - 1)
+        end
+
+        if value_start and is_secret_name(flag) then
+          local value_end = shell_token_end(text, value_start)
+          if value_end >= value_start then
+            local marker = redaction_marker(
+              unquote_value(text:sub(value_start, value_end)))
+            if marker then
+              counter.n = counter.n + 1
+              out[#out + 1] = text:sub(cursor, index - 1) .. prefix .. marker
+              cursor = value_end + 1
+              index = cursor
+              handled = true
+            end
+          end
+        end
+      end
+    end
+
+    if not handled then
+      index = index + 1
+    end
+  end
+
+  out[#out + 1] = text:sub(cursor)
+  return table.concat(out)
+end
+
 --- Apply the redaction passes to one free-form string.
 -- @param text string
 -- @param counter table { n = number }
@@ -456,6 +551,7 @@ local function redact_text(text, counter)
   end
   text = clean_text(text)
   text = redact_secret_headers(text, counter)
+  text = redact_secret_assignments(text, counter)
 
   local function span(prefix, value)
     local marker = redaction_marker(value)
@@ -480,71 +576,10 @@ local function redact_text(text, counter)
     return whole(value)
   end)
 
-  -- Environment assignments keep the secret-shaped name for correlation, but
-  -- replace the complete shell value (quoted or unquoted), not just the first
-  -- whitespace-delimited fragment. Quoted passes run first so a value such as
-  -- AUTHORIZATION='Token opaque' is removed as one unit.
-  text = text:gsub("([%a_][%w_]*)(=)('[^']*')", function(name, separator, value)
-    if is_secret_name(name) then
-      return span(name .. separator, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub('([%a_][%w_]*)(=)("[^"]*")', function(name, separator, value)
-    if is_secret_name(name) then
-      return span(name .. separator, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub("([%a_][%w_]*)(=)([^%s]+)", function(name, separator, value)
-    if is_secret_name(name) and value:sub(1, 10) ~= "[redacted:" then
-      return span(name .. separator, value)
-    end
-    return nil
-  end)
-
-  -- Long and short flags use the same complete-value rule for `--flag=value`
-  -- and `--flag value` forms.
-  text = text:gsub("(%-%-?[%w%-_]+)(=)('[^']*')", function(flag, separator, value)
-    if is_secret_name(flag) then
-      return span(flag .. separator, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub('(%-%-?[%w%-_]+)(=)("[^"]*")', function(flag, separator, value)
-    if is_secret_name(flag) then
-      return span(flag .. separator, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub("(%-%-?[%w%-_]+)(=)([^%s]+)", function(flag, separator, value)
-    if is_secret_name(flag) and value:sub(1, 10) ~= "[redacted:" then
-      return span(flag .. separator, value)
-    end
-    return nil
-  end)
-
-  text = text:gsub("(%-%-?[%w%-_]+)(%s+)('[^']*')", function(flag, space, value)
-    if is_secret_name(flag) then
-      return span(flag .. space, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub('(%-%-?[%w%-_]+)(%s+)("[^"]*")', function(flag, space, value)
-    if is_secret_name(flag) then
-      return span(flag .. space, unquote_value(value))
-    end
-    return nil
-  end)
-  text = text:gsub("(%-%-?[%w%-_]+)(%s+)([^%s%-][^%s]*)", function(flag, space, value)
-    if is_secret_name(flag) and value:sub(1, 10) ~= "[redacted:" then
-      return span(flag .. space, value)
-    end
-    return nil
-  end)
-
+  -- Environment assignments and flags are handled above by the complete
+  -- shell-token scanner; the query-string pass below covers URL parameters.
   text = text:gsub("([?&][%w%-_]+)(=)([^&%s]+)", function(name, separator, value)
-    if is_secret_name(name) then
+    if is_secret_name(name) and value:sub(1, 10) ~= "[redacted:" then
       return span(name .. separator, value)
     end
     return nil
