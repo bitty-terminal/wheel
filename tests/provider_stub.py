@@ -8,11 +8,14 @@ Boundary (CTX-0029 / wheel#95):
 * The expected synthetic credential is read once from the process environment
   variable ``WHEEL_PROVIDER_STUB_KEY``. It is never accepted through argv, a
   file, or the request body, and it is never written to stdout, stderr, or the
-  request record. A value that appears in this process's own argv is treated as
-  a test defect and the stub refuses to start.
+  request record. The argv scan runs before argument parsing with a static
+  diagnostic, so an unrecognized option containing the key cannot be echoed by
+  ``argparse``.
 * Exactly one route is served: ``POST /chat/completions``. Every other path,
   method, or malformed request is rejected with a static response. The stub
-  never issues a redirect.
+  never issues a redirect. ``--redirect URL`` is a test-only mode that answers
+  the authorized route with a 302 so the client's redirect refusal can be
+  exercised; it never follows or contacts that URL.
 * The request record keeps metadata only: path, method, status, whether an
   Authorization header was present, whether it matched the expected key, and
   the declared body size. Header values, the key, and prompt bodies are never
@@ -20,6 +23,8 @@ Boundary (CTX-0029 / wheel#95):
 * The readiness file carries the bound port, the process id, and the protocol
   marker. It is written atomically with mode ``0600`` so the test can wait for
   a fully initialized server and later signal only that recorded pid.
+  ``--stopped PATH`` writes an atomic clean-shutdown marker after SIGTERM/SIGINT
+  teardown completes, which proves graceful termination without SIGKILL.
 * SIGTERM/SIGINT requests a clean shutdown; the test only ever signals the pid
   it recorded at launch and confirmed with the readiness file.
 
@@ -118,10 +123,18 @@ class StubServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, address, handler, key: str, recorder: RequestRecorder) -> None:
+    def __init__(
+        self,
+        address,
+        handler,
+        key: str,
+        recorder: RequestRecorder,
+        redirect_url: str | None = None,
+    ) -> None:
         super().__init__(address, handler)
         self.expected_key = key
         self.recorder = recorder
+        self.redirect_url = redirect_url
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -156,6 +169,10 @@ class StubHandler(BaseHTTPRequestHandler):
             self._authorize()
         except HttpRejection as error:
             self._reject(error.status, error.reason)
+            return
+
+        if self.server.redirect_url:
+            self._respond(302, b"", location=self.server.redirect_url)
             return
 
         payload = {
@@ -211,7 +228,7 @@ class StubHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             return None
 
-    def _respond(self, status: int, body: bytes) -> None:
+    def _respond(self, status: int, body: bytes, location: str | None = None) -> None:
         authorization = self.headers.get("Authorization", "")
         authorization_present = bool(authorization)
         authorization_valid = False
@@ -234,6 +251,8 @@ class StubHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if location is not None:
+            self.send_header("Location", location)
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
@@ -251,24 +270,45 @@ def _wait_for_stop(stop_event: threading.Event) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Credential checks run before argument parsing: argparse echoes an
+    # unrecognized argument in its error text, so an argv value carrying the
+    # key must be refused first, with a static diagnostic.
+    key = os.environ.get(KEY_ENV, "")
+    if not key:
+        return _fail(f"{KEY_ENV} is not set in the stub environment")
+    scanned_argv = sys.argv[1:] if argv is None else argv
+    if any(key in argument for argument in scanned_argv):
+        return _fail(f"{KEY_ENV} must not appear in the stub's argv")
+
     parser = argparse.ArgumentParser(
         description="Loopback OpenAI-compatible provider stub (test only)."
     )
     parser.add_argument("--ready", required=True, help="atomic readiness file")
     parser.add_argument("--requests", required=True, help="request metadata record")
+    parser.add_argument(
+        "--redirect",
+        default=None,
+        help="answer the authorized route with a 302 to this URL (test only)",
+    )
+    parser.add_argument(
+        "--stopped",
+        default=None,
+        help="atomic clean-shutdown marker written after SIGTERM/SIGINT teardown",
+    )
     options = parser.parse_args(argv)
-
-    key = os.environ.get(KEY_ENV, "")
-    if not key:
-        return _fail(f"{KEY_ENV} is not set in the stub environment")
-    if any(key in argument for argument in sys.argv[1:]):
-        return _fail(f"{KEY_ENV} must not appear in the stub's argv")
 
     ready_path = os.path.abspath(options.ready)
     requests_path = os.path.abspath(options.requests)
+    stopped_path = os.path.abspath(options.stopped) if options.stopped else None
 
     recorder = RequestRecorder(requests_path)
-    server = StubServer(("127.0.0.1", 0), StubHandler, key, recorder)
+    server = StubServer(
+        ("127.0.0.1", 0),
+        StubHandler,
+        key,
+        recorder,
+        redirect_url=options.redirect,
+    )
     stop_event = threading.Event()
 
     def _request_stop(_signum: int, _frame: object) -> None:
@@ -299,6 +339,10 @@ def main(argv: list[str] | None = None) -> int:
         server.server_close()
         thread.join(timeout=THREAD_JOIN_TIMEOUT_SECONDS)
         recorder.close()
+    if stopped_path:
+        _write_ready_atomically(
+            stopped_path, {"protocol": READY_PROTOCOL, "status": "stopped"}
+        )
     return 0
 
 

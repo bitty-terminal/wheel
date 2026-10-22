@@ -19,7 +19,13 @@ test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   paths, and other methods are refused locally. The key reaches only child
   environments through an anonymous `sh -s` pipe, never argv or a request file,
   and the stub records only path, method, status, and authorization
-  presence/validity. The gate is part of `just check` and CI; audit output,
+  presence/validity. Review hardening adds static transport diagnostics that
+  report only the exception type (`http.client` embeds rejected header values
+  in its `ValueError` message), a CRLF-key regression, an ambient-value
+  missing-key probe backed by an explicit `unset`, a key-bearing-argv guard
+  before `argparse`, missing-authorization 401, query/fragment and redirect
+  refusal, a graceful SIGTERM shutdown marker, and a non-vacuous `/proc`
+  cmdline check. The gate is part of `just check` and CI; audit output,
   asynchronous cancellation, and panel presentation remain open Gate 2 items
   (`SECURITY-MODEL.md`, `tests/PROVIDER-STUB.md`).
 - Experimental local session daemon (CTX-0024 / wheel#85): a detached per-user

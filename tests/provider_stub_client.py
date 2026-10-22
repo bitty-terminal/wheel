@@ -19,7 +19,12 @@ Security boundary:
 * Any caller-supplied ``Authorization``/``X-Api-Key`` header is discarded, so
   the Lua adapter cannot forward a credential through a captured request file.
   The key is attached only as ``Authorization: Bearer <key>`` for this one
-  request.
+  request. ``"omit_authorization": true`` is a test-only negative-coverage
+  switch that suppresses the header so the stub's 401 path can be exercised.
+* Transport failures report only the exception type name. ``http.client``
+  raises ``ValueError`` with the rejected header value embedded in its message
+  for control characters, so neither the message nor a traceback is ever
+  written to stderr.
 * The destination is restricted to ``http://127.0.0.1:<port>`` or
   ``http://[::1]:<port>`` with no userinfo, no query, no fragment, and the
   exact path ``/chat/completions``. Redirects are never followed: ``http.client``
@@ -90,7 +95,7 @@ def _validate_url(url: str) -> tuple[str, int]:
     return parsed.hostname, port
 
 
-def _safe_headers(headers: dict, key: str) -> dict:
+def _safe_headers(headers: dict, key: str, attach_authorization: bool = True) -> dict:
     safe: dict[str, str] = {}
     for name, value in headers.items():
         if not isinstance(name, str) or not isinstance(value, str):
@@ -101,7 +106,8 @@ def _safe_headers(headers: dict, key: str) -> dict:
         if lowered in DISCARDED_HEADERS:
             continue
         safe[name] = value
-    safe["Authorization"] = f"Bearer {key}"
+    if attach_authorization:
+        safe["Authorization"] = f"Bearer {key}"
     return safe
 
 
@@ -110,16 +116,21 @@ def fetch(spec: dict, key: str) -> tuple[int, str]:
     method = spec.get("method", ALLOWED_METHOD)
     body = spec.get("body", "")
     headers = spec.get("headers") or {}
+    omit_authorization = spec.get("omit_authorization", False)
 
     if not isinstance(url, str) or not isinstance(body, str):
         raise InvalidRequest("request url and body must be strings")
     if not isinstance(headers, dict) or not isinstance(method, str):
         raise InvalidRequest("request headers must be an object")
+    if not isinstance(omit_authorization, bool):
+        raise InvalidRequest("omit_authorization must be a boolean")
     if method != ALLOWED_METHOD:
         raise InvalidRequest("test client only permits POST")
 
     host, port = _validate_url(url)
-    safe_headers = _safe_headers(headers, key)
+    safe_headers = _safe_headers(
+        headers, key, attach_authorization=not omit_authorization
+    )
 
     connection = http.client.HTTPConnection(host, port, timeout=REQUEST_TIMEOUT_SECONDS)
     try:
@@ -132,8 +143,16 @@ def fetch(spec: dict, key: str) -> tuple[int, str]:
         response = connection.getresponse()
         status = response.status
         payload = response.read(MAX_RESPONSE_BYTES + 1)
-    except (OSError, http.client.HTTPException):
-        raise TransportFailure() from None
+    except (
+        OSError,
+        http.client.HTTPException,
+        ValueError,
+        UnicodeEncodeError,
+    ) as error:
+        # http.client validates header values itself and its ValueError text
+        # embeds the rejected value. Report only the exception type, never the
+        # message or a traceback, so a malformed credential cannot reach stderr.
+        raise TransportFailure(type(error).__name__) from None
     finally:
         connection.close()
 

@@ -898,15 +898,23 @@ control plane across separate client processes. `tests/test_provider_stub.lua`
 (`just test-provider-stub`) adds the loopback provider item: a real
 `ThreadingHTTPServer` on `127.0.0.1:0` with an atomically published readiness
 record, a deterministic OpenAI-compatible completion through the real
-`OpenAIAdapter`, and a real Python `http.client` hop. A wrong key returns 401
-and a missing key fails before any request; the stub records only path, method,
-status, and authorization presence/validity (never the header value or the
-key). The test audits stdout, stderr, errors, the adapter description, request
-and response captures, and every file it creates for the synthetic key, and
-checks the launched stub's `/proc/<pid>/cmdline` for key-free argv. The
-synthetic key travels only in child environments, exported over an anonymous
-`sh -s` pipe rather than an `env` argv. See `tests/PROVIDER-STUB.md` for the
-trust boundary and reproduction steps.
+`OpenAIAdapter`, and a real Python `http.client` hop. A wrong key returns 401, a
+request without an authorization header returns 401, a missing key fails before
+any request even with an ambient value present, and a key containing CRLF is
+reported only as a static `ValueError` type without echoing the value or a
+traceback; a 302 is refused without a second hop; query strings, fragments,
+userinfo, non-loopback hosts, other paths, and other methods are refused
+locally; and SIGTERM completes the stub's graceful shutdown (proved by its
+atomic clean-shutdown marker, so a SIGKILL fallback fails the test). The stub
+records only path, method, status, and authorization presence/validity (never
+the header value or the key). The test audits stdout, stderr, errors, the
+adapter description, request/response captures, shutdown markers, and every
+file it creates for the synthetic values, checks the launched stub's
+`/proc/<pid>/cmdline` for key-free argv without a vacuous unreadable pass, and
+refuses key-bearing stub argv before argument parsing. The synthetic key
+travels only in child environments, exported over an anonymous `sh -s` pipe
+rather than an `env` argv. See `tests/PROVIDER-STUB.md` for the trust boundary
+and reproduction steps.
 
 Cancellation (as distinct from timeout) is not implemented, the fixture does not
 cover audit output, and no Bitty panel presentation was run. Audit output

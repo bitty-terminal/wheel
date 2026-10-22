@@ -944,13 +944,15 @@ WHEEL_LIVE_PROVIDER=commandcode just test-live  # Command Code
 loopback OpenAI-compatible stub on `127.0.0.1:0`, performs a completion through
 the real `OpenAIAdapter` and a test-only Python `http.client` transport, and
 fails if the fixed synthetic key appears in stdout, stderr, errors, the adapter
-description, request/response captures, or any file the run creates. A wrong
-key returns 401; a missing key fails before any request; non-loopback hosts,
-userinfo, other paths, and other methods are refused locally. The key reaches
-only child environments (never argv or a request file). The gate runs in
-`just check` and CI; `tests/PROVIDER-STUB.md` records the trust boundary and
-limits. Audit output, asynchronous cancellation, and Bitty panel presentation
-remain open Gate 2 items.
+description, request/response captures, shutdown markers, or any file the run
+creates. A wrong key returns 401; a missing key fails before any request even
+with an ambient value; a request without an authorization header returns 401;
+a CRLF-bearing key is reported only as a static exception type; non-loopback
+hosts, userinfo, query strings, fragments, other paths, other methods, and
+redirects are refused. The key reaches only child environments (never argv or a
+request file). The gate runs in `just check` and CI; `tests/PROVIDER-STUB.md`
+records the trust boundary and limits. Audit output, asynchronous cancellation,
+and Bitty panel presentation remain open Gate 2 items.
 
 ## Benchmarks
 
