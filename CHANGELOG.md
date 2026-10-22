@@ -166,6 +166,9 @@ test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
 
 ### Changed
 
+- Declare the MIT license in `bitty-plugin.toml` (`license = "MIT"`), matching
+  the tracked `LICENSE` file and `package.json`, so the manifest carries the
+  same SPDX expression as the rest of the repository metadata.
 - `create_branch` publishes its caller-visible 256-byte ref-name bound
   (`WheelContext.MAX_REF_NAME_BYTES`): a longer branch name fails with
   `invalid_branch_name`, a name at exactly 256 bytes remains valid, and the
