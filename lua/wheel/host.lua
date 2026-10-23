@@ -2162,9 +2162,20 @@ function standalone.new(opts)
 
     local result
     if terminal == "cancelled" then
+      -- GNU timeout can leave its 124 sentinel in the leader's status when a
+      -- cancellation wins the terminal race (CI observed this even though the
+      -- local host usually reported 143/137). Cancellation evidence takes
+      -- precedence over that sentinel: TERM maps to 143 and KILL to 137, while
+      -- genuine 137/143 and a raw status without cancellation evidence are
+      -- preserved.
       local code = status
+      local cancel_evidence = cancel ~= nil
+        and (cancel.term_sent == true or cancel.kill_sent == true)
+      local signal_code = (cancel and cancel.kill_sent) and 137 or 143
       if code == nil then
-        code = (cancel and cancel.kill_sent) and 137 or 143
+        code = signal_code
+      elseif cancel_evidence and (code == 0 or code == 124) then
+        code = signal_code
       end
       local cleanup = WheelHost.GROUP_CLEANUP.UNVERIFIED
       if swept then

@@ -208,6 +208,17 @@ local function wait_gone(pid, label)
   error(label .. " is still running: " .. tostring(state), 0)
 end
 
+local function wait_leader_gone(handle, label)
+  local pgid = handle:pgid()
+  for _ = 1, 100 do
+    if not WheelHost.proc.is_alive(pgid) then
+      return
+    end
+    WheelHost.time.sleep_ms(20)
+  end
+  error(label .. " retained leader is still running", 0)
+end
+
 local function wait_no_process_with(fragment, label)
   for _ = 1, 150 do
     local probe = WheelHost.proc.run_program("ps", { "-ww", "-eo", "args=" }, {
@@ -406,6 +417,28 @@ local function main()
   check(refused_cancel_ok == true and refused_info.state == "requested",
     "the refused job must be cancellable after the probe is restored")
   check(refused:wait(5000) ~= nil, "the refused job must reach a terminal result")
+
+  -- 1c. CI observed GNU timeout's 124 sentinel in the retained leader's status
+  -- for a cancelled job. The cancellation evidence must map that sentinel to
+  -- the TERM-derived 143 instead of leaking a timeout code.
+  local timeout_sentinel = start("sleep", { "30" }, {
+    timeout_ms = 60000,
+    job_root = job_root,
+  })
+  local sentinel_cancel_ok, sentinel_cancel_info = timeout_sentinel:cancel()
+  check(sentinel_cancel_ok == true and sentinel_cancel_info.term_sent == true,
+    "the 124-mapping job must receive a TERM")
+  wait_leader_gone(timeout_sentinel, "124-mapping job")
+  local sentinel_status_path = job_root .. "/" .. timeout_sentinel:job_id() .. "/status"
+  check(WheelHost.fs.write_file(sentinel_status_path, "124"),
+    "cannot synthesize the timeout sentinel status")
+  local sentinel_result = timeout_sentinel:wait(1000)
+  check(sentinel_result ~= nil and sentinel_result.code == 143,
+    "a cancelled 124 sentinel must map to 143, got "
+      .. tostring(sentinel_result and sentinel_result.code))
+  check(sentinel_result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED
+    and sentinel_result.timed_out == false,
+    "the 124-mapped result must remain a cancellation, not a timeout")
 
   -- 2. Repeated cancellation is idempotent and a no-op after the terminal state.
   local repeat_status, repeat_record = cli({
@@ -651,6 +684,10 @@ local function main()
     "the TERM-ignoring job must receive the KILL escalation")
   check(stubborn_info.group_alive_after == false,
     "the KILL-escalated group must be observed gone")
+  wait_leader_gone(stubborn, "KILL-escalation job")
+  local stubborn_status_path = job_root .. "/" .. stubborn:job_id() .. "/status"
+  check(WheelHost.fs.write_file(stubborn_status_path, "124"),
+    "cannot synthesize the KILL-path timeout sentinel")
   local stubborn_result = stubborn:wait(5000)
   check(stubborn_result ~= nil and stubborn_result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED,
     "the TERM-ignoring job must reach a cancelled result")
