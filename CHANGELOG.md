@@ -8,6 +8,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Opt-in OpenRouter caller attribution (CTX-0032 / wheel#102):
+  `OpenAIAdapter.new` accepts an optional `attribution` block (`referer`,
+  `title`, optional `categories` array, and `visibility = "hidden"`) and sends
+  `HTTP-Referer`, `X-OpenRouter-Title`, `X-OpenRouter-Categories`, and
+  `X-OpenRouter-App-Visibility` only when configured. `WheelProvider.create`
+  forwards it for the `openai` and `deepseek` routes. An absent block sends no
+  identity headers, and no product URL, title, or category is defaulted.
+  Values are validated fail-closed (absolute `http`/`https` referer with a
+  complete host and optional `1..65535` port, printable ASCII, no userinfo,
+  one or two lowercase `[a-z0-9-]{1,30}` categories, a 120-byte title, plain
+  table, known fields) with the typed `E_ARGS_INVALID` code before any HTTP
+  request; caller header maps cannot inject or override adapter-owned
+  headers. `ATTRIBUTION.md` records
+  the identity/title/icon relationship and the deferred
+  `https://wheel.bitty.run` switch. No OpenRouter application is created, and
+  the broader attribution decision remains open.
 - Local append-only execution audit stream (CTX-0030 / wheel#98):
   `lua/wheel/audit.lua` writes one JSON object per line under
   `$XDG_STATE_HOME/wheel/audit/` (fallback
