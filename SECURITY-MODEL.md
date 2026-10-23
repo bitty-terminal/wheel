@@ -27,6 +27,11 @@ decision and defines the authority policy for the 0.1.0 window:
   gate. This departs from OQ-068 and is recorded as a divergence below.
 - The 0.1.0 deliverable is a single harness artifact. Plugin packaging and
   `compat.plugin-api` are dropped from the 0.1.0 scope.
+- Wheel remains the Coding Agent Harness. The experimental `wheel-session`
+  control plane is a local/headless/development/CI prototype and transport
+  reference, not the final daemon. Final daemon lifecycle, IPC and
+  authentication, attach/detach, session registry, generation, and worker
+  supervision belong to `bittyd` and are not claimed here.
 - Any later capability widening requires independent security review plus dual
   evidence (mock/unit and a real host fixture).
 
@@ -376,9 +381,19 @@ authority.
 
 ### Local session control plane (experimental)
 
-The local session daemon is a runtime boundary, not a new authority class. It
-holds the same user-owned authority as the harness and adds no network, remote,
-or multi-user surface.
+The local session daemon is an experimental local/headless/development/CI
+prototype and transport reference. It is a runtime boundary, not a new
+authority class: it holds the same user-owned authority as the harness and adds
+no network, remote, or multi-user surface. It is not a substitute for `bittyd`,
+which owns final daemon lifecycle, IPC and authentication, attach/detach, the
+session registry, generation, and worker supervision
+([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546),
+[bitty#2064](https://github.com/bitty-terminal/bitty/issues/2064),
+[bitty#2218](https://github.com/bitty-terminal/bitty/issues/2218)). `bittyd`
+does not ship today, and Wheel adds no competing daemon scope while that
+contract is pending; the blocked note on Wheel CTX-0031
+([wheel#101](https://github.com/bitty-terminal/wheel/issues/101), CarryCtx
+PX-0195) records the same boundary.
 
 - The control plane is two POSIX FIFOs in a per-session directory. The session
   root and directory are user-owned `0700`; metadata and both FIFOs are
@@ -425,6 +440,15 @@ or multi-user surface.
   handoff aborts without replacing the newer metadata or FIFOs.
 - The daemon does not own a task DAG, call a provider, execute an agent, or
   expose a remote listener. Those remain outside this experimental slice.
+- Client lifetime is not worker lifetime. Closing a Bitty panel or a
+  `wheel-session` client is not a promise that a Wheel worker continues. The
+  prototype does not attach, reattach, or supervise a worker after its
+  presenting client disappears.
+- Daemon stop, daemon crash, and host reboot are outside the prototype's
+  contract. `shutdown` stops the process this slice started, and metadata is
+  private local runtime state rather than a durable session registry.
+  Continuation across any of those events requires a durable registry,
+  generation, and supervision contract, which is `bittyd` scope.
 
 Same-user residual: POSIX FIFOs carry no peer credentials in pure Lua. The
 `0700`/`0600` modes keep _other_ users out, but any process running as the
@@ -1048,8 +1072,11 @@ that the policy relies on, and they remain unverified until the gates pass:
   mutex-serialized stale-lock claim, start-lock handoff before metadata,
   private `0700`/`0600` paths, symlink/ownership refusals, `kill -0`-only stale
   detection, explicit shutdown, and static errors are implemented and covered
-  by `tests/test_session.lua`. It is not a task executor, provider caller, or
-  multi-user service.
+  by `tests/test_session.lua`. It is a local/headless/development/CI prototype
+  and transport reference, not the final daemon: it has no attach/detach,
+  generation, worker supervision, or reboot recovery, and those remain `bittyd`
+  scope ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546)). It
+  is not a task executor, provider caller, or multi-user service.
 
 Backend-selection decision: the 0.1.0 harness has exactly one execution
 backend, the standalone POSIX surface, selected explicitly with
@@ -1128,7 +1155,10 @@ Known gaps relative to this policy (not claims of compliance):
   manual recovery. Removing a live session directory leaves an unreachable
   daemon; the harness refuses to guess a pid and requires an explicit stop by
   the recorded pid. No provider, task DAG, agent execution, remote access, or
-  multi-user authentication is claimed for this slice.
+  multi-user authentication is claimed for this slice. The prototype is not
+  the final daemon: it has no attach/reattach, generation, worker supervision,
+  or reboot recovery, and those belong to the pending `bittyd` contract
+  ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546)).
 - The project-configuration trust gate now refuses symlinks/non-regular and
   oversized entries before hashing, resolves the canonical root through the
   host, shows escaped full content plus a pure-Lua change diff under a per-run
@@ -1201,6 +1231,9 @@ These gaps are blockers for release evidence, not for recording the policy.
 - Artifact signing, distribution, and update verification.
 - Optional IPC client scopes and consent UX, if host-visible operations are
   added after 0.1.0.
+- The replaceable transport adapter from Wheel to the `bittyd` session-host
+  contract, once bitty#2546 is accepted. Wheel does not implement a daemon
+  ahead of that contract; the current `wheel-session` slice stays a prototype.
 - Removal of the transitional plugin manifest and its SDK lint gate.
 - Whether project configuration may ever narrow network destinations without
   user-level approval.
@@ -1231,6 +1264,10 @@ An independent reviewer verifies at least:
 ## Affected contracts
 
 - No canonical contract is changed by this document.
+- No daemon or session-host contract is defined here. The upstream `bittyd`
+  contract (bitty#2546) remains pending; this document records only that
+  Wheel's local session prototype stays local, experimental, and subordinate to
+  it.
 - `repo.toml`, `README.md`, `AGENTS.md`, `SECURITY.md`, and this file record the
   owner-approved position change. `workspace.toml` is updated by the umbrella
   owner.
@@ -1288,6 +1325,11 @@ An independent reviewer verifies at least:
 ## References
 
 - wheel#51, owner decision comments of 2026-10-20 (D1-D7).
+- Wheel CTX-0031 / wheel#101, blocked on the `bittyd` session-host contract for
+  cancellation and worker-lifetime scope.
+- bitty#2546, bitty#2064, and bitty#2218, upstream `bittyd` session-host, core
+  service-host, and attach/detach design issues (open; `bittyd` does not ship
+  today).
 - [SECURITY.md](SECURITY.md), the repository reporting policy.
 - `bitty-docs` security corpus: overview, threat model, and risk register.
 - `bitty-docs` OQ-068, `.wheel/` declarative-data-only position.
