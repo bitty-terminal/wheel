@@ -11,17 +11,18 @@ private and unattributed. Wheel hardcodes no product URL, title, or category.
 
 ## Header contract
 
-| Field        | Header                        | Required | Validation                                                                                       |
-| ------------ | ----------------------------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `referer`    | `HTTP-Referer`                | yes      | Absolute `http`/`https` URL, printable ASCII, no userinfo, at most 2048 bytes.                   |
-| `title`      | `X-OpenRouter-Title`          | yes      | Printable ASCII, no leading or trailing whitespace, at most 128 bytes.                           |
-| `categories` | `X-OpenRouter-Categories`     | no       | Comma-separated tokens (`A-Z`, `a-z`, `0-9`, `.`, `_`, `-`); at most 16 tokens of 64 bytes each. |
-| `visibility` | `X-OpenRouter-App-Visibility` | no       | Only `hidden`.                                                                                   |
+| Field        | Header                        | Required | Validation                                                                                                                            |
+| ------------ | ----------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `referer`    | `HTTP-Referer`                | yes      | Absolute `http`/`https` URL with a valid host and optional numeric port `1..65535`; printable ASCII, no userinfo, at most 2048 bytes. |
+| `title`      | `X-OpenRouter-Title`          | yes      | Printable ASCII, no leading or trailing whitespace, at most 120 bytes.                                                                |
+| `categories` | `X-OpenRouter-Categories`     | no       | Array of one or two lowercase tokens matching `[a-z0-9-]{1,30}`; the joined header is at most 61 bytes.                               |
+| `visibility` | `X-OpenRouter-App-Visibility` | no       | Only `hidden`.                                                                                                                        |
 
 `referer` is the application identity and the key a gateway merges usage on.
-`title` only sets the display name. `categories` is optional metadata; Wheel's
-intended category is `cli-agent`. `visibility = "hidden"` opts a newly created
-application out of the public ranking and has no effect on an existing one.
+`title` only sets the display name. `categories` is optional metadata supplied
+as an array; Wheel's intended category is `{ "cli-agent" }`. `visibility =
+"hidden"` opts a newly created application out of the public ranking and has no
+effect on an existing one.
 
 ## Opt-in configuration
 
@@ -36,7 +37,7 @@ local adapter = WheelProvider.OpenAIAdapter.new({
   attribution = {
     referer = "https://wheel.bitty.run", -- future identity; see below
     title = "Wheel",
-    categories = "cli-agent",
+    categories = { "cli-agent" },
     visibility = "hidden",
   },
   http_client = client,
@@ -74,9 +75,18 @@ must not claim Wheel's identity by accident.
 Validation is fail-closed and runs before any request is sent:
 
 - A missing, empty, oversized, non-string, or non-printable field is rejected.
-- A `referer` that is not an absolute `http`/`https` URL, lacks a host,
-  contains userinfo, or contains characters outside RFC 3986 is rejected.
-  CR, LF, tabs, and other control characters can never reach a header.
+- A `referer` that is not an absolute `http`/`https` URL, lacks a valid host,
+  contains userinfo, or contains characters outside RFC 3986 is rejected. The
+  complete authority is parsed: the host must be a valid DNS name, IPv4
+  address, or bracketed IPv6 address, and an optional port must be numeric in
+  `1..65535`. Empty labels, dot-only hosts, invalid IPv4, malformed IPv6,
+  trailing bytes after a bracketed host, and text or out-of-range ports are
+  rejected. CR, LF, tabs, and other control characters can never reach a
+  header.
+- `categories` must be an array of one or two lowercase strings matching
+  `[a-z0-9-]{1,30}`. A comma-separated string, uppercase or non-ASCII entries,
+  empty entries, more than two entries, sparse arrays, and extra keys are
+  rejected. The joined comma-separated value is at most 61 bytes.
 - Unknown fields fail closed, so a misspelled key cannot silently produce
   unattributed traffic. The block must be a plain table (no metatable).
 - `visibility` accepts only `hidden`; other values, including booleans, are
