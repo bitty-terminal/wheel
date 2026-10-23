@@ -1,0 +1,56 @@
+#!/bin/sh
+# Wheel recorded-process cancellation CLI.
+#
+#   wheel-proc cancel JOB_ID [--root DIR] [--grace-ms N]
+#
+# `cancel` validates a private job record and signals only the recorded process
+# group. Repeated cancellation is idempotent; a job that already reached a
+# terminal state is a typed no-op. The command never sends a name- or
+# pattern-based signal. The job root defaults to the private runtime directory;
+# `--root` is the explicit root used by `WheelHost.proc.start({ job_root = ... })`
+# and must be absolute.
+#
+# The client is internally bounded: record validation, the TERM-to-KILL grace
+# (250 ms default, 2 s maximum), and the final liveness wait all have fixed
+# limits. There is no ambient signal target and no caller-supplied signal name.
+set -eu
+
+umask 077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
+LUA_ROOT="$REPO_ROOT/lua"
+
+select_interpreter() {
+  for candidate in lua5.1 luajit lua; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ ! -f "$LUA_ROOT/wheel/job.lua" ]; then
+  printf 'wheel-proc: Lua sources are missing under %s/lua/wheel\n' "$REPO_ROOT" >&2
+  exit 1
+fi
+
+LUA_BIN=$(select_interpreter) || {
+  printf 'wheel-proc: no Lua interpreter found (lua5.1, luajit, lua)\n' >&2
+  exit 1
+}
+
+export LUA_PATH="$LUA_ROOT/?.lua;$LUA_ROOT/?/init.lua;;"
+
+# The CLI entry point lives in wheel.job so the command surface stays inside
+# the scoped module. The here-document is the script; `$@` is the Lua `arg`
+# table and stdin is consumed by the interpreter before any job work starts.
+exec "$LUA_BIN" - "$@" <<'LUA'
+local ok, mod = pcall(require, "wheel.job")
+if not ok then
+  io.stderr:write("wheel-proc: cannot load wheel.job: " .. tostring(mod) .. "\n")
+  os.exit(1)
+end
+os.exit(mod.cli(arg))
+LUA
