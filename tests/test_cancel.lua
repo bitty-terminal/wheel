@@ -162,6 +162,40 @@ local function find_foreign_pid()
   return chosen
 end
 
+-- Find a process group whose members are all owned by another user, so a
+-- signal-0 probe exercises the EPERM branch without signalling anyone.
+local function find_foreign_group()
+  local euid = WheelHost.fs.euid()
+  if euid == nil or euid == 0 then
+    return nil
+  end
+  local probe = WheelHost.proc.run_program("ps", { "-eo", "pid=,uid=,pgid=" }, {
+    discard_stderr = true,
+  })
+  if not probe.ok or probe.code ~= 0 then
+    return nil
+  end
+  local groups = {}
+  for line in (probe.stdout or ""):gmatch("[^\n]+") do
+    local pid, uid, pgid = line:match("^%s*(%d+)%s+(%d+)%s+(%d+)")
+    local group = tonumber(pgid)
+    if pid and group and group > 1 then
+      if groups[group] == nil then
+        groups[group] = tonumber(uid) ~= euid
+      elseif tonumber(uid) == euid then
+        groups[group] = false
+      end
+    end
+  end
+  local chosen = nil
+  for group, foreign in pairs(groups) do
+    if foreign and (chosen == nil or group < chosen) then
+      chosen = group
+    end
+  end
+  return chosen
+end
+
 local function wait_gone(pid, label)
   for _ = 1, 100 do
     local state = process_state(pid)
@@ -172,6 +206,28 @@ local function wait_gone(pid, label)
   end
   local state = process_state(pid)
   error(label .. " is still running: " .. tostring(state), 0)
+end
+
+local function wait_no_process_with(fragment, label)
+  for _ = 1, 150 do
+    local probe = WheelHost.proc.run_program("ps", { "-ww", "-eo", "args=" }, {
+      discard_stderr = true,
+    })
+    local found = false
+    if probe.ok and probe.code == 0 then
+      for line in (probe.stdout or ""):gmatch("[^\n]+") do
+        if line:find(fragment, 1, true) then
+          found = true
+          break
+        end
+      end
+    end
+    if not found then
+      return
+    end
+    WheelHost.time.sleep_ms(20)
+  end
+  error(label .. " is still running", 0)
 end
 
 local function recorded_pid(path)
@@ -227,6 +283,21 @@ local function main()
   check(type(WheelHost.proc.start) == "function", "WheelHost.proc.start must be exposed")
   check(type(WheelHost.proc.cancel_job) == "function", "WheelHost.proc.cancel_job must be exposed")
 
+  local missing_ok, missing_reason = WheelHost.proc.signal_group(2147483000, "0")
+  check(missing_ok == false and missing_reason == "no such process group",
+    "a missing process group must be reported as absent, got "
+      .. tostring(missing_ok) .. "/" .. tostring(missing_reason))
+
+  local foreign_group = find_foreign_group()
+  if foreign_group ~= nil then
+    local foreign_ok, foreign_reason = WheelHost.proc.signal_group(foreign_group, "0")
+    check(foreign_ok == false and foreign_reason == "permission denied",
+      "a foreign process group must be reported as denied, got "
+        .. tostring(foreign_ok) .. "/" .. tostring(foreign_reason))
+  else
+    print("[INFO] no foreign-owned process group available; EPERM probe not exercised")
+  end
+
   local created = WheelHost.proc.run_program("mktemp", {
     "-d", "--", scratch_root .. "/wheel-cancel.XXXXXX",
   })
@@ -276,6 +347,8 @@ local function main()
   check(cli_record.state == "requested", "the first request must be reported as requested")
   check(cli_record.terminal_reason == "cancelled", "the CLI must publish a cancelled terminal reason")
   check(cli_record.term_sent == true, "the CLI must record the TERM it sent")
+  check(cli_record.group_alive_after == false,
+    "the CLI must observe the recorded group gone after cancellation")
   check(cli_record.pgid == target_pgid, "the CLI must report the recorded PGID")
 
   local result = target:wait(5000)
@@ -309,6 +382,30 @@ local function main()
   check(process_state(sentinel_pgid) ~= nil,
     "the unrelated job's recorded group must still be alive")
   check(sentinel_pgid ~= target_pgid, "the sentinel and target groups must differ")
+
+  -- 1b. A refused TERM must be a typed failure and must not publish a
+  -- cancelled terminal reason.
+  local refused = start("sleep", { "30" }, { timeout_ms = 60000, job_root = job_root })
+  local refused_id = refused:job_id()
+  local real_signal_group = WheelHost.proc.signal_group
+  WheelHost.proc.signal_group = function(pgid, sig)
+    if sig == "TERM" then
+      return false, "no such process group"
+    end
+    return real_signal_group(pgid, sig)
+  end
+  local refusal_ok, refusal_err = refused:cancel()
+  WheelHost.proc.signal_group = real_signal_group
+  check(refusal_ok == nil and type(refusal_err) == "table",
+    "a refused TERM must be a typed failure")
+  check(refusal_err.code == WheelErrors.E_JOB_NOT_RUNNING,
+    "a vanished group after validation must report E_JOB_NOT_RUNNING")
+  check(not WheelHost.fs.stat(job_root .. "/" .. refused_id .. "/terminal").exists,
+    "a refused TERM must not publish a cancelled terminal")
+  local refused_cancel_ok, refused_info = refused:cancel()
+  check(refused_cancel_ok == true and refused_info.state == "requested",
+    "the refused job must be cancellable after the probe is restored")
+  check(refused:wait(5000) ~= nil, "the refused job must reach a terminal result")
 
   -- 2. Repeated cancellation is idempotent and a no-op after the terminal state.
   local repeat_status, repeat_record = cli({
@@ -552,15 +649,16 @@ local function main()
     "the TERM-ignoring job cancel must be accepted")
   check(stubborn_info.kill_sent == true,
     "the TERM-ignoring job must receive the KILL escalation")
+  check(stubborn_info.group_alive_after == false,
+    "the KILL-escalated group must be observed gone")
   local stubborn_result = stubborn:wait(5000)
   check(stubborn_result ~= nil and stubborn_result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED,
     "the TERM-ignoring job must reach a cancelled result")
   check(stubborn_result.code == 137,
     "the KILL-escalated job must carry the KILL-derived status: "
       .. tostring(stubborn_result.code))
-  check(stubborn_result.cleanup == WheelHost.GROUP_CLEANUP.SWEPT
-    or stubborn_result.cleanup == WheelHost.GROUP_CLEANUP.UNVERIFIED,
-    "the KILL-escalated job must report a swept or unverified group: "
+  check(stubborn_result.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "the KILL-escalated group must be observed swept, got "
       .. tostring(stubborn_result.cleanup))
 
   -- 7b. The shell-string start path shares the same record and cancellation
@@ -618,6 +716,9 @@ local function main()
     "the request record must carry the job and cancellation state")
   check(outcome.terminal_reason == "cancelled" and outcome.outcome == "cancelled",
     "the outcome record must carry the cancelled terminal reason")
+  check(outcome.cleanup == "swept",
+    "the cancellation outcome must record a swept group, got "
+      .. tostring(outcome.cleanup))
   check(completed.cancel_requested == true and completed.outcome == "cancelled",
     "the completion record must preserve cancellation")
   local previous = string.rep("0", 64)
@@ -727,6 +828,10 @@ local function main()
       check(closed == true, "every terminal handle must close")
     end
   end
+  -- A post-launch start failure deliberately leaves an unrecorded group to its
+  -- own timeout; wait for that leader/supervisor to finish before removing the
+  -- scratch records it is still using.
+  wait_no_process_with(base, "a cancellation scratch process")
   check(remove_tree(base), "cannot remove the cancellation scratch base")
   print(string.format("[PASS] cancellation suite: %d checks", checks))
 end

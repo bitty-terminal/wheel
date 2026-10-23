@@ -3056,6 +3056,10 @@ function standalone.new(opts)
   -- (`false, "permission denied"`) from a vanished group
   -- (`false, "no such process group"`) and from a probe failure, so a caller
   -- never treats a foreign target as an already-exited job.
+  --
+  -- Lua 5.1 `io.popen():close()` returns `true` without the child exit status,
+  -- so the command appends its own status marker. The marker is parsed from the
+  -- captured output; the close return is deliberately ignored.
   -- @param pgid number
   -- @param signal string "0", "TERM", or "KILL"
   -- @return boolean ok, string? err
@@ -3068,19 +3072,25 @@ function standalone.new(opts)
     if signal ~= "0" and signal ~= "TERM" and signal ~= "KILL" then
       return false, "invalid signal"
     end
+    local marker = "__WHEEL_SIGNAL_STATUS__"
     local pipe = io.popen(
-      "LC_ALL=C kill -" .. signal .. " -" .. tostring(pgid) .. " 2>&1", "r")
+      "LC_ALL=C kill -" .. signal .. " -" .. tostring(pgid)
+        .. " 2>&1; printf '\\n" .. marker .. "%s' \"$?\"", "r")
     if not pipe then
       return false, "process-group signal probe unavailable"
     end
     local output = pipe:read("*a") or ""
-    local closed, reason, code = pipe:close()
-    local status = normalized_exit_status(closed, reason, code)
+    pipe:close()
+    local diagnostic, status_text = output:match("^(.*)" .. marker .. "(%d+)%s*$")
+    local status = tonumber(status_text)
+    if status == nil then
+      return false, "process-group signal probe failed"
+    end
     if status == 0 then
       return true
     end
     if status == 1 then
-      local text = tostring(output):lower()
+      local text = tostring(diagnostic or ""):lower()
       if text:find("operation not permitted", 1, true)
         or text:find("not permitted", 1, true)
         or text:find("permission denied", 1, true) then
