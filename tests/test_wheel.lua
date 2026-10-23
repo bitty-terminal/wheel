@@ -5207,6 +5207,310 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.usage.output_tokens == 20)
 end)
 
+run_test("WheelProvider: opt-in caller attribution is absent by default and strictly validated", function()
+  local OpenAIAdapter = WheelProvider.OpenAIAdapter
+  local REFERER_MAX = WheelProvider.ATTRIBUTION_REFERER_MAX
+  local TITLE_MAX = WheelProvider.ATTRIBUTION_TITLE_MAX
+  local CATEGORY_MAX = WheelProvider.ATTRIBUTION_CATEGORY_MAX
+  local CATEGORIES_MAX = WheelProvider.ATTRIBUTION_CATEGORIES_MAX
+
+  -- Absent attribution is the explicit unattributed default, not an error.
+  local absent_referer, absent_err = WheelProvider.validate_attribution(nil)
+  assert(absent_referer == nil and absent_err == nil)
+
+  -- A complete block normalizes to exactly the declared values.
+  local valid, valid_err = WheelProvider.validate_attribution({
+    referer = "https://attribution.example/app",
+    title = "Attribution Test Harness",
+    categories = "cli-agent,code-review",
+    visibility = "hidden",
+  })
+  assert(valid_err == nil, "valid attribution must be accepted: " .. tostring(valid_err))
+  assert(valid.referer == "https://attribution.example/app")
+  assert(valid.title == "Attribution Test Harness")
+  assert(valid.categories == "cli-agent,code-review")
+  assert(valid.visibility == "hidden")
+
+  -- Optional fields stay absent instead of being defaulted.
+  local minimal, minimal_err = WheelProvider.validate_attribution({
+    referer = "http://127.0.0.1:8080/app",
+    title = "Local Test Harness",
+  })
+  assert(minimal_err == nil, "minimal attribution must be accepted: " .. tostring(minimal_err))
+  assert(minimal.categories == nil and minimal.visibility == nil)
+
+  local function expect_invalid(value, label)
+    local ok, validation_err = pcall(OpenAIAdapter.new, { attribution = value })
+    assert(not ok, label .. " must be rejected")
+    assert_typed_error(validation_err, WheelErrors.E_ARGS_INVALID, WheelErrors.CLASS_VALIDATION)
+    assert(not validation_err.message:find("[\r\n]"),
+      label .. " must not echo control characters")
+  end
+
+  local many_categories = {}
+  for i = 1, WheelProvider.ATTRIBUTION_MAX_CATEGORIES + 1 do
+    many_categories[i] = "a"
+  end
+  many_categories = table.concat(many_categories, ",")
+
+  local invalid_cases = {
+    { "non-table attribution", "https://attribution.example/app" },
+    { "unknown field", {
+      referer = "https://attribution.example/app",
+      title = "Attribution Test Harness",
+      referrer = "https://attribution.example/app",
+    } },
+    { "missing referer", { title = "Attribution Test Harness" } },
+    { "missing title", { referer = "https://attribution.example/app" } },
+    { "non-string referer", { referer = 42, title = "Attribution Test Harness" } },
+    { "empty referer", { referer = "", title = "Attribution Test Harness" } },
+    { "non-string title", { referer = "https://attribution.example/app", title = 42 } },
+    { "empty title", { referer = "https://attribution.example/app", title = "" } },
+    { "non-http scheme", { referer = "ftp://attribution.example/app", title = "Harness" } },
+    { "non-http file scheme", { referer = "file:///tmp/app", title = "Harness" } },
+    { "relative referer", { referer = "attribution.example/app", title = "Harness" } },
+    { "missing host", { referer = "https:///app", title = "Harness" } },
+    { "userinfo", { referer = "https://user:pass@attribution.example/app", title = "Harness" } },
+    { "userinfo without password", {
+      referer = "https://attribution.example@spoofed.example/app",
+      title = "Harness",
+    } },
+    { "CR in referer", { referer = "https://attribution.example/\rX-Evil: 1", title = "Harness" } },
+    { "LF in referer", { referer = "https://attribution.example/\nX-Evil: 1", title = "Harness" } },
+    { "tab in referer", { referer = "https://attribution.example/\t", title = "Harness" } },
+    { "space in referer", { referer = "https://attribution.example/a b", title = "Harness" } },
+    { "backslash in referer", { referer = "https://attribution.example\\app", title = "Harness" } },
+    { "oversize referer", {
+      referer = "https://attribution.example/" .. string.rep("a", REFERER_MAX),
+      title = "Harness",
+    } },
+    { "CRLF in title", {
+      referer = "https://attribution.example/app",
+      title = "Harness\r\nX-Evil: 1",
+    } },
+    { "tab in title", { referer = "https://attribution.example/app", title = "Harness\tCLI" } },
+    { "non-ASCII title", {
+      referer = "https://attribution.example/app",
+      title = "Harness " .. string.char(226, 128, 147) .. " CLI",
+    } },
+    { "oversize title", {
+      referer = "https://attribution.example/app",
+      title = string.rep("a", TITLE_MAX + 1),
+    } },
+    { "non-string categories", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = { "cli-agent" },
+    } },
+    { "empty categories", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = "",
+    } },
+    { "leading category comma", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = ",cli-agent",
+    } },
+    { "trailing category comma", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = "cli-agent,",
+    } },
+    { "empty category token", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = "cli-agent,,code-review",
+    } },
+    { "category whitespace", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = "cli agent",
+    } },
+    { "category punctuation", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = "cli-agent;code-review",
+    } },
+    { "oversize category token", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = string.rep("a", CATEGORY_MAX + 1),
+    } },
+    { "oversize categories header", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = string.rep("cli-agent,", 30),
+    } },
+    { "too many categories", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      categories = many_categories,
+    } },
+    { "unsupported visibility", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      visibility = "visible",
+    } },
+    { "boolean visibility", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      visibility = true,
+    } },
+    { "empty visibility", {
+      referer = "https://attribution.example/app",
+      title = "Harness",
+      visibility = "",
+    } },
+  }
+
+  for _, case in ipairs(invalid_cases) do
+    expect_invalid(case[2], case[1])
+  end
+
+  -- A table with a metatable is not a plain configuration block.
+  local proxied = setmetatable({}, {
+    __index = function()
+      return "https://attribution.example/app"
+    end,
+  })
+  expect_invalid(proxied, "attribution table with a metatable")
+
+  -- Rejection never echoes the untrusted value into the typed diagnostic.
+  local ok, leak_err = pcall(OpenAIAdapter.new, {
+    attribution = {
+      referer = "https://attribution.example/\r\nX-Injected: attribution-leak-marker",
+      title = "Harness",
+    },
+  })
+  assert(not ok)
+  assert(not tostring(leak_err):find("attribution-leak-marker", 1, true),
+    "invalid attribution must not echo the untrusted value")
+end)
+
+run_test("WheelProvider: attribution headers are opt-in, adapter-owned, and factory-forwarded", function()
+  local OpenAIAdapter = WheelProvider.OpenAIAdapter
+  local ATTRIBUTION_HEADERS = {
+    "HTTP-Referer",
+    "X-OpenRouter-Title",
+    "X-OpenRouter-Categories",
+    "X-OpenRouter-App-Visibility",
+  }
+  local API_KEY = "test-attribution-key"
+  local COMPLETION_BODY =
+    '{"choices":[{"message":{"content":"ok"},"finish_reason":"stop"}],"usage":{"total_tokens":1}}'
+  local captured = {}
+
+  local function client(req)
+    table.insert(captured, req)
+    if req.stream and req.on_stream_chunk then
+      req.on_stream_chunk("data: [DONE]\n\n")
+    end
+    return { status = 200, body = COMPLETION_BODY }
+  end
+
+  -- 1. Default: no attribution identity headers, standard headers unchanged.
+  local plain = OpenAIAdapter.new({ api_key = API_KEY, http_client = client })
+  local plain_res, plain_err = plain:complete({ messages = { { role = "user", content = "hi" } } })
+  assert(plain_res ~= nil and plain_err == nil)
+  local plain_stream_res, plain_stream_err =
+    plain:stream({ messages = { { role = "user", content = "hi" } } }, function() end)
+  assert(plain_stream_res ~= nil and plain_stream_err == nil)
+
+  for _, name in ipairs(ATTRIBUTION_HEADERS) do
+    assert(captured[1].headers[name] == nil, "default complete must not send " .. name)
+    assert(captured[2].headers[name] == nil, "default stream must not send " .. name)
+  end
+  assert(captured[1].headers["Authorization"] == "Bearer " .. API_KEY)
+  assert(captured[1].headers["Content-Type"] == "application/json")
+  assert(captured[2].headers["Accept"] == "text/event-stream")
+
+  -- 2. Full configuration: identity, title, categories, and hidden visibility
+  -- travel on both complete and streaming requests.
+  local configured = OpenAIAdapter.new({
+    api_key = API_KEY,
+    attribution = {
+      referer = "https://attribution.example/app",
+      title = "Attribution Test Harness",
+      categories = "cli-agent,code-review",
+      visibility = "hidden",
+    },
+    http_client = client,
+  })
+  local configured_res, configured_err =
+    configured:complete({ messages = { { role = "user", content = "hi" } } })
+  assert(configured_res ~= nil and configured_err == nil)
+  local configured_stream_res, configured_stream_err =
+    configured:stream({ messages = { { role = "user", content = "hi" } } }, function() end)
+  assert(configured_stream_res ~= nil and configured_stream_err == nil)
+
+  for _, index in ipairs({ 3, 4 }) do
+    assert(captured[index].headers["HTTP-Referer"] == "https://attribution.example/app")
+    assert(captured[index].headers["X-OpenRouter-Title"] == "Attribution Test Harness")
+    assert(captured[index].headers["X-OpenRouter-Categories"] == "cli-agent,code-review")
+    assert(captured[index].headers["X-OpenRouter-App-Visibility"] == "hidden")
+    assert(captured[index].headers["Authorization"] == "Bearer " .. API_KEY)
+    assert(captured[index].headers["Content-Type"] == "application/json")
+  end
+
+  -- 3. Caller headers cannot inject or override attribution or credentials.
+  local spoof_res, spoof_err = configured:complete({
+    messages = { { role = "user", content = "hi" } },
+    headers = {
+      ["HTTP-Referer"] = "https://spoofed.example/",
+      ["X-OpenRouter-Title"] = "Spoofed",
+      ["X-OpenRouter-Categories"] = "spoofed",
+      ["X-OpenRouter-App-Visibility"] = "visible",
+      ["Authorization"] = "Bearer attacker",
+      ["Content-Type"] = "text/plain",
+    },
+  })
+  assert(spoof_res ~= nil and spoof_err == nil)
+  assert(captured[5].headers["HTTP-Referer"] == "https://attribution.example/app")
+  assert(captured[5].headers["X-OpenRouter-Title"] == "Attribution Test Harness")
+  assert(captured[5].headers["X-OpenRouter-Categories"] == "cli-agent,code-review")
+  assert(captured[5].headers["X-OpenRouter-App-Visibility"] == "hidden")
+  assert(captured[5].headers["Authorization"] == "Bearer " .. API_KEY)
+  assert(captured[5].headers["Content-Type"] == "application/json")
+
+  -- 4. The factory forwards attribution for both OpenAI-compatible routes.
+  local factory_attribution = {
+    referer = "https://attribution.example/factory",
+    title = "Factory Test Harness",
+    categories = "cli-agent",
+    visibility = "hidden",
+  }
+  for _, provider in ipairs({ "openai", "deepseek" }) do
+    local adapter, create_err = WheelProvider.create(
+      { provider = provider, model = "test-model" },
+      { api_key = API_KEY, attribution = factory_attribution, http_client = client }
+    )
+    assert(adapter ~= nil and create_err == nil,
+      provider .. " factory must accept attribution: " .. tostring(create_err))
+    local res, err = adapter:complete({ messages = { { role = "user", content = "hi" } } })
+    assert(res ~= nil and err == nil)
+    local request = captured[#captured]
+    assert(request.headers["HTTP-Referer"] == "https://attribution.example/factory")
+    assert(request.headers["X-OpenRouter-Title"] == "Factory Test Harness")
+    assert(request.headers["X-OpenRouter-Categories"] == "cli-agent")
+    assert(request.headers["X-OpenRouter-App-Visibility"] == "hidden")
+  end
+
+  -- 5. Invalid factory attribution returns the typed error before any request.
+  local sent = #captured
+  local rejected, rejected_err = WheelProvider.create(
+    { provider = "openai", model = "test-model" },
+    {
+      api_key = API_KEY,
+      attribution = { referer = "ftp://attribution.example/app", title = "Harness" },
+      http_client = client,
+    }
+  )
+  assert(rejected == nil, "invalid attribution must fail factory creation")
+  assert_typed_error(rejected_err, WheelErrors.E_ARGS_INVALID, WheelErrors.CLASS_VALIDATION)
+  assert(#captured == sent, "invalid attribution must not reach the HTTP client")
+end)
+
 run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpointing", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })

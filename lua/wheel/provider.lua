@@ -154,6 +154,275 @@ function WheelProvider.resolve_max_completion_tokens(request, configured)
 end
 
 -- ---------------------------------------------------------------------------
+-- Opt-in Caller Attribution
+-- ---------------------------------------------------------------------------
+--
+-- Attribution is caller-declared identity for gateway-side aggregation, not a
+-- credential and not inferred. It is opt-in: an adapter with no attribution
+-- configuration sends no identity headers and remains private/unattributed.
+-- No product URL or title is defaulted here, and the values never enter a
+-- prompt, request body, or log; they travel only as validated request headers.
+--
+-- Header names follow the OpenRouter Apps mechanism. `HTTP-Referer` is the
+-- application identity, `X-OpenRouter-Title` only changes the display name,
+-- and `X-OpenRouter-App-Visibility: hidden` applies when an app is created.
+-- Callers who configure attribution own that choice; Wheel ships no default.
+
+--- Maximum byte length of the attribution referer.
+WheelProvider.ATTRIBUTION_REFERER_MAX = 2048
+
+--- Maximum byte length of the attribution display title.
+WheelProvider.ATTRIBUTION_TITLE_MAX = 128
+
+--- Maximum byte length of the comma-separated category header.
+WheelProvider.ATTRIBUTION_CATEGORIES_MAX = 256
+
+--- Maximum byte length of one category token.
+WheelProvider.ATTRIBUTION_CATEGORY_MAX = 64
+
+--- Maximum number of category tokens in one header.
+WheelProvider.ATTRIBUTION_MAX_CATEGORIES = 16
+
+local ATTRIBUTION_HEADER_NAMES = {
+  referer = "HTTP-Referer",
+  title = "X-OpenRouter-Title",
+  categories = "X-OpenRouter-Categories",
+  visibility = "X-OpenRouter-App-Visibility",
+}
+
+local ATTRIBUTION_FIELDS = {
+  referer = true,
+  title = true,
+  categories = true,
+  visibility = true,
+}
+
+--- Build the typed invalid-attribution failure.
+-- Details are static diagnostic text; an untrusted value is never echoed.
+-- @param detail string
+-- @return table typed validation error
+local function attribution_invalid(detail)
+  return WheelErrors.args_invalid("provider.attribution", detail)
+end
+
+--- Validate the attribution referer: an absolute http(s) URL.
+-- @param value any
+-- @return string? normalized referer, table? typed validation error
+local function validate_attribution_referer(value)
+  if type(value) ~= "string" then
+    return nil, attribution_invalid("attribution.referer must be a string")
+  end
+  if value == "" then
+    return nil, attribution_invalid("attribution.referer must not be empty")
+  end
+  if #value > WheelProvider.ATTRIBUTION_REFERER_MAX then
+    return nil, attribution_invalid(string.format(
+      "attribution.referer must not exceed %d bytes",
+      WheelProvider.ATTRIBUTION_REFERER_MAX
+    ))
+  end
+  -- Reject CR, LF, tabs, other controls, and non-ASCII bytes before the value
+  -- can reach a header. Header values are a newline-terminated wire format.
+  if value:find("[^\32-\126]") then
+    return nil, attribution_invalid("attribution.referer must be printable ASCII")
+  end
+  -- RFC 3986 characters only: this also rejects spaces, backslashes, quotes,
+  -- angle brackets, and other bytes that have no place in a URL header.
+  if value:find("[^%w%-._~:/?#%[%]@!$&'()*+,;=%%]") then
+    return nil, attribution_invalid("attribution.referer contains characters not allowed in a URL")
+  end
+
+  local scheme, rest = value:match("^([A-Za-z][A-Za-z0-9+.-]*)://(.*)$")
+  if not scheme or rest == "" then
+    return nil, attribution_invalid("attribution.referer must be an absolute http(s) URL")
+  end
+  scheme = scheme:lower()
+  if scheme ~= "http" and scheme ~= "https" then
+    return nil, attribution_invalid("attribution.referer must be an absolute http(s) URL")
+  end
+
+  local authority = rest:match("^([^/?#]*)")
+  if authority == "" then
+    return nil, attribution_invalid("attribution.referer must include a host")
+  end
+  if authority:find("@", 1, true) then
+    return nil, attribution_invalid("attribution.referer must not contain userinfo")
+  end
+  local host = authority:match("^%[([^%]]+)%]") or authority:match("^([^:]+)")
+  if not host or host == "" then
+    return nil, attribution_invalid("attribution.referer must include a host")
+  end
+
+  return value, nil
+end
+
+--- Validate the display title: printable ASCII, non-blank, bounded.
+-- @param value any
+-- @return string? normalized title, table? typed validation error
+local function validate_attribution_title(value)
+  if type(value) ~= "string" then
+    return nil, attribution_invalid("attribution.title must be a string")
+  end
+  if value == "" then
+    return nil, attribution_invalid("attribution.title must not be empty")
+  end
+  if #value > WheelProvider.ATTRIBUTION_TITLE_MAX then
+    return nil, attribution_invalid(string.format(
+      "attribution.title must not exceed %d bytes",
+      WheelProvider.ATTRIBUTION_TITLE_MAX
+    ))
+  end
+  if value:find("[^\32-\126]") then
+    return nil, attribution_invalid("attribution.title must be printable ASCII")
+  end
+  if value:find("^%s") or value:find("%s$") then
+    return nil, attribution_invalid("attribution.title must not have leading or trailing whitespace")
+  end
+  return value, nil
+end
+
+--- Validate the optional category list: comma-separated safe tokens.
+-- @param value any
+-- @return string? normalized categories, table? typed validation error
+local function validate_attribution_categories(value)
+  if value == nil then
+    return nil, nil
+  end
+  if type(value) ~= "string" then
+    return nil, attribution_invalid("attribution.categories must be a string")
+  end
+  if value == "" then
+    return nil, attribution_invalid("attribution.categories must not be empty")
+  end
+  if #value > WheelProvider.ATTRIBUTION_CATEGORIES_MAX then
+    return nil, attribution_invalid(string.format(
+      "attribution.categories must not exceed %d bytes",
+      WheelProvider.ATTRIBUTION_CATEGORIES_MAX
+    ))
+  end
+  if value:find("[^\32-\126]") then
+    return nil, attribution_invalid("attribution.categories must be printable ASCII")
+  end
+  if not value:match("^[A-Za-z0-9._,-]+$")
+    or value:sub(1, 1) == ","
+    or value:sub(-1) == ","
+    or value:find(",,", 1, true) then
+    return nil, attribution_invalid(
+      "attribution.categories must be a comma-separated list of category tokens"
+    )
+  end
+
+  local count = 0
+  for token in value:gmatch("[^,]+") do
+    count = count + 1
+    if not token:match("^[A-Za-z0-9][A-Za-z0-9._-]*$") then
+      return nil, attribution_invalid(
+        "attribution.categories must be a comma-separated list of category tokens"
+      )
+    end
+    if #token > WheelProvider.ATTRIBUTION_CATEGORY_MAX then
+      return nil, attribution_invalid(string.format(
+        "attribution.categories token must not exceed %d bytes",
+        WheelProvider.ATTRIBUTION_CATEGORY_MAX
+      ))
+    end
+  end
+  if count > WheelProvider.ATTRIBUTION_MAX_CATEGORIES then
+    return nil, attribution_invalid(string.format(
+      "attribution.categories must not exceed %d tokens",
+      WheelProvider.ATTRIBUTION_MAX_CATEGORIES
+    ))
+  end
+  return value, nil
+end
+
+--- Validate and normalize the opt-in caller attribution block.
+-- A nil block is the explicit unattributed default: no identity headers are
+-- sent. A configured block requires `referer` and `title`; `categories` and
+-- `visibility` are optional. `visibility` accepts only `"hidden"`, the one
+-- value the OpenRouter mechanism defines. Unknown fields fail closed so a
+-- misspelled key cannot silently produce unattributed traffic.
+-- @param value any
+-- @return table? normalized attribution, table? typed validation error
+function WheelProvider.validate_attribution(value)
+  if value == nil then
+    return nil, nil
+  end
+  if type(value) ~= "table" then
+    return nil, attribution_invalid("attribution must be a table")
+  end
+  if getmetatable(value) ~= nil then
+    return nil, attribution_invalid("attribution must be a plain table")
+  end
+  for key in pairs(value) do
+    if type(key) ~= "string" or not ATTRIBUTION_FIELDS[key] then
+      return nil, attribution_invalid("attribution has an unknown field")
+    end
+  end
+
+  local referer, referer_err = validate_attribution_referer(value.referer)
+  if not referer then
+    return nil, referer_err
+  end
+  local title, title_err = validate_attribution_title(value.title)
+  if not title then
+    return nil, title_err
+  end
+  local categories, categories_err = validate_attribution_categories(value.categories)
+  if categories_err then
+    return nil, categories_err
+  end
+
+  local visibility = value.visibility
+  if visibility ~= nil and visibility ~= "hidden" then
+    return nil, attribution_invalid("attribution.visibility must be 'hidden' when set")
+  end
+
+  return {
+    referer = referer,
+    title = title,
+    categories = categories,
+    visibility = visibility,
+  }, nil
+end
+
+--- Build the adapter-owned attribution headers from a validated block.
+-- @param attribution table?
+-- @return table? headers
+local function build_attribution_headers(attribution)
+  if not attribution then
+    return nil
+  end
+  local headers = {
+    [ATTRIBUTION_HEADER_NAMES.referer] = attribution.referer,
+    [ATTRIBUTION_HEADER_NAMES.title] = attribution.title,
+  }
+  if attribution.categories then
+    headers[ATTRIBUTION_HEADER_NAMES.categories] = attribution.categories
+  end
+  if attribution.visibility then
+    headers[ATTRIBUTION_HEADER_NAMES.visibility] = attribution.visibility
+  end
+  return headers
+end
+
+--- Merge adapter-owned attribution headers into a request header table.
+-- Applied last so an attribution value always wins over any standard header
+-- with the same name; caller-supplied maps are never merged into the request.
+-- @param headers table
+-- @param attribution_headers table?
+-- @return table headers
+local function apply_attribution_headers(headers, attribution_headers)
+  if not attribution_headers then
+    return headers
+  end
+  for name, value in pairs(attribution_headers) do
+    headers[name] = value
+  end
+  return headers
+end
+
+-- ---------------------------------------------------------------------------
 -- Line-Buffered SSE Parser
 -- ---------------------------------------------------------------------------
 
@@ -436,10 +705,16 @@ OpenAIAdapter.__index = OpenAIAdapter
 --   opts.temperature number?
 --   opts.thinking table?
 --   opts.max_completion_tokens number?: validated completion bound override
+--   opts.attribution table?: opt-in caller attribution
+--     { referer = string, title = string, categories = string?, visibility = "hidden"? }
 --   opts.http_client function?: injectable client fn(req) -> { status, body, stream_fn }
 -- @return table OpenAIAdapter instance
 function OpenAIAdapter.new(opts)
   opts = opts or {}
+  local attribution, attribution_err = WheelProvider.validate_attribution(opts.attribution)
+  if attribution_err then
+    error(attribution_err, 0)
+  end
   local self = setmetatable({}, OpenAIAdapter)
   self.name = "openai"
   self.api_key = opts.api_key or ""
@@ -448,6 +723,10 @@ function OpenAIAdapter.new(opts)
   self.temperature = opts.temperature or 0.0
   self.thinking = opts.thinking
   self.max_completion_tokens = opts.max_completion_tokens
+  self.attribution = attribution
+  -- Precompute the adapter-owned header table. Request and opts header maps
+  -- are not a header channel, so a caller cannot inject or override these.
+  self._attribution_headers = build_attribution_headers(attribution)
   self.http_client = opts.http_client
   return self
 end
@@ -532,6 +811,7 @@ function OpenAIAdapter:complete(request, opts)
   if #self.api_key > 0 then
     headers["Authorization"] = "Bearer " .. self.api_key
   end
+  apply_attribution_headers(headers, self._attribution_headers)
 
   local client = opts.http_client or self.http_client
   if not client then
@@ -604,6 +884,7 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   if #self.api_key > 0 then
     headers["Authorization"] = "Bearer " .. self.api_key
   end
+  apply_attribution_headers(headers, self._attribution_headers)
 
   local client = opts.http_client or self.http_client
   if not client then
@@ -1319,7 +1600,7 @@ WheelProvider.StdioAdapter = StdioAdapter
 
 --- Create a model provider adapter based on model profile or role specification.
 -- @param profile table ModelProfile { provider = string, model = string, temperature = number, thinking = table, ... }
--- @param opts table? Additional options (e.g. http_client, api_key, base_url)
+-- @param opts table? Additional options (e.g. http_client, api_key, base_url, attribution)
 -- @return table? WheelProvider adapter instance, or nil on failure
 -- @return string? Error message on failure
 function WheelProvider.create(profile, opts)
@@ -1334,6 +1615,19 @@ function WheelProvider.create(profile, opts)
   local completion_budget, budget_err = WheelProvider.validate_max_completion_tokens(requested_budget)
   if not completion_budget then
     return nil, budget_err
+  end
+
+  -- Attribution applies to the OpenAI-compatible adapter family (the
+  -- `openai` and `deepseek` routes). Validate before construction so the
+  -- factory returns its usual `nil, typed error` contract; the adapter
+  -- constructor re-validates for direct callers and raises.
+  local attribution = nil
+  if p_type == "openai" or p_type == "deepseek" then
+    local attribution_err
+    attribution, attribution_err = WheelProvider.validate_attribution(opts.attribution)
+    if attribution_err then
+      return nil, attribution_err
+    end
   end
 
   if p_type == "mock" then
@@ -1353,6 +1647,7 @@ function WheelProvider.create(profile, opts)
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
       max_completion_tokens = completion_budget,
+      attribution = attribution,
       http_client = opts.http_client,
     })
   elseif p_type == "deepseek" then
@@ -1364,6 +1659,7 @@ function WheelProvider.create(profile, opts)
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
       max_completion_tokens = completion_budget,
+      attribution = attribution,
       http_client = opts.http_client,
     })
   elseif p_type == "anthropic" then
