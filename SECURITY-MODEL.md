@@ -226,17 +226,23 @@ not receive it.
   (`/proc` on Linux, `ps -ww` fallback). Only then does it signal the recorded
   group. There is no name- or pattern-based kill and no fallback to an
   unrecorded PID.
-  Cancellation reuses the retained-leader discipline: the request publishes
-  `cancelled` under an exclusive `mkdir` lock before signaling, sends TERM to
-  the recorded group, waits the bounded grace (250 ms default, 2 s maximum),
-  and sends KILL to the same group only if it is still present. The leader
+  Cancellation reuses the retained-leader discipline: the request sends TERM to
+  the recorded group while holding the exclusive `mkdir` transition lock,
+  publishes `cancelled` before releasing it, waits the bounded grace (250 ms
+  default, 2 s maximum), and sends KILL to the same group only if it is still
+  present. The leader
   ignores TERM while it waits for the direct child, so the recorded PGID cannot
   be reused during the request; its normal TERM/grace/KILL sweep still runs
-  after the direct child exits. Terminal reasons are first-writer-wins:
-  `exited`, `timeout`, or `cancelled`; a request that loses the lock is a typed
-  no-op. Repeated cancellation is idempotent, cancel-after-exit is a typed
-  no-op, and cancel-before-spawn is refused (`E_JOB_NOT_RUNNING` or
-  `E_JOB_NOT_FOUND`). The result distinguishes cancellation from timeout
+  after the direct child exits. The leader's real and effective uid must equal
+  the current effective uid; a foreign or credential-transitioned leader is
+  refused with `E_JOB_GENERATION_MISMATCH` before any signal. Terminal reasons
+  are first-writer-wins: `exited`, `timeout`, or `cancelled`; a request that
+  loses the terminal race is a typed no-op, while a request that cannot acquire
+  the transition lock within the bound returns `E_JOB_BUSY` and sends nothing.
+  Repeated cancellation is idempotent (the immutable terminal record is read
+  before the lock), cancel-after-exit is a typed no-op, and cancel-before-spawn
+  is refused (`E_JOB_NOT_RUNNING` or `E_JOB_NOT_FOUND`). The result
+  distinguishes cancellation from timeout
   (`cancel_requested = true`, `terminal_reason = "cancelled"`,
   `outcome = "cancelled"`, `timed_out = false`); a timeout keeps
   `terminal_reason = "timeout"` and `timed_out = true`.

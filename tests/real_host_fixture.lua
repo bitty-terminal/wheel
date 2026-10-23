@@ -464,10 +464,12 @@ end
 
 local function build_evidence(status, failure)
   local info = environment_info()
+  local evidence_date = os.date("%Y-%m-%d", WheelHost.time.now())
   local lines = {
-    "# Real-host activation and command-smoke evidence (2026-10-21)",
+    "# Real-host activation, audit, and cancellation evidence (" .. evidence_date .. ")",
     "",
-    "Status: " .. status .. " durable scratch evidence for CTX-0017 / wheel#53.",
+    "Status: " .. status
+      .. " durable scratch evidence for CTX-0017 / wheel#53 and CTX-0034.",
     "It is implementation evidence, not a canonical specification, not a release",
     "claim, and not a plugin-VM or Bitty-host result.",
     "",

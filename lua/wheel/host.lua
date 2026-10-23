@@ -271,6 +271,15 @@ local KILL_AFTER_MS = 2000
 --- Grace period for the retained-leader group sweep (TERM, then KILL).
 local SWEEP_GRACE_MS = 250
 
+--- Maximum leader-side attempts to acquire the terminal-transition lock.
+-- The leader waits 200 x 10 ms (2 s), deliberately below the canceller's
+-- bounded 3 s lock window, so a slow canceller keeps first-writer authority and
+-- the leader never treats a lock it did not acquire as its own.
+local LEADER_LOCK_ATTEMPTS = 200
+
+--- Leader-side lock retry interval (10 ms).
+local LEADER_LOCK_INTERVAL_MS = 10
+
 --- Maximum bytes accepted for one stdin payload (1 MiB).
 local MAX_STDIN_BYTES = 1024 * 1024
 
@@ -371,6 +380,8 @@ WheelHost.LIMITS = {
   READ_CHUNK_BYTES = READ_CHUNK_BYTES,
   MAX_RANDOM_BYTES = MAX_RANDOM_BYTES,
   MAX_SLEEP_MS = MAX_SLEEP_MS,
+  LEADER_LOCK_ATTEMPTS = LEADER_LOCK_ATTEMPTS,
+  LEADER_LOCK_INTERVAL_MS = LEADER_LOCK_INTERVAL_MS,
 }
 
 --- Process-group supervisor wrapper. It runs the launch under `setsid -w` and
@@ -396,7 +407,7 @@ local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > /dev/null; exit 0
 --- A leader that exits early never signals anything. No caller value is
 --- interpolated into the script; the generation token is a positional argument
 --- used only as command-line identity for the canceller.
-local LEADER_SCRIPT = 'umask 077; pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; cancel_file="$8"; terminal_file="$9"; lock_dir="${10}"; generation="${11}"; shift 11; trap "" TERM; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; if [ -n "$terminal_file" ]; then i=0; while ! mkdir "$lock_dir" 2>/dev/null; do i=$((i+1)); [ "$i" -lt 200 ] || break; "$sleep_bin" 0.01 2>/dev/null || :; done; if [ -d "$lock_dir" ]; then if [ ! -e "$terminal_file" ]; then if [ -e "$cancel_file" ]; then printf "%s" "cancelled" > "$terminal_file"; elif [ "$status" = "124" ] || [ "$status" = "137" ]; then printf "%s" "timeout" > "$terminal_file"; else printf "%s" "exited" > "$terminal_file"; fi; fi; rmdir "$lock_dir" 2>/dev/null || :; fi; fi; exec 2>/dev/null; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
+local LEADER_SCRIPT = 'umask 077; pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; cancel_file="$8"; terminal_file="$9"; lock_dir="${10}"; generation="${11}"; lock_attempts="${12}"; lock_interval="${13}"; shift 13; trap "" TERM; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; if [ -n "$terminal_file" ]; then lock_held=0; i=0; while [ "$i" -lt "$lock_attempts" ]; do if mkdir "$lock_dir" 2>/dev/null; then lock_held=1; break; fi; i=$((i+1)); "$sleep_bin" "$lock_interval" 2>/dev/null || break; done; if [ "$lock_held" = "1" ]; then if [ ! -e "$terminal_file" ]; then if [ -e "$cancel_file" ]; then printf "%s" "cancelled" > "$terminal_file"; elif [ "$status" = "124" ] || [ "$status" = "137" ]; then printf "%s" "timeout" > "$terminal_file"; else printf "%s" "exited" > "$terminal_file"; fi; fi; rmdir "$lock_dir" 2>/dev/null || :; fi; fi; exec 2>/dev/null; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); Lua 5.2+ reports
@@ -1701,6 +1712,8 @@ function standalone.new(opts)
       shell_quote(tools.sleep_bin),
       shell_quote(paths.cancel or ""), shell_quote(paths.terminal or ""),
       shell_quote(paths.lock or ""), shell_quote(paths.generation or "-"),
+      shell_quote(tostring(LEADER_LOCK_ATTEMPTS)),
+      shell_quote(format_sleep(LEADER_LOCK_INTERVAL_MS)),
       shell_quote(tools.env_bin), "-i",
     }
     for _, assignment in ipairs(env_parts) do
@@ -2544,6 +2557,22 @@ function standalone.new(opts)
       end
     end
 
+    local function audit_stub()
+      return {
+        audit_meta = audit_meta,
+        audit_dir = job_audit and job_audit.dir or nil,
+        audit_recorded = audit_recorded,
+        audit_started = audit_started,
+        audit_warning = audit_warning,
+        mode = mode,
+        payload = payload,
+        payload_args = payload_args,
+        cwd = normalized.cwd,
+        audit_decision = audit_decision,
+        job = job,
+      }
+    end
+
     local command = build_launch_command(mode, payload, payload_args, normalized.cwd,
       stdin_path, tools, env_parts, {
         out = job.paths.out,
@@ -2564,19 +2593,7 @@ function standalone.new(opts)
     if launch_status ~= 0 then
       cleanup_job()
       local failure = start_failure("the job supervisor could not be launched", nil, false)
-      handle_audit_finish({
-        audit_meta = audit_meta,
-        audit_dir = job_audit and job_audit.dir or nil,
-        audit_recorded = audit_recorded,
-        audit_started = audit_started,
-        audit_warning = audit_warning,
-        mode = mode,
-        payload = payload,
-        payload_args = payload_args,
-        cwd = normalized.cwd,
-        audit_decision = audit_decision,
-        job = job,
-      }, failure, false)
+      handle_audit_finish(audit_stub(), failure, false)
       return nil, failure
     end
 
@@ -2607,6 +2624,7 @@ function standalone.new(opts)
         "the job supervisor did not record its process group", nil, false)
       failure.audit_error = WheelErrors.job_failure(
         WheelErrors.E_JOB_UNAVAILABLE, "process group was not recorded")
+      handle_audit_finish(audit_stub(), failure, false)
       return nil, failure
     end
 
@@ -2638,6 +2656,7 @@ function standalone.new(opts)
         or WheelHost.GROUP_CLEANUP.UNVERIFIED
       failure.pgid = pgid
       failure.audit_error = meta_err
+      handle_audit_finish(audit_stub(), failure, true)
       return nil, failure
     end
 
@@ -3032,14 +3051,16 @@ function standalone.new(opts)
   --- Probe or signal one recorded process group.
   -- Only signal 0 (liveness), TERM, and KILL are accepted, and the target is a
   -- validated positive integer rendered directly into `kill -SIGNAL -PGID`.
-  -- No name, pattern, or caller-supplied fragment is ever interpolated. A
-  -- missing group returns `false, "no such process group"` so a caller can
-  -- distinguish an already-exited job from a probe failure.
+  -- No name, pattern, or caller-supplied fragment is ever interpolated. The
+  -- C-locale `kill` diagnostic distinguishes a denied target
+  -- (`false, "permission denied"`) from a vanished group
+  -- (`false, "no such process group"`) and from a probe failure, so a caller
+  -- never treats a foreign target as an already-exited job.
   -- @param pgid number
   -- @param signal string "0", "TERM", or "KILL"
   -- @return boolean ok, string? err
   function backend.signal_group(pgid, signal)
-    require_surface(type(os) == "table" and type(os.execute) == "function", "process.spawn")
+    require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
     if type(pgid) ~= "number" or pgid ~= pgid or pgid % 1 ~= 0 or pgid <= 1
       or pgid > 2147483647 then
       return false, "invalid process group"
@@ -3047,12 +3068,24 @@ function standalone.new(opts)
     if signal ~= "0" and signal ~= "TERM" and signal ~= "KILL" then
       return false, "invalid signal"
     end
-    local status = normalized_exit_status(os.execute(
-      "kill -" .. signal .. " -" .. tostring(pgid) .. " 2>/dev/null"))
+    local pipe = io.popen(
+      "LC_ALL=C kill -" .. signal .. " -" .. tostring(pgid) .. " 2>&1", "r")
+    if not pipe then
+      return false, "process-group signal probe unavailable"
+    end
+    local output = pipe:read("*a") or ""
+    local closed, reason, code = pipe:close()
+    local status = normalized_exit_status(closed, reason, code)
     if status == 0 then
       return true
     end
     if status == 1 then
+      local text = tostring(output):lower()
+      if text:find("operation not permitted", 1, true)
+        or text:find("not permitted", 1, true)
+        or text:find("permission denied", 1, true) then
+        return false, "permission denied"
+      end
       return false, "no such process group"
     end
     return false, "process-group signal failed"

@@ -491,25 +491,25 @@ keeps its identity so the budget failure is not misreported. The token is not
 reachable from a handler and cannot be forged with a table field; it is not part
 of the public error contract.
 
-| `code`                        | `class`      | Meaning                                                                                                                      |
-| ----------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                               |
-| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.           |
-| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                         |
-| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                     |
-| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                   |
-| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                  |
-| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.        |
-| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                   |
-| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic. |
-| `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                             |
-| `E_JOB_METADATA_INVALID`      | `runtime`    | A job record is malformed, unowned, wrongly moded, oversized, or names an invalid id/generation; no signal was sent.         |
-| `E_JOB_GENERATION_MISMATCH`   | `runtime`    | The recorded leader generation, process group, or session does not match the live retained leader; no signal was sent.       |
-| `E_JOB_NOT_RUNNING`           | `runtime`    | The job did not reach `running`, or its retained leader already exited without a terminal record; no signal was sent.        |
-| `E_JOB_BUSY`                  | `runtime`    | The bounded terminal-transition lock stayed held; the request was refused rather than racing the transition.                 |
-| `E_JOB_SIGNAL_FAILED`         | `runtime`    | The recorded process group could not be signalled after validation; the failure is reported without a fallback pattern kill. |
-| `E_JOB_UNAVAILABLE`           | `runtime`    | The private job root, random source, capture file, or bounded sleep is unavailable; no weaker execution path was used.       |
-| `E_JOB_CLEANUP_FAILED`        | `runtime`    | A terminal job's private files could not be removed; the record was kept for diagnosis and no other path was deleted.        |
+| `code`                        | `class`      | Meaning                                                                                                                           |
+| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                                    |
+| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.                |
+| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                              |
+| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                          |
+| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                        |
+| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                       |
+| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.             |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                        |
+| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic.      |
+| `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                                  |
+| `E_JOB_METADATA_INVALID`      | `runtime`    | A job record is malformed, unowned, wrongly moded, oversized, or names an invalid id/generation; no signal was sent.              |
+| `E_JOB_GENERATION_MISMATCH`   | `runtime`    | The recorded leader generation, process group, session, or owner uid does not match the live retained leader; no signal was sent. |
+| `E_JOB_NOT_RUNNING`           | `runtime`    | The job did not reach `running`, or its retained leader already exited without a terminal record; no signal was sent.             |
+| `E_JOB_BUSY`                  | `runtime`    | The bounded terminal-transition lock stayed held; the request was refused rather than racing the transition.                      |
+| `E_JOB_SIGNAL_FAILED`         | `runtime`    | The recorded process group could not be signalled after validation; the failure is reported without a fallback pattern kill.      |
+| `E_JOB_UNAVAILABLE`           | `runtime`    | The private job root, random source, capture file, or bounded sleep is unavailable; no weaker execution path was used.            |
+| `E_JOB_CLEANUP_FAILED`        | `runtime`    | A terminal job's private files could not be removed; the record was kept for diagnosis and no other path was deleted.             |
 
 `E_COMPLETION_BUDGET_INVALID` is raised by the provider adapters and
 `WheelRunner` before a network request when a `max_completion_tokens` override
@@ -745,23 +745,27 @@ they do not expose the handle. A job is one private `0700` directory under
 `$XDG_RUNTIME_DIR/wheel/jobs` (or the explicit `opts.job_root`) containing an
 owned `0600` metadata record: a 32-hex job id, a random generation token, the
 recorded leader PID/PGID, the timeout, and optional audit identity. Capture
-files are `0600`; the job id is the only value a caller needs to pass to the
-external client.
+files are `0600`; a caller passes the job id to the external client, plus
+`--root` when the job uses an explicit non-default job root.
 
 ```sh
 scripts/wheel-proc cancel <job-id> [--root <job-root>] [--grace-ms <ms>]
 ```
 
 The CLI validates the id, metadata ownership/mode/size, and the live retained
-leader's generation (`/proc/<pid>` on Linux, with a `ps -ww` fallback), then
-signals only the recorded process group. It accepts signal 0 for a liveness
-probe and TERM/KILL for cancellation; there is no name- or pattern-based kill.
-The request publishes `cancelled` as the terminal reason before signaling, sends
-TERM, waits the bounded grace (250 ms by default, at most 2 s), and sends KILL
-to the same recorded group only if the leader is still present. The retained
-leader ignores TERM while it waits for the direct child, so the recorded PGID
-cannot be reused during the sweep; the leader's normal TERM/grace/KILL sweep
-still runs after the direct child exits.
+leader's generation and real/effective uid (`/proc/<pid>` on Linux, with a
+`ps -ww` fallback), then signals only the recorded process group. A foreign or
+credential-transitioned leader is refused with `E_JOB_GENERATION_MISMATCH`
+before any signal. The backend accepts signal 0 for a liveness probe and
+TERM/KILL for cancellation; the CLI uses TERM/KILL only. There is no name- or
+pattern-based kill.
+The request sends TERM while holding the terminal-transition lock, publishes
+`cancelled` before releasing it, then waits the bounded grace (250 ms by
+default, at most 2 s) and sends KILL to the same recorded group only if the
+leader is still present. A refused TERM never leaves a `cancelled` terminal
+record behind. The retained leader ignores TERM while it waits for the direct
+child, so the recorded PGID cannot be reused during the sweep; the leader's
+normal TERM/grace/KILL sweep still runs after the direct child exits.
 
 The result distinguishes cancellation from timeout: `cancel_requested = true`,
 `terminal_reason = "cancelled"`, `outcome = "cancelled"`, and `timed_out = false`.
@@ -770,8 +774,8 @@ cancellation is idempotent (`already_requested`/`already_cancelled`); a job that
 already published `exited` or `timeout` is a typed no-op (`already_exited`, CLI
 exit 3, no signal); a missing or unpublished job is refused (`E_JOB_NOT_FOUND`
 or `E_JOB_NOT_RUNNING`) before any signal. A tampered generation, process group,
-or session is refused with `E_JOB_GENERATION_MISMATCH`; a foreign PID is never
-signaled.
+session, or owner uid is refused with `E_JOB_GENERATION_MISMATCH`; a foreign PID
+is never signaled.
 
 When `opts.audit` is supplied to `start`, the pre-spawn record is followed by
 `process.cancel_requested`, `process.cancel_outcome`, and a completion record

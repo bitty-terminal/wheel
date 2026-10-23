@@ -309,7 +309,9 @@ function Job:swept()
 end
 
 --- Read the cancellation outcome evidence written by the canceller.
--- @return table { term_sent, kill_sent, group_alive_after, grace_ms }
+-- `group_alive_after` is `true`, `false`, or nil when the final probe was
+-- unknown; nil must never be read as swept.
+-- @return table { term_sent, kill_sent, group_alive_after?, grace_ms }
 function Job:cancel_outcome()
   local h = host()
   if not h then
@@ -326,10 +328,16 @@ function Job:cancel_outcome()
       outcome[key] = value
     end
   end
+  local group_alive_after = nil
+  if outcome.group_alive_after == "1" then
+    group_alive_after = true
+  elseif outcome.group_alive_after == "0" then
+    group_alive_after = false
+  end
   return {
     term_sent = outcome.term_sent == "1",
     kill_sent = outcome.kill_sent == "1",
-    group_alive_after = outcome.group_alive_after == "1",
+    group_alive_after = group_alive_after,
     grace_ms = tonumber(outcome.grace_ms),
   }
 end
@@ -350,19 +358,27 @@ function Job:leader_alive()
   return alive == true
 end
 
---- Return true while any member of the recorded process group is present.
--- This is a signal-0 probe, never a delivered signal.
--- @return boolean
+--- Probe the recorded process group without delivering a signal.
+-- The three-state result keeps an unknown probe distinct from a vanished
+-- group: `true` means present, `false` means the group is gone (ESRCH), and
+-- `nil, err` means the result is unknown (permission denial or probe failure).
+-- @return boolean? alive, string? err
 function Job:group_alive()
   if self.recorded_pgid == nil then
     return false
   end
   local h = host()
   if not h or type(h.proc) ~= "table" or type(h.proc.signal_group) ~= "function" then
+    return nil, "process-group probe unavailable"
+  end
+  local ok, reason = h.proc.signal_group(self.recorded_pgid, "0")
+  if ok == true then
+    return true
+  end
+  if reason == "no such process group" then
     return false
   end
-  local ok = h.proc.signal_group(self.recorded_pgid, "0")
-  return ok == true
+  return nil, reason or "process-group probe failed"
 end
 
 --- Acquire the job's exclusive terminal-transition lock.
@@ -652,15 +668,82 @@ local function cmdline_has_token(cmdline, token)
   return false
 end
 
---- Verify the recorded generation against the live retained leader.
+--- Split a `ps args=` line into tokens and compare one exactly.
+-- Exact token matching prevents a crafted generation from matching as a
+-- substring of a longer argument.
+-- @param args string
+-- @param token string
+-- @return boolean
+local function args_has_token(args, token)
+  if type(args) ~= "string" or type(token) ~= "string" then
+    return false
+  end
+  for part in args:gmatch("%S+") do
+    if part == token then
+      return true
+    end
+  end
+  return false
+end
+
+--- Read the recorded leader's real and effective uid from `/proc`.
+-- `/proc/<pid>/status` is the primary source; `/proc/<pid>` ownership is the
+-- fallback when the status file is unreadable. A missing owner is unknown, not
+-- an implicit match.
+-- @param pid number
+-- @return number? real_uid, number? effective_uid
+local function proc_owner(pid)
+  local h = host()
+  if not h then
+    return nil, nil
+  end
+  local status = h.fs.read_file_bounded("/proc/" .. tostring(pid) .. "/status", 8192)
+  if type(status) == "string" then
+    local fields = status:match("\nUid:%s*([^\n]+)")
+    if fields then
+      local real, effective = fields:match("^%s*(%d+)%s+(%d+)")
+      if real and effective then
+        return tonumber(real), tonumber(effective)
+      end
+    end
+  end
+  local info = h.fs.stat("/proc/" .. tostring(pid))
+  if info.exists and type(info.uid) == "number" then
+    return info.uid, info.uid
+  end
+  return nil, nil
+end
+
+--- Verify the recorded generation and owner against the live retained leader.
 -- Linux uses `/proc`; other POSIX hosts fall back to `ps -ww`. Both checks
--- require the leader's process group/session to equal the recorded PGID and
--- its command line to carry `wheel-leader` plus the exact generation token.
+-- require the leader's real/effective uid to equal the current effective uid,
+-- its process group/session to equal the recorded PGID, and its command line
+-- to carry `wheel-leader` plus the exact generation token. A foreign or
+-- credential-transitioned leader is refused before any audit or signal.
 -- @param meta table
 -- @return boolean ok, table? err
 local function validate_generation(meta)
+  local h = host()
+  if not h then
+    return false, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the host seam is unavailable")
+  end
+  local euid = h.fs.euid()
+  if euid == nil then
+    return false, job_error(WheelErrors.E_JOB_UNAVAILABLE,
+      "the current effective uid is unavailable")
+  end
+
   local stat = read_proc_stat(meta.leader_pid)
   if stat then
+    local real_uid, effective_uid = proc_owner(meta.leader_pid)
+    if real_uid == nil or effective_uid == nil then
+      return false, job_error(WheelErrors.E_JOB_UNAVAILABLE,
+        "the recorded leader owner is unavailable")
+    end
+    if real_uid ~= euid or effective_uid ~= euid then
+      return false, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
+        "the recorded leader is not owned by the current user")
+    end
     if stat.state == "Z" or stat.state == "X" then
       return false, job_error(WheelErrors.E_JOB_NOT_RUNNING, "the recorded leader is not running")
     end
@@ -668,7 +751,6 @@ local function validate_generation(meta)
       return false, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
         "the recorded leader group identity does not match")
     end
-    local h = host()
     local cmdline = h.fs.read_file("/proc/" .. tostring(meta.leader_pid) .. "/cmdline")
     if not cmdline_has_token(cmdline, "wheel-leader")
       or not cmdline_has_token(cmdline, meta.generation) then
@@ -678,22 +760,33 @@ local function validate_generation(meta)
     return true
   end
 
-  local h = host()
-  if not h or type(h.proc) ~= "table" or type(h.proc.run_program) ~= "function" then
+  if type(h.proc) ~= "table" or type(h.proc.run_program) ~= "function" then
     return false, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the process probe is unavailable")
   end
   local probe = h.proc.run_program("ps", {
-    "-ww", "-p", tostring(meta.leader_pid), "-o", "pgid=,stat=,args=",
+    "-ww", "-p", tostring(meta.leader_pid), "-o", "pgid=,sess=,stat=,uid=,args=",
   }, { timeout_ms = 5000, discard_stderr = true })
   if not probe.ok or probe.code ~= 0 then
     return false, job_error(WheelErrors.E_JOB_NOT_RUNNING, "the recorded leader is not running")
   end
-  local pgid, state, args = probe.stdout:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
-  if not pgid or tonumber(pgid) ~= meta.pgid or state:sub(1, 1) == "Z" then
+  local pgid, session, state, uid, args =
+    probe.stdout:match("^%s*(%d+)%s+(%d+)%s+(%S+)%s+(%d+)%s+(.+)$")
+  if not pgid or not session or not state or not uid or not args then
+    return false, job_error(WheelErrors.E_JOB_UNAVAILABLE,
+      "the recorded leader metadata is unreadable")
+  end
+  if tonumber(uid) ~= euid then
+    return false, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
+      "the recorded leader is not owned by the current user")
+  end
+  if tonumber(pgid) ~= meta.pgid or tonumber(session) ~= meta.pgid then
     return false, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
       "the recorded leader group identity does not match")
   end
-  if not args:find("wheel%-leader", 1) or not args:find(meta.generation, 1, true) then
+  if state:sub(1, 1) == "Z" then
+    return false, job_error(WheelErrors.E_JOB_NOT_RUNNING, "the recorded leader is not running")
+  end
+  if not args_has_token(args, "wheel-leader") or not args_has_token(args, meta.generation) then
     return false, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
       "the recorded leader generation does not match")
   end
@@ -742,6 +835,16 @@ end
 -- Cancellation
 -- ---------------------------------------------------------------------------
 
+local function encode_group_alive(value)
+  if value == true then
+    return "1"
+  end
+  if value == false then
+    return "0"
+  end
+  return "unknown"
+end
+
 local function write_cancel_outcome(job, term_sent, kill_sent, group_alive_after, grace_ms)
   local h = host()
   if not h then
@@ -754,7 +857,7 @@ local function write_cancel_outcome(job, term_sent, kill_sent, group_alive_after
     OUTCOME_FORMAT,
     "term_sent=" .. (term_sent and "1" or "0"),
     "kill_sent=" .. (kill_sent and "1" or "0"),
-    "group_alive_after=" .. (group_alive_after and "1" or "0"),
+    "group_alive_after=" .. encode_group_alive(group_alive_after),
     "grace_ms=" .. tostring(grace_ms),
   }, "\n") .. "\n"
   return h.fs.create_private_file(job.paths.outcome, content) == true
@@ -783,6 +886,25 @@ function Job:request_cancel(opts)
     return nil, job_error(WheelErrors.E_JOB_METADATA_INVALID, "invalid cancellation grace")
   end
 
+  local function terminal_no_op(reason)
+    return {
+      state = reason == "cancelled" and "already_cancelled" or "already_exited",
+      terminal_reason = reason,
+      term_sent = false,
+      kill_sent = false,
+      pgid = self.recorded_pgid,
+    }
+  end
+
+  -- The terminal reason is immutable once published (only `close` removes the
+  -- record after the leader is gone), so a repeated request can answer before
+  -- touching the transition lock. This keeps repeated cancel idempotent even
+  -- when a crashed canceller left a stale lock behind.
+  local observed = self:terminal_reason()
+  if observed ~= nil then
+    return terminal_no_op(observed)
+  end
+
   local locked, lock_err = self:acquire_lock()
   if not locked then
     return nil, lock_err
@@ -792,17 +914,10 @@ function Job:request_cancel(opts)
     self:release_lock()
   end
 
-  local observed = self:terminal_reason()
+  observed = self:terminal_reason()
   if observed ~= nil then
     unlock()
-    local state = observed == "cancelled" and "already_cancelled" or "already_exited"
-    return {
-      state = state,
-      terminal_reason = observed,
-      term_sent = false,
-      kill_sent = false,
-      pgid = self.recorded_pgid,
-    }
+    return terminal_no_op(observed)
   end
 
   local valid, generation_err = validate_generation(self.meta)
@@ -826,6 +941,7 @@ function Job:request_cancel(opts)
     end
   end
 
+  local marker_created = false
   if not repeated then
     local created, create_err = h.fs.create_private_file(self.paths.cancel, "")
     if not created then
@@ -833,11 +949,44 @@ function Job:request_cancel(opts)
       return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE,
         "the cancellation request marker could not be created: " .. tostring(create_err))
     end
+    marker_created = true
   end
 
-  -- The first writer wins. Publishing `cancelled` before the signal means a
-  -- leader that is killed during the grace still has a durable terminal reason;
-  -- a leader that exits normally sees the existing marker and leaves it alone.
+  local function discard_marker()
+    if marker_created then
+      h.fs.remove_file(self.paths.cancel)
+    end
+  end
+
+  -- Signal while holding the transition lock. The leader cannot publish a
+  -- terminal reason until it acquires the same lock, so a refused signal never
+  -- leaves `cancelled` behind: the terminal record is written only after a
+  -- delivered TERM. The cancel marker is still created before the signal so a
+  -- leader that wins the race after the lock is released records `cancelled`.
+  local term_ok, term_reason = h.proc.signal_group(self.recorded_pgid, "TERM")
+  if not term_ok then
+    discard_marker()
+    unlock()
+    if term_reason == "no such process group" then
+      local after = self:terminal_reason()
+      if after ~= nil then
+        return terminal_no_op(after)
+      end
+      return nil, job_error(WheelErrors.E_JOB_NOT_RUNNING,
+        "the recorded process group is not running")
+    end
+    if term_reason == "permission denied" then
+      return nil, job_error(WheelErrors.E_JOB_GENERATION_MISMATCH,
+        "the recorded group is not signalable by the current user")
+    end
+    return nil, job_error(WheelErrors.E_JOB_SIGNAL_FAILED,
+      "the recorded group could not be signalled")
+  end
+
+  -- The first writer wins. Writing the terminal reason before releasing the
+  -- lock means a leader that is killed during the grace still has a durable
+  -- reason; a leader that exits normally sees the existing marker and leaves it
+  -- alone.
   local terminal_written = true
   if not h.fs.exists(self.paths.terminal) then
     terminal_written = h.fs.create_private_file(self.paths.terminal, "cancelled\n") == true
@@ -850,39 +999,59 @@ function Job:request_cancel(opts)
 
   unlock()
 
-  local term_sent = false
-  local term_ok, term_reason = h.proc.signal_group(self.recorded_pgid, "TERM")
-  if term_ok then
-    term_sent = true
-  elseif term_reason ~= "no such process group" then
-    return nil, job_error(WheelErrors.E_JOB_SIGNAL_FAILED, "the recorded group could not be signalled")
-  end
-
-  local group_alive_after = false
+  local alive_state = true
+  local probe_failure = nil
+  local sleep_failure = nil
   local grace_steps = math.max(1, math.floor(grace_ms / LIMITS.POLL_MS))
   for _ = 1, grace_steps do
-    if not self:group_alive() then
+    local alive, probe_err = self:group_alive()
+    if alive == false then
+      alive_state = false
       break
     end
-    h.time.sleep_ms(LIMITS.POLL_MS)
+    if alive == nil then
+      alive_state = nil
+      probe_failure = probe_err
+      break
+    end
+    local slept = h.time.sleep_ms(LIMITS.POLL_MS)
+    if not slept then
+      sleep_failure = "the bounded grace sleep failed"
+      break
+    end
   end
 
   local kill_sent = false
-  if self:group_alive() then
+  if alive_state == true and probe_failure == nil and sleep_failure == nil then
     local kill_ok = h.proc.signal_group(self.recorded_pgid, "KILL")
     kill_sent = kill_ok == true
     local kill_steps = math.max(1, math.floor(LIMITS.CANCEL_KILL_WAIT_MS / LIMITS.POLL_MS))
     for _ = 1, kill_steps do
-      if not self:group_alive() then
+      local alive, probe_err = self:group_alive()
+      if alive == false then
+        alive_state = false
         break
       end
-      h.time.sleep_ms(LIMITS.POLL_MS)
+      if alive == nil then
+        alive_state = nil
+        probe_failure = probe_err
+        break
+      end
+      local slept = h.time.sleep_ms(LIMITS.POLL_MS)
+      if not slept then
+        sleep_failure = "the bounded kill-wait sleep failed"
+        break
+      end
     end
   end
-  group_alive_after = self:group_alive()
+
+  local group_alive_after, final_probe_err = self:group_alive()
+  if group_alive_after == nil then
+    probe_failure = probe_failure or final_probe_err
+  end
 
   local outcome_written = write_cancel_outcome(
-    self, term_sent, kill_sent, group_alive_after, grace_ms)
+    self, true, kill_sent, group_alive_after, grace_ms)
   local outcome_warning = nil
   if not terminal_written then
     outcome_warning = "the cancellation terminal record could not be written"
@@ -891,13 +1060,18 @@ function Job:request_cancel(opts)
     outcome_warning = outcome_warning or
       "the cancellation outcome record could not be written"
   end
+  if probe_failure ~= nil or sleep_failure ~= nil then
+    outcome_warning = outcome_warning or
+      "the recorded-group state is unverified: "
+      .. tostring(probe_failure or sleep_failure)
+  end
 
   local recorded, audit_err = record_audit(self.meta, audit_event(self.meta,
     "process.cancel_outcome", {
       cancel_requested = true,
       terminal_reason = "cancelled",
       outcome = "cancelled",
-      cleanup = group_alive_after and "unverified" or "swept",
+      cleanup = group_alive_after == false and "swept" or "unverified",
     }))
   if not recorded then
     audit_warning = audit_warning
@@ -907,7 +1081,7 @@ function Job:request_cancel(opts)
   return {
     state = repeated and "already_requested" or "requested",
     terminal_reason = "cancelled",
-    term_sent = term_sent,
+    term_sent = true,
     kill_sent = kill_sent,
     group_alive_after = group_alive_after,
     grace_ms = grace_ms,
@@ -1003,8 +1177,19 @@ function WheelJob.resolve_root(opts)
   elseif not h.fs.mkdir_p(root) then
     return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the job root could not be created")
   end
+  -- Re-check immediately before chmod (a link can appear after the first
+  -- stat) and immediately after it, so chmod never intentionally follows a
+  -- replaced component of an explicit job_root.
+  local before_chmod = h.fs.stat(root)
+  if not before_chmod.exists or before_chmod.symlink or not before_chmod.directory then
+    return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the job root is not a real directory")
+  end
   if not h.fs.chmod(root, "700") then
     return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the job root mode could not be repaired")
+  end
+  local after_chmod = h.fs.stat(root)
+  if not after_chmod.exists or after_chmod.symlink or not after_chmod.directory then
+    return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE, "the job root is not a real directory")
   end
   local verified, err = verify_directory(root)
   if not verified then
@@ -1359,7 +1544,7 @@ function WheelJob.cli(argv)
     terminal_reason = info.terminal_reason,
     term_sent = info.term_sent == true,
     kill_sent = info.kill_sent == true,
-    group_alive_after = info.group_alive_after == true,
+    group_alive_after = info.group_alive_after,
     pgid = info.pgid,
     audit_warning = info.audit_warning,
     outcome_warning = info.outcome_warning,

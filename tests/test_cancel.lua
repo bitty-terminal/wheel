@@ -15,6 +15,7 @@
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local WheelHost = require("wheel.host")
+local WheelJob = require("wheel.job")
 local WheelKernel = require("wheel.kernel")
 local WheelErrors = require("wheel.errors")
 
@@ -22,6 +23,7 @@ local JSON = WheelKernel.JSON
 
 local checks = 0
 local failures = 0
+local scratch_root = nil
 local base = nil
 local job_root = nil
 local handles = {}
@@ -61,11 +63,45 @@ local function read_file(path)
   return content
 end
 
+local function wait_for_file(path, label)
+  for _ = 1, 100 do
+    if read_file(path) ~= nil then
+      return
+    end
+    WheelHost.time.sleep_ms(20)
+  end
+  error(label .. " was not written", 0)
+end
+
+local function within_scratch(path)
+  if type(path) ~= "string" or type(scratch_root) ~= "string" then
+    return false
+  end
+  if path:sub(1, #scratch_root + 1) ~= scratch_root .. "/" then
+    return false
+  end
+  return path:find("%.%.") == nil
+end
+
 local function remove_tree(path)
-  local cleanup_root = base and (base .. ".cleanup") or "/tmp/bitty"
-  local backend = WheelHost.create_backend("standalone", { tmp_root = cleanup_root })
-  local removed = backend.run_program("rm", { "-rf", path })
-  return removed.ok and removed.code == 0
+  if not within_scratch(path) then
+    return false
+  end
+  return normalize_exit(os.execute("rm -rf -- " .. shell_quote(path))) == 0
+end
+
+local function select_scratch_root()
+  local configured = os.getenv("WHEEL_TEST_TMP")
+  if type(configured) == "string" and configured ~= "" then
+    scratch_root = configured:gsub("/+$", "")
+  else
+    scratch_root = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "") .. "/bitty"
+  end
+  check(scratch_root:sub(1, 1) == "/", "the scratch root must be absolute")
+  check(scratch_root ~= "/" and scratch_root:find("%.%.") == nil,
+    "the scratch root must not be root or contain '..'")
+  check(normalize_exit(os.execute("mkdir -p -- " .. shell_quote(scratch_root))) == 0,
+    "cannot create the scratch root")
 end
 
 local function start(program, args, opts)
@@ -101,6 +137,29 @@ local function process_state(pid)
     return nil
   end
   return (probe.stdout or ""):match("^%s*(%S+)")
+end
+
+local function find_foreign_pid()
+  local euid = WheelHost.fs.euid()
+  if euid == nil then
+    return nil
+  end
+  local probe = WheelHost.proc.run_program("ps", { "-eo", "pid=,uid=" }, {
+    discard_stderr = true,
+  })
+  if not probe.ok or probe.code ~= 0 then
+    return nil
+  end
+  local chosen = nil
+  for line in (probe.stdout or ""):gmatch("[^\n]+") do
+    local pid, uid = line:match("^%s*(%d+)%s+(%d+)")
+    local number = tonumber(pid)
+    if number and number > 1 and tonumber(uid) ~= euid
+      and (chosen == nil or number < chosen) then
+      chosen = number
+    end
+  end
+  return chosen
 end
 
 local function wait_gone(pid, label)
@@ -169,11 +228,12 @@ local function main()
   check(type(WheelHost.proc.cancel_job) == "function", "WheelHost.proc.cancel_job must be exposed")
 
   local created = WheelHost.proc.run_program("mktemp", {
-    "-d", "-p", os.getenv("WHEEL_TEST_TMP") or "/tmp/bitty", "wheel-cancel.XXXXXX",
+    "-d", "--", scratch_root .. "/wheel-cancel.XXXXXX",
   })
   check(created.ok and created.code == 0, "cannot create the cancellation scratch base")
   base = (created.stdout or ""):match("^%s*(.-)%s*$")
   check(type(base) == "string" and base:sub(1, 1) == "/", "the scratch base must be absolute")
+  check(within_scratch(base), "the cancellation base must live under the scratch root")
   job_root = base .. "/jobs"
   check(WheelHost.fs.mkdir_p(job_root), "cannot create the job root")
 
@@ -194,8 +254,8 @@ local function main()
   local target = start("sh", {
     "-c",
     "echo $$ > " .. shell_quote(child_pid)
-      .. "; sleep 30 & echo $! > " .. shell_quote(grandchild_pid)
-      .. "; wait",
+      .. "; sleep 30 & bg=$!; echo $bg > " .. shell_quote(grandchild_pid)
+      .. "; wait $bg; [ $? -eq 0 ] && : > " .. shell_quote(cancelled_marker),
   }, { timeout_ms = 60000, job_root = job_root })
   local target_pgid = target:pgid()
   local target_id = target:job_id()
@@ -203,6 +263,8 @@ local function main()
     "the job id must be a 32-hex token")
   check(target_id ~= sentinel:job_id(), "jobs must have distinct ids")
   check(target:job_root() == job_root, "the handle must expose the job root")
+  wait_for_file(child_pid, "target child pid")
+  wait_for_file(grandchild_pid, "target grandchild pid")
 
   local started_seconds = os.time()
   local cli_status, cli_record, cli_run = cli({
@@ -219,7 +281,10 @@ local function main()
   local result = target:wait(5000)
   check(result ~= nil, "the cancelled job must reach a terminal result")
   check(result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED,
-    "cancellation must have a distinct typed outcome: " .. tostring(result.outcome))
+    "cancellation must have a distinct typed outcome: " .. tostring(result.outcome)
+      .. " (terminal=" .. tostring(result.terminal_reason)
+      .. ", cleanup=" .. tostring(result.cleanup)
+      .. ", code=" .. tostring(result.code) .. ")")
   check(result.cancel_requested == true, "the result must carry cancel_requested")
   check(result.terminal_reason == "cancelled", "the result must carry the cancelled terminal reason")
   check(result.timed_out == false, "cancellation must not be reported as a timeout")
@@ -255,6 +320,47 @@ local function main()
   check(repeat_record.terminal_reason == "cancelled",
     "a repeated cancellation must keep the cancelled reason")
   check(repeat_record.term_sent == false, "a repeated cancellation must not claim a new TERM")
+
+  -- 2b. A stale transition lock must not defeat terminal idempotency or be
+  -- removed by the repeat request.
+  local stale_lock = job_root .. "/" .. target_id .. "/lock"
+  check(WheelHost.fs.mkdir(stale_lock), "cannot create the stale-lock fixture")
+  local stale_status, stale_record = cli({
+    "cancel", target_id, "--root", job_root,
+  })
+  check(stale_status == 0, "a repeated cancellation must ignore a stale lock")
+  check(stale_record.state == "already_cancelled",
+    "a stale lock must not change the terminal no-op: " .. tostring(stale_record.state))
+  check(WheelHost.fs.stat(stale_lock).exists,
+    "a repeated cancellation must not remove a foreign/stale lock")
+  check(WheelHost.fs.remove_dir(stale_lock), "cannot remove the stale-lock fixture")
+
+  -- 2c. A leader that cannot acquire the terminal lock must not publish a
+  -- terminal reason or remove the lock it did not acquire. Hold the lock while
+  -- a short command exits; the leader's bounded wait (2 s) expires first.
+  local lock_job = start("sleep", { "0.5" }, {
+    timeout_ms = 10000,
+    job_root = job_root,
+  })
+  local lock_job_dir = job_root .. "/" .. lock_job:job_id()
+  local held_lock = lock_job_dir .. "/lock"
+  local held_terminal = lock_job_dir .. "/terminal"
+  check(WheelHost.fs.mkdir(held_lock), "cannot create the leader-contention lock")
+  WheelHost.time.sleep_ms(2500)
+  check(not WheelHost.fs.stat(held_terminal).exists,
+    "a leader without the lock must not publish a terminal reason")
+  check(WheelHost.fs.stat(held_lock).exists,
+    "a leader without the lock must not remove the held lock")
+  check(WheelHost.fs.remove_dir(held_lock), "cannot release the held lock")
+  local lock_result = lock_job:wait(5000)
+  local lock_cancel_ok, lock_cancel_info = lock_job:cancel()
+  check(lock_cancel_ok == true,
+    "the contention job cancel must be a typed no-op or request: "
+      .. tostring(lock_cancel_info))
+  if lock_result == nil then
+    lock_result = lock_job:wait(5000)
+  end
+  check(lock_result ~= nil, "the contention job must still reach a result")
 
   -- 3. Cancel after a normal exit is a typed no-op, not a signal.
   local short = start("true", {}, { timeout_ms = 5000, job_root = job_root })
@@ -397,6 +503,32 @@ local function main()
   check(mismatch_status == 4, "a copied generation must not authorize a stale record")
   check(sentinel:poll() == nil, "a stale record must not signal a live job")
 
+  -- A record whose PID belongs to another user must be refused by the owner
+  -- check before any audit or signal. Only a same-user process can be signalled
+  -- in this test environment, so use an existing foreign-owned PID.
+  local foreign_pid = find_foreign_pid()
+  if foreign_pid ~= nil then
+    local foreign_id = string.rep("7", 32)
+    fake_job(foreign_id, table.concat({
+      "format=wheel-job/1",
+      "job_id=" .. foreign_id,
+      "generation=" .. sentinel_generation,
+      "state=running",
+      "pgid=" .. tostring(foreign_pid),
+      "leader_pid=" .. tostring(foreign_pid),
+      "timeout_ms=60000",
+      "started_ms=1",
+    }, "\n"))
+    local foreign_status, foreign_record = cli({
+      "cancel", foreign_id, "--root", job_root,
+    })
+    check(foreign_status == 4, "a foreign-owner PID must be refused")
+    check(foreign_record.error.code == WheelErrors.E_JOB_GENERATION_MISMATCH,
+      "a foreign-owner PID must report E_JOB_GENERATION_MISMATCH")
+  else
+    print("[INFO] no foreign-owner process available; foreign-UID refusal not exercised")
+  end
+
   -- 7. The in-process handle cancellation path.
   local handled = start("sleep", { "30" }, { timeout_ms = 60000, job_root = job_root })
   local cancel_ok, cancel_info = handled:cancel()
@@ -409,6 +541,27 @@ local function main()
   local repeat_ok, repeat_info = handled:cancel()
   check(repeat_ok == true and repeat_info.state == "already_cancelled",
     "the handle repeated cancel must be idempotent")
+
+  -- 7a. A TERM-ignoring direct child must deterministically escalate to KILL.
+  local stubborn = start("sh", {
+    "-c",
+    "trap '' TERM; while sleep 1; do :; done",
+  }, { timeout_ms = 60000, job_root = job_root })
+  local stubborn_ok, stubborn_info = stubborn:cancel()
+  check(stubborn_ok == true and stubborn_info.state == "requested",
+    "the TERM-ignoring job cancel must be accepted")
+  check(stubborn_info.kill_sent == true,
+    "the TERM-ignoring job must receive the KILL escalation")
+  local stubborn_result = stubborn:wait(5000)
+  check(stubborn_result ~= nil and stubborn_result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED,
+    "the TERM-ignoring job must reach a cancelled result")
+  check(stubborn_result.code == 137,
+    "the KILL-escalated job must carry the KILL-derived status: "
+      .. tostring(stubborn_result.code))
+  check(stubborn_result.cleanup == WheelHost.GROUP_CLEANUP.SWEPT
+    or stubborn_result.cleanup == WheelHost.GROUP_CLEANUP.UNVERIFIED,
+    "the KILL-escalated job must report a swept or unverified group: "
+      .. tostring(stubborn_result.cleanup))
 
   -- 7b. The shell-string start path shares the same record and cancellation
   -- discipline; it is a distinct primitive from the argv handle above.
@@ -480,7 +633,7 @@ local function main()
   -- before any signal; the job then reaches its own timeout.
   local blocked_audit = base .. "/blocked-audit"
   local blocked = start("sleep", { "30" }, {
-    timeout_ms = 1000,
+    timeout_ms = 3000,
     job_root = job_root,
     audit = { dir = blocked_audit, high_risk = true },
   })
@@ -500,6 +653,67 @@ local function main()
   check(blocked_result.cancel_requested == false,
     "the refused job must not be marked cancelled")
 
+  -- 8b. Post-launch start failures must still close the audit pair.
+  local pgid_audit = base .. "/pgid-audit"
+  local pgid_pid_file = base .. "/pgid-fail.pid"
+  local real_read_bounded = WheelHost.backend.read_file_bounded
+  local real_start_wait = WheelJob.LIMITS.START_WAIT_MS
+  WheelHost.backend.read_file_bounded = function(path, count)
+    if type(path) == "string" and path:match("/pgid$") then
+      return nil
+    end
+    return real_read_bounded(path, count)
+  end
+  WheelJob.LIMITS.START_WAIT_MS = 200
+  local pgid_ok, pgid_failed, pgid_err = pcall(WheelHost.proc.start, "sh", {
+    "-c",
+    "echo $$ > " .. shell_quote(pgid_pid_file) .. "; sleep 2",
+  }, {
+    timeout_ms = 1000,
+    job_root = job_root,
+    audit = { dir = pgid_audit, task = "CTX-0034" },
+  })
+  WheelJob.LIMITS.START_WAIT_MS = real_start_wait
+  WheelHost.backend.read_file_bounded = real_read_bounded
+  check(pgid_ok, "the pgid-failure probe must not throw: " .. tostring(pgid_failed))
+  check(pgid_failed == nil and type(pgid_err) == "table",
+    "a missing pgid must fail the start")
+  local pgid_records = parse_audit(pgid_audit)
+  check(find_event(pgid_records, "process.pre_spawn") ~= nil,
+    "the pgid failure must have a pre-spawn record")
+  check(find_event(pgid_records, "process.aborted") ~= nil,
+    "the pgid failure must have an aborted record")
+  wait_for_file(pgid_pid_file, "pgid-failure command pid")
+  local pgid_child = recorded_pid(pgid_pid_file)
+  check(pgid_child ~= nil, "the pgid-failure command must record its pid")
+  wait_gone(pgid_child, "pgid-failure child")
+
+  local meta_audit = base .. "/meta-audit"
+  local real_create_private = WheelHost.backend.create_private_file
+  WheelHost.backend.create_private_file = function(path, content)
+    if type(path) == "string" and path:match("/job%.meta$") then
+      return false, "simulated metadata publish failure"
+    end
+    return real_create_private(path, content)
+  end
+  local meta_ok, meta_failed, meta_err = pcall(WheelHost.proc.start, "sleep", { "30" }, {
+    timeout_ms = 3000,
+    job_root = job_root,
+    audit = { dir = meta_audit, task = "CTX-0034" },
+  })
+  WheelHost.backend.create_private_file = real_create_private
+  check(meta_ok, "the metadata-failure probe must not throw: " .. tostring(meta_failed))
+  check(meta_failed == nil and type(meta_err) == "table",
+    "a metadata publish failure must fail the start")
+  check(type(meta_err.audit_error) == "table"
+    and meta_err.audit_error.code == WheelErrors.E_JOB_METADATA_INVALID,
+    "the metadata publish failure must carry the typed job error")
+  local meta_records = parse_audit(meta_audit)
+  check(find_event(meta_records, "process.pre_spawn") ~= nil,
+    "the metadata failure must have a pre-spawn record")
+  check(find_event(meta_records, "process.completed") ~= nil,
+    "the metadata failure must have a completion record")
+
   -- 9. Close every handle and remove the scratch base.
   for _, handle in ipairs(handles) do
     local result = handle:poll()
@@ -514,10 +728,10 @@ local function main()
     end
   end
   check(remove_tree(base), "cannot remove the cancellation scratch base")
-  os.execute("rmdir " .. shell_quote(base .. ".cleanup") .. " 2>/dev/null || :")
   print(string.format("[PASS] cancellation suite: %d checks", checks))
 end
 
+select_scratch_root()
 local ok, err = pcall(main)
 if not ok then
   io.stderr:write("[FAIL] cancellation suite: " .. tostring(err) .. "\n")
