@@ -40,6 +40,17 @@ packaging is not part of the 0.1.0 deliverable.
 - **Optional Bitty integration.** Running in a Bitty panel or terminal is
   presentation, not authority. An optional host IPC client for host-visible
   operations is a post-decision follow-up, not a 0.1.0 claim.
+- **Daemon ownership stays with Bitty.** The experimental `wheel-session`
+  daemon is a local/headless/development/CI prototype and transport reference,
+  not Wheel's final daemon. Final lifecycle, IPC and authentication,
+  attach/detach, session registry, generation, and worker supervision belong to
+  `bittyd`
+  ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546),
+  [bitty#2064](https://github.com/bitty-terminal/bitty/issues/2064),
+  [bitty#2218](https://github.com/bitty-terminal/bitty/issues/2218)), which does
+  not ship today. Wheel remains the Coding Agent Harness and will adapt through
+  a replaceable transport adapter. No new Wheel daemon scope is added while
+  that contract is pending.
 - **Policy before code.** [SECURITY-MODEL.md](SECURITY-MODEL.md) owns the
   authority policy, path and role gates, command deny-list, audit, secret
   handling, executable project-config gate, and evidence gates. No capability
@@ -67,6 +78,9 @@ Wheel is not intended to be:
 - a home automation agent
 - a lifelong user-memory system
 - a cron/automation daemon
+- a long-lived session daemon or worker supervisor (the experimental
+  `wheel-session` prototype is developer tooling; the final daemon belongs to
+  `bittyd`)
 - a general cloud-management agent
 
 Wheel is focused on software engineering workflows.
@@ -622,7 +636,8 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   `meta.json`, then stop it explicitly with `wheel-session stop` or, after
   manual verification, signal that exact pid. Deleting a live session
   directory leaves the daemon unreachable; it must be stopped by its recorded
-  pid.
+  pid. This prototype has no attach/reattach, generation, or worker-supervision
+  contract; see [Continuation boundary](#continuation-boundary).
 - `just manifest` rejects `bitty-plugin.toml` — the transitional manifest is
   unchanged by the harness position; fix the manifest or the SDK pin rather than
   widening it.
@@ -740,6 +755,15 @@ Wheel models agent context as an immutable, content-addressed versioned DAG insp
 
 ### Local Session Daemon (Experimental)
 
+> **Prototype, not the final daemon.** `scripts/wheel-session` is an
+> experimental local/headless/development/CI prototype and a transport
+> reference. It is same-user only and is not a substitute for `bittyd`, which
+> owns the final lifecycle, IPC and authentication, attach/detach, session
+> registry, generation, and worker supervision. `bittyd` does not ship today.
+> Wheel remains the Coding Agent Harness and will adapt through a replaceable
+> transport adapter; no new Wheel daemon scope is added while that contract is
+> pending.
+
 A Wheel runtime can outlive one client. `scripts/wheel-session start NAME`
 prepares a private per-session runtime directory, launches
 `lua/wheel/daemon.lua` detached with `setsid`, and waits for metadata that is
@@ -805,6 +829,35 @@ expose a network service. The same-user FIFO residual is recorded in
 [SECURITY-MODEL.md](SECURITY-MODEL.md). The `scripts/wheel-session` CLI is
 repository-local developer tooling; it is not part of the 0.1.0 library
 artifact.
+
+#### Continuation boundary
+
+The prototype deliberately promises less than a session host:
+
+- **Client lifetime is not worker lifetime.** Closing a Bitty panel or a
+  `wheel-session` client is not a promise that a Wheel worker continues.
+  Presentation ends at the client; worker lifetime is a separate execution
+  concern that this prototype does not attach, reattach, or supervise.
+- **Stop, crash, and reboot need the upstream contract.** The prototype's
+  `stop` is an explicit shutdown of the process it started, and its metadata is
+  private local state, not a durable session registry. Continuation after a
+  daemon stop, a daemon crash, or a host reboot requires the `bittyd` contract;
+  this slice makes no recovery or restart promise for those events.
+- **`bittyd` owns the final daemon.** Final daemon lifecycle, IPC and
+  authentication, attach/detach, session registry, generation, and worker
+  supervision belong to `bittyd`
+  ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546),
+  [bitty#2064](https://github.com/bitty-terminal/bitty/issues/2064),
+  [bitty#2218](https://github.com/bitty-terminal/bitty/issues/2218)), not to
+  additional Wheel daemon features. `bittyd` does not ship today, and this
+  repository does not claim otherwise.
+- **No competing Wheel daemon.** Wheel CTX-0031
+  ([wheel#101](https://github.com/bitty-terminal/wheel/issues/101)) records the
+  same boundary in its blocked note (CarryCtx PX-0195): cancellation work waits
+  for the `bittyd` session-host, ownership, generation, IPC,
+  worker-supervision, and cancellation contract, and non-daemon cancellation
+  may be re-scoped separately. Wheel adds no new daemon scope while that
+  contract is pending.
 
 ## Development
 
