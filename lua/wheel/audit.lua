@@ -48,11 +48,15 @@
 -- or filesystem diagnostic is copied into either one.
 --
 -- Concurrency: one process reuses one sink per directory, so sequences stay
--- monotonic inside that process. Two processes appending at the same instant
--- can interleave records and duplicate a sequence number; cross-process
--- serialization is a documented residual, not a claimed guarantee. Appends are
--- flushed to the OS but not fsynced; a crash can lose the last line, which the
--- next writer treats as a torn tail rather than silently repairing it.
+-- monotonic inside that process. Before every append the sink compares the
+-- active file size it last saw and re-reads the tail when another process
+-- appended, so sequential writers (for example the cancellation CLI followed by
+-- the owning harness) continue the same chain. Two processes appending at
+-- exactly the same instant can still interleave records and duplicate a
+-- sequence number; cross-process serialization is a documented residual, not a
+-- claimed guarantee. Appends are flushed to the OS but not fsynced; a crash can
+-- lose the last line, which the next writer treats as a torn tail rather than
+-- silently repairing it.
 
 local WheelAudit = {}
 
@@ -752,8 +756,15 @@ local CLEANUP_VALUES = {
 local OUTCOME_VALUES = {
   exited = true,
   timeout = true,
+  cancelled = true,
   unavailable = true,
   failure = true,
+}
+local TERMINAL_REASONS = {
+  exited = true,
+  timeout = true,
+  cancelled = true,
+  unverified = true,
 }
 
 --- Build the allowlisted, redacted part of one record.
@@ -865,6 +876,22 @@ local function build_record(event, counter)
   end
   if event.timed_out == true then
     record.timed_out = true
+  end
+  if type(event.cancel_requested) == "boolean" then
+    record.cancel_requested = event.cancel_requested
+  end
+  if event.terminal_reason ~= nil then
+    if not TERMINAL_REASONS[event.terminal_reason] then
+      return nil, "invalid_event"
+    end
+    record.terminal_reason = event.terminal_reason
+  end
+  if event.job_id ~= nil then
+    if type(event.job_id) ~= "string" or #event.job_id > 64
+      or event.job_id:match("^[a-z0-9]+$") == nil then
+      return nil, "invalid_event"
+    end
+    record.job_id = event.job_id
   end
   if event.truncated == true then
     record.truncated = true
@@ -1214,6 +1241,23 @@ end
 -- @param event table
 -- @return boolean ok, table? err, string? reason
 function Sink:record(event)
+  -- Another process may have appended to the active file since this sink last
+  -- prepared itself (the cancellation CLI and the owning harness are two
+  -- writers by design). A size change forces a tail re-read before the next
+  -- sequence number is assigned; concurrent appends at exactly the same instant
+  -- remain the documented cross-process residual.
+  if self._ready then
+    local fs = host() and host().fs or nil
+    if fs then
+      local info = fs.stat(self:_active_path())
+      if not info.exists or info.symlink or not info.regular
+        or info.mode ~= FILE_MODE or info.links ~= 1
+        or info.size ~= self._size then
+        self._ready = false
+      end
+    end
+  end
+
   local prepared, prepare_reason = self:_prepare()
   if not prepared then
     return audit_failure(prepare_reason)

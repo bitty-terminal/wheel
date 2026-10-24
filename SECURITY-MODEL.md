@@ -213,11 +213,51 @@ not receive it.
   (`swept`/`unverified`/`not_run`), and the recorded `pgid`. GNU maps expiry to
   124 (kill-after escalation may surface 137 on some hosts), so a child that
   itself exits 124/137 is indistinguishable and is reported as a timeout.
-- There is no asynchronous cancellation hook in the single-threaded Lua
-  runtime yet. Timeout expiry and the retained-leader group sweep are the
-  termination triggers; a caller cannot interrupt an in-flight invocation. This
-  is a known limitation, not a claim that the policy's recorded-PID cancellation
-  requirement is complete.
+- Asynchronous cancellation by recorded process generation is exposed through
+  `WheelHost.proc.start` and `scripts/wheel-proc cancel <job-id>` (CTX-0034).
+  `start` returns a job handle with `poll`, `wait`, `cancel`, and `close`; the
+  synchronous `run_program`/`run_command` contract is unchanged. A job is one
+  private `0700` directory with an owned `0600` metadata record containing a
+  32-hex job id, a random generation token, the recorded leader PID/PGID, the
+  timeout, and optional audit identity. The canceller validates the record's
+  ownership/mode/size and the live retained leader: the leader must be alive,
+  its process group and session must equal the recorded PGID, and its command
+  line must carry both `wheel-leader` and the exact generation token
+  (`/proc` on Linux, `ps -ww` fallback). Only then does it signal the recorded
+  group. There is no name- or pattern-based kill and no fallback to an
+  unrecorded PID.
+  Cancellation reuses the retained-leader discipline: the request sends TERM to
+  the recorded group while holding the exclusive `mkdir` transition lock,
+  publishes `cancelled` before releasing it, waits the bounded grace (250 ms
+  default, 2 s maximum), and sends KILL to the same group only if it is still
+  present. The leader
+  ignores TERM while it waits for the direct child, so the recorded PGID cannot
+  be reused during the request; its normal TERM/grace/KILL sweep still runs
+  after the direct child exits. The leader's real and effective uid must equal
+  the current effective uid; a foreign or credential-transitioned leader is
+  refused with `E_JOB_GENERATION_MISMATCH` before any signal. Terminal reasons
+  are first-writer-wins: `exited`, `timeout`, or `cancelled`; a request that
+  loses the terminal race is a typed no-op, while a request that cannot acquire
+  the transition lock within the bound returns `E_JOB_BUSY` and sends nothing.
+  Repeated cancellation is idempotent (the immutable terminal record is read
+  before the lock), cancel-after-exit is a typed no-op, and cancel-before-spawn
+  is refused (`E_JOB_NOT_RUNNING` or `E_JOB_NOT_FOUND`). The result
+  distinguishes cancellation from timeout
+  (`cancel_requested = true`, `terminal_reason = "cancelled"`,
+  `outcome = "cancelled"`, `timed_out = false`); a timeout keeps
+  `terminal_reason = "timeout"` and `timed_out = true`.
+  When `opts.audit` is supplied to `start`, the canceller writes
+  `process.cancel_requested` and `process.cancel_outcome` through the existing
+  sink, and the handle completion carries the cancellation fields. A high-risk
+  request whose audit record cannot be written is refused before any signal; a
+  low-risk failure continues with `audit_warning`, and an outcome-record failure
+  after the signal is reported rather than hidden. This is same-user authority:
+  a same-user process can read the private record and act with the same OS
+  authority; the generation check protects against stale PID/PGID reuse, not
+  against that user. Cross-user isolation is not claimed. Windows is
+  unsupported by this slice and fails closed through the standalone host and
+  POSIX shell client. A child that calls `setsid` or joins another process group
+  can still escape the recorded group; that orphan residual is unchanged.
 - Interactive stdin and TTY allocation are off by default. stdin is
   `/dev/null` unless the caller supplies bytes, which are staged in an
   exclusive `0600` file inside the private runtime directory. No TTY is
@@ -264,9 +304,11 @@ controls are mandatory:
    executed as a separate recorded step.
 10. **Bounded execution.** The same timeout, 256 KiB-per-stream capture bound,
     setsid-recorded group, and retained-leader TERM/KILL sweep as argv apply.
-    Asynchronous cancellation by recorded PID is not exposed by the current
-    runtime; timeout expiry and normal-exit group cleanup are the in-flight
-    termination triggers.
+    A running shell-string job can be cancelled by its recorded job generation
+    through `WheelHost.proc.start`/`handle:cancel` or the
+    `scripts/wheel-proc cancel` client; the canceller validates the recorded
+    leader generation and signals only the recorded group (TERM, bounded grace,
+    KILL). Cancellation is distinct from timeout in the result and audit.
 
 Residual risk: a shell command can write outside the workspace root because the
 harness has no OS-level confinement in 0.1.0. The path sandbox governs
@@ -994,16 +1036,36 @@ the sink cannot be written, with no marker file created. The sink remains
 opt-in at the process seam, so this is evidence for the mechanism, not for
 mandatory audit on every tool invocation.
 
-Cancellation (as distinct from timeout) is not implemented and no Bitty panel
-presentation was run. The CTX-0030 review inspected the Gate 1 suite and the
-Gate 2 audit JSONL, including the pre-spawn/completion fields, the deny record,
+The cancellation slice (CTX-0034) adds `just test-cancel`
+(`tests/test_cancel.lua`) for Gate 1 and extends `tests/real_host_fixture.lua`
+with a Gate 2 cancellation section. The suite starts real long commands through
+`WheelHost.proc.start`, cancels them from the separate `scripts/wheel-proc`
+process, and checks a prompt `cancelled` terminal result, a swept recorded group,
+no running child/grandchild, an untouched unrelated recorded job, idempotent
+repeated cancellation, typed cancel-after-exit, the timeout/cancel distinction,
+a cancellation/timeout race, cancel-before-spawn refusal, forged/stale
+generation refusal without a signal, and the audit request/outcome records. The
+fixture runs the handle path in every mode and the separate CLI path in a
+development checkout; the installed-tree run exercises the handle because the
+0.1.0 library artifact does not package `scripts/`. A high-risk cancellation
+whose request audit cannot be written is refused before any signal and the job
+reaches its own timeout. The audit sink re-reads its tail when another process
+appended, so the sequential CLI and harness writers continue one hash chain;
+simultaneous appenders remain the documented cross-process residual.
+
+Cancellation is same-user only and does not add cross-user isolation. A child
+that calls `setsid` or joins another process group can still escape the recorded
+group, and the first-writer-wins terminal record under the transition lock is
+the only cancellation-vs-timeout arbitration; a race resolves to exactly one
+terminal reason. No Bitty panel/terminal presentation
+was run. The CTX-0030 review inspected the Gate 1 audit suite and the Gate 2
+audit JSONL, including the pre-spawn/completion fields, the deny record,
 redaction of synthetic credentials (escaped JSON headers, authorization
 environment assignments, and flags), private modes, the chain, and the
-high-risk refusal. Independent reviewer inspection is therefore satisfied for
-this opt-in slice; a later widening that makes audit default-on requires fresh
-review. Asynchronous cancellation and panel presentation with recorded host and
-tool versions remain open, so Gate 2 remains open and this is not a security
-approval.
+high-risk refusal. The CTX-0034 review must inspect the cancellation JSONL and
+the real-host results independently; this paragraph is not that review.
+Bitty panel presentation with recorded host and tool versions remains open, so
+Gate 2 remains open and this is not a security approval.
 
 Because Wheel is out of process, the "real host fixture" is the real OS and
 terminal boundary, not a plugin VM activation. A plugin-host fixture is not
@@ -1125,10 +1187,19 @@ Known gaps relative to this policy (not claims of compliance):
   10 min), a 256 KiB capture cap per stream, `/dev/null` stdin unless bytes are
   supplied, a `setsid`-recorded process group held by a retained leader through
   the TERM/grace/KILL sweep (CTX-0021 / wheel#81), timeout SIGKILL escalation,
-  and a direct-command status written before any signal. Remaining gaps: there
-  is no asynchronous cancellation hook, so timeout expiry and the sweep are the
-  only termination triggers; GNU timeout maps expiry to 124 and kill-after may
-  surface 137, so a child that itself exits 124/137 is indistinguishable;
+  and a direct-command status written before any signal. Asynchronous
+  cancellation by recorded job generation is implemented for started jobs
+  (CTX-0034): a private `0700`/`0600` record, generation validation against the
+  live retained leader, TERM/grace/KILL over the recorded PGID, terminal-reason
+  lock, and distinct cancellation audit/result fields. Remaining gaps: the
+  canceller and the job record are same-user authority, so a same-user process
+  can read the record and act with the same OS authority; there is a narrow
+  validation-to-signal window in which the retained leader could exit and the
+  PGID be reused, reduced but not eliminated by the generation check; a
+  TERM-ignoring command needs the KILL fallback, whose synthetic status is
+  signal-derived rather than the direct command's own status; Windows is
+  unsupported and fails closed; GNU timeout maps expiry to 124 and kill-after
+  may surface 137, so a child that itself exits 124/137 is indistinguishable;
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, and `sh` must be resolvable or
   the primitive fails closed as `unavailable`; timeout enforcement is not a
   real-time guarantee; disk capture has no per-file quota, only the timeout
@@ -1325,8 +1396,9 @@ An independent reviewer verifies at least:
 ## References
 
 - wheel#51, owner decision comments of 2026-10-20 (D1-D7).
-- Wheel CTX-0031 / wheel#101, blocked on the `bittyd` session-host contract for
-  cancellation and worker-lifetime scope.
+- Wheel CTX-0034 (process-level cancellation, extracted from CTX-0031) is the
+  implemented non-daemon slice; the remaining CTX-0031 daemon, session-host,
+  and worker-lifetime scope stays blocked on the `bittyd` contract.
 - bitty#2546, bitty#2064, and bitty#2218, upstream `bittyd` session-host, core
   service-host, and attach/detach design issues (open; `bittyd` does not ship
   today).

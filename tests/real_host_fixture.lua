@@ -29,11 +29,16 @@
 -- Limitations (documented in README.md):
 --   * offline; no network, credentials, release claim, or plugin-VM evidence.
 --   * opt-in audit JSONL is inspected after a permitted and a denied command;
---     default-on audit wiring, asynchronous cancellation, OS sandbox, and Bitty
---     panel/terminal presentation are not covered. Timeout, retained-leader
---     process-group identity, stdin, and scrubbed-environment bounds are
---     covered below; a child that calls setsid or joins another group can still
---     escape the recorded group.
+--     CTX-0034 adds real asynchronous cancellation (handle in every mode, the
+--     separate scripts/wheel-proc client in a development checkout) with a
+--     distinct cancelled terminal reason, swept group, no orphan, unrelated-job
+--     isolation, idempotent repeat, timeout/cancel race, and cancellation
+--     audit. Default-on audit wiring, OS sandbox, and Bitty panel/terminal
+--     presentation are not covered. Timeout, retained-leader process-group
+--     identity, stdin, and scrubbed-environment bounds are covered below; a
+--     child that calls setsid or joins another group can still escape the
+--     recorded group. Cancellation is same-user only and the installed-tree run
+--     uses the handle because scripts/ is not packaged.
 --   * single host and one interpreter per run; CPU frequency is not pinned.
 
 -- WHEEL_ROOT points the fixture at an installed artifact tree instead of the
@@ -459,10 +464,12 @@ end
 
 local function build_evidence(status, failure)
   local info = environment_info()
+  local evidence_date = os.date("%Y-%m-%d", WheelHost.time.now())
   local lines = {
-    "# Real-host activation and command-smoke evidence (2026-10-21)",
+    "# Real-host activation, audit, and cancellation evidence (" .. evidence_date .. ")",
     "",
-    "Status: " .. status .. " durable scratch evidence for CTX-0017 / wheel#53.",
+    "Status: " .. status
+      .. " durable scratch evidence for CTX-0017 / wheel#53 and CTX-0034.",
     "It is implementation evidence, not a canonical specification, not a release",
     "claim, and not a plugin-VM or Bitty-host result.",
     "",
@@ -570,15 +577,21 @@ local function build_evidence(status, failure)
   lines[#lines + 1] = "  recorded PGID is held until the final KILL), stdin, and"
   lines[#lines + 1] = "  scrubbed-environment bounds are covered. If the leader dies"
   lines[#lines + 1] = "  early, cleanup is reported `unverified` and no signal is sent."
-  lines[#lines + 1] = "  Asynchronous cancellation and a child that leaves the"
-  lines[#lines + 1] = "  recorded group (setsid or another process group) are"
-  lines[#lines + 1] = "  not covered."
+  lines[#lines + 1] = "  CTX-0034 covers asynchronous cancellation through the handle in"
+  lines[#lines + 1] = "  every mode and through the separate scripts/wheel-proc client in a"
+  lines[#lines + 1] = "  development checkout; the installed-tree run uses the handle because"
+  lines[#lines + 1] = "  the library artifact does not package scripts/. Cancellation is"
+  lines[#lines + 1] = "  same-user only. A child that leaves the recorded group (setsid or"
+  lines[#lines + 1] = "  another process group) is still not covered."
   lines[#lines + 1] = "- The audit section wrote a permitted pre-spawn/completion pair and a"
   lines[#lines + 1] = "  denied pre-spawn record into a private state directory, then read"
   lines[#lines + 1] = "  the JSONL back and checked fields, chain, modes, the absent denied"
   lines[#lines + 1] = "  side effect, redaction of a synthetic value, and a high-risk refusal."
-  lines[#lines + 1] = "  The sink is opt-in at the process seam; default-on tool wiring is"
-  lines[#lines + 1] = "  not covered and remains a follow-up."
+  lines[#lines + 1] = "  The cancellation audit section additionally records"
+  lines[#lines + 1] = "  `process.cancel_requested`/`process.cancel_outcome` and the cancelled"
+  lines[#lines + 1] = "  completion, and proves a high-risk request with an unwritable sink is"
+  lines[#lines + 1] = "  refused before any signal. The sink is opt-in at the process seam;"
+  lines[#lines + 1] = "  default-on tool wiring is not covered and remains a follow-up."
   lines[#lines + 1] = "- No OS sandbox/containment evidence and no Bitty panel/terminal"
   lines[#lines + 1] = "  presentation run; the host table is a presentation double only."
   lines[#lines + 1] = "- `os.clock()` is process CPU time, not elapsed wall clock; CPU"
@@ -586,7 +599,7 @@ local function build_evidence(status, failure)
   lines[#lines + 1] = "  interpreter per run."
   lines[#lines + 1] = "- SECURITY-MODEL.md Gate 2 requires broader evidence; this fixture"
   lines[#lines + 1] = "  is partial evidence for the standalone activation, command-smoke,"
-  lines[#lines + 1] = "  and opt-in audit surfaces only."
+  lines[#lines + 1] = "  opt-in audit, and cancellation surfaces only."
   lines[#lines + 1] = ""
   lines[#lines + 1] = "The ephemeral base and workspace were removed on success; no"
   lines[#lines + 1] = "absolute host path is recorded in this file."
@@ -1055,6 +1068,143 @@ local function main()
     "audit: permitted pre-spawn/completion records, denied record without a spawn, private modes, chain, and redaction inspected from JSONL"
   state.coverage[#state.coverage + 1] =
     "audit: a high-risk spawn with an unwritable sink failed closed before launch"
+
+  -- 6c. Asynchronous cancellation (CTX-0034): a real long command is started
+  -- through the job handle, cancelled, and checked for a distinct terminal
+  -- reason, a swept recorded group, no orphan, and an unrelated recorded job
+  -- that keeps running. In a development checkout the same path is driven by
+  -- the separate `scripts/wheel-proc` process; installed-tree runs skip that
+  -- client because the library artifact does not package scripts/.
+  local cancel_root = BASE .. "/cancel-jobs"
+  local cancel_child_path = BASE .. "/cancel-child.pid"
+  local cancel_grandchild_path = BASE .. "/cancel-grandchild.pid"
+
+  local function fixture_process_state(pid)
+    local probe = WheelHost.proc.run_program("ps", { "-o", "stat=", "-p", tostring(pid) },
+      { discard_stderr = true })
+    if probe.code ~= 0 then
+      return nil
+    end
+    return trim(probe.stdout)
+  end
+
+  local function fixture_wait_gone(pid, label)
+    for _ = 1, 100 do
+      local state = fixture_process_state(pid)
+      if state == nil or state:sub(1, 1) == "Z" then
+        return
+      end
+      WheelHost.time.sleep_ms(20)
+    end
+    check(false, label .. " must not be running after cancellation")
+  end
+
+  local cancel_sentinel = WheelHost.proc.start("sleep", { "30" }, {
+    timeout_ms = 60000,
+    job_root = cancel_root,
+  })
+  check(cancel_sentinel ~= nil, "the cancellation sentinel job must start")
+  local sentinel_pgid = cancel_sentinel:pgid()
+
+  local cancel_target = WheelHost.proc.start("sh", {
+    "-c",
+    "echo $$ > " .. shell_quote(cancel_child_path)
+      .. "; sleep 30 & echo $! > " .. shell_quote(cancel_grandchild_path)
+      .. "; wait",
+  }, { timeout_ms = 60000, job_root = cancel_root })
+  check(cancel_target ~= nil, "the cancellation target job must start")
+  check(cancel_target:job_id():match("^[0-9a-f]+$") ~= nil
+    and #cancel_target:job_id() == 32, "the cancellation job id must be 32 hex")
+  check(type(cancel_target:pgid()) == "number" and cancel_target:pgid() > 1,
+    "the cancellation job must record its PGID")
+
+  local cancel_cli_used = false
+  if WHEEL_ROOT == nil then
+    local cli = WheelHost.proc.run_program("./scripts/wheel-proc", {
+      "cancel", cancel_target:job_id(), "--root", cancel_root,
+    }, { timeout_ms = 10000 })
+    check(cli.ok and cli.code == 0, "the cancellation CLI must accept the request: "
+      .. tostring(cli.stderr))
+    local cli_record = nil
+    local decoded_ok, decoded = pcall(require("wheel.kernel").JSON.decode, cli.stdout)
+    if decoded_ok then
+      cli_record = decoded
+    end
+    check(type(cli_record) == "table" and cli_record.state == "requested",
+      "the cancellation CLI must report a requested state")
+    check(cli_record.terminal_reason == "cancelled" and cli_record.term_sent == true,
+      "the cancellation CLI must record the cancelled reason and TERM")
+    cancel_cli_used = true
+  else
+    local handle_ok, handle_info = cancel_target:cancel()
+    check(handle_ok == true and handle_info.state == "requested",
+      "the installed-tree handle cancellation must be accepted")
+  end
+
+  local cancel_result = cancel_target:wait(5000)
+  check(cancel_result ~= nil, "the cancelled job must reach a terminal result")
+  check(cancel_result.outcome == WheelHost.PROCESS_OUTCOME.CANCELLED,
+    "cancellation must be a distinct typed outcome, got " .. tostring(cancel_result.outcome))
+  check(cancel_result.cancel_requested == true and cancel_result.timed_out == false,
+    "cancellation must set cancel_requested and not timed_out")
+  check(cancel_result.terminal_reason == "cancelled",
+    "cancellation must publish the cancelled terminal reason")
+  check(cancel_result.code == 143 or cancel_result.code == 137,
+    "cancellation must carry a signal-derived status, got " .. tostring(cancel_result.code))
+  check(cancel_result.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "cancellation must complete the recorded-group sweep, got " .. tostring(cancel_result.cleanup))
+  local cancel_child = WheelHost.fs.read_file(cancel_child_path)
+  local cancel_grandchild = WheelHost.fs.read_file(cancel_grandchild_path)
+  cancel_child = cancel_child and trim(cancel_child) or ""
+  cancel_grandchild = cancel_grandchild and trim(cancel_grandchild) or ""
+  check(cancel_child:match("^%d+$") ~= nil and cancel_grandchild:match("^%d+$") ~= nil,
+    "the cancelled command must record its child and grandchild PIDs")
+  fixture_wait_gone(cancel_child, "cancelled child")
+  fixture_wait_gone(cancel_grandchild, "cancelled grandchild")
+  check(cancel_sentinel:poll() == nil, "cancellation must not terminate an unrelated job")
+  check(fixture_process_state(sentinel_pgid) ~= nil,
+    "the unrelated job group must still be running after cancellation")
+
+  local repeat_ok, repeat_info = cancel_target:cancel()
+  check(repeat_ok == true and repeat_info.state == "already_cancelled",
+    "repeated cancellation must be an idempotent no-op")
+  check(repeat_info.term_sent == false, "repeated cancellation must not send another TERM")
+
+  local cancel_timeout = WheelHost.proc.start("sleep", { "30" }, {
+    timeout_ms = 300,
+    job_root = cancel_root,
+  })
+  local timeout_result = cancel_timeout and cancel_timeout:wait(5000)
+  check(timeout_result ~= nil and timeout_result.outcome == WheelHost.PROCESS_OUTCOME.TIMEOUT,
+    "timeout must remain distinct from cancellation")
+  check(timeout_result.timed_out == true and timeout_result.cancel_requested == false,
+    "a timeout must not claim cancellation")
+  check(timeout_result.terminal_reason == "timeout",
+    "a timeout must publish the timeout terminal reason")
+  check(timeout_result.cleanup == WheelHost.GROUP_CLEANUP.SWEPT,
+    "a timeout must still sweep the recorded group")
+
+  local sentinel_cancelled, sentinel_info = cancel_sentinel:cancel()
+  check(sentinel_cancelled == true and sentinel_info.state == "requested",
+    "the sentinel cleanup cancel must be accepted")
+  check(cancel_sentinel:wait(5000) ~= nil, "the sentinel must reach a terminal result")
+  check(cancel_target:close() == true, "the cancelled job record must close")
+  check(cancel_timeout and cancel_timeout:close() == true, "the timeout job record must close")
+  check(cancel_sentinel:close() == true, "the sentinel job record must close")
+
+  state.coverage[#state.coverage + 1] =
+    "cancellation: long command cancelled during execution with a distinct terminal reason"
+  state.coverage[#state.coverage + 1] =
+    "cancellation: recorded group swept, child and grandchild gone, unrelated job untouched"
+  state.coverage[#state.coverage + 1] =
+    "cancellation: repeated request idempotent; timeout and cancellation remain distinct"
+  if cancel_cli_used then
+    state.coverage[#state.coverage + 1] =
+      "cancellation: separate scripts/wheel-proc process validated the job and signalled the recorded group"
+  else
+    state.coverage[#state.coverage + 1] =
+      "cancellation: installed-tree handle path only (scripts/ is not packaged)"
+  end
 
   -- 7. Tool paths with real files and commands.
   local WheelTool = require("wheel.tool")
