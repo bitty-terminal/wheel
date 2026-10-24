@@ -88,6 +88,8 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/kernel.lua
     bun run luaparse --quiet --file lua/wheel/config.lua
     bun run luaparse --quiet --file lua/wheel/host.lua
+    bun run luaparse --quiet --file lua/wheel/audit.lua
+    bun run luaparse --quiet --file lua/wheel/job.lua
     bun run luaparse --quiet --file lua/wheel/agent.lua
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
@@ -118,6 +120,8 @@ lua: deps
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/test_provider_stub.lua
     bun run luaparse --quiet --file tests/test_session.lua
+    bun run luaparse --quiet --file tests/test_audit.lua
+    bun run luaparse --quiet --file tests/test_cancel.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
@@ -140,6 +144,31 @@ test-session: deps
     else \
         echo "No lua interpreter found; skipping session-daemon tests" >&2; \
     fi
+
+# Run the execution-audit suite: private modes, bounded records, rotation,
+# hash chain, redaction, fail-closed high-risk spawns, and non-high-risk
+# warning behavior. Real host files and processes; no network.
+test-audit: deps
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-audit requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_audit.lua
+
+# Real-host recorded-process cancellation suite: starts long commands through
+# WheelHost.proc.start, cancels them from the separate scripts/wheel-proc
+# process, and checks prompt exit, orphan cleanup, foreign/stale generation
+# refusal, repeated cancel, timeout distinctness, and cancellation audit.
+test-cancel: deps
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-cancel requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_cancel.lua
 
 # Verify the interpreter-selection branches of `just test` without running the
 # suite: lua5.1 wins when present, luajit/lua fall back in order, and absence is
@@ -229,8 +258,8 @@ verify-package:
 # workflow-*.sh scripts are outside this gate; reformatting them is a separate
 # change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session scripts/wheel-proc
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session scripts/wheel-proc
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and
@@ -294,7 +323,7 @@ lua-control: deps
     @! bun run luaparse --quiet --code 'local ='
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test test-bench test-session lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-audit test-cancel test test-bench test-session lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

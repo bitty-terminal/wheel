@@ -40,6 +40,17 @@ packaging is not part of the 0.1.0 deliverable.
 - **Optional Bitty integration.** Running in a Bitty panel or terminal is
   presentation, not authority. An optional host IPC client for host-visible
   operations is a post-decision follow-up, not a 0.1.0 claim.
+- **Daemon ownership stays with Bitty.** The experimental `wheel-session`
+  daemon is a local/headless/development/CI prototype and transport reference,
+  not Wheel's final daemon. Final lifecycle, IPC and authentication,
+  attach/detach, session registry, generation, and worker supervision belong to
+  `bittyd`
+  ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546),
+  [bitty#2064](https://github.com/bitty-terminal/bitty/issues/2064),
+  [bitty#2218](https://github.com/bitty-terminal/bitty/issues/2218)), which does
+  not ship today. Wheel remains the Coding Agent Harness and will adapt through
+  a replaceable transport adapter. No new Wheel daemon scope is added while
+  that contract is pending.
 - **Policy before code.** [SECURITY-MODEL.md](SECURITY-MODEL.md) owns the
   authority policy, path and role gates, command deny-list, audit, secret
   handling, executable project-config gate, and evidence gates. No capability
@@ -67,6 +78,9 @@ Wheel is not intended to be:
 - a home automation agent
 - a lifelong user-memory system
 - a cron/automation daemon
+- a long-lived session daemon or worker supervisor (the experimental
+  `wheel-session` prototype is developer tooling; the final daemon belongs to
+  `bittyd`)
 - a general cloud-management agent
 
 Wheel is focused on software engineering workflows.
@@ -414,10 +428,11 @@ function classes.
   Evaluation remains in-process with best-effort instruction and string/table
   bounds; direct and method forms of `string.rep`/`table.concat` are capped,
   but `string.format`, patterns, concatenation, sort comparators, and other
-  C-library allocations are not metered. There is no wall-clock kill, memory
-  cgroup, or append-only audit stream, so trust approval cannot yet fail closed
-  on an audit write. The store is not tamper-proof against same-user processes
-  and is not fsynced or signed. Native hashing and host primitives resolve
+  C-library allocations are not metered. The execution audit sink exists, but
+  trust approval does not yet write through it, so approval cannot yet fail
+  closed on an audit write. The store is not tamper-proof against same-user
+  processes and is not fsynced or signed. Native hashing and host primitives
+  resolve
   `sha256sum`/`shasum`/`openssl`, `realpath`/`readlink`, `stat`, `test`, `id`,
   and `mktemp` through `PATH`, which is same-user authority. `trust_file` and
   `global_path` are internal call-site/test overrides, not command or
@@ -476,16 +491,25 @@ keeps its identity so the budget failure is not misreported. The token is not
 reachable from a handler and cannot be forged with a table field; it is not part
 of the public error contract.
 
-| `code`                        | `class`      | Meaning                                                                                                               |
-| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                        |
-| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.    |
-| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                  |
-| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                              |
-| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                            |
-| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.           |
-| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built. |
-| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.            |
+| `code`                        | `class`      | Meaning                                                                                                                           |
+| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                                    |
+| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.                |
+| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                              |
+| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                          |
+| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                        |
+| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                       |
+| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.             |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                        |
+| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic.      |
+| `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                                  |
+| `E_JOB_METADATA_INVALID`      | `runtime`    | A job record is malformed, unowned, wrongly moded, oversized, or names an invalid id/generation; no signal was sent.              |
+| `E_JOB_GENERATION_MISMATCH`   | `runtime`    | The recorded leader generation, process group, session, or owner uid does not match the live retained leader; no signal was sent. |
+| `E_JOB_NOT_RUNNING`           | `runtime`    | The job did not reach `running`, or its retained leader already exited without a terminal record; no signal was sent.             |
+| `E_JOB_BUSY`                  | `runtime`    | The bounded terminal-transition lock stayed held; the request was refused rather than racing the transition.                      |
+| `E_JOB_SIGNAL_FAILED`         | `runtime`    | The recorded process group could not be signalled after validation; the failure is reported without a fallback pattern kill.      |
+| `E_JOB_UNAVAILABLE`           | `runtime`    | The private job root, random source, capture file, or bounded sleep is unavailable; no weaker execution path was used.            |
+| `E_JOB_CLEANUP_FAILED`        | `runtime`    | A terminal job's private files could not be removed; the record was kept for diagnosis and no other path was deleted.             |
 
 `E_COMPLETION_BUDGET_INVALID` is raised by the provider adapters and
 `WheelRunner` before a network request when a `max_completion_tokens` override
@@ -507,6 +531,31 @@ them. The format and bounds are documented in
 cannot be loaded, or on first use when an optional lazy submodule fails. The
 message names the rooted module (for example `wheel.agent`) and keeps only a
 bounded, path-free cause; no stack trace, host path, or secret is included.
+
+`E_AUDIT_UNAVAILABLE` is returned or attached by the process seam when the
+local audit sink cannot write:
+
+- a high-risk pre-spawn failure returns the typed failure with
+  `spawned = false`, no `audit_warning`, and the command is not launched;
+- a lower-risk pre-spawn failure runs the command, sets `audit_warning`, and
+  leaves `audit_error` unset;
+- a completion-record failure after a launched command sets both
+  `audit_error` and `audit_warning` (the command already ran);
+- a denied command whose deny record cannot be written returns `denied = true`,
+  `spawned = false`, and sets both fields, but still does not launch.
+
+Its message is the fixed `the audit record could not be written`; the sink's
+reason code (`no_state_dir`, `audit_directory`, `audit_file`, `audit_corrupt`,
+`rotation_failed`, `write_failed`, `record_too_large`, `hash_unavailable`,
+`invalid_event`) is the static failure class and never a path or value.
+
+The `E_JOB_*` codes are raised only by the recorded-process cancellation
+surface (`WheelHost.proc.start`/`handle:cancel` and `scripts/wheel-proc`). They
+cover a missing record, malformed or foreign metadata, a generation/process-group
+mismatch, an unpublished or already-exited leader, a busy transition lock, a
+failed signal after validation, an unavailable private job root, and a failed
+cleanup of an already terminal record. A refusal never signals anything; the
+message never includes a job id, generation token, pid, or path.
 
 Capability denials use host wording, for example
 `capability 'env.read' is not granted`, and name the capability family
@@ -563,6 +612,17 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   oversized, partial, or cryptographically inconsistent. Re-export from the live
   context instead of editing the snapshot table; see
   [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
+- `E_AUDIT_UNAVAILABLE` — the local audit sink could not write a record. A
+  high-risk spawn is refused before launch; a lower-risk pre-spawn failure runs
+  the command with `audit_warning` and no `audit_error`; a completion failure
+  after launch sets both fields; a denied command whose record cannot be
+  written remains denied with both fields. Check that
+  `$XDG_STATE_HOME/wheel/audit` (or the explicit override) is a real,
+  user-owned `0700` directory with no symlink, and that the active `0600`
+  JSONL file has a complete last line. A torn or corrupt tail blocks the next
+  append; corruption in an earlier retained line does not block appends and is
+  reported by `WheelAudit.verify`. The sink never repairs a torn or corrupt
+  tail silently.
 - `unavailable` from the temp/process primitive — check `mktemp`, `ln`,
   `setsid`, `sleep`, `env`, `timeout`/`gtimeout`, `stat`, `id`, and `sh` on
   `PATH`; these
@@ -592,56 +652,62 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
   `meta.json`, then stop it explicitly with `wheel-session stop` or, after
   manual verification, signal that exact pid. Deleting a live session
   directory leaves the daemon unreachable; it must be stopped by its recorded
-  pid.
+  pid. This prototype has no attach/reattach, generation, or worker-supervision
+  contract; see [Continuation boundary](#continuation-boundary).
 - `just manifest` rejects `bitty-plugin.toml` — the transitional manifest is
   unchanged by the harness position; fix the manifest or the SDK pin rather than
   widening it.
 
 ## Layout
 
-| Path                                      | Purpose                                                                                                                                                                                                              |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `README.md`                               | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                     |
-| `CONTEXT-SNAPSHOT.md`                     | WheelContext snapshot v1 format, canonical encoding, bounds, integrity limits, trust boundary, and excluded state.                                                                                                   |
-| `bitty-plugin.toml`                       | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                          |
-| `lua/wheel/init.lua`                      | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`).  |
-| `lua/wheel/errors.lua`                    | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                      |
-| `lua/wheel/schema.lua`                    | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                              |
-| `lua/wheel/commands.lua`                  | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                    |
-| `lua/wheel/config.lua`                    | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                     |
-| `lua/wheel/host.lua`                      | WheelHost authority seam: explicitly selected standalone POSIX backend for filesystem, process, temporary-file, wall-clock, and CPU-time primitives; typed denials on unsupported platforms or unavailable surfaces. |
-| `lua/wheel/kernel.lua`                    | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                   |
-| `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                              |
-| `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                         |
-| `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                   |
-| `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                           |
-| `lua/wheel/session.lua`                   | Local session control plane (client/shared): bounded strict JSON framing, session-name and private-path validation, metadata, serialization lock, and RPC.                                                           |
-| `lua/wheel/daemon.lua`                    | Detached session daemon: owns one WheelContext, serves the `wheel-session/1` methods over private FIFOs, and shuts down explicitly.                                                                                  |
-| `lua/wheel/session_cli.lua`               | Script entry point used by `scripts/wheel-session`; bootstraps the module path and prints structured results.                                                                                                        |
-| `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                         |
-| `lua/wheel/provider.lua`                  | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                       |
-| `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                 |
-| `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                          |
-| `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                  |
-| `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                       |
-| `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                   |
-| `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                               |
-| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                               |
-| `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                         |
-| `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                           |
-| `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                            |
-| `tests/test_live_provider_selection.py`   | Key-free offline selector test: default/case-insensitive selection, per-provider key and host binding, HTTPS-only requests, and fail-closed diagnostics.                                                             |
-| `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                |
-| `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                       |
-| `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                |
-| `scripts/install-local.sh`                | Offline install/upgrade/rollback under `<prefix>/wheel/<version>` with digest, prefix, ownership, and symlink checks.                                                                                                |
-| `scripts/wheel-session`                   | POSIX shell CLI for the experimental local session daemon: start/stop, ping/status/snapshot, context put/get/list, and bounded client calls.                                                                         |
-| `scripts/verify-package.sh`               | Builds, installs, runs the real-host fixture on the installed tree, upgrades, rolls back, and tests refusals.                                                                                                        |
-| `dist/`                                   | Gitignored package output (`wheel-<version>.tar.gz`, `.sha256`, `.manifest.json`).                                                                                                                                   |
-| `package.json`                            | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                     |
-| `bun.lock`                                | Locked dependency graph installed by `just install`.                                                                                                                                                                 |
-| `justfile`                                | Quality gates with pinned tool versions, including the SDK README checker in `just check` and the package/install recipes.                                                                                           |
-| `.github/workflows/ci.yml`                | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                               |
+| Path                                      | Purpose                                                                                                                                                                                                                                                                                                                    |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `README.md`                               | Canonical user document: the six required H2 sections plus developer and architecture reference.                                                                                                                                                                                                                           |
+| `CONTEXT-SNAPSHOT.md`                     | WheelContext snapshot v1 format, canonical encoding, bounds, integrity limits, trust boundary, and excluded state.                                                                                                                                                                                                         |
+| `bitty-plugin.toml`                       | Transitional v1 plugin manifest (identity, compatibility, capability requests, lazy triggers). Retained unchanged by CTX-0010; not the 0.1.0 distribution path, and removal is a follow-up.                                                                                                                                |
+| `lua/wheel/init.lua`                      | Harness entry point and legacy command surface (14 command definitions: `hello`, `status`, `graph`, `plan`, `run`, `trust`, `team`, `context`, `tools`, `orchestrate`, `models`, `branch`, `checkpoint`, `reflog`).                                                                                                        |
+| `lua/wheel/errors.lua`                    | Typed command failure boundary: capability denials in the accepted bridge shape, validation failures, and a Wheel-local generic internal error.                                                                                                                                                                            |
+| `lua/wheel/schema.lua`                    | Bounded command schema validator: finite vocabulary, registration admission, invocation argument checks, and typed validation failures.                                                                                                                                                                                    |
+| `lua/wheel/commands.lua`                  | Command registration layer: no-argument/result schema factories, host-bounded result truncation, argument/result dispatch checks.                                                                                                                                                                                          |
+| `lua/wheel/config.lua`                    | WheelConfig loader: hierarchical layering, executable project-config trust gate, and skill capability discovery.                                                                                                                                                                                                           |
+| `lua/wheel/host.lua`                      | WheelHost authority seam: explicitly selected standalone POSIX backend for filesystem, process, temporary-file, wall-clock, and CPU-time primitives; synchronous run primitives plus the asynchronous job handle (`start`/`poll`/`wait`/`cancel`/`close`); typed denials on unsupported platforms or unavailable surfaces. |
+| `lua/wheel/job.lua`                       | Private process-job record and recorded-group cancellation: `0700`/`0600` metadata, random job/generation tokens, generation validation against the live retained leader, TERM/grace/KILL, terminal-reason lock, and typed job failures.                                                                                   |
+| `lua/wheel/audit.lua`                     | Local append-only execution audit sink: `0700`/`0600` JSONL, 16 KiB records, 1 MiB x 4 rotation, SHA-256 previous-hash chain, redaction markers, cancellation fields, size-based tail refresh for sequential cross-process writers, and typed `E_AUDIT_UNAVAILABLE` failures.                                              |
+| `lua/wheel/kernel.lua`                    | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                                                                                                                         |
+| `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                                                                                                                                    |
+| `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                                                                                                                               |
+| `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                                                                                                                         |
+| `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                                                                                                                                 |
+| `lua/wheel/session.lua`                   | Local session control plane (client/shared): bounded strict JSON framing, session-name and private-path validation, metadata, serialization lock, and RPC.                                                                                                                                                                 |
+| `lua/wheel/daemon.lua`                    | Detached session daemon: owns one WheelContext, serves the `wheel-session/1` methods over private FIFOs, and shuts down explicitly.                                                                                                                                                                                        |
+| `lua/wheel/session_cli.lua`               | Script entry point used by `scripts/wheel-session`; bootstraps the module path and prints structured results.                                                                                                                                                                                                              |
+| `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                                                                                                                               |
+| `lua/wheel/provider.lua`                  | WheelProvider abstraction: line-buffered SSE streaming parser, tool formatters, and adapters (Mock, OpenAI, Anthropic, Stdio).                                                                                                                                                                                             |
+| `lua/wheel/runner.lua`                    | WheelRunner execution loop: autonomous ReAct turn loop, streaming token callbacks, tool dispatch, and checkpointing.                                                                                                                                                                                                       |
+| `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                                                                                                                                |
+| `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                                                                                                                        |
+| `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                                                                                                                             |
+| `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                                                                                                                         |
+| `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                                                                                                                                     |
+| `tests/test_audit.lua`                    | Execution-audit suite (`just test-audit`): append/rotation, private modes, hash chain, redaction, 16 KiB bounds, high-risk fail-closed, non-high-risk warning, and denied no-spawn behavior.                                                                                                                               |
+| `tests/test_cancel.lua`                   | Real cancellation suite (`just test-cancel`): separate CLI process, prompt terminal result, no orphan/unrelated signal, repeated cancel, timeout/cancel race, forged/stale generation refusal, and audit.                                                                                                                  |
+| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                                                                                                                                     |
+| `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                                                                                                                               |
+| `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                                                                                                                                 |
+| `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                                                                                                                                  |
+| `tests/test_live_provider_selection.py`   | Key-free offline selector test: default/case-insensitive selection, per-provider key and host binding, HTTPS-only requests, and fail-closed diagnostics.                                                                                                                                                                   |
+| `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                                                                                                                      |
+| `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                                                                                                                             |
+| `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                                                                                                                      |
+| `scripts/install-local.sh`                | Offline install/upgrade/rollback under `<prefix>/wheel/<version>` with digest, prefix, ownership, and symlink checks.                                                                                                                                                                                                      |
+| `scripts/wheel-session`                   | POSIX shell CLI for the experimental local session daemon: start/stop, ping/status/snapshot, context put/get/list, and bounded client calls.                                                                                                                                                                               |
+| `scripts/wheel-proc`                      | POSIX shell cancellation client: `cancel <job-id>`, explicit `--root`, bounded grace, one JSON result, and no name/pattern signal.                                                                                                                                                                                         |
+| `scripts/verify-package.sh`               | Builds, installs, runs the real-host fixture on the installed tree, upgrades, rolls back, and tests refusals.                                                                                                                                                                                                              |
+| `dist/`                                   | Gitignored package output (`wheel-<version>.tar.gz`, `.sha256`, `.manifest.json`).                                                                                                                                                                                                                                         |
+| `package.json`                            | Pinned dev dependencies: the `bitty-plugin-sdk` commit (manifest linter and README docs checker) and `luaparse`.                                                                                                                                                                                                           |
+| `bun.lock`                                | Locked dependency graph installed by `just install`.                                                                                                                                                                                                                                                                       |
+| `justfile`                                | Quality gates with pinned tool versions, including the SDK README checker in `just check` and the package/install recipes.                                                                                                                                                                                                 |
+| `.github/workflows/ci.yml`                | CI gate with a read-only token and SHA-pinned actions.                                                                                                                                                                                                                                                                     |
 
 ## Architecture
 
@@ -669,6 +735,70 @@ context budgets:
 - **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
 - **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
 - **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (bounded chunked reads; line ranges apply inside the bounded prefix, a `start_line` beyond it fails loud, and a prefix ending inside an included line reports `truncated=true` with a marker), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (bounded process execution with a timeout, a `setsid`-recorded process group held by a retained leader through the TERM/grace/KILL sweep, scrubbed environment, typed timeout/unavailable/cleanup outcomes, and metrics), `list_directory` (fails closed on `ls` errors/timeouts), `search_code` (bounded `grep` capture before the 100-line observation cap; grep errors fail closed), and `read_blob`.
+
+### Process Cancellation (CTX-0034)
+
+`WheelHost.proc.start(program, args, opts)` starts a bounded command without
+blocking and returns a handle with `poll()`, `wait(timeout_ms)`, `cancel(opts)`,
+and `close()`. `run_program` and `run_command` keep their synchronous contract;
+they do not expose the handle. A job is one private `0700` directory under
+`$XDG_RUNTIME_DIR/wheel/jobs` (or the explicit `opts.job_root`) containing an
+owned `0600` metadata record: a 32-hex job id, a random generation token, the
+recorded leader PID/PGID, the timeout, and optional audit identity. Capture
+files are `0600`; a caller passes the job id to the external client, plus
+`--root` when the job uses an explicit non-default job root.
+
+```sh
+scripts/wheel-proc cancel <job-id> [--root <job-root>] [--grace-ms <ms>]
+```
+
+The CLI validates the id, metadata ownership/mode/size, and the live retained
+leader's generation and real/effective uid (`/proc/<pid>` on Linux, with a
+`ps -ww` fallback), then signals only the recorded process group. A foreign or
+credential-transitioned leader is refused with `E_JOB_GENERATION_MISMATCH`
+before any signal. The backend accepts signal 0 for a liveness probe and
+TERM/KILL for cancellation; the CLI uses TERM/KILL only. There is no name- or
+pattern-based kill.
+The request sends TERM while holding the terminal-transition lock, publishes
+`cancelled` before releasing it, then waits the bounded grace (250 ms by
+default, at most 2 s) and sends KILL to the same recorded group only if the
+leader is still present. A refused TERM never leaves a `cancelled` terminal
+record behind. The retained leader ignores TERM while it waits for the direct
+child, so the recorded PGID cannot be reused during the sweep; the leader's
+normal TERM/grace/KILL sweep still runs after the direct child exits.
+
+The result distinguishes cancellation from timeout: `cancel_requested = true`,
+`terminal_reason = "cancelled"`, `outcome = "cancelled"`, and `timed_out = false`.
+A timeout keeps `terminal_reason = "timeout"` and `timed_out = true`. Repeated
+cancellation is idempotent (`already_requested`/`already_cancelled`); a job that
+already published `exited` or `timeout` is a typed no-op (`already_exited`, CLI
+exit 3, no signal); a missing or unpublished job is refused (`E_JOB_NOT_FOUND`
+or `E_JOB_NOT_RUNNING`) before any signal. A tampered generation, process group,
+session, or owner uid is refused with `E_JOB_GENERATION_MISMATCH`; a foreign PID
+is never signaled.
+
+When `opts.audit` is supplied to `start`, the pre-spawn record is followed by
+`process.cancel_requested`, `process.cancel_outcome`, and a completion record
+carrying `cancel_requested`, `terminal_reason`, and `outcome = "cancelled"`.
+A high-risk cancellation whose request record cannot be written is refused
+before any signal; a low-risk failure continues with `audit_warning`. The audit
+sink re-reads its tail when another process appended, so the sequential CLI and
+harness writers continue one chain; simultaneous appenders remain the documented
+cross-process residual.
+
+`just test-cancel` starts real long commands, cancels them from the separate
+`scripts/wheel-proc` process, and checks prompt exit, no child/grandchild orphan,
+no signal to an unrelated recorded job, repeated cancel, timeout/cancel
+distinctness, the timeout race, forged/stale generation refusal, and the
+cancellation audit. The real-host fixture also exercises the handle path and,
+in a development checkout, the CLI path. The 0.1.0 library artifact does not
+package `scripts/`, so the installed-tree fixture uses the handle API; the CLI
+is a checkout/operator surface. Cancellation is same-user only: a same-user
+process can read the private job record and act with the same OS authority.
+Cross-user isolation is not claimed, and Windows remains unsupported (the
+standalone host and the POSIX shell client fail closed). A child that calls
+`setsid` or joins another process group can still leave the recorded group; that
+orphan residual is unchanged.
 
 ### Autonomous Wave Orchestration & Task Execution Loop
 
@@ -707,6 +837,15 @@ Wheel models agent context as an immutable, content-addressed versioned DAG insp
 - **Task-Isolated Workflows**: Multi-agent wave orchestration supports running worker tasks in dedicated task branches (`task/<id>`), merging deliverables into `main` upon reviewer acceptance.
 
 ### Local Session Daemon (Experimental)
+
+> **Prototype, not the final daemon.** `scripts/wheel-session` is an
+> experimental local/headless/development/CI prototype and a transport
+> reference. It is same-user only and is not a substitute for `bittyd`, which
+> owns the final lifecycle, IPC and authentication, attach/detach, session
+> registry, generation, and worker supervision. `bittyd` does not ship today.
+> Wheel remains the Coding Agent Harness and will adapt through a replaceable
+> transport adapter; no new Wheel daemon scope is added while that contract is
+> pending.
 
 A Wheel runtime can outlive one client. `scripts/wheel-session start NAME`
 prepares a private per-session runtime directory, launches
@@ -773,6 +912,35 @@ expose a network service. The same-user FIFO residual is recorded in
 [SECURITY-MODEL.md](SECURITY-MODEL.md). The `scripts/wheel-session` CLI is
 repository-local developer tooling; it is not part of the 0.1.0 library
 artifact.
+
+#### Continuation boundary
+
+The prototype deliberately promises less than a session host:
+
+- **Client lifetime is not worker lifetime.** Closing a Bitty panel or a
+  `wheel-session` client is not a promise that a Wheel worker continues.
+  Presentation ends at the client; worker lifetime is a separate execution
+  concern that this prototype does not attach, reattach, or supervise.
+- **Stop, crash, and reboot need the upstream contract.** The prototype's
+  `stop` is an explicit shutdown of the process it started, and its metadata is
+  private local state, not a durable session registry. Continuation after a
+  daemon stop, a daemon crash, or a host reboot requires the `bittyd` contract;
+  this slice makes no recovery or restart promise for those events.
+- **`bittyd` owns the final daemon.** Final daemon lifecycle, IPC and
+  authentication, attach/detach, session registry, generation, and worker
+  supervision belong to `bittyd`
+  ([bitty#2546](https://github.com/bitty-terminal/bitty/issues/2546),
+  [bitty#2064](https://github.com/bitty-terminal/bitty/issues/2064),
+  [bitty#2218](https://github.com/bitty-terminal/bitty/issues/2218)), not to
+  additional Wheel daemon features. `bittyd` does not ship today, and this
+  repository does not claim otherwise.
+- **No competing Wheel daemon.** Wheel CTX-0031
+  ([wheel#101](https://github.com/bitty-terminal/wheel/issues/101)) records the
+  same boundary in its blocked note (CarryCtx PX-0195): cancellation work waits
+  for the `bittyd` session-host, ownership, generation, IPC,
+  worker-supervision, and cancellation contract, and non-daemon cancellation
+  may be re-scoped separately. Wheel adds no new daemon scope while that
+  contract is pending.
 
 ## Development
 
@@ -864,25 +1032,29 @@ outside-workspace paths, the destructive-command deny-list, the read-only role
 gate, and unsupported backends. Process evidence covers a real timeout with a
 child-plus-grandchild process-group check, a normal-exit background-child sweep
 with status preservation and the recorded PGID, a scrubbed-environment probe
-(harness and secret-shaped variables absent), stdin round-trip, and typed
-timeout results. Temporary-file evidence covers exclusive `0600` creation and
-refusal of a pre-existing file and symlink. Activation is measured cold and
-warm with `os.clock()` and a `debug.sethook` instruction count against RC-1
-(10^7 instructions, 50 ms CPU, 8 ms warning); the series, interpreter, CPU, OS,
-and revision are written to `recording/real-host-2026-10-21.md`, which is
+(harness and secret-shaped variables absent), stdin round-trip, typed timeout
+results, and CTX-0034 cancellation: a long command cancelled through the handle
+(and, in a development checkout, the separate `scripts/wheel-proc` process)
+with a distinct `cancelled` terminal reason, a swept group, no child/grandchild
+orphan, an untouched unrelated recorded job, an idempotent repeat, and a
+timeout/cancel distinction. Temporary-file evidence covers exclusive `0600`
+creation and refusal of a pre-existing file and symlink. Activation is measured
+cold and warm with `os.clock()` and a `debug.sethook` instruction count against
+RC-1 (10^7 instructions, 50 ms CPU, 8 ms warning); the series, interpreter, CPU,
+OS, and revision are written to `recording/real-host-2026-10-21.md`, which is
 gitignored durable scratch rather than a committed artifact.
 
 Evidence limits: the fixture is offline and uses no credentials. It is
 implementation evidence, not a release claim and not full Gate 2 evidence. It
-does not cover asynchronous cancellation (not implemented), OS sandboxing, or a
-Bitty panel/terminal presentation run. A grandchild that calls `setsid` or joins
-another process group can leave the setsid-recorded process group; timeout
-enforcement is not a real-time guarantee; and disk capture during a run has no
-per-file quota. The session
-leader is retained through the sweep, so the recorded PGID cannot be reused
-while the group is signaled; if the leader is killed before the sweep, no
-signal is sent, `cleanup` reports `unverified`, and descendants may survive
-(CTX-0021 / wheel#81).
+does not cover OS sandboxing or a Bitty panel/terminal presentation run.
+Cancellation is same-user only and the installed-tree run exercises the handle
+rather than the CLI because `scripts/` is not packaged. A grandchild that calls
+`setsid` or joins another process group can leave the setsid-recorded process
+group; timeout enforcement is not a real-time guarantee; and disk capture during
+a run has no per-file quota. The session leader is retained through the sweep,
+so the recorded PGID cannot be reused while the group is signaled; if the leader
+is killed before the sweep, no signal is sent, `cleanup` reports `unverified`,
+and descendants may survive (CTX-0021 / wheel#81).
 `os.clock()` measures process CPU time, not elapsed wall clock; CPU frequency
 is not pinned, and one host runs one interpreter per run. The record is not a
 canonical specification and does not satisfy SECURITY-MODEL.md Gate 2 on its
@@ -951,8 +1123,10 @@ a CRLF-bearing key is reported only as a static exception type; non-loopback
 hosts, userinfo, query strings, fragments, other paths, other methods, and
 redirects are refused. The key reaches only child environments (never argv or a
 request file). The gate runs in `just check` and CI; `tests/PROVIDER-STUB.md`
-records the trust boundary and limits. Audit output, asynchronous cancellation,
-and Bitty panel presentation remain open Gate 2 items.
+records the trust boundary and limits. The real-host fixture also reads the
+execution audit JSONL after a permitted and a denied command, and CTX-0034 adds
+the cancellation evidence described above; Bitty panel presentation remains an
+open Gate 2 item.
 
 ## Benchmarks
 
@@ -1009,6 +1183,65 @@ fixture evidence (owner D7).
 The in-tree `bitty-plugin.toml` still requests only `platform.notify` and is
 unchanged by the position record. It is transitional, must not be widened, and
 does not describe harness authority; removal is a follow-up task.
+
+## Audit and logging
+
+Wheel has a local, append-only execution audit stream in
+`lua/wheel/audit.lua`. The default location is
+`$XDG_STATE_HOME/wheel/audit/`, falling back to
+`$HOME/.local/state/wheel/audit/`; an explicit directory override exists only
+for tests and embedders. The directory is repaired to `0700`, every record file
+is an owned, singly linked `0600` regular file, and a symbolic link, foreign
+owner, or weaker mode is refused.
+
+- **Format.** One JSON object per line (`wheel-audit/1`). Recorded fields are
+  the event name, sequence number, previous and current SHA-256 hash, wall-clock
+  time, role/agent/task/tool/intent when supplied, redacted argv or shell
+  command, cwd, allow/deny decision and reason, risk class, and, for a
+  completion, exit status, duration, truncation, outcome, and process-group
+  cleanup. Prompts, output, environment values, file contents, provider
+  responses, and authorization header values are never record fields.
+- **Bounds.** A record is at most 16 KiB. The active file rotates at 1 MiB and
+  four files are retained (`audit.jsonl` plus `audit.1.jsonl` through
+  `audit.3.jsonl`), so the stream is bounded at 4 MiB. A torn or corrupt
+  **tail** fails the next append closed instead of being repaired silently.
+  Opening the sink reads only the tail, so corruption in an earlier retained
+  line does not block appends; `WheelAudit.verify` scans the retained files and
+  reports the first broken line.
+- **Chain.** Each record carries a monotonic `seq` and the previous record's
+  `hash`; `hash` is the SHA-256 of the canonical record without that field.
+  `WheelAudit.verify` walks the retained files and reports the first broken
+  line. This raises the cost of silent edits within the retained files; it is
+  not a same-user boundary, and the stream is not externally anchored.
+- **Redaction.** Command previews, argv elements, metadata, and reasons pass
+  header, flag, environment-assignment, query, token-shape, and URL-userinfo
+  passes. A credential-bearing header is removed as a complete value (name,
+  scheme, and every parameter), including escaped JSON keys/values and shell
+  quotes; an ambiguous escaped JSON value is over-redacted through the end of
+  the preview rather than guessing a closing delimiter. Secret-shaped
+  environment assignments and flags replace their complete quoted or unquoted
+  shell value. A removed value becomes
+  `[redacted:<16 hex of its SHA-256>]`, so the
+  same value correlates across events without being recoverable from the
+  record. Pattern redaction is heuristic for a value Wheel did not load itself.
+- **Process boundary.** `WheelHost.proc.run_program` and `run_command` accept an
+  optional `opts.audit` table. When supplied, a pre-spawn record is written
+  before the wrapper launches and a completion record after the bounded sweep.
+  A `deny` decision is a recorded refusal and never launches. When
+  `opts.audit.high_risk` is true, a failed pre-spawn write returns the typed
+  `E_AUDIT_UNAVAILABLE` failure and the command is not launched. A lower-risk
+  write failure continues with `result.audit_warning`.
+- **Current scope.** The sink is opt-in. No tool or trust call site supplies
+  `opts.audit` yet, so a normal run does not create an audit directory and the
+  policy's mandatory pre-spawn record is not yet applied to every invocation.
+  Default-on wiring, cross-process append serialization, and trust-approval
+  records are follow-ups. This is implemented evidence, not a completed Gate 1
+  or Gate 2 claim.
+
+Inspect the stream with an ordinary line reader, for example
+`tail -n 20 "$XDG_STATE_HOME/wheel/audit/audit.jsonl"`. `just test-audit` covers
+the sink and `tests/real_host_fixture.lua` reads the JSONL after a real
+permitted and denied command as Gate 2 evidence.
 
 ## Plugin API surface (transitional)
 

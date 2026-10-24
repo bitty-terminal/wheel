@@ -8,6 +8,74 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Real asynchronous process cancellation (CTX-0034, extracted from CTX-0031):
+  `WheelHost.proc.start(program, args, opts)` starts a bounded command without
+  blocking and returns a handle with `poll`, `wait`, `cancel`, and `close`;
+  `run_program`/`run_command` keep their synchronous contract. Each job is a
+  private `0700` directory with an owned `0600` record carrying a 32-hex job id,
+  a random generation token, the recorded leader PID/PGID, the timeout, and
+  optional audit identity. `scripts/wheel-proc cancel <job-id>` validates the
+  record and the live leader generation (`/proc`/`ps`), then signals only the
+  recorded process group: TERM, a bounded grace (250 ms default), and KILL only
+  if the group is still present. There is no name- or pattern-based kill.
+  Cancellation publishes a first-writer-wins `cancelled` terminal reason and is
+  distinct from timeout in the result and audit (`cancel_requested`,
+  `terminal_reason`, `outcome = "cancelled"`); repeated cancel is idempotent,
+  cancel-after-exit is a typed no-op, cancel-before-spawn is refused, and a
+  forged/stale generation or foreign PID is never signaled. The audit sink
+  re-reads its tail when another process appended, so sequential CLI and harness
+  writers continue one chain. `just test-cancel` exercises the real separate CLI
+  process, no-orphan/unrelated-job checks, the timeout race, and the audit; the
+  real-host fixture adds a Gate 2 cancellation section. Cancellation is
+  same-user only, the 0.1.0 library artifact does not package `scripts/`, and
+  Windows remains unsupported/fail-closed. No daemon, session registry,
+  attach/detach, or bittyd protocol is added by this slice.
+- Opt-in OpenRouter caller attribution (CTX-0032 / wheel#102):
+  `OpenAIAdapter.new` accepts an optional `attribution` block (`referer`,
+  `title`, optional `categories` array, and `visibility = "hidden"`) and sends
+  `HTTP-Referer`, `X-OpenRouter-Title`, `X-OpenRouter-Categories`, and
+  `X-OpenRouter-App-Visibility` only when configured. `WheelProvider.create`
+  forwards it for the `openai` and `deepseek` routes. An absent block sends no
+  identity headers, and no product URL, title, or category is defaulted.
+  Values are validated fail-closed (absolute `http`/`https` referer with a
+  complete host and optional `1..65535` port, printable ASCII, no userinfo,
+  one or two lowercase `[a-z0-9-]{1,30}` categories, a 120-byte title, plain
+  table, known fields) with the typed `E_ARGS_INVALID` code before any HTTP
+  request; caller header maps cannot inject or override adapter-owned
+  headers. `ATTRIBUTION.md` records
+  the identity/title/icon relationship and the deferred
+  `https://wheel.bitty.run` switch. No OpenRouter application is created, and
+  the broader attribution decision remains open.
+- Local append-only execution audit stream (CTX-0030 / wheel#98):
+  `lua/wheel/audit.lua` writes one JSON object per line under
+  `$XDG_STATE_HOME/wheel/audit/` (fallback
+  `$HOME/.local/state/wheel/audit/`), repairs the directory to `0700`, keeps
+  every record file an owned `0600` regular file, bounds records at 16 KiB,
+  rotates at 1 MiB with four retained files, and carries a monotonic sequence
+  plus a SHA-256 previous-hash chain. Command previews, argv, metadata, and
+  reasons are redacted with stable `[redacted:<SHA-256 prefix>]` markers;
+  prompts, output, environment values, file contents, provider responses, and
+  authorization header values are never record fields. `WheelHost.proc`
+  accepts an optional `opts.audit` table and writes pre-spawn and completion
+  records; a `deny` decision never launches, and a high-risk spawn whose
+  pre-spawn record cannot be written returns the typed `E_AUDIT_UNAVAILABLE`
+  failure without spawning. Lower-risk failures continue with a visible
+  `result.audit_warning`. `just test-audit` covers append, rotation, private
+  modes, chain, redaction, bounds, fail-closed, and warning behavior; the
+  real-host fixture reads the JSONL after a real permitted and denied command.
+  Review hardening consumes the complete Authorization and Proxy-Authorization
+  value for Token/ApiKey/SSWS/Digest/AWS4 and quoted/JSON forms, including
+  shell-escaped JSON keys/values (ambiguous escaped values are over-redacted
+  through the end of the preview), and replaces complete quoted or unquoted
+  values for authorization environment assignments and flags, including
+  escaped inner quotes. It also refuses
+  an unsafe active audit file (symlink or weak mode), rejects `opts.audit` with
+  an injected `command_runner`, reports `spawned = false` on a high-risk
+  refusal, and documents that only a torn/corrupt tail blocks append while
+  `WheelAudit.verify` scans earlier corruption. The sink is intentionally
+  opt-in in this slice: tool and trust call sites do not yet supply audit
+  metadata, and default-on wiring plus cross-process append serialization
+  remain follow-ups.
 - Offline Gate 2 provider-stub evidence (CTX-0029 / wheel#95): `just
 test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   (`tests/provider_stub.py`), performs one completion through the real
@@ -25,9 +93,9 @@ test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   missing-key probe backed by an explicit `unset`, a key-bearing-argv guard
   before `argparse`, missing-authorization 401, query/fragment and redirect
   refusal, a graceful SIGTERM shutdown marker, and a non-vacuous `/proc`
-  cmdline check. The gate is part of `just check` and CI; audit output,
-  asynchronous cancellation, and panel presentation remain open Gate 2 items
-  (`SECURITY-MODEL.md`, `tests/PROVIDER-STUB.md`).
+  cmdline check. The gate is part of `just check` and CI; audit output and
+  panel presentation remain open Gate 2 items (`SECURITY-MODEL.md`,
+  `tests/PROVIDER-STUB.md`). CTX-0034 later added cancellation evidence.
 - Experimental local session daemon (CTX-0024 / wheel#85): a detached per-user
   process owns one `WheelContext` and serves the bounded `wheel-session/1`
   control plane over private POSIX FIFOs. `scripts/wheel-session` starts, probes,
@@ -90,7 +158,7 @@ test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   and revision recorded in gitignored `recording/real-host-2026-10-21.md`.
   This is implementation evidence only, not a release claim or full Gate 2
   evidence; CTX-0016 later added the process timeout, process-group, and
-  scrubbed-environment bounds, while asynchronous cancellation remains open.
+  scrubbed-environment bounds, and CTX-0034 added asynchronous cancellation.
 - Versioned 0.1.0 harness artifact (CTX-0018 / wheel#58): the root `VERSION`
   file is the single version source, and `just package` builds the deterministic
   `dist/wheel-0.1.0.tar.gz` with a SHA-256 sidecar and a manifest record. The

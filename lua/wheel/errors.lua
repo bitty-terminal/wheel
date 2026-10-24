@@ -35,6 +35,15 @@ WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
+WheelErrors.E_AUDIT_UNAVAILABLE = "E_AUDIT_UNAVAILABLE"
+WheelErrors.E_JOB_NOT_FOUND = "E_JOB_NOT_FOUND"
+WheelErrors.E_JOB_METADATA_INVALID = "E_JOB_METADATA_INVALID"
+WheelErrors.E_JOB_GENERATION_MISMATCH = "E_JOB_GENERATION_MISMATCH"
+WheelErrors.E_JOB_NOT_RUNNING = "E_JOB_NOT_RUNNING"
+WheelErrors.E_JOB_BUSY = "E_JOB_BUSY"
+WheelErrors.E_JOB_SIGNAL_FAILED = "E_JOB_SIGNAL_FAILED"
+WheelErrors.E_JOB_UNAVAILABLE = "E_JOB_UNAVAILABLE"
+WheelErrors.E_JOB_CLEANUP_FAILED = "E_JOB_CLEANUP_FAILED"
 WheelErrors.MESSAGE_MAX_LENGTH = 160
 
 local CLASSES = {
@@ -204,6 +213,51 @@ function WheelErrors.snapshot_invalid(detail)
     WheelErrors.E_SNAPSHOT_INVALID,
     "invalid context snapshot: " .. reason
   )
+end
+
+--- Build a typed audit-sink failure.
+-- The message is deliberately static: an audit path, a filesystem diagnostic,
+-- or an event value could embed a secret, so the caller receives only the
+-- stable code and a fixed explanation. The sink's separate reason code names
+-- the failure class (directory, permissions, corruption, write) without any
+-- recorded value.
+-- @return table
+function WheelErrors.audit_unavailable()
+  return typed(
+    WheelErrors.CLASS_RUNTIME,
+    WheelErrors.E_AUDIT_UNAVAILABLE,
+    "the audit record could not be written"
+  )
+end
+
+--- Build a typed cancellation/job failure.
+-- The message is a short static diagnostic; it never includes a job id, a
+-- generation token, a pid, or a filesystem path.
+-- @param code string One of the E_JOB_* constants.
+-- @param detail string? short reason
+-- @return table
+function WheelErrors.job_failure(code, detail)
+  local accepted = false
+  for _, candidate in ipairs({
+    WheelErrors.E_JOB_NOT_FOUND,
+    WheelErrors.E_JOB_METADATA_INVALID,
+    WheelErrors.E_JOB_GENERATION_MISMATCH,
+    WheelErrors.E_JOB_NOT_RUNNING,
+    WheelErrors.E_JOB_BUSY,
+    WheelErrors.E_JOB_SIGNAL_FAILED,
+    WheelErrors.E_JOB_UNAVAILABLE,
+    WheelErrors.E_JOB_CLEANUP_FAILED,
+  }) do
+    if candidate == code then
+      accepted = true
+      break
+    end
+  end
+  local message = "wheel job operation failed"
+  if accepted and type(detail) == "string" and detail ~= "" then
+    message = detail
+  end
+  return typed(WheelErrors.CLASS_RUNTIME, accepted and code or WheelErrors.E_INTERNAL, message)
 end
 
 -- Loader diagnostics can carry the interpreter's package search path, which

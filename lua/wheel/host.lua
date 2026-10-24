@@ -15,6 +15,7 @@
 --   WheelHost.fs.read_file(path)            read a whole file
 --   WheelHost.fs.read_file_bounded(path, n) read at most n bytes, chunked
 --   WheelHost.fs.write_file(path, content)  write a whole file
+--   WheelHost.fs.append_file(path, content) append to a private 0600 file
 --   WheelHost.fs.create_private_file(path, content)
 --                                           exclusive 0600 regular file at a path
 --   WheelHost.fs.link_exclusive(from, to)   create a hard link without replacing
@@ -22,6 +23,8 @@
 --   WheelHost.fs.open_fifo(path)            open a verified 0600 FIFO read/write
 --   WheelHost.fs.remove_dir(path)           remove one empty directory
 --   WheelHost.fs.chmod(path, mode)          set a file mode
+--   WheelHost.fs.mkdir(path)                create one 0700 directory exclusively
+--   WheelHost.fs.random_bytes(count)        host random bytes (/dev/urandom)
 --   WheelHost.fs.rename(from, to)           atomically rename within a filesystem
 --   WheelHost.fs.remove_file(path)          remove a file
 --   WheelHost.fs.exists(path)               test for a readable file
@@ -33,6 +36,14 @@
 --   WheelHost.proc.run_program(program, args, opts?)
 --                                           run argv with stdin, cwd, timeout,
 --                                           output cap, and scrubbed env
+--   WheelHost.proc.start(program, args, opts?)
+--                                           start a recorded job handle
+--                                           (poll/wait/cancel/close)
+--   WheelHost.proc.start_command(shell, opts?)
+--                                           start a shell-string job handle
+--   WheelHost.proc.cancel_job(job_id, opts?)
+--                                           cancel a recorded job by id
+--   WheelHost.proc.signal_group(pgid, sig)  recorded-PGID liveness/TERM/KILL
 --   WheelHost.proc.shell_quote(value)       quote one POSIX shell argument
 --   WheelHost.proc.pid()                    current process id
 --   WheelHost.proc.is_alive(pid)            `kill -0` liveness probe
@@ -43,6 +54,7 @@
 --                                           exclusive 0600 file at a given path
 --   WheelHost.time.now()                    wall-clock seconds
 --   WheelHost.time.clock()                  CPU seconds
+--   WheelHost.time.sleep_ms(ms)             bounded host sleep
 --
 -- Backend selection (Option B):
 -- The harness runs out of process and holds execution authority, so the
@@ -100,18 +112,60 @@
 -- `WheelHost.backend` is the documented swap point for tests; call sites never
 -- touch it directly.
 --
+-- Execution audit (CTX-0030):
+-- `proc.run_program(program, args, opts)`, `proc.run_command(shell, env, opts)`,
+-- and the asynchronous `proc.start` handle accept an optional `opts.audit`
+-- table. The sink is opt-in: omitting it
+-- never resolves, creates, or writes an audit directory, so existing call
+-- sites and tests are unchanged. When supplied, the table may carry `dir` (an
+-- explicit test/embedding override), `role`, `agent`, `task`, `tool`, `intent`,
+-- `decision` (`"allow"` or `"deny"`), `reason`, and `high_risk`. A pre-spawn
+-- record with the redacted argv or shell command, cwd, decision, reason, and a
+-- stable command hash is written before the wrapper launches; a completion
+-- record carries exit status, duration, truncation, and group cleanup. A
+-- `"deny"` decision is a recorded refusal and never launches. When
+-- `high_risk` is true and the pre-spawn write fails, the command is not
+-- launched and the result carries the typed `E_AUDIT_UNAVAILABLE` error; a
+-- lower-risk write failure continues with `result.audit_warning` set. The
+-- process result therefore may also carry `spawned`, `denied`, `audit_error`,
+-- and `audit_warning`. A recorded job also writes `process.cancel_requested`
+-- and `process.cancel_outcome` through the same opt-in sink; a high-risk
+-- cancellation whose request record cannot be written is refused before any
+-- signal, while a lower-risk failure continues with `audit_warning`. Full
+-- prompts, output, environment values, file contents, and provider responses
+-- are never passed to the sink.
+--
 -- Process result shape: every `proc.*` primitive returns
 -- { ok, code, exit_code, stdout, stderr, timed_out, truncated,
---   stdout_truncated, stderr_truncated, outcome, cleanup, pgid? } where `ok`
+--   stdout_truncated, stderr_truncated, outcome, cleanup, pgid?,
+--   cancel_requested?, terminal_reason?, job_id? } where `ok`
 -- reports that the execution was launched by the backend (a nonzero `code`
 -- still has ok = true; a timeout is a launched process), `code`/`exit_code`
 -- carry the POSIX exit status recorded by the retained leader, and `outcome` is
--- one of `WheelHost.PROCESS_OUTCOME` (`exited`, `timeout`, `unavailable`,
--- `failure`). `cleanup` is one of `WheelHost.GROUP_CLEANUP` (`swept`,
--- `unverified`, `not_run`), and `pgid` is the recorded process-group id when
--- the retained leader wrote it. GNU timeout maps expiry to 124 (kill-after
--- escalation may surface 137); a command that itself exits 124/137 is
--- indistinguishable and is reported as a timeout.
+-- one of `WheelHost.PROCESS_OUTCOME` (`exited`, `timeout`, `cancelled`,
+-- `unavailable`, `failure`). `cleanup` is one of `WheelHost.GROUP_CLEANUP`
+-- (`swept`, `unverified`, `not_run`), and `pgid` is the recorded process-group
+-- id when the retained leader wrote it. GNU timeout maps expiry to 124
+-- (kill-after escalation may surface 137); a command that itself exits 124/137
+-- is indistinguishable and is reported as a timeout.
+--
+-- Recorded jobs and cancellation (CTX-0034):
+-- `proc.start(program, args, opts)` returns a handle with `poll`,
+-- `wait(timeout_ms)`, `cancel(opts)`, and `close`; `proc.start_command` is the
+-- shell-string form. The command runs in the same `setsid`-recorded group under
+-- the same timeout, capture, and environment bounds as `run_program`. The job
+-- record is a private 0700 directory with an owned 0600 metadata file holding
+-- a random job id, a random generation token, the recorded leader PID/PGID,
+-- the timeout, and optional audit identity. Cancellation validates the record
+-- and the live leader (generation, process group, and session) before sending
+-- only `kill -0`, TERM, or KILL to the recorded PGID; there is no name- or
+-- pattern-based kill and no fallback to an unrecorded PID. The request
+-- publishes a first-writer-wins terminal reason, sends TERM, waits the bounded
+-- grace, and sends KILL only if the group is still present. The terminal reason
+-- distinguishes `cancelled` from `timeout`/`exited`; repeated cancellation is
+-- idempotent and a terminal job is a typed no-op. `opts.job_root` is an
+-- explicit test/embedding root (documented swap point); the default is
+-- `<private tmp dir>/jobs`.
 --
 -- Temporary files:
 -- `WheelHost.tmp.name()` never uses the ambient temporary-name API. It returns
@@ -135,6 +189,8 @@
 
 local WheelHost = {}
 local WheelErrors = require("wheel.errors")
+local WheelAudit = require("wheel.audit")
+local WheelJob = require("wheel.job")
 
 -- ---------------------------------------------------------------------------
 -- Shared helpers
@@ -215,6 +271,15 @@ local KILL_AFTER_MS = 2000
 --- Grace period for the retained-leader group sweep (TERM, then KILL).
 local SWEEP_GRACE_MS = 250
 
+--- Maximum leader-side attempts to acquire the terminal-transition lock.
+-- The leader waits 200 x 10 ms (2 s), deliberately below the canceller's
+-- bounded 3 s lock window, so a slow canceller keeps first-writer authority and
+-- the leader never treats a lock it did not acquire as its own.
+local LEADER_LOCK_ATTEMPTS = 200
+
+--- Leader-side lock retry interval (10 ms).
+local LEADER_LOCK_INTERVAL_MS = 10
+
 --- Maximum bytes accepted for one stdin payload (1 MiB).
 local MAX_STDIN_BYTES = 1024 * 1024
 
@@ -229,6 +294,12 @@ local MAX_ENV_ENTRIES = 128
 
 --- Maximum exclusive-creation attempts before failing closed.
 local MAX_TMP_CREATE_ATTEMPTS = 16
+
+--- Maximum bytes accepted from the host random source in one read.
+local MAX_RANDOM_BYTES = 64
+
+--- Maximum bounded host sleep (60 s).
+local MAX_SLEEP_MS = 60000
 
 --- Environment variables passed through when present. Nothing else is
 --- inherited: the child environment is rebuilt from this list plus explicit
@@ -280,6 +351,7 @@ local ENV_FORBIDDEN_NAMES = {
 WheelHost.PROCESS_OUTCOME = {
   EXITED = "exited",
   TIMEOUT = "timeout",
+  CANCELLED = "cancelled",
   UNAVAILABLE = "unavailable",
   FAILURE = "failure",
 }
@@ -306,6 +378,10 @@ WheelHost.LIMITS = {
   MAX_ENV_VALUE_BYTES = MAX_ENV_VALUE_BYTES,
   MAX_ENV_ENTRIES = MAX_ENV_ENTRIES,
   READ_CHUNK_BYTES = READ_CHUNK_BYTES,
+  MAX_RANDOM_BYTES = MAX_RANDOM_BYTES,
+  MAX_SLEEP_MS = MAX_SLEEP_MS,
+  LEADER_LOCK_ATTEMPTS = LEADER_LOCK_ATTEMPTS,
+  LEADER_LOCK_INTERVAL_MS = LEADER_LOCK_INTERVAL_MS,
 }
 
 --- Process-group supervisor wrapper. It runs the launch under `setsid -w` and
@@ -321,12 +397,17 @@ local SUPERVISOR_SCRIPT = 'out="$1"; err="$2"; shift 2; "$@" > /dev/null; exit 0
 --- writes the direct command's status before any signal, then holds the group
 --- identity through TERM, the bounded grace, and the final KILL. The KILL
 --- targets the whole recorded group and therefore takes the leader with it; the
---- status and sweep files are already written. After recording status, the
---- leader sends its own stderr to `/dev/null`, so any shell diagnostic for the
---- self-KILL cannot leak into the wrapper's command stream. A leader that exits
---- early never signals anything. No caller value is interpolated into the
---- script.
-local LEADER_SCRIPT = 'pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; shift 7; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; exec 2>/dev/null; trap "" TERM; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
+--- status and sweep files are already written. The leader ignores TERM from its
+--- start so a cancellation TERM can interrupt the command without killing the
+--- identity holder; the direct child resets TERM to the default. When a job
+--- terminal path is supplied, the leader publishes `exited`, `timeout`, or
+--- `cancelled` exactly once under an exclusive `mkdir` lock. After recording
+--- status, the leader sends its own stderr to `/dev/null`, so any shell
+--- diagnostic for the self-KILL cannot leak into the wrapper's command stream.
+--- A leader that exits early never signals anything. No caller value is
+--- interpolated into the script; the generation token is a positional argument
+--- used only as command-line identity for the canceller.
+local LEADER_SCRIPT = 'umask 077; pgid_file="$1"; status_file="$2"; sweep_file="$3"; out="$4"; err="$5"; grace="$6"; sleep_bin="$7"; cancel_file="$8"; terminal_file="$9"; lock_dir="${10}"; generation="${11}"; lock_attempts="${12}"; lock_interval="${13}"; shift 13; trap "" TERM; printf "%s\\n" "$$" > "$pgid_file" || exit 125; ( trap - TERM; exec "$@" ) > "$out" 2> "$err" & child=$!; wait "$child"; status=$?; printf "%s" "$status" > "$status_file" || :; if [ -n "$terminal_file" ]; then lock_held=0; i=0; while [ "$i" -lt "$lock_attempts" ]; do if mkdir "$lock_dir" 2>/dev/null; then lock_held=1; break; fi; i=$((i+1)); "$sleep_bin" "$lock_interval" 2>/dev/null || break; done; if [ "$lock_held" = "1" ]; then if [ ! -e "$terminal_file" ]; then if [ -e "$cancel_file" ]; then printf "%s" "cancelled" > "$terminal_file"; elif [ "$status" = "124" ] || [ "$status" = "137" ]; then printf "%s" "timeout" > "$terminal_file"; else printf "%s" "exited" > "$terminal_file"; fi; fi; rmdir "$lock_dir" 2>/dev/null || :; fi; fi; exec 2>/dev/null; kill -TERM -"$$" 2>/dev/null || :; "$sleep_bin" "$grace" 2>/dev/null || :; printf "%s" "swept" > "$sweep_file" 2>/dev/null || :; kill -KILL -"$$" 2>/dev/null || :; exit "$status"'
 
 --- Normalize an os.execute result into a POSIX exit status.
 -- Lua 5.1 reports the raw wait status (exit 1 -> 256); Lua 5.2+ reports
@@ -845,6 +926,25 @@ function standalone.new(opts)
     return false, (type(code) == "number" and code or 1)
   end
 
+  --- Create one directory with mode 0700, refusing an existing path.
+  -- The exclusive create is the lock/job-directory primitive: `mkdir` fails
+  -- atomically when the path exists (including a symlink), so two processes
+  -- cannot both acquire the same lock.
+  -- @param path string
+  -- @return boolean ok, string? err
+  function backend.mkdir_exclusive(path)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "fs.write")
+    if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
+      return false, "invalid directory path"
+    end
+    local status = normalized_exit_status(os.execute(
+      "umask 077; mkdir -m 700 -- " .. shell_quote(path) .. " 2>/dev/null"))
+    if status == 0 then
+      return true
+    end
+    return false, "path already exists or cannot be created"
+  end
+
   --- List a directory as raw `ls -la` lines.
   -- The argv is passed one argument at a time; the standalone primitive is a
   -- POSIX shell, but no call site builds a shell string. stderr is kept
@@ -949,6 +1049,43 @@ function standalone.new(opts)
     return true
   end
 
+  --- Append <content> to the existing private file at <path>.
+  -- The path is verified as an owned, singly linked, mode-0600 regular file
+  -- immediately before the append; a symbolic link, foreign owner, weaker
+  -- mode, FIFO, device, or missing path is refused. The open uses append mode,
+  -- so an existing record is never truncated. The audit sink creates the file
+  -- with `create_private_file` before its first append.
+  -- @param path string
+  -- @param content string
+  -- @return boolean ok, string? err
+  function backend.append_file(path, content)
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.write")
+    if type(path) ~= "string" or path == "" or path:find("[%z\n\r]") then
+      return false, "invalid appended file path"
+    end
+    if type(content) ~= "string" then
+      return false, "appended content must be a string"
+    end
+    local verified, verify_err = verify_private_file(path)
+    if not verified then
+      return false, verify_err
+    end
+    local file, open_err = io.open(path, "a")
+    if not file then
+      return false, tostring(open_err)
+    end
+    local wrote, write_err = file:write(content)
+    if not wrote then
+      file:close()
+      return false, tostring(write_err or "write failed")
+    end
+    local close_ok, close_err = file:close()
+    if not close_ok then
+      return false, tostring(close_err or "close failed")
+    end
+    return true
+  end
+
   --- Remove the file at <path>.
   -- @param path string
   -- @return boolean ok, string? err
@@ -998,8 +1135,8 @@ function standalone.new(opts)
     local command = "p=$1; "
       .. "if test -L \"$p\"; then printf 'LINK\\n'; fi; "
       .. "if test -e \"$p\"; then printf 'EXISTS\\n'; fi; "
-      .. "rc=0; stat -L -c '%u %a %h %F' -- \"$p\" 2>/dev/null "
-      .. "|| stat -L -f '%u %Lp %l %HT' -- \"$p\" 2>/dev/null "
+      .. "rc=0; stat -L -c '%u %a %h %s %F' -- \"$p\" 2>/dev/null "
+      .. "|| stat -L -f '%u %Lp %l %z %HT' -- \"$p\" 2>/dev/null "
       .. "|| rc=$?; "
       .. "if [ \"$rc\" -ne 0 ] && test -e \"$p\"; then printf 'UNREADABLE\\n'; fi"
     local pipe = io.popen("sh -c " .. shell_quote(command) .. " sh " .. shell_quote(target) .. " 2>/dev/null", "r")
@@ -1013,7 +1150,7 @@ function standalone.new(opts)
     end
 
     local symlink, exists = false, false
-    local uid, mode, links
+    local uid, mode, links, size
     for line in tostring(output or ""):gmatch("[^\n]+") do
       if line == "LINK" then
         symlink = true
@@ -1022,11 +1159,13 @@ function standalone.new(opts)
       elseif line == "UNREADABLE" then
         error(WheelErrors.capability_denied("fs.read"), 0)
       else
-        local owner, permissions, link_count, kind = line:match("^(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
-        if owner and permissions and link_count and kind then
+        local owner, permissions, link_count, byte_size, kind =
+          line:match("^(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(.+)$")
+        if owner and permissions and link_count and byte_size and kind then
           uid = tonumber(owner)
           mode = tonumber(permissions, 8)
           links = tonumber(link_count)
+          size = tonumber(byte_size)
           exists = true
           local normalized = kind:lower()
           if normalized:find("regular", 1, true) then
@@ -1039,6 +1178,7 @@ function standalone.new(opts)
               uid = uid,
               mode = mode,
               links = links,
+              size = size,
             }
           elseif normalized:find("directory", 1, true) then
             return {
@@ -1050,6 +1190,7 @@ function standalone.new(opts)
               uid = uid,
               mode = mode,
               links = links,
+              size = size,
             }
           elseif normalized:find("fifo", 1, true) then
             return {
@@ -1061,6 +1202,7 @@ function standalone.new(opts)
               uid = uid,
               mode = mode,
               links = links,
+              size = size,
             }
           end
         end
@@ -1076,6 +1218,7 @@ function standalone.new(opts)
       uid = uid,
       mode = mode,
       links = links,
+      size = size,
     }
   end
 
@@ -1100,6 +1243,30 @@ function standalone.new(opts)
   -- @return number? uid
   function backend.euid()
     return current_euid()
+  end
+
+  --- Read `count` bytes from the host random source (`/dev/urandom`).
+  -- Job identifiers and cancellation generation tokens are capability material,
+  -- so they must not be derived from a predictable clock or table address. A
+  -- missing or short source fails closed instead of returning a weak token.
+  -- @param count number
+  -- @return string? bytes, string? err
+  function backend.random_bytes(count)
+    require_surface(type(io) == "table" and type(io.open) == "function", "fs.read")
+    if type(count) ~= "number" or count ~= count or count % 1 ~= 0
+      or count < 1 or count > MAX_RANDOM_BYTES then
+      return nil, "invalid random byte count"
+    end
+    local file = io.open("/dev/urandom", "rb")
+    if not file then
+      return nil, "the host random source is unavailable"
+    end
+    local bytes = file:read(count)
+    file:close()
+    if type(bytes) ~= "string" or #bytes ~= count then
+      return nil, "the host random source returned insufficient bytes"
+    end
+    return bytes
   end
 
   --- Create a new regular file with mode 0600 at <path> and write <content>.
@@ -1295,14 +1462,13 @@ function standalone.new(opts)
     return string.format("%.3f", ms / 1000)
   end
 
-  --- Execute one bounded child process and normalize its result.
-  -- @param mode string "argv" or "shell"
-  -- @param payload string program name or shell string
-  -- @param payload_args string[]? argv elements for mode "argv"
+  --- Validate and normalize the shared process options.
+  -- This is the single validation path for the synchronous primitive and the
+  -- asynchronous start handle; both must reject the same shapes before any
+  -- file or process is created.
   -- @param opts table?
-  -- @return table process result
-  local function execute_process(mode, payload, payload_args, opts)
-    require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
+  -- @return table? normalized, table? failure
+  local function normalize_process_options(opts)
     opts = type(opts) == "table" and opts or {}
 
     local timeout_ms = opts.timeout_ms
@@ -1314,7 +1480,7 @@ function standalone.new(opts)
       or timeout_ms % 1 ~= 0
       or timeout_ms < MIN_TIMEOUT_MS
       or timeout_ms > MAX_TIMEOUT_MS then
-      return process_failure(string.format(
+      return nil, process_failure(string.format(
         "timeout_ms must be an integer between %d and %d", MIN_TIMEOUT_MS, MAX_TIMEOUT_MS))
     end
 
@@ -1327,17 +1493,17 @@ function standalone.new(opts)
       or capture_cap % 1 ~= 0
       or capture_cap < 1
       or capture_cap > MAX_CAPTURE_BYTES then
-      return process_failure("max_output_bytes must be an integer between 1 and "
+      return nil, process_failure("max_output_bytes must be an integer between 1 and "
         .. MAX_CAPTURE_BYTES)
     end
 
     local stdin_data = opts.stdin
     if stdin_data ~= nil then
       if type(stdin_data) ~= "string" then
-        return process_failure("stdin must be a string")
+        return nil, process_failure("stdin must be a string")
       end
       if #stdin_data > MAX_STDIN_BYTES then
-        return process_failure("stdin exceeds the " .. MAX_STDIN_BYTES .. " byte bound")
+        return nil, process_failure("stdin exceeds the " .. MAX_STDIN_BYTES .. " byte bound")
       end
     end
 
@@ -1350,59 +1516,106 @@ function standalone.new(opts)
         or cwd == ""
         or #cwd > MAX_ENV_VALUE_BYTES
         or cwd:find("[%z\n\r]") then
-        return process_failure("cwd must be a control-free absolute or relative path")
+        return nil, process_failure("cwd must be a control-free absolute or relative path")
       end
     end
 
-    local env_parts, env_err, env_outcome =
-      build_child_environment(os.getenv, opts.env)
-    if not env_parts then
-      return process_failure(env_err, env_outcome)
+    -- Optional execution audit (CTX-0030). The sink is opt-in: a call without
+    -- opts.audit never resolves or creates an audit directory, so existing
+    -- tests and embedders keep their behavior. When supplied, the metadata is
+    -- an allowlisted identity/decision table; command values and metadata are
+    -- redacted by the sink, and no output, environment value, prompt, or file
+    -- content is passed to it.
+    local audit_meta = opts.audit
+    if audit_meta ~= nil and type(audit_meta) ~= "table" then
+      return nil, process_failure("audit metadata must be a table")
+    end
+    local audit_decision = "allow"
+    if audit_meta ~= nil then
+      audit_decision = audit_meta.decision
+      if audit_decision == nil then
+        audit_decision = "allow"
+      end
+      if audit_decision ~= "allow" and audit_decision ~= "deny" then
+        return nil, process_failure("audit decision must be 'allow' or 'deny'")
+      end
+      if audit_meta.high_risk ~= nil and type(audit_meta.high_risk) ~= "boolean" then
+        local failure = process_failure("audit high_risk must be a boolean")
+        failure.audit_error = WheelErrors.args_invalid(
+          "host.proc", "audit high_risk must be a boolean")
+        return nil, failure
+      end
     end
 
+    return {
+      opts = opts,
+      timeout_ms = timeout_ms,
+      capture_cap = capture_cap,
+      stdin_data = stdin_data,
+      cwd = cwd,
+      audit_meta = audit_meta,
+      audit_decision = audit_decision,
+    }
+  end
+
+  --- Resolve every fixed wrapper tool required by the process seam.
+  -- A missing tool is a typed `unavailable` failure, never an implicit weaker
+  -- execution surface.
+  -- @return table? tools, table? failure
+  local function resolve_process_tools()
     local env_bin = resolve_tool("env")
     if not env_bin then
-      return process_failure(
+      return nil, process_failure(
         "the 'env' utility is unavailable; refusing to inherit the parent environment",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
     local timeout_bin = resolve_timeout_tool()
     if not timeout_bin then
-      return process_failure(
+      return nil, process_failure(
         "GNU 'timeout' is unavailable; refusing to run an unbounded process",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
     local sh_bin = resolve_tool("sh")
     if not sh_bin then
-      return process_failure("the POSIX 'sh' is unavailable",
+      return nil, process_failure("the POSIX 'sh' is unavailable",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
     local setsid_bin = resolve_tool("setsid")
     if not setsid_bin then
-      return process_failure(
+      return nil, process_failure(
         "the 'setsid' utility is unavailable; refusing to run without a recorded process group",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
     local sleep_bin = resolve_tool("sleep")
     if not sleep_bin then
-      return process_failure(
+      return nil, process_failure(
         "the 'sleep' utility is unavailable; cannot bound the process-group sweep",
         WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
     end
     for _, required in ipairs({ "mktemp", "stat", "id" }) do
       if not resolve_tool(required) then
-        return process_failure(
+        return nil, process_failure(
           "the '" .. required .. "' utility is unavailable; cannot validate private files",
           WheelHost.PROCESS_OUTCOME.UNAVAILABLE)
       end
     end
+    return {
+      env_bin = env_bin,
+      timeout_bin = timeout_bin,
+      sh_bin = sh_bin,
+      setsid_bin = setsid_bin,
+      sleep_bin = sleep_bin,
+    }
+  end
 
+  --- Allocate the private capture files for one launch.
+  -- The caller owns cleanup; a partial allocation is removed before returning.
+  -- @param dir string
+  -- @param need_stdin boolean
+  -- @return table? paths, function? cleanup, table? failure
+  local function allocate_capture_paths(dir, need_stdin)
     local created = {}
     local function fresh_temp()
-      local dir_ok, dir = pcall(backend.tmp_dir)
-      if not dir_ok then
-        return nil
-      end
       for _ = 1, MAX_TMP_CREATE_ATTEMPTS do
         local path = create_private_temp(dir)
         if path then
@@ -1423,29 +1636,254 @@ function standalone.new(opts)
       return errors
     end
 
-    local out_path = fresh_temp()
-    local err_path = fresh_temp()
-    local diag_path = fresh_temp()
-    local status_path = fresh_temp()
-    local sweep_path = fresh_temp()
-    local pgid_path = fresh_temp()
-    local stdin_path
-    if out_path and err_path and diag_path and status_path and sweep_path and pgid_path then
-      if stdin_data ~= nil then
-        stdin_path = fresh_temp()
-      end
+    local paths = {
+      out = fresh_temp(),
+      err = fresh_temp(),
+      diag = fresh_temp(),
+      status = fresh_temp(),
+      sweep = fresh_temp(),
+      pgid = fresh_temp(),
+    }
+    if need_stdin then
+      paths.stdin = fresh_temp()
     end
-    if (not out_path) or (not err_path) or (not diag_path) or (not status_path)
-      or (not sweep_path) or (not pgid_path)
-      or (stdin_data ~= nil and not stdin_path) then
+    if not paths.out or not paths.err or not paths.diag or not paths.status
+      or not paths.sweep or not paths.pgid
+      or (need_stdin and not paths.stdin) then
       local errors = cleanup()
       local message = "cannot create private process-capture files"
       if #errors > 0 then
         message = message .. "; cleanup failed: " .. table.concat(errors, "; ")
       end
-      return process_failure(message)
+      return nil, nil, process_failure(message)
+    end
+    return paths, cleanup
+  end
+
+  --- Build the constant launch wrapper command.
+  -- Every caller value crosses as a quoted positional argument; no caller value
+  -- is interpolated into the script text.
+  -- @param mode string
+  -- @param payload string
+  -- @param payload_args table?
+  -- @param cwd string?
+  -- @param stdin_path string
+  -- @param tools table
+  -- @param env_parts table
+  -- @param paths table
+  -- @param timeout_ms number
+  -- @return string command
+  local function build_launch_command(mode, payload, payload_args, cwd, stdin_path,
+    tools, env_parts, paths, timeout_ms)
+    local script
+    local launch_args
+    if mode == "argv" then
+      if cwd then
+        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
+        launch_args = { stdin_path, tools.env_bin, cwd, payload }
+      else
+        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
+        launch_args = { stdin_path, tools.env_bin, payload }
+      end
+      for _, arg in ipairs(payload_args or {}) do
+        launch_args[#launch_args + 1] = arg
+      end
+    else
+      if cwd then
+        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
+        launch_args = { stdin_path, tools.env_bin, cwd, tools.sh_bin, "-c", payload }
+      else
+        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
+        launch_args = { stdin_path, tools.env_bin, tools.sh_bin, "-c", payload }
+      end
     end
 
+    local kill_after_ms = math.min(KILL_AFTER_MS, timeout_ms)
+    local pieces = {
+      shell_quote(tools.sh_bin), "-c", shell_quote(SUPERVISOR_SCRIPT),
+      shell_quote("wheel-supervisor"),
+      shell_quote(paths.out), shell_quote(paths.err),
+      shell_quote(tools.setsid_bin), "-w",
+      shell_quote(tools.sh_bin), "-c", shell_quote(LEADER_SCRIPT),
+      shell_quote("wheel-leader"),
+      shell_quote(paths.pgid), shell_quote(paths.status), shell_quote(paths.sweep),
+      shell_quote(paths.out), shell_quote(paths.err),
+      shell_quote(format_sleep(SWEEP_GRACE_MS)),
+      shell_quote(tools.sleep_bin),
+      shell_quote(paths.cancel or ""), shell_quote(paths.terminal or ""),
+      shell_quote(paths.lock or ""), shell_quote(paths.generation or "-"),
+      shell_quote(tostring(LEADER_LOCK_ATTEMPTS)),
+      shell_quote(format_sleep(LEADER_LOCK_INTERVAL_MS)),
+      shell_quote(tools.env_bin), "-i",
+    }
+    for _, assignment in ipairs(env_parts) do
+      pieces[#pieces + 1] = shell_quote(assignment)
+    end
+    pieces[#pieces + 1] = shell_quote(tools.timeout_bin)
+    pieces[#pieces + 1] = "--foreground"
+    pieces[#pieces + 1] = "-k"
+    pieces[#pieces + 1] = format_seconds(kill_after_ms)
+    pieces[#pieces + 1] = format_seconds(timeout_ms)
+    pieces[#pieces + 1] = shell_quote(tools.sh_bin)
+    pieces[#pieces + 1] = "-c"
+    pieces[#pieces + 1] = shell_quote(script)
+    pieces[#pieces + 1] = shell_quote("wheel-exec")
+    for _, arg in ipairs(launch_args) do
+      pieces[#pieces + 1] = shell_quote(arg)
+    end
+    return table.concat(pieces, " ")
+  end
+
+  --- Execute one bounded child process and normalize its result.
+  -- @param mode string "argv" or "shell"
+  -- @param payload string program name or shell string
+  -- @param payload_args string[]? argv elements for mode "argv"
+  -- @param opts table?
+  -- @return table process result
+  local function execute_process(mode, payload, payload_args, opts)
+    require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
+    local normalized, option_failure = normalize_process_options(opts)
+    if not normalized then
+      return option_failure
+    end
+    opts = normalized.opts
+    local timeout_ms = normalized.timeout_ms
+    local capture_cap = normalized.capture_cap
+    local stdin_data = normalized.stdin_data
+    local cwd = normalized.cwd
+    local audit_meta = normalized.audit_meta
+    local audit_decision = normalized.audit_decision
+
+    local function audit_clock_ms()
+      local ok, now = pcall(WheelHost.time.now)
+      if ok and type(now) == "number" and now >= 0 then
+        return math.floor(now * 1000)
+      end
+      return nil
+    end
+
+    local function audit_event(name, extra)
+      if audit_meta == nil then
+        return nil
+      end
+      local event = {
+        event = name,
+        kind = mode,
+        cwd = cwd,
+        role = audit_meta.role,
+        agent = audit_meta.agent,
+        task = audit_meta.task,
+        tool = audit_meta.tool,
+        intent = audit_meta.intent,
+        decision = audit_decision,
+        reason = audit_meta.reason,
+        high_risk = audit_meta.high_risk == true,
+      }
+      if mode == "argv" then
+        event.program = payload
+        event.args = payload_args
+      else
+        event.shell = payload
+      end
+      for key, value in pairs(extra or {}) do
+        event[key] = value
+      end
+      return event
+    end
+
+    local audit_started = nil
+    local audit_recorded = false
+    local audit_warning = nil
+
+    local function write_audit(event)
+      local ok, recorded, audit_err =
+        pcall(WheelAudit.record, event, { dir = audit_meta.dir })
+      if not ok then
+        return nil, WheelErrors.audit_unavailable()
+      end
+      return recorded, audit_err
+    end
+
+    local function finish_audit(result, spawned)
+      if audit_meta == nil then
+        return result
+      end
+      result.spawned = spawned
+      if audit_warning then
+        result.audit_warning = audit_warning
+      end
+      if not audit_recorded then
+        return result
+      end
+      local finished = audit_clock_ms()
+      local extra = {
+        spawned = spawned,
+        exit_code = result.exit_code,
+        truncated = result.truncated == true,
+        timed_out = result.timed_out == true,
+        cleanup = result.cleanup,
+        outcome = result.outcome,
+      }
+      if audit_started ~= nil and finished ~= nil then
+        extra.duration_ms = math.max(0, finished - audit_started)
+      end
+      local recorded, audit_err = write_audit(
+        audit_event(spawned and "process.completed" or "process.aborted", extra))
+      if not recorded then
+        result.audit_warning = result.audit_warning
+          or "audit completion record could not be written"
+        result.audit_error = result.audit_error or audit_err
+      end
+      return result
+    end
+
+    -- A caller-supplied deny decision is a recorded refusal, not a launch. The
+    -- pre-spawn record is attempted first so a denial is auditable; either way
+    -- the command never reaches the wrapper. A high-risk denial is still a
+    -- denial even when the audit write fails.
+    if audit_meta ~= nil and audit_decision == "deny" then
+      local recorded, audit_err = write_audit(
+        audit_event("process.pre_spawn", { spawned = false }))
+      local denied = process_failure("process denied by policy")
+      denied.denied = true
+      denied.spawned = false
+      if not recorded then
+        denied.audit_error = audit_err
+        denied.audit_warning = "audit record could not be written for a denied command"
+      end
+      return denied
+    end
+
+    local env_parts, env_err, env_outcome =
+      build_child_environment(os.getenv, opts.env)
+    if not env_parts then
+      return process_failure(env_err, env_outcome)
+    end
+
+    local tools, tools_failure = resolve_process_tools()
+    if not tools then
+      return tools_failure
+    end
+
+    local tmp_ok, tmp_dir = pcall(backend.tmp_dir)
+    local paths, cleanup
+    if tmp_ok then
+      paths, cleanup = allocate_capture_paths(tmp_dir, stdin_data ~= nil)
+    end
+    if not paths then
+      if not tmp_ok then
+        return process_failure("the private temporary directory is unavailable")
+      end
+      return process_failure("cannot create private process-capture files")
+    end
+
+    local stdin_path = paths.stdin
+    local out_path = paths.out
+    local err_path = paths.err
+    local diag_path = paths.diag
+    local status_path = paths.status
+    local sweep_path = paths.sweep
+    local pgid_path = paths.pgid
     if stdin_path then
       local wrote, write_err = write_private_file(stdin_path, stdin_data)
       if not wrote then
@@ -1460,65 +1898,6 @@ function standalone.new(opts)
       stdin_path = "/dev/null"
     end
 
-    -- A constant wrapper: `$0` is `wheel-exec`, `$1` is the stdin path, and the
-    -- remaining positional arguments are either the argv vector or
-    -- `sh -c <shell string>` after the shifts. No caller value is interpolated
-    -- into the script text. `--` stops env option parsing, and a program name
-    -- that starts with `-` or contains `=` is refused so env cannot treat it as
-    -- an option or environment assignment.
-    local script
-    local launch_args
-    if mode == "argv" then
-      if cwd then
-        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
-        launch_args = { stdin_path, env_bin, cwd, payload }
-      else
-        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
-        launch_args = { stdin_path, env_bin, payload }
-      end
-      for _, arg in ipairs(payload_args or {}) do
-        launch_args[#launch_args + 1] = arg
-      end
-    else
-      if cwd then
-        script = 'stdin="$1"; envbin="$2"; cwd="$3"; shift 3; case "$cwd" in -*) exit 126;; esac; case "$1" in ""|-*|*=*) exit 126;; esac; cd "$cwd" || exit 126; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
-        launch_args = { stdin_path, env_bin, cwd, sh_bin, "-c", payload }
-      else
-        script = 'stdin="$1"; envbin="$2"; shift 2; case "$1" in ""|-*|*=*) exit 126;; esac; exec "$envbin" -u SHLVL -u PWD -u _ -- "$@" < "$stdin"'
-        launch_args = { stdin_path, env_bin, sh_bin, "-c", payload }
-      end
-    end
-
-    local kill_after_ms = math.min(KILL_AFTER_MS, timeout_ms)
-    local pieces = {
-      shell_quote(sh_bin), "-c", shell_quote(SUPERVISOR_SCRIPT),
-      shell_quote("wheel-supervisor"),
-      shell_quote(out_path), shell_quote(err_path),
-      shell_quote(setsid_bin), "-w",
-      shell_quote(sh_bin), "-c", shell_quote(LEADER_SCRIPT),
-      shell_quote("wheel-leader"),
-      shell_quote(pgid_path), shell_quote(status_path), shell_quote(sweep_path),
-      shell_quote(out_path), shell_quote(err_path),
-      shell_quote(format_sleep(SWEEP_GRACE_MS)),
-      shell_quote(sleep_bin),
-      shell_quote(env_bin), "-i",
-    }
-    for _, assignment in ipairs(env_parts) do
-      pieces[#pieces + 1] = shell_quote(assignment)
-    end
-    pieces[#pieces + 1] = shell_quote(timeout_bin)
-    pieces[#pieces + 1] = "--foreground"
-    pieces[#pieces + 1] = "-k"
-    pieces[#pieces + 1] = format_seconds(kill_after_ms)
-    pieces[#pieces + 1] = format_seconds(timeout_ms)
-    pieces[#pieces + 1] = shell_quote(sh_bin)
-    pieces[#pieces + 1] = "-c"
-    pieces[#pieces + 1] = shell_quote(script)
-    pieces[#pieces + 1] = shell_quote("wheel-exec")
-    for _, arg in ipairs(launch_args) do
-      pieces[#pieces + 1] = shell_quote(arg)
-    end
-
     -- The supervisor always exits 0 and leaves its stderr to the outer diag
     -- file; the retained leader redirects the command into the private capture
     -- files itself. The expected SIGKILL of the leader therefore stays in the
@@ -1526,8 +1905,43 @@ function standalone.new(opts)
     -- the only process that signals the group and the only authority for the
     -- command status; the status, sweep marker, and recorded PGID are read back
     -- below.
-    local command = table.concat(pieces, " ")
-      .. " 2> " .. shell_quote(diag_path)
+    local command = build_launch_command(mode, payload, payload_args, cwd, stdin_path,
+      tools, env_parts, {
+        out = out_path,
+        err = err_path,
+        diag = diag_path,
+        status = status_path,
+        sweep = sweep_path,
+        pgid = pgid_path,
+        cancel = "",
+        terminal = "",
+        lock = "",
+        generation = "-",
+      }, timeout_ms) .. " 2> " .. shell_quote(diag_path)
+
+    -- The pre-spawn record is written after every argument, environment, and
+    -- temporary-file check but immediately before the launch. A high-risk
+    -- operation fails closed when that write cannot complete; a lower-risk one
+    -- continues with a visible result warning. Existing capture files are
+    -- removed on the refusal path.
+    if audit_meta ~= nil then
+      audit_started = audit_clock_ms()
+      local recorded, audit_err = write_audit(
+        audit_event("process.pre_spawn", { spawned = false }))
+      if recorded then
+        audit_recorded = true
+      elseif audit_meta.high_risk == true then
+        cleanup()
+        local refused = process_failure(
+          "audit record could not be written; refusing a high-risk spawn")
+        refused.spawned = false
+        refused.audit_error = audit_err
+        return refused
+      else
+        audit_warning =
+          "audit record could not be written; continuing because the command is not marked high risk"
+      end
+    end
 
     local pipe = io.popen(command, "r")
     if not pipe then
@@ -1536,7 +1950,7 @@ function standalone.new(opts)
       if #errors > 0 then
         message = message .. "; cleanup failed: " .. table.concat(errors, "; ")
       end
-      return process_failure(message)
+      return finish_audit(process_failure(message), false)
     end
     pipe:read("*a")
     pipe:close()
@@ -1574,7 +1988,7 @@ function standalone.new(opts)
         and WheelHost.GROUP_CLEANUP.SWEPT
         or WheelHost.GROUP_CLEANUP.UNVERIFIED
       failure.pgid = pgid
-      return failure
+      return finish_audit(failure, true)
     end
 
     local timed_out = code == 124 or code == 137
@@ -1610,7 +2024,7 @@ function standalone.new(opts)
       stderr = ""
     end
 
-    return {
+    return finish_audit({
       ok = ok,
       code = code,
       exit_code = code,
@@ -1623,7 +2037,660 @@ function standalone.new(opts)
       outcome = outcome,
       cleanup = group_cleanup,
       pgid = pgid,
+      cancel_requested = false,
+      terminal_reason = timed_out and "timeout" or "exited",
+    }, true)
+  end
+
+  --- Read one bounded decimal file from a job record.
+  -- @param path string
+  -- @return number? value
+  local function read_private_number(path)
+    local raw = backend.read_file_bounded(path, 32)
+    if type(raw) ~= "string" then
+      return nil
+    end
+    return tonumber(raw:match("^%s*(%d+)%s*$"))
+  end
+
+  local function start_clock_ms()
+    local ok, now = pcall(WheelHost.time.now)
+    if ok and type(now) == "number" and now >= 0 then
+      return math.floor(now * 1000)
+    end
+    return 0
+  end
+
+  local Handle = {}
+  Handle.__index = Handle
+
+  --- Return the recorded job id for this handle.
+  -- @return string
+  function Handle:job_id()
+    return self.job.job_id
+  end
+
+  --- Return the job root (the directory holding this job's private record).
+  -- @return string
+  function Handle:job_root()
+    return self.job.root
+  end
+
+  --- Return the recorded process-group id, when available.
+  -- @return number? pgid
+  function Handle:pgid()
+    return self.job.recorded_pgid
+  end
+
+  --- Return true after `close` removed the private record.
+  -- @return boolean
+  function Handle:is_closed()
+    return self.closed == true
+  end
+
+  local function handle_audit_identity(self, name, extra)
+    if self.audit_meta == nil then
+      return nil
+    end
+    local event = {
+      event = name,
+      kind = self.mode,
+      cwd = self.cwd,
+      role = self.audit_meta.role,
+      agent = self.audit_meta.agent,
+      task = self.audit_meta.task,
+      tool = self.audit_meta.tool,
+      intent = self.audit_meta.intent,
+      decision = self.audit_decision,
+      high_risk = self.audit_meta.high_risk == true,
+      job_id = self.job.job_id,
     }
+    if self.mode == "argv" then
+      event.program = self.payload
+      event.args = self.payload_args
+    else
+      event.shell = self.payload
+    end
+    for key, value in pairs(extra or {}) do
+      event[key] = value
+    end
+    return event
+  end
+
+  local function handle_audit_finish(self, result, spawned)
+    if self.audit_meta == nil or self.audit_dir == nil then
+      return result
+    end
+    result.spawned = spawned
+    if self.audit_warning then
+      result.audit_warning = result.audit_warning or self.audit_warning
+    end
+    if not self.audit_recorded then
+      return result
+    end
+    local extra = {
+      spawned = spawned,
+      exit_code = result.exit_code,
+      truncated = result.truncated == true,
+      timed_out = result.timed_out == true,
+      cleanup = result.cleanup,
+      outcome = result.outcome,
+      cancel_requested = result.cancel_requested == true,
+      terminal_reason = result.terminal_reason,
+    }
+    if self.audit_started ~= nil then
+      extra.duration_ms = math.max(0, start_clock_ms() - self.audit_started)
+    end
+    local event = handle_audit_identity(self,
+      spawned and "process.completed" or "process.aborted", extra)
+    local ok, recorded = pcall(WheelAudit.record, event, { dir = self.audit_dir })
+    if not ok or not recorded then
+      result.audit_warning = result.audit_warning
+        or "audit completion record could not be written"
+    end
+    return result
+  end
+
+  local function build_handle_result(self, terminal)
+    local cap = self.capture_cap
+    local out_raw = backend.read_file_bounded(self.job.paths.out, cap + 1) or ""
+    local err_raw = backend.read_file_bounded(self.job.paths.err, cap + 1) or ""
+    local status = self.job:exit_status()
+    local swept = self.job:swept()
+    local cancel = self.job:cancel_outcome()
+    local pgid = self.job.recorded_pgid
+
+    local result
+    if terminal == "cancelled" then
+      -- GNU timeout can leave its 124 sentinel in the leader's status when a
+      -- cancellation wins the terminal race (CI observed this even though the
+      -- local host usually reported 143/137). Cancellation evidence takes
+      -- precedence over that sentinel: TERM maps to 143 and KILL to 137, while
+      -- genuine 137/143 and a raw status without cancellation evidence are
+      -- preserved.
+      local code = status
+      local cancel_evidence = cancel ~= nil
+        and (cancel.term_sent == true or cancel.kill_sent == true)
+      local signal_code = (cancel and cancel.kill_sent) and 137 or 143
+      if code == nil then
+        code = signal_code
+      elseif cancel_evidence and (code == 0 or code == 124) then
+        code = signal_code
+      end
+      local cleanup = WheelHost.GROUP_CLEANUP.UNVERIFIED
+      if swept then
+        cleanup = WheelHost.GROUP_CLEANUP.SWEPT
+      elseif cancel and cancel.group_alive_after == false
+        and (cancel.term_sent or cancel.kill_sent) then
+        cleanup = WheelHost.GROUP_CLEANUP.SWEPT
+      end
+      result = {
+        ok = true,
+        code = code,
+        exit_code = code,
+        stdout = "",
+        stderr = "",
+        timed_out = false,
+        truncated = false,
+        stdout_truncated = false,
+        stderr_truncated = false,
+        outcome = WheelHost.PROCESS_OUTCOME.CANCELLED,
+        cleanup = cleanup,
+        pgid = pgid,
+        cancel_requested = true,
+        terminal_reason = "cancelled",
+        job_id = self.job.job_id,
+        spawned = true,
+      }
+    elseif terminal == "timeout" then
+      local code = status or 124
+      result = {
+        ok = true,
+        code = code,
+        exit_code = code,
+        stdout = "",
+        stderr = "",
+        timed_out = true,
+        truncated = false,
+        stdout_truncated = false,
+        stderr_truncated = false,
+        outcome = WheelHost.PROCESS_OUTCOME.TIMEOUT,
+        cleanup = swept and WheelHost.GROUP_CLEANUP.SWEPT
+          or WheelHost.GROUP_CLEANUP.UNVERIFIED,
+        pgid = pgid,
+        cancel_requested = false,
+        terminal_reason = "timeout",
+        job_id = self.job.job_id,
+        spawned = true,
+      }
+    elseif terminal == "exited" and status ~= nil then
+      result = {
+        ok = true,
+        code = status,
+        exit_code = status,
+        stdout = "",
+        stderr = "",
+        timed_out = false,
+        truncated = false,
+        stdout_truncated = false,
+        stderr_truncated = false,
+        outcome = WheelHost.PROCESS_OUTCOME.EXITED,
+        cleanup = swept and WheelHost.GROUP_CLEANUP.SWEPT
+          or WheelHost.GROUP_CLEANUP.UNVERIFIED,
+        pgid = pgid,
+        cancel_requested = false,
+        terminal_reason = "exited",
+        job_id = self.job.job_id,
+        spawned = true,
+      }
+    else
+      local message = terminal == "unverified"
+        and "the recorded job terminal reason is unverified"
+        or "the retained leader did not report the command's exit status"
+      result = process_failure(message)
+      result.cleanup = swept and WheelHost.GROUP_CLEANUP.SWEPT
+        or WheelHost.GROUP_CLEANUP.UNVERIFIED
+      result.pgid = pgid
+      result.job_id = self.job.job_id
+      result.cancel_requested = terminal == "cancelled"
+      result.terminal_reason = terminal or "unverified"
+      result.spawned = true
+    end
+
+    if result.cleanup == WheelHost.GROUP_CLEANUP.UNVERIFIED then
+      err_raw = err_raw
+        .. (#err_raw > 0 and "\n" or "")
+        .. "process-group cleanup unverified: the retained session leader did not complete the recorded-group sweep"
+    end
+
+    local stdout_truncated = #out_raw > cap
+    local stderr_truncated = #err_raw > cap
+    result.stdout = stdout_truncated and out_raw:sub(1, cap) or out_raw
+    result.stderr = stderr_truncated and err_raw:sub(1, cap) or err_raw
+    result.stdout_truncated = stdout_truncated
+    result.stderr_truncated = stderr_truncated
+    result.truncated = stdout_truncated or stderr_truncated
+    if self.merge_stderr then
+      result.stdout = result.stdout .. result.stderr
+      result.stderr = ""
+    elseif self.discard_stderr then
+      result.stderr = ""
+    end
+    return result
+  end
+
+  --- Poll one asynchronous job without blocking.
+  -- @return table? result, table? err
+  function Handle:poll()
+    if self.result then
+      return self.result
+    end
+    local terminal = self.job:terminal_reason()
+    if terminal == nil then
+      if self.job:leader_alive() then
+        return nil
+      end
+      terminal = "unverified"
+    elseif self.job:leader_alive() then
+      -- The terminal reason is published before the retained leader sends its
+      -- final group signals. Waiting for the leader to exit keeps `cleanup`
+      -- honest: a sweep marker or cancellation evidence is not read while the
+      -- identity holder is still working.
+      return nil
+    end
+    local result = build_handle_result(self, terminal)
+    self.result = result
+    handle_audit_finish(self, result, true)
+    return result
+  end
+
+  --- Wait for the job's terminal result, bounded by `timeout_ms`.
+  -- A nil return means the wait bound expired; the handle remains usable and
+  -- can be polled, cancelled, or waited again.
+  -- @param timeout_ms number?
+  -- @return table? result, table? err
+  function Handle:wait(timeout_ms)
+    if self.result then
+      return self.result
+    end
+    local bound = timeout_ms
+    if bound == nil then
+      bound = self.timeout_ms + KILL_AFTER_MS + SWEEP_GRACE_MS + 1000
+    end
+    if type(bound) ~= "number" or bound ~= bound or bound % 1 ~= 0 or bound < 0 then
+      return nil, process_failure("wait timeout must be a non-negative integer")
+    end
+    local poll_ms = WheelJob.LIMITS.POLL_MS
+    local steps = math.max(1, math.floor(bound / poll_ms))
+    for _ = 1, steps do
+      local result = self:poll()
+      if result then
+        return result
+      end
+      local slept, sleep_err = backend.sleep_ms(poll_ms)
+      if not slept then
+        return nil, process_failure("bounded job polling failed: " .. tostring(sleep_err))
+      end
+    end
+    return nil
+  end
+
+  --- Request cancellation of this job's recorded process group.
+  -- Repeated calls are idempotent; a terminal job returns a typed no-op state.
+  -- @param opts table? { grace_ms = number? }
+  -- @return boolean ok, table? info, table? err
+  function Handle:cancel(opts)
+    if self.result then
+      local state = self.result.terminal_reason == "cancelled"
+        and "already_cancelled" or "already_exited"
+      return true, {
+        state = state,
+        terminal_reason = self.result.terminal_reason,
+        term_sent = false,
+        kill_sent = false,
+        pgid = self.result.pgid,
+      }
+    end
+    local info, err = self.job:request_cancel(opts)
+    if not info then
+      return nil, err
+    end
+    return true, info
+  end
+
+  --- Remove this job's private record after it reaches a terminal state.
+  -- A running job is refused; `close` never signals or cancels implicitly. The
+  -- retained leader is given a bounded time to finish its sweep so its files
+  -- are not removed underneath it.
+  -- @return boolean ok, table? err
+  function Handle:close()
+    local result = self:poll()
+    if not result then
+      return false, process_failure("the job is still running; cancel or wait before close")
+    end
+    local poll_ms = WheelJob.LIMITS.POLL_MS
+    local steps = math.floor((KILL_AFTER_MS + SWEEP_GRACE_MS + 1000) / poll_ms)
+    for _ = 1, steps do
+      if not self.job:leader_alive() then
+        break
+      end
+      backend.sleep_ms(poll_ms)
+    end
+    if self.job:leader_alive() then
+      return false, process_failure("the retained leader is still running; the job record was kept")
+    end
+    local cleaned, cleanup_err = self.job:cleanup()
+    if not cleaned then
+      return false, cleanup_err
+    end
+    self.closed = true
+    return true
+  end
+
+  --- Start one bounded process without blocking and return its job handle.
+  -- The launch is backgrounded by the outer POSIX shell; the retained session
+  -- leader records its own PID/PGID, and `start` waits only for that record (not
+  -- for the command) before publishing the private job metadata. The handle is
+  -- the only owner of the job record: callers must `wait`/`poll` and then
+  -- `close`, or the private files remain for diagnosis.
+  -- @param mode string "argv" or "shell"
+  -- @param payload string
+  -- @param payload_args table?
+  -- @param opts table?
+  -- @return table? handle, table? failure
+  local function start_process(mode, payload, payload_args, opts)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "process.spawn")
+    local normalized, option_failure = normalize_process_options(opts)
+    if not normalized then
+      return nil, option_failure
+    end
+    opts = normalized.opts
+    local audit_meta = normalized.audit_meta
+    local audit_decision = normalized.audit_decision
+    local job_audit = nil
+    local audit_warning = nil
+
+    local function start_failure(message, outcome, spawned)
+      local failure = process_failure(message, outcome)
+      failure.spawned = spawned == true
+      if audit_warning then
+        failure.audit_warning = audit_warning
+      end
+      return failure
+    end
+
+    if audit_meta ~= nil and audit_decision == "deny" then
+      local denied = start_failure("process denied by policy", nil, false)
+      denied.denied = true
+      local event = {
+        event = "process.pre_spawn",
+        kind = mode,
+        cwd = normalized.cwd,
+        role = audit_meta.role,
+        agent = audit_meta.agent,
+        task = audit_meta.task,
+        tool = audit_meta.tool,
+        intent = audit_meta.intent,
+        decision = "deny",
+        reason = audit_meta.reason,
+        high_risk = audit_meta.high_risk == true,
+        spawned = false,
+      }
+      if mode == "argv" then
+        event.program = payload
+        event.args = payload_args
+      else
+        event.shell = payload
+      end
+      local ok, recorded = pcall(WheelAudit.record, event, { dir = audit_meta.dir })
+      if not ok or not recorded then
+        denied.audit_error = WheelErrors.audit_unavailable()
+        denied.audit_warning = "audit record could not be written for a denied command"
+      end
+      return nil, denied
+    end
+
+    if audit_meta ~= nil then
+      local dir, resolve_err = WheelAudit.resolve_dir({ dir = audit_meta.dir })
+      if dir then
+        job_audit = {
+          dir = dir,
+          high_risk = audit_meta.high_risk == true,
+          role = audit_meta.role,
+          agent = audit_meta.agent,
+          task = audit_meta.task,
+          tool = audit_meta.tool,
+          intent = audit_meta.intent,
+        }
+      elseif audit_meta.high_risk == true then
+        local failure = start_failure(
+          "audit directory could not be resolved; refusing a high-risk spawn", nil, false)
+        failure.audit_error = resolve_err or WheelErrors.audit_unavailable()
+        return nil, failure
+      else
+        audit_warning = "audit directory could not be resolved; cancellation audit is unavailable"
+      end
+    end
+
+    local job, job_err = WheelJob.create({ root = opts.job_root })
+    if not job then
+      local failure = start_failure("job record could not be created")
+      failure.audit_error = job_err
+      return nil, failure
+    end
+
+    local function cleanup_job()
+      job:cleanup()
+    end
+
+    for _, name in ipairs({ "out", "err", "diag", "status", "sweep", "pgid" }) do
+      local created = backend.create_private_file(job.paths[name], "")
+      if not created then
+        cleanup_job()
+        local failure = start_failure("job capture files could not be created")
+        failure.audit_error = WheelErrors.job_failure(
+          WheelErrors.E_JOB_UNAVAILABLE, "job capture files could not be created")
+        return nil, failure
+      end
+    end
+
+    local stdin_path = "/dev/null"
+    if normalized.stdin_data ~= nil then
+      local staged = backend.create_private_file(job.paths.stdin, normalized.stdin_data)
+      if not staged then
+        cleanup_job()
+        local failure = start_failure("job stdin could not be staged")
+        failure.audit_error = WheelErrors.job_failure(
+          WheelErrors.E_JOB_UNAVAILABLE, "job stdin could not be staged")
+        return nil, failure
+      end
+      stdin_path = job.paths.stdin
+    end
+
+    local generation, generation_err = WheelJob.random_token(16)
+    if not generation then
+      cleanup_job()
+      local failure = start_failure("job generation could not be created")
+      failure.audit_error = generation_err
+      return nil, failure
+    end
+
+    local env_parts, env_err, env_outcome =
+      build_child_environment(os.getenv, opts.env)
+    if not env_parts then
+      cleanup_job()
+      return nil, start_failure(env_err, env_outcome, false)
+    end
+
+    local tools, tools_failure = resolve_process_tools()
+    if not tools then
+      cleanup_job()
+      return nil, tools_failure
+    end
+
+    local started_ms = start_clock_ms()
+    local audit_started = nil
+    local audit_recorded = false
+    if audit_meta ~= nil and job_audit ~= nil then
+      audit_started = started_ms
+      local event = {
+        event = "process.pre_spawn",
+        kind = mode,
+        cwd = normalized.cwd,
+        role = audit_meta.role,
+        agent = audit_meta.agent,
+        task = audit_meta.task,
+        tool = audit_meta.tool,
+        intent = audit_meta.intent,
+        decision = "allow",
+        reason = audit_meta.reason,
+        high_risk = audit_meta.high_risk == true,
+        spawned = false,
+        job_id = job.job_id,
+      }
+      if mode == "argv" then
+        event.program = payload
+        event.args = payload_args
+      else
+        event.shell = payload
+      end
+      local ok, recorded, audit_err = pcall(WheelAudit.record, event, { dir = job_audit.dir })
+      if ok and recorded then
+        audit_recorded = true
+      elseif audit_meta.high_risk == true then
+        cleanup_job()
+        local failure = start_failure(
+          "audit record could not be written; refusing a high-risk spawn", nil, false)
+        failure.audit_error = (ok and audit_err) or WheelErrors.audit_unavailable()
+        return nil, failure
+      else
+        audit_warning = "audit record could not be written; continuing because the command is not marked high risk"
+      end
+    end
+
+    local function audit_stub()
+      return {
+        audit_meta = audit_meta,
+        audit_dir = job_audit and job_audit.dir or nil,
+        audit_recorded = audit_recorded,
+        audit_started = audit_started,
+        audit_warning = audit_warning,
+        mode = mode,
+        payload = payload,
+        payload_args = payload_args,
+        cwd = normalized.cwd,
+        audit_decision = audit_decision,
+        job = job,
+      }
+    end
+
+    local command = build_launch_command(mode, payload, payload_args, normalized.cwd,
+      stdin_path, tools, env_parts, {
+        out = job.paths.out,
+        err = job.paths.err,
+        diag = job.paths.diag,
+        status = job.paths.status,
+        sweep = job.paths.sweep,
+        pgid = job.paths.pgid,
+        cancel = job.paths.cancel,
+        terminal = job.paths.terminal,
+        lock = job.paths.lock,
+        generation = generation,
+      }, normalized.timeout_ms)
+    local launch = "umask 077; ( " .. command .. " ) > /dev/null 2> "
+      .. shell_quote(job.paths.diag) .. " < /dev/null & echo $! > "
+      .. shell_quote(job.paths.wrapper)
+    local launch_status = normalized_exit_status(os.execute(launch))
+    if launch_status ~= 0 then
+      cleanup_job()
+      local failure = start_failure("the job supervisor could not be launched", nil, false)
+      handle_audit_finish(audit_stub(), failure, false)
+      return nil, failure
+    end
+
+    local poll_ms = WheelJob.LIMITS.POLL_MS
+    local pgid = nil
+    local start_steps = math.floor(WheelJob.LIMITS.START_WAIT_MS / poll_ms)
+    for _ = 1, start_steps do
+      pgid = read_private_number(job.paths.pgid)
+      if pgid and pgid > 1 then
+        break
+      end
+      local wrapper = read_private_number(job.paths.wrapper)
+      if wrapper and not backend.proc_is_alive(wrapper) then
+        pgid = read_private_number(job.paths.pgid)
+        if not pgid or pgid <= 1 then
+          pgid = nil
+          break
+        end
+      end
+      backend.sleep_ms(poll_ms)
+    end
+    if not pgid or pgid <= 1 then
+      -- The wrapper PID is a recorded child of this harness, but a group
+      -- signal would target the harness's own group. Never do that: leave the
+      -- bounded command to its own timeout and remove only the private record.
+      cleanup_job()
+      local failure = start_failure(
+        "the job supervisor did not record its process group", nil, false)
+      failure.audit_error = WheelErrors.job_failure(
+        WheelErrors.E_JOB_UNAVAILABLE, "process group was not recorded")
+      handle_audit_finish(audit_stub(), failure, false)
+      return nil, failure
+    end
+
+    local meta_ok, meta_err = job:write_meta({
+      generation = generation,
+      pgid = pgid,
+      leader_pid = pgid,
+      timeout_ms = normalized.timeout_ms,
+      started_ms = started_ms,
+      audit = job_audit,
+    })
+    if not meta_ok then
+      backend.signal_group(pgid, "TERM")
+      backend.sleep_ms(SWEEP_GRACE_MS)
+      if backend.signal_group(pgid, "0") then
+        backend.signal_group(pgid, "KILL")
+      end
+      for _ = 1, math.floor(WheelJob.LIMITS.CANCEL_KILL_WAIT_MS / WheelJob.LIMITS.POLL_MS) do
+        if not backend.signal_group(pgid, "0") then
+          break
+        end
+        backend.sleep_ms(WheelJob.LIMITS.POLL_MS)
+      end
+      local group_gone = not backend.signal_group(pgid, "0")
+      cleanup_job()
+      local failure = start_failure(
+        "the job metadata could not be published; the recorded group was terminated", nil, true)
+      failure.cleanup = group_gone and WheelHost.GROUP_CLEANUP.SWEPT
+        or WheelHost.GROUP_CLEANUP.UNVERIFIED
+      failure.pgid = pgid
+      failure.audit_error = meta_err
+      handle_audit_finish(audit_stub(), failure, true)
+      return nil, failure
+    end
+
+    local handle = setmetatable({
+      job = job,
+      mode = mode,
+      payload = payload,
+      payload_args = payload_args,
+      cwd = normalized.cwd,
+      timeout_ms = normalized.timeout_ms,
+      capture_cap = normalized.capture_cap,
+      merge_stderr = opts.merge_stderr == true,
+      discard_stderr = opts.discard_stderr == true,
+      audit_meta = audit_meta,
+      audit_dir = job_audit and job_audit.dir or nil,
+      audit_decision = audit_decision,
+      audit_started = audit_started,
+      audit_recorded = audit_recorded,
+      audit_warning = audit_warning,
+      result = nil,
+      closed = false,
+    }, Handle)
+    return handle
   end
 
   --- Execute a shell command line inside the bounded, scrubbed process
@@ -1645,7 +2712,7 @@ function standalone.new(opts)
   -- (swept|unverified|not_run) are explicit.
   -- @param shell_string string
   -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
-  --                         discard_stderr, env }
+  --                         discard_stderr, env, audit }
   -- @return table process result
   function backend.run_command(shell_string, opts)
     if type(shell_string) ~= "string" then
@@ -1667,7 +2734,7 @@ function standalone.new(opts)
   -- @param program string
   -- @param args string[]?
   -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
-  --                      discard_stderr, env }
+  --                      discard_stderr, env, audit }
   -- @return table process result
   function backend.run_program(program, args, opts)
     if type(program) ~= "string" or program == "" then
@@ -1684,6 +2751,59 @@ function standalone.new(opts)
       argv[#argv + 1] = arg
     end
     return execute_process("argv", program, argv, opts)
+  end
+
+  --- Start an argv process without blocking and return its job handle.
+  -- The handle exposes `poll`, `wait`, `cancel`, and `close`; the synchronous
+  -- `run_program` contract is unchanged.
+  -- @param program string
+  -- @param args string[]?
+  -- @param opts table? same as run_program plus `job_root`
+  -- @return table? handle, table? failure
+  function backend.start_program(program, args, opts)
+    if type(program) ~= "string" or program == "" then
+      return nil, process_failure("program must be a non-empty string")
+    end
+    if args ~= nil and type(args) ~= "table" then
+      return nil, process_failure("program arguments must be a table")
+    end
+    local argv = {}
+    for index, arg in ipairs(args or {}) do
+      if type(arg) ~= "string" then
+        return nil, process_failure("program argument " .. tostring(index) .. " must be a string")
+      end
+      argv[#argv + 1] = arg
+    end
+    return start_process("argv", program, argv, opts)
+  end
+
+  --- Start a shell-string process without blocking and return its job handle.
+  -- @param shell_string string
+  -- @param opts table? same as run_command plus `job_root`
+  -- @return table? handle, table? failure
+  function backend.start_command(shell_string, opts)
+    if type(shell_string) ~= "string" then
+      return nil, process_failure("shell command must be a string")
+    end
+    return start_process("shell", shell_string, nil, opts)
+  end
+
+  --- Cancel one recorded job by id through its private metadata record.
+  -- @param job_id string
+  -- @param opts table? { root = string?, grace_ms = number? }
+  -- @return table? info, table? err
+  function backend.cancel_job(job_id, opts)
+    opts = type(opts) == "table" and opts or {}
+    local root = opts.root
+    if root == nil or root == "" then
+      local ok, dir = pcall(backend.tmp_dir)
+      if not ok or type(dir) ~= "string" then
+        return nil, WheelErrors.job_failure(
+          WheelErrors.E_JOB_UNAVAILABLE, "the private runtime directory is unavailable")
+      end
+      root = dir .. "/jobs"
+    end
+    return WheelJob.cancel(root, job_id, opts)
   end
 
   --- Quote one POSIX shell argument for the explicit shell-string primitive.
@@ -1864,6 +2984,31 @@ function standalone.new(opts)
     return os.time()
   end
 
+  --- Sleep for a bounded number of milliseconds using the resolved `sleep`.
+  -- This is the one host primitive used by cancellation polling; callers never
+  -- spin on `os.execute`. A missing `sleep` or a non-zero status fails closed.
+  -- @param ms number
+  -- @return boolean ok, string? err
+  function backend.sleep_ms(ms)
+    require_surface(type(os) == "table" and type(os.execute) == "function", "process.spawn")
+    if type(ms) ~= "number" or ms ~= ms or ms % 1 ~= 0 or ms < 0 or ms > MAX_SLEEP_MS then
+      return false, "invalid sleep duration"
+    end
+    if ms == 0 then
+      return true
+    end
+    local sleep_bin = resolve_tool("sleep")
+    if not sleep_bin then
+      return false, "the 'sleep' utility is unavailable"
+    end
+    local status = normalized_exit_status(os.execute(
+      shell_quote(sleep_bin) .. " " .. format_sleep(ms) .. " 2>/dev/null"))
+    if status == 0 then
+      return true
+    end
+    return false, "sleep failed"
+  end
+
   --- CPU time in seconds (os.clock semantics).
   -- @return number
   function backend.clock()
@@ -1912,6 +3057,59 @@ function standalone.new(opts)
       return false
     end
     return false, "liveness probe failed"
+  end
+
+  --- Probe or signal one recorded process group.
+  -- Only signal 0 (liveness), TERM, and KILL are accepted, and the target is a
+  -- validated positive integer rendered directly into `kill -SIGNAL -PGID`.
+  -- No name, pattern, or caller-supplied fragment is ever interpolated. The
+  -- C-locale `kill` diagnostic distinguishes a denied target
+  -- (`false, "permission denied"`) from a vanished group
+  -- (`false, "no such process group"`) and from a probe failure, so a caller
+  -- never treats a foreign target as an already-exited job.
+  --
+  -- Lua 5.1 `io.popen():close()` returns `true` without the child exit status,
+  -- so the command appends its own status marker. The marker is parsed from the
+  -- captured output; the close return is deliberately ignored.
+  -- @param pgid number
+  -- @param signal string "0", "TERM", or "KILL"
+  -- @return boolean ok, string? err
+  function backend.signal_group(pgid, signal)
+    require_surface(type(io) == "table" and type(io.popen) == "function", "process.spawn")
+    if type(pgid) ~= "number" or pgid ~= pgid or pgid % 1 ~= 0 or pgid <= 1
+      or pgid > 2147483647 then
+      return false, "invalid process group"
+    end
+    if signal ~= "0" and signal ~= "TERM" and signal ~= "KILL" then
+      return false, "invalid signal"
+    end
+    local marker = "__WHEEL_SIGNAL_STATUS__"
+    local pipe = io.popen(
+      "LC_ALL=C kill -" .. signal .. " -" .. tostring(pgid)
+        .. " 2>&1; printf '\\n" .. marker .. "%s' \"$?\"", "r")
+    if not pipe then
+      return false, "process-group signal probe unavailable"
+    end
+    local output = pipe:read("*a") or ""
+    pipe:close()
+    local diagnostic, status_text = output:match("^(.*)" .. marker .. "(%d+)%s*$")
+    local status = tonumber(status_text)
+    if status == nil then
+      return false, "process-group signal probe failed"
+    end
+    if status == 0 then
+      return true
+    end
+    if status == 1 then
+      local text = tostring(diagnostic or ""):lower()
+      if text:find("operation not permitted", 1, true)
+        or text:find("not permitted", 1, true)
+        or text:find("permission denied", 1, true) then
+        return false, "permission denied"
+      end
+      return false, "no such process group"
+    end
+    return false, "process-group signal failed"
   end
 
   return backend
@@ -1981,6 +3179,13 @@ function WheelHost.fs.mkdir_p(path)
   return invoke("fs.write", "mkdir_p", path)
 end
 
+--- Create one directory with mode 0700, refusing an existing path.
+-- @param path string
+-- @return boolean ok, string? err
+function WheelHost.fs.mkdir(path)
+  return invoke("fs.write", "mkdir_exclusive", path)
+end
+
 --- List directory entries.
 -- @param path string
 -- @return table { ok, code, stdout, stderr, entries, total }
@@ -2009,6 +3214,14 @@ end
 -- @return boolean ok, string? err
 function WheelHost.fs.write_file(path, content)
   return invoke("fs.write", "write_file", path, content)
+end
+
+--- Append to an existing private 0600 regular file without truncating it.
+-- @param path string
+-- @param content string
+-- @return boolean ok, string? err
+function WheelHost.fs.append_file(path, content)
+  return invoke("fs.write", "append_file", path, content)
 end
 
 --- Set a file mode.
@@ -2052,6 +3265,13 @@ end
 -- @return number? uid
 function WheelHost.fs.euid()
   return invoke("fs.read", "euid")
+end
+
+--- Read `count` bytes from the host random source (`/dev/urandom`).
+-- @param count number
+-- @return string? bytes, string? err
+function WheelHost.fs.random_bytes(count)
+  return invoke("fs.read", "random_bytes", count)
 end
 
 --- Create a new regular file with mode 0600 at `path` and write `content`.
@@ -2122,6 +3342,8 @@ local function normalize_runner_result(result)
       and WheelHost.PROCESS_OUTCOME.TIMEOUT
       or WheelHost.PROCESS_OUTCOME.EXITED,
     cleanup = WheelHost.GROUP_CLEANUP.NOT_RUN,
+    cancel_requested = false,
+    terminal_reason = timed_out and "timeout" or "exited",
   }
 end
 
@@ -2135,10 +3357,18 @@ end
 -- allowlist.
 -- @param shell_string string
 -- @param env table? { command_runner = function? }
--- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, env }
+-- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, env, audit }
 -- @return table process result
 function WheelHost.proc.run_command(shell_string, env, opts)
   if env and type(env.command_runner) == "function" then
+    -- The injected runner is a test seam that never crosses the host process
+    -- boundary, so it cannot produce the real pre-spawn/completion records. An
+    -- audit request is rejected rather than silently producing incomplete
+    -- evidence.
+    if type(opts) == "table" and opts.audit ~= nil then
+      return process_failure(
+        "audit is not supported with an injected command_runner")
+    end
     return normalize_runner_result(env.command_runner({ command = shell_string }, env))
   end
   return invoke("process.spawn", "run_command", shell_string, opts)
@@ -2153,10 +3383,40 @@ end
 -- @param program string
 -- @param args string[]?
 -- @param opts table? { timeout_ms, max_output_bytes, stdin, cwd, merge_stderr,
---                      discard_stderr, env }
+--                      discard_stderr, env, audit }
 -- @return table process result
 function WheelHost.proc.run_program(program, args, opts)
   return invoke("process.spawn", "run_program", program, args, opts)
+end
+
+--- Start a program with an explicit argument vector without blocking.
+-- Returns a handle with `poll()`, `wait(timeout_ms)`, `cancel(opts)`, and
+-- `close()`; the synchronous `run_program` contract is unchanged. `opts` is the
+-- same table plus `job_root` for an explicit private job directory.
+-- @param program string
+-- @param args string[]?
+-- @param opts table?
+-- @return table? handle, table? failure
+function WheelHost.proc.start(program, args, opts)
+  return invoke("process.spawn", "start_program", program, args, opts)
+end
+
+--- Start a shell-string command without blocking and return its job handle.
+-- @param shell_string string
+-- @param opts table?
+-- @return table? handle, table? failure
+function WheelHost.proc.start_command(shell_string, opts)
+  return invoke("process.spawn", "start_command", shell_string, opts)
+end
+
+--- Cancel one recorded job by id through `scripts/wheel-proc`.
+-- The job id and root identify a private record; metadata, ownership, and the
+-- recorded leader generation are validated before any signal.
+-- @param job_id string
+-- @param opts table? { root = string?, grace_ms = number? }
+-- @return table? info, table? err
+function WheelHost.proc.cancel_job(job_id, opts)
+  return invoke("process.spawn", "cancel_job", job_id, opts)
 end
 
 --- Quote one POSIX shell argument for an explicit shell-string call site.
@@ -2179,6 +3439,16 @@ end
 -- @return boolean alive, string? err
 function WheelHost.proc.is_alive(pid)
   return invoke("process.spawn", "proc_is_alive", pid)
+end
+
+--- Probe or signal one recorded process group.
+-- Signal 0 is a liveness probe; TERM and KILL target the recorded PGID. No
+-- name or pattern is accepted.
+-- @param pgid number
+-- @param signal string "0", "TERM", or "KILL"
+-- @return boolean ok, string? err
+function WheelHost.proc.signal_group(pgid, signal)
+  return invoke("process.spawn", "signal_group", pgid, signal)
 end
 
 --- Temporary-file primitives.
@@ -2228,6 +3498,13 @@ end
 -- @return number
 function WheelHost.time.clock()
   return invoke("time.clock", "clock")
+end
+
+--- Sleep for a bounded number of milliseconds through the host `sleep` tool.
+-- @param ms number
+-- @return boolean ok, string? err
+function WheelHost.time.sleep_ms(ms)
+  return invoke("time.sleep", "sleep_ms", ms)
 end
 
 return WheelHost
