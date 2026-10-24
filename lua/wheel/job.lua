@@ -480,10 +480,10 @@ function Job:write_meta(fields)
   if #content > LIMITS.META_BYTES then
     return false, job_error(WheelErrors.E_JOB_METADATA_INVALID, "job metadata exceeds its bound")
   end
-  local created, create_err = h.fs.create_private_file(self.paths.meta, content)
+  local created = h.fs.create_private_file(self.paths.meta, content)
   if not created then
     return false, job_error(WheelErrors.E_JOB_METADATA_INVALID,
-      "job metadata could not be created: " .. tostring(create_err))
+      "job metadata could not be created")
   end
   self.generation = fields.generation
   self.recorded_pgid = fields.pgid
@@ -943,11 +943,11 @@ function Job:request_cancel(opts)
 
   local marker_created = false
   if not repeated then
-    local created, create_err = h.fs.create_private_file(self.paths.cancel, "")
+    local created = h.fs.create_private_file(self.paths.cancel, "")
     if not created then
       unlock()
       return nil, job_error(WheelErrors.E_JOB_UNAVAILABLE,
-        "the cancellation request marker could not be created: " .. tostring(create_err))
+        "the cancellation request marker could not be created")
     end
     marker_created = true
   end

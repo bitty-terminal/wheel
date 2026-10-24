@@ -1055,8 +1055,9 @@ simultaneous appenders remain the documented cross-process residual.
 
 Cancellation is same-user only and does not add cross-user isolation. A child
 that calls `setsid` or joins another process group can still escape the recorded
-group, and table wins are the only cancellation-vs-timeout arbitration; a race
-resolves to exactly one terminal reason. No Bitty panel/terminal presentation
+group, and the first-writer-wins terminal record under the transition lock is
+the only cancellation-vs-timeout arbitration; a race resolves to exactly one
+terminal reason. No Bitty panel/terminal presentation
 was run. The CTX-0030 review inspected the Gate 1 audit suite and the Gate 2
 audit JSONL, including the pre-spawn/completion fields, the deny record,
 redaction of synthetic credentials (escaped JSON headers, authorization

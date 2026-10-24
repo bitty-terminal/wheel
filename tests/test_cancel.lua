@@ -830,7 +830,7 @@ local function main()
   local real_create_private = WheelHost.backend.create_private_file
   WheelHost.backend.create_private_file = function(path, content)
     if type(path) == "string" and path:match("/job%.meta$") then
-      return false, "simulated metadata publish failure"
+      return false, "/private/tmp/wheel-job-meta-leak"
     end
     return real_create_private(path, content)
   end
@@ -846,6 +846,9 @@ local function main()
   check(type(meta_err.audit_error) == "table"
     and meta_err.audit_error.code == WheelErrors.E_JOB_METADATA_INVALID,
     "the metadata publish failure must carry the typed job error")
+  check(not tostring(meta_err.message):find("wheel-job-meta-leak", 1, true)
+    and not tostring(meta_err.audit_error.message):find("wheel-job-meta-leak", 1, true),
+    "a typed job error must not leak host path diagnostics")
   local meta_records = parse_audit(meta_audit)
   check(find_event(meta_records, "process.pre_spawn") ~= nil,
     "the metadata failure must have a pre-spawn record")

@@ -2484,24 +2484,24 @@ function standalone.new(opts)
     end
 
     for _, name in ipairs({ "out", "err", "diag", "status", "sweep", "pgid" }) do
-      local created, create_err = backend.create_private_file(job.paths[name], "")
+      local created = backend.create_private_file(job.paths[name], "")
       if not created then
         cleanup_job()
         local failure = start_failure("job capture files could not be created")
         failure.audit_error = WheelErrors.job_failure(
-          WheelErrors.E_JOB_UNAVAILABLE, tostring(create_err))
+          WheelErrors.E_JOB_UNAVAILABLE, "job capture files could not be created")
         return nil, failure
       end
     end
 
     local stdin_path = "/dev/null"
     if normalized.stdin_data ~= nil then
-      local staged, stage_err = backend.create_private_file(job.paths.stdin, normalized.stdin_data)
+      local staged = backend.create_private_file(job.paths.stdin, normalized.stdin_data)
       if not staged then
         cleanup_job()
         local failure = start_failure("job stdin could not be staged")
         failure.audit_error = WheelErrors.job_failure(
-          WheelErrors.E_JOB_UNAVAILABLE, tostring(stage_err))
+          WheelErrors.E_JOB_UNAVAILABLE, "job stdin could not be staged")
         return nil, failure
       end
       stdin_path = job.paths.stdin
