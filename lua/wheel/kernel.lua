@@ -573,9 +573,10 @@ local function create_mock_dispatcher()
       local action
       if WheelAction then
         action = WheelAction.normalize(payload, function(hash, content)
+          if type(hash) ~= "string" or #hash ~= 64 or content == "" then return end
           local slot_name = "blobs/" .. hash
           if not state.slots[slot_name] then
-            local h = mock_hash(content)
+            local h = hash
             state.slots[slot_name] = {
               name = slot_name, hash = h, content = content, size_bytes = #content,
             }

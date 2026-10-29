@@ -43,6 +43,8 @@ local WheelTool = {}
 local WheelErrors = load_errors()
 local ok_action, WheelAction = pcall(require, "wheel.action")
 if not ok_action then WheelAction = nil end
+local ok_audit, WheelAudit = pcall(require, "wheel.audit")
+if not ok_audit then WheelAudit = nil end
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end
@@ -161,17 +163,15 @@ function WheelTool.compute_hash(str)
   if WheelContext and type(WheelContext.compute_hash) == "function" then
     return WheelContext.compute_hash(str)
   end
-  local h1 = 0x811c9dc5
-  local h2 = 0x27d4eb2f
-  local len = #str
-  for i = 1, len do
-    local b = string.byte(str, i)
-    h1 = (h1 * 16777619 + b) % 4294967296
-    h2 = (h2 * 2166136261 + b) % 4294967296
+  return nil
+end
+
+local function safe_preview(value, limit)
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    return WheelAudit.redact_bounded(value, limit)
   end
-  return string.format("%08x%08x%08x%08x%08x%08x%08x%08x",
-    h1, h2, (h1 + h2) % 4294967296, (h1 * 31 + h2) % 4294967296,
-    h2, h1, (h2 * 17 + h1) % 4294967296, (h1 * 13 + h2 * 7) % 4294967296)
+  if type(value) ~= "string" then return "" end
+  return value:sub(1, limit)
 end
 
 -- ---------------------------------------------------------------------------
@@ -401,9 +401,11 @@ function ActionOutcome:to_table()
     timed_out = self.timed_out,
     truncated = self.truncated,
     diagnostics = self.diagnostics,
-    size_bytes = #(self.stdout or "") + #(self.stderr or ""),
-    stdout_bytes = #(self.stdout or ""),
-    stderr_bytes = #(self.stderr or ""),
+    stdout_preview = self.stdout_preview,
+    stderr_preview = self.stderr_preview,
+    size_bytes = self.size_bytes,
+    stdout_bytes = self.stdout_bytes,
+    stderr_bytes = self.stderr_bytes,
   }
 end
 
@@ -417,6 +419,7 @@ WheelTool.ActionOutcome = ActionOutcome
 -- @return table ActionOutcome instance
 function WheelTool.process_spillover(raw, opts)
   opts = opts or {}
+  raw = raw or {}
   local threshold = opts.threshold_bytes or WheelTool.DEFAULT_SPILLOVER_THRESHOLD
   local stdout = raw.stdout or ""
   local stderr = raw.stderr or ""
@@ -432,6 +435,12 @@ function WheelTool.process_spillover(raw, opts)
   self.duration_ms = raw.duration_ms or 0
   self.stdout = stdout
   self.stderr = stderr
+  self.stdout_bytes = tonumber(raw.stdout_bytes) or #stdout
+  self.stderr_bytes = tonumber(raw.stderr_bytes) or #stderr
+  self.size_bytes = tonumber(raw.size_bytes) or total_bytes
+  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
+  self.stdout_preview = safe_preview(raw.stdout_preview or stdout, preview_limit)
+  self.stderr_preview = safe_preview(raw.stderr_preview or stderr, preview_limit)
   self.outcome = raw.outcome
   self.timed_out = raw.timed_out == true
   self.truncated = raw.truncated == true
@@ -443,6 +452,13 @@ function WheelTool.process_spillover(raw, opts)
       full_payload = full_payload .. "\n--- STDERR ---\n" .. stderr
     end
     local hash = WheelTool.compute_hash(full_payload)
+    if type(hash) ~= "string" or #hash ~= 64 or full_payload == "" then
+      self.spilled = false
+      self.spillover_hash = nil
+      self.spillover_bytes = 0
+      self.preview = raw.preview or raw.stdout_preview or stdout:sub(1, preview_limit)
+      return self
+    end
 
     -- Persist blob into context if context available
     if opts.context and type(opts.context.put_slot) == "function" then
@@ -482,7 +498,7 @@ function WheelTool.process_spillover(raw, opts)
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
-    self.preview = table.concat(preview_lines, "\n")
+    self.preview = raw.preview or table.concat(preview_lines, "\n")
   else
     self.spilled = false
     self.spillover_hash = nil
@@ -491,7 +507,7 @@ function WheelTool.process_spillover(raw, opts)
     if #stderr > 0 then
       p = p .. (#p > 0 and "\n" or "") .. "STDERR: " .. stderr
     end
-    self.preview = p
+    self.preview = raw.preview or p
   end
 
   return self
@@ -1208,9 +1224,9 @@ function WheelToolRegistry:dispatch(name, args, env)
         preview = outcome.preview,
         stdout_preview = outcome.stdout and outcome.stdout:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
         stderr_preview = outcome.stderr and outcome.stderr:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
-        size_bytes = (outcome.spillover_bytes or 0) > 0 and outcome.spillover_bytes or #(outcome.stdout or "") + #(outcome.stderr or ""),
-        stdout_bytes = #(outcome.stdout or ""),
-        stderr_bytes = #(outcome.stderr or ""),
+        size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
+        stdout_bytes = outcome.stdout_bytes,
+        stderr_bytes = outcome.stderr_bytes,
         spilled = outcome.spilled,
         blob_hash = outcome.spillover_hash,
         spillover_bytes = outcome.spillover_bytes,

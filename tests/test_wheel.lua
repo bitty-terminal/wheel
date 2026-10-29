@@ -9,6 +9,7 @@ local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
 local WheelTool = require("wheel.tool")
 local WheelAction = require("wheel.action")
+local WheelContext = require("wheel.context")
 local WheelHost = require("wheel.host")
 local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
@@ -328,6 +329,77 @@ run_test("WheelAction: stderr, truncation, timeout and spillover metadata", func
   assert(blobs[large.blob_hash] ~= nil)
   assert(large.raw_stdout == nil and large.raw_stderr == nil)
   assert(large.size_bytes > WheelAction.SPILLOVER_THRESHOLD_BYTES)
+end)
+
+run_test("WheelAction: review regressions stay bounded, redacted and content-addressed", function()
+  local secret = "sk-action-review-secret-9f4e2d7c"
+  local supplied = WheelAction.normalize({
+    action_id = "preview-only",
+    spilled = true,
+    blob_hash = string.rep("a", 64),
+    preview = "useful existing preview",
+    stdout_preview = "token=" .. secret,
+    stderr_preview = "password=" .. secret,
+    diagnostics = {
+      errors = { "error: token=" .. secret .. string.rep("x", 1000) },
+      locations = {{ file = "src/main.lua", line = 7, text = "token=" .. secret }},
+      final_failure_stage = "compiler",
+    },
+  })
+  assert(supplied.preview == "useful existing preview")
+  assert(not supplied.diagnostics.errors[1]:find(secret, 1, true))
+  assert(not supplied.diagnostics.locations[1].text:find(secret, 1, true))
+  assert(not supplied.stdout_preview:find(secret, 1, true))
+  assert(not supplied.stderr_preview:find(secret, 1, true))
+  assert(#supplied.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+
+  local empty_writes = 0
+  local invalid = WheelAction.normalize({
+    spilled = true,
+    blob_hash = "not-a-sha256",
+    preview = "keep this preview",
+  }, function() empty_writes = empty_writes + 1 end)
+  assert(invalid.preview == "keep this preview")
+  assert(invalid.blob_hash == nil)
+  assert(empty_writes == 0)
+
+  local diag = WheelAction.extract_diagnostics("server:8080\n", "", 1, false)
+  assert(#diag.locations == 0, "server:port is not a file location")
+end)
+
+run_test("WheelTool: non-spilled outcomes carry exact byte counts", function()
+  local outcome = WheelTool.process_spillover({
+    tool = "run_command",
+    stdout = "12345",
+    stderr = "678",
+    success = true,
+  }, { threshold_bytes = 4096 })
+  assert(outcome.stdout_bytes == 5)
+  assert(outcome.stderr_bytes == 3)
+  assert(outcome.size_bytes == 8)
+  local serialized = outcome:to_table()
+  assert(serialized.stdout_bytes == 5 and serialized.stderr_bytes == 3)
+  assert(serialized.size_bytes == 8)
+end)
+
+run_test("WheelAction: existing blob identity preserves authoritative content", function()
+  local payload = string.rep("blob-content\n", 500)
+  local hash = WheelTool.compute_hash(payload)
+  local kernel = WheelKernel.new({ in_memory = true })
+  local context = WheelContext.new({ kernel = kernel })
+  context:put_slot("blobs/" .. hash, payload)
+  local writes = {}
+  local record = WheelAction.normalize({
+    spilled = true,
+    blob_hash = hash,
+    stdout = payload,
+    preview = "existing preview",
+  }, function(key, content) writes[key] = content end)
+  assert(record.blob_hash == hash)
+  assert(writes[hash] == payload)
+  assert(record.preview == "existing preview")
+  local recovered = context:get_slot("blobs/" .. hash)
+  assert(recovered.found == true and recovered.content == payload)
 end)
 
 run_test("WheelKernel: context compilation", function()
@@ -5812,6 +5884,36 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   assert(string.find(art_slot.content, "Verified test_core()", 1, true) ~= nil)
 end)
 
+run_test("WheelRunner: action records retain non-spilled output byte counts", function()
+  local recorded
+  local agent = {
+    name = "runner-bytes",
+    role = WheelAgent.Role.CODING,
+    kernel = {
+      record_action = function(_, action) recorded = action end,
+      commit_checkpoint = function() return nil end,
+    },
+    execute_tool = function()
+      return WheelTool.process_spillover({
+        tool = "inspect_file", stdout = "abcd", stderr = "ef", success = true,
+      }, { threshold_bytes = 4096 })
+    end,
+  }
+  local provider = WheelProvider.MockProvider.new({
+    responses = {
+      { tool_calls = {{ id = "bytes-1", name = "inspect_file", arguments = {} }} },
+      { content = "done", tool_calls = {} },
+    },
+  })
+  local task = { id = "T-BYTES", title = "byte counts" }
+  local result = WheelRunner.run_task(agent, task, {
+    provider = provider, max_turns = 2, commit_checkpoints = false,
+  })
+  assert(result.success == true)
+  assert(recorded.stdout_bytes == 4 and recorded.stderr_bytes == 2)
+  assert(recorded.size_bytes == 6)
+end)
+
 run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })
@@ -8849,5 +8951,3 @@ cleanup_test_run_root()
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
-
-

@@ -296,7 +296,7 @@ function WheelRunner.run_task(agent, task, opts)
             preview = outcome.preview,
             stdout_preview = outcome.stdout_preview,
             stderr_preview = outcome.stderr_preview,
-            size_bytes = (outcome.spillover_bytes or 0) > 0 and outcome.spillover_bytes or 0,
+            size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
             stdout_bytes = outcome.stdout_bytes,
             stderr_bytes = outcome.stderr_bytes,
             spilled = outcome.spilled,
