@@ -1510,6 +1510,7 @@ local PROJECTION_MAX_SEMANTIC_BYTES = 64 * 1024
 local PROJECTION_MAX_BUDGET_BYTES = WheelContext.MAX_TOTAL_BUDGET_BYTES
 local PROJECTION_WORK_NODES_PER_BYTE = 16
 local PROJECTION_MIN_WORK_NODES = 64
+local PROJECTION_MAX_SCALAR = 9007199254740991
 
 local function projection_byte_less(left, right)
   local length = math.min(#left, #right)
@@ -1858,7 +1859,12 @@ local function projection_commit(context, reference)
     local hash = context:head_commit_hash()
     return hash and context:get_commit(hash) or nil
   end
-  if type(reference) == "table" then return reference end
+  if type(reference) == "table" then
+    for _, commit in pairs(context._commits) do
+      if commit == reference then return commit end
+    end
+    return nil
+  end
   if type(reference) ~= "string" then return nil end
   return context:get_commit(reference)
     or (context._refs["refs/heads/" .. reference]
@@ -1910,6 +1916,14 @@ local function projection_record(record, commit, opts, index, include_provenance
   if type(copy.ref) ~= "string" or #copy.ref == 0
     or #copy.ref > PROJECTION_MAX_REFERENCE_BYTES then
     return nil, "record ref must be a bounded non-empty string"
+  end
+  for _, field in ipairs({ "timestamp_ms", "revision" }) do
+    local value = copy[field]
+    if value ~= nil and (type(value) ~= "number" or value ~= value
+        or value == math.huge or value == -math.huge
+        or value < 0 or value > PROJECTION_MAX_SCALAR) then
+      return nil, field .. " must be a finite bounded number"
+    end
   end
   local derived_category = projection_category(copy.ref)
   if copy.category ~= nil and type(copy.category) ~= "string" then
@@ -2182,6 +2196,7 @@ function WheelContext:project(opts)
 
   local provenance = projection_provenance(current, opts, current.timestamp_ms)
   local p0, p2, p4 = {}, {}, {}
+  local assigned_record_refs = {}
   local omitted_input = {}
   local function add_omitted(ref, reason, provenance_source)
     omitted_input[#omitted_input + 1] = {
@@ -2247,6 +2262,7 @@ function WheelContext:project(opts)
     if eligible then
       if normalized.task_id == opts.task_id then
         p2[#p2 + 1] = normalized
+        assigned_record_refs[normalized.ref] = "P2"
       end
     else
       if eligibility_reason ~= "task" and eligibility_reason ~= "session" then
@@ -2257,7 +2273,10 @@ function WheelContext:project(opts)
     if session_eligible == nil then return nil, projection_error("records[" .. tostring(index) .. "]: " .. session_reason) end
     if session_eligible and not (eligible and normalized.task_id == opts.task_id) then
       if normalized.session_id == opts.session_id then
-        p4[#p4 + 1] = normalized
+        if not assigned_record_refs[normalized.ref] then
+          p4[#p4 + 1] = normalized
+          assigned_record_refs[normalized.ref] = "P4"
+        end
       end
     elseif session_reason ~= "task" and session_reason ~= "session" then
       add_omitted(normalized.ref, session_reason, normalized.provenance)
@@ -2268,8 +2287,20 @@ function WheelContext:project(opts)
     if not normalized then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. normalize_err) end
     local eligible, eligibility_reason = projection_record_eligible(role, normalized, scopes, opts)
     if eligible == nil then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. eligibility_reason) end
-    if eligible then
-      p4[#p4 + 1] = normalized
+    if eligible and not assigned_record_refs[normalized.ref] then
+      local task_eligible, task_reason = projection_record_eligible(role, normalized, scopes, opts, "task")
+      if task_eligible == nil then
+        return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. task_reason)
+      end
+      if task_eligible and normalized.task_id == opts.task_id then
+        p2[#p2 + 1] = normalized
+        assigned_record_refs[normalized.ref] = "P2"
+      else
+        p4[#p4 + 1] = normalized
+        assigned_record_refs[normalized.ref] = "P4"
+      end
+    elseif eligible and assigned_record_refs[normalized.ref] then
+      add_omitted(normalized.ref, "duplicate_reference", normalized.provenance)
     else
       add_omitted(normalized.ref, eligibility_reason, normalized.provenance)
     end

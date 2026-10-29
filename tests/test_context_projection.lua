@@ -344,4 +344,62 @@ return function(run_test)
     end
     assert(p2_count == 1 and p4_count == 0)
   end)
+
+  run_test("Context projections: task/session refs are disjoint across collections", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "collection deduplication", timestamp_ms = 1700000000000,
+    }))
+    local projection = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, task_id = "TASK-1", session_id = "SESSION-1",
+      records = {
+        { ref = "workspace/shared", category = "project", task_id = "TASK-1", session_id = "SESSION-1", value = "P2 copy" },
+      },
+      recent_records = {
+        { ref = "workspace/shared", category = "project", task_id = "TASK-1", session_id = "SESSION-1", value = "P4 duplicate" },
+        { ref = "workspace/session-only", category = "project", session_id = "SESSION-1", value = "P4 only" },
+      },
+    }))
+    local p2_shared, p4_shared, p4_only = 0, 0, 0
+    for _, record in ipairs(projection.layers.P2.records) do
+      if record.ref == "workspace/shared" then p2_shared = p2_shared + 1 end
+    end
+    for _, record in ipairs(projection.layers.P4.records) do
+      if record.ref == "workspace/shared" then p4_shared = p4_shared + 1 end
+      if record.ref == "workspace/session-only" then p4_only = p4_only + 1 end
+    end
+    assert(p2_shared == 1 and p4_shared == 0 and p4_only == 1)
+    assert(not projection.canonical_bytes:find("P4 duplicate", 1, true))
+  end)
+
+  run_test("Context projections: malformed commit tables fail with typed errors", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "commit table validation", timestamp_ms = 1700000000000,
+    }))
+    assert_projection_error(context, { current_commit = { slots = "bad" } }, "malformed current commit table")
+    local delta, err = context:semantic_delta({ slots = "bad" }, commit.hash)
+    assert(delta == nil and err.code == "E_PROJECTION_INVALID")
+    local valid_table = context:get_commit(commit.hash)
+    assert(context:project({ current_commit = valid_table }).current_commit == commit.hash)
+  end)
+
+  run_test("Context projections: timestamp and revision fields are finite numbers", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "timestamp validation", timestamp_ms = 1700000000000,
+    }))
+    local malformed_values = { "text", {}, 0 / 0, math.huge }
+    for _, value in ipairs(malformed_values) do
+      assert_projection_error(context, {
+        current_commit = commit.hash, role = WheelContext.Role.CODING,
+        recent_records = { { ref = "diagnostics/bad-time", category = "diagnostics", timestamp_ms = value } },
+      }, "malformed timestamp")
+      assert_projection_error(context, {
+        current_commit = commit.hash, role = WheelContext.Role.CODING,
+        recent_records = { { ref = "diagnostics/bad-revision", category = "diagnostics", revision = value } },
+      }, "malformed revision")
+    end
+  end)
 end
