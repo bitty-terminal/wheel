@@ -106,8 +106,9 @@ engineering only: its task domain is always software development. It
 may support multi-agent, multi-role, multi-model, and multi-workspace/panel
 operation within that domain. Roles (Primary, Commander, Coding, Debug,
 Research, Reviewer) vary by configuration, never by class explosion. The staged
-MVP direction is a single Primary Coding Agent, then Primary plus Subagents,
-then a Commander.
+MVP direction is a single Coding Agent, then a peer Team of Agents with
+explicit roles and coordination, then richer planning and Dashboard controls.
+Wheel does not model runtime participants as Main Agent/Subagent.
 
 ### Non-goals
 
@@ -763,6 +764,8 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 
 ## Architecture
 
+The lifecycle and context projection target is documented in [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md). It is a draft design and does not claim that the listed follow-up runtime surfaces are implemented.
+
 ### Headless Panel Working Container Invariant
 
 Under Bitty Core Rule R1, `ExecutionContext` is primary: panels describe presentation and view projections, not execution authority (`PanelId != ViewId != TerminalId`). Every Wheel agent defaults to running in an isolated **Headless Panel working container** (`panel_id = "headless:panel:<agent_name>"`, `headless = true`), binding its execution environment without requiring desktop screen rendering. Presentation UI panels are optional observation projections.
@@ -774,7 +777,11 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
 - **Semantic Slots & CAS**: Structured slots (`workspace/*`, `tasks/<id>/*`, `decisions/*`, `scratch/*`) with optimistic Compare-And-Swap (`expected_version`) concurrency control and Merkle tree root hashing (`tree:v1\0`).
 - **Semantic 3-Way Merge**: Non-conflicting additions or edits merge automatically; concurrent edits surface structured conflict records for explicit resolution.
 - **Context Event Bus**: Real-time in-memory pubsub (`ContextBus`) notifying peer agents of slot modifications, checkpoint commits, and task handoffs without polling.
-- **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)** shared across agents of the same model family for maximum KV cache reuse (>90%), coupled with a multi-tier budget reduction pipeline (Tier 1 scratchpad pruning, Tier 2 rationale compression, Tier 3 tail truncation).
+- **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)**
+  designed for prefix reuse, coupled with a multi-tier budget reduction
+  pipeline (Tier 1 scratchpad pruning, Tier 2 bounded rationale/slot previews,
+  Tier 3 tail truncation). Provider-level cache hits are not yet implemented or
+  verified; see [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
 
 ### Context Graph Projections (CTX-0037)
 
@@ -829,7 +836,12 @@ context budgets:
 - **Path Sandboxing**: Lexical workspace-boundary verification (`sanitize_path`) rejects `..` traversal and absolute paths outside the root. Symlink target resolution, non-regular file rejection, and atomic writes are required by [SECURITY-MODEL.md](SECURITY-MODEL.md) and are not yet evidenced.
 - **Role Authority Gating**: `Research` and `Reviewer` roles are strictly read-only and fail-closed on `Modify` or `Execute` intents; `Commander` plans and orchestrates without direct file mutation.
 - **Catastrophic Command Protection**: Pattern scanning against a deny-list subset (`rm -rf /`, `mkfs`, fork bombs, and similar). It is defense-in-depth, not a sandbox; the missing categories and limits are recorded in [SECURITY-MODEL.md](SECURITY-MODEL.md).
-- **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is automatically persisted as a content-addressed blob in context memory (`blobs/<hash>`), providing bounded head/tail previews to preserve the context window while ensuring full byte-exact recovery via `read_blob`.
+- **Auto-Spillover Observation Pipeline**: Oversized tool output (> 4 KiB) is
+  automatically persisted as a content-addressed blob in context memory
+  (`blobs/<hash>`), providing bounded head/tail previews to preserve the
+  context window while ensuring full byte-exact recovery via `read_blob`.
+  Build/compiler-aware diagnostics and durable Action Record density are
+  follow-up work, not yet a complete semantic log summarizer.
 - **Core Engineering Tools**: Built-in pure Lua implementations of `read_file` (bounded chunked reads; line ranges apply inside the bounded prefix, a `start_line` beyond it fails loud, and a prefix ending inside an included line reports `truncated=true` with a marker), `write_file` (truncating write with directory creation; atomic replace not yet implemented), `edit_file` (exact target replacement), `run_command` (bounded process execution with a timeout, a `setsid`-recorded process group held by a retained leader through the TERM/grace/KILL sweep, scrubbed environment, typed timeout/unavailable/cleanup outcomes, and metrics), `list_directory` (fails closed on `ls` errors/timeouts), `search_code` (bounded `grep` capture before the 100-line observation cap; grep errors fail closed), and `read_blob`.
 
 ### Process Cancellation (CTX-0034)
