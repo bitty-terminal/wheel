@@ -724,6 +724,35 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
 - **Context Event Bus**: Real-time in-memory pubsub (`ContextBus`) notifying peer agents of slot modifications, checkpoint commits, and task handoffs without polling.
 - **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)** shared across agents of the same model family for maximum KV cache reuse (>90%), coupled with a multi-tier budget reduction pipeline (Tier 1 scratchpad pruning, Tier 2 rationale compression, Tier 3 tail truncation).
 
+### Context Graph Projections (CTX-0037)
+
+`WheelContext:project(opts)` is the deterministic source for role- and
+task-specific prompt inputs. It reads immutable Context commits and
+caller-owned structured records; it does not read conversation transcripts,
+persist Agent/Panel lifecycle state, summarize with an LLM, or add a `bittyd`
+surface. Every result records `base_commit`, `current_commit`, role, task and
+session identifiers, byte budgets, provenance, and explicit omitted
+references.
+
+The projection keeps five inputs separate:
+
+- **P0 project knowledge** — eligible architecture, accepted decisions,
+  documentation, security facts, and workspace knowledge.
+- **P1 role lens** — deterministic category selection for Planner,
+  Documentation, Coding, Debug, Research, and Reviewer.
+- **P2 task projection** — task-scoped slots and structured records.
+- **P3 session delta** — structured added/modified/removed records between
+  immutable commits, never raw string subtraction.
+- **P4 recent tail** — explicitly supplied recent structured records, ordered
+  newest-first with a reference for every omitted record.
+
+The default per-layer budgets are 16 KiB, 8 KiB, 16 KiB, 16 KiB, and 8 KiB
+respectively. Selection is byte-bounded and deterministic: records are sorted
+by stable reference (with P4 using timestamp then reference), and records that
+do not fit are omitted rather than silently truncated. `semantic_delta` is
+available independently when a structured change set is needed before prompt
+compilation. These are Wheel context budgets, not provider cache controls.
+
 ### Standardized Action Protocol & Tool Execution Engine
 
 Wheel executes software engineering tools under policy gates and bounded

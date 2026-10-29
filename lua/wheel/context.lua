@@ -85,6 +85,51 @@ WheelContext.DEFAULT_ZONE1_MAX_BYTES = 16 * 1024 -- 16 KiB
 WheelContext.DEFAULT_ZONE2_MAX_BYTES = 32 * 1024 -- 32 KiB
 WheelContext.DEFAULT_ZONE3_MAX_BYTES = 16 * 1024 -- 16 KiB
 
+-- Context projection budgets are deliberately independent from provider
+-- settings. They bound deterministic, caller-owned plain data before prompt
+-- compilation and keep each projection layer observable.
+WheelContext.DEFAULT_PROJECTION_BUDGET_BYTES = WheelContext.MAX_TOTAL_BUDGET_BYTES
+WheelContext.DEFAULT_P0_BUDGET_BYTES = 16 * 1024
+WheelContext.DEFAULT_P1_BUDGET_BYTES = 8 * 1024
+WheelContext.DEFAULT_P2_BUDGET_BYTES = 16 * 1024
+WheelContext.DEFAULT_P3_BUDGET_BYTES = 16 * 1024
+WheelContext.DEFAULT_P4_BUDGET_BYTES = 8 * 1024
+WheelContext.PROJECTION_VERSION = 1
+
+WheelContext.Role = {
+  PLANNER = "Planner",
+  DOCUMENTATION = "Documentation",
+  CODING = "Coding",
+  DEBUG = "Debug",
+  RESEARCH = "Research",
+  REVIEWER = "Reviewer",
+}
+
+local ROLE_VALUES = {}
+for _, role in pairs(WheelContext.Role) do
+  ROLE_VALUES[role] = true
+end
+
+-- These defaults are selection policy, not authority. A caller may supply
+-- explicit scopes and records; a role lens only decides which eligible
+-- categories are useful by default.
+local ROLE_LENSES = {
+  Planner = { "project", "decisions", "tasks", "architecture", "security", "diagnostics" },
+  Documentation = { "project", "decisions", "architecture", "documentation", "security", "tasks" },
+  Coding = { "project", "decisions", "architecture", "source", "diagnostics", "tasks" },
+  Debug = { "project", "decisions", "source", "diagnostics", "logs", "tasks" },
+  Research = { "project", "decisions", "architecture", "research", "security", "tasks" },
+  Reviewer = { "project", "decisions", "architecture", "source", "diagnostics", "security", "tasks" },
+}
+
+local PROJECTION_LAYERS = {
+  { id = "P0", name = "project", budget = "p0_max_bytes" },
+  { id = "P1", name = "role", budget = "p1_max_bytes" },
+  { id = "P2", name = "task", budget = "p2_max_bytes" },
+  { id = "P3", name = "session_delta", budget = "p3_max_bytes" },
+  { id = "P4", name = "recent_tail", budget = "p4_max_bytes" },
+}
+
 -- Snapshot policy constants have one source: the snapshot module. Keeping the
 -- public context aliases avoids a second format/version/bound that can drift.
 WheelContext.MAX_BUS_HISTORY = WheelSnapshot.MAX_BUS_HISTORY
@@ -1426,6 +1471,540 @@ function WheelContext:diff(from_ref, to_ref)
     count = count,
   }
 end
+
+-- ---------------------------------------------------------------------------
+-- Deterministic Context Graph Projections
+-- ---------------------------------------------------------------------------
+
+local PROJECT_CATEGORIES = {
+  architecture = true,
+  decisions = true,
+  documentation = true,
+  project = true,
+  security = true,
+}
+
+local function projection_byte_less(left, right)
+  local length = math.min(#left, #right)
+  for index = 1, length do
+    local left_byte = string.byte(left, index)
+    local right_byte = string.byte(right, index)
+    if left_byte ~= right_byte then
+      return left_byte < right_byte
+    end
+  end
+  return #left < #right
+end
+
+local function projection_escape(value)
+  return (value:gsub("[\\\"\n\r\t%z\1-\31]", function(char)
+    local escapes = { ["\\"] = "\\\\", ["\""] = "\\\"", ["\n"] = "\\n",
+      ["\r"] = "\\r", ["\t"] = "\\t" }
+    return escapes[char] or string.format("\\x%02x", string.byte(char))
+  end))
+end
+
+-- Canonical plain-data encoding is intentionally local to projections. It is
+-- not a wire format and rejects executable/cyclic values before they can enter
+-- a caller-owned view.
+local function canonical_projection_value(value, visiting)
+  local value_type = type(value)
+  if value_type == "nil" then return "null" end
+  if value_type == "string" then return '"' .. projection_escape(value) .. '"' end
+  if value_type == "boolean" then return value and "true" or "false" end
+  if value_type == "number" then
+    if value ~= value or value == math.huge or value == -math.huge then
+      return nil, "non-finite number"
+    end
+    return string.format("%.17g", value)
+  end
+  if value_type ~= "table" then return nil, "unsupported value type" end
+
+  visiting = visiting or {}
+  if visiting[value] then return nil, "cyclic value" end
+  visiting[value] = true
+
+  local keys = {}
+  local array = true
+  local count = 0
+  for key in pairs(value) do
+    count = count + 1
+    if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+      array = false
+    end
+    keys[#keys + 1] = key
+  end
+  if array then
+    for index = 1, count do
+      if rawget(value, index) == nil then array = false; break end
+    end
+  end
+
+  local encoded = {}
+  if array then
+    for index = 1, count do
+      local item, err = canonical_projection_value(value[index], visiting)
+      if not item then visiting[value] = nil; return nil, err end
+      encoded[index] = item
+    end
+    visiting[value] = nil
+    return "[" .. table.concat(encoded, ",") .. "]"
+  end
+
+  for _, key in ipairs(keys) do
+    if type(key) ~= "string" then
+      visiting[value] = nil
+      return nil, "map keys must be strings"
+    end
+  end
+  table.sort(keys, projection_byte_less)
+  for _, key in ipairs(keys) do
+    local item, err = canonical_projection_value(value[key], visiting)
+    if not item then visiting[value] = nil; return nil, err end
+    encoded[#encoded + 1] = '"' .. projection_escape(key) .. '":' .. item
+  end
+  visiting[value] = nil
+  return "{" .. table.concat(encoded, ",") .. "}"
+end
+
+local function copy_projection_value(value, visiting)
+  if type(value) ~= "table" then return value end
+  visiting = visiting or {}
+  if visiting[value] then return nil end
+  visiting[value] = true
+  local copy = {}
+  for key, item in pairs(value) do
+    local item_copy = copy_projection_value(item, visiting)
+    if item_copy == nil and item ~= nil then
+      visiting[value] = nil
+      return nil
+    end
+    copy[key] = item_copy
+  end
+  visiting[value] = nil
+  return copy
+end
+
+local function projection_category(name)
+  local prefix = name:match("^([^/]+)/")
+  if prefix == "code" then return "source" end
+  if prefix == "docs" then return "documentation" end
+  if prefix == "research" then return "research" end
+  if prefix == "logs" then return "logs" end
+  if prefix == "diagnostics" then return "diagnostics" end
+  if prefix == "tasks" then return "tasks" end
+  if prefix == "decisions" then return "decisions" end
+  if prefix == "workspace" then return "project" end
+  if prefix == "architecture" then return "architecture" end
+  if prefix == "security" then return "security" end
+  if prefix == "scratch" then return "scratch" end
+  return "project"
+end
+
+local function projection_scope_matches(name, category, scopes)
+  if not scopes or #scopes == 0 then return true end
+  for _, scope in ipairs(scopes) do
+    if scope == "*" or scope == category or name == scope
+      or name:sub(1, #scope + 1) == scope .. "/" then
+      return true
+    end
+  end
+  return false
+end
+
+local function role_allows_category(role, category)
+  for _, allowed in ipairs(ROLE_LENSES[role] or {}) do
+    if allowed == category then return true end
+  end
+  return false
+end
+
+local function projection_commit(context, reference)
+  if reference == nil then
+    local hash = context:head_commit_hash()
+    return hash and context:get_commit(hash) or nil
+  end
+  if type(reference) == "table" then return reference end
+  if type(reference) ~= "string" then return nil end
+  return context:get_commit(reference)
+    or (context._refs["refs/heads/" .. reference]
+      and context:get_commit(context._refs["refs/heads/" .. reference]))
+end
+
+local function projection_provenance(commit, opts, revision)
+  return {
+    source_commit = commit and commit.hash or nil,
+    source_task = (commit and commit.task_id) or opts.task_id,
+    source_session = opts.session_id,
+    revision = revision or (commit and commit.timestamp_ms) or 0,
+    confidence = opts.confidence or 1.0,
+  }
+end
+
+local function projection_slot_record(slot, commit, opts)
+  return {
+    ref = "slot:" .. slot.name,
+    category = projection_category(slot.name),
+    name = slot.name,
+    content = slot.content,
+    kind = slot.kind,
+    revision = slot.version,
+    provenance = projection_provenance(commit, opts, slot.version),
+  }
+end
+
+local function projection_slot_copy(slot)
+  if not slot then return nil end
+  return {
+    name = slot.name,
+    content = slot.content,
+    hash = slot.hash,
+    version = slot.version,
+    kind = slot.kind,
+    size_bytes = slot.size_bytes,
+    updated_at_ms = slot.updated_at_ms,
+  }
+end
+
+local function projection_record(record, commit, opts, index)
+  local copy = copy_projection_value(record)
+  if not copy then return nil end
+  copy.ref = copy.ref or copy.id or string.format("record:%06d", index)
+  copy.category = copy.category or copy.kind or "project"
+  copy.provenance = copy.provenance or projection_provenance(commit, opts,
+    copy.revision or copy.timestamp_ms or index)
+  return copy
+end
+
+local function projection_sorted_records(records)
+  table.sort(records, function(left, right)
+    return tostring(left.ref) < tostring(right.ref)
+  end)
+end
+
+local function projection_layer(id, name, budget, candidates, provenance)
+  local selected = {}
+  local omitted = {}
+  local used = 0
+  for _, candidate in ipairs(candidates) do
+    local encoded = candidate._encoded
+    local size = #encoded
+    if used + size <= budget then
+      selected[#selected + 1] = candidate
+      used = used + size
+    else
+      omitted[#omitted + 1] = {
+        ref = candidate.ref,
+        reason = "byte_budget",
+        bytes = size,
+      }
+    end
+  end
+  local rendered = {}
+  for _, candidate in ipairs(selected) do rendered[#rendered + 1] = candidate._encoded end
+  return {
+    id = id,
+    name = name,
+    budget_bytes = budget,
+    bytes = used,
+    records = selected,
+    omitted_references = omitted,
+    provenance = provenance,
+    text = table.concat(rendered, "\n"),
+  }
+end
+
+local function prepare_projection_candidates(candidates)
+  for _, candidate in ipairs(candidates) do
+    local encoded, err = canonical_projection_value(candidate)
+    if not encoded then return nil, err end
+    candidate._encoded = encoded
+  end
+  return candidates
+end
+
+local function clean_projection_candidates(candidates)
+  for _, candidate in ipairs(candidates) do candidate._encoded = nil end
+end
+
+local function projection_budget(opts, name, default)
+  local value = opts[name]
+  if value == nil then return default end
+  if type(value) ~= "number" or value < 0 or value ~= math.floor(value) then return nil end
+  return value
+end
+
+local function projection_error(message)
+  return { error = "invalid_projection", message = message }
+end
+
+--- Compute a structured semantic delta between two immutable commits.
+-- Slot content is compared by its structured hash/record fields; no textual
+-- subtraction or transcript access is involved.
+-- @param base_ref string|table Base commit hash, branch, or commit
+-- @param current_ref string|table Current commit hash, branch, or commit
+-- @param opts table|nil { base_records, current_records, records }
+-- @return table|nil Delta, or nil and an error table
+function WheelContext:semantic_delta(base_ref, current_ref, opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
+  local base = projection_commit(self, base_ref)
+  local current = projection_commit(self, current_ref)
+  if not base or not current then
+    return nil, projection_error("base_commit and current_commit must resolve to commits")
+  end
+
+  local names = {}
+  local seen = {}
+  for name in pairs(base.slots or {}) do seen[name] = true end
+  for name in pairs(current.slots or {}) do seen[name] = true end
+  for name in pairs(seen) do names[#names + 1] = name end
+  table.sort(names, projection_byte_less)
+
+  local delta = { added = {}, modified = {}, removed = {}, unchanged = {}, count = 0 }
+  for _, name in ipairs(names) do
+    local before = (base.slots or {})[name]
+    local after = (current.slots or {})[name]
+    local before_hash = before and before.hash
+    local after_hash = after and after.hash
+    if not before then
+      delta.added[#delta.added + 1] = { ref = "slot:" .. name, after = projection_slot_copy(after) }
+      delta.count = delta.count + 1
+    elseif not after then
+      delta.removed[#delta.removed + 1] = { ref = "slot:" .. name, before = projection_slot_copy(before) }
+      delta.count = delta.count + 1
+    elseif before_hash ~= after_hash or before.version ~= after.version then
+      delta.modified[#delta.modified + 1] = { ref = "slot:" .. name,
+        before = projection_slot_copy(before), after = projection_slot_copy(after) }
+      delta.count = delta.count + 1
+    else
+      delta.unchanged[#delta.unchanged + 1] = { ref = "slot:" .. name, after = projection_slot_copy(after) }
+    end
+  end
+
+  local base_records = opts.base_records or {}
+  local current_records = opts.current_records or opts.records or {}
+  local before_by_ref, after_by_ref = {}, {}
+  for index, record in ipairs(base_records) do
+    local normalized = projection_record(record, base, opts, index)
+    if normalized then before_by_ref[normalized.ref] = normalized end
+  end
+  for index, record in ipairs(current_records) do
+    local normalized = projection_record(record, current, opts, index)
+    if normalized then after_by_ref[normalized.ref] = normalized end
+  end
+  local record_refs = {}
+  for ref in pairs(before_by_ref) do record_refs[ref] = true end
+  for ref in pairs(after_by_ref) do record_refs[ref] = true end
+  local sorted_record_refs = {}
+  for ref in pairs(record_refs) do sorted_record_refs[#sorted_record_refs + 1] = ref end
+  table.sort(sorted_record_refs, projection_byte_less)
+  delta.records = { added = {}, modified = {}, removed = {}, unchanged = {} }
+  for _, ref in ipairs(sorted_record_refs) do
+    local before_record, after_record = before_by_ref[ref], after_by_ref[ref]
+    local before_encoded = before_record and canonical_projection_value(before_record)
+    local after_encoded = after_record and canonical_projection_value(after_record)
+    if not before_record then
+      delta.records.added[#delta.records.added + 1] = { ref = ref, after = after_record }
+    elseif not after_record then
+      delta.records.removed[#delta.records.removed + 1] = { ref = ref, before = before_record }
+    elseif before_encoded ~= after_encoded then
+      delta.records.modified[#delta.records.modified + 1] = { ref = ref, before = before_record, after = after_record }
+    else
+      delta.records.unchanged[#delta.records.unchanged + 1] = { ref = ref, after = after_record }
+    end
+  end
+  delta.base_commit = base.hash
+  delta.current_commit = current.hash
+  delta.provenance = {
+    source_commit = current.hash,
+    base_commit = base.hash,
+    source_task = current.task_id or opts.task_id,
+    source_session = opts.session_id,
+    revision = current.timestamp_ms,
+    confidence = opts.confidence or 1.0,
+  }
+  return delta
+end
+
+WheelContext.compute_semantic_delta = WheelContext.semantic_delta
+
+--- Build a deterministic role-aware P0-P4 Context projection.
+-- The result is plain data and can be reconstructed from immutable commits and
+-- caller-owned structured records; it never reads conversation transcripts.
+-- @param opts table { base_commit, current_commit, role, task_id, session_id,
+--   relevant_scopes/scopes, records, recent_records, p0_max_bytes..p4_max_bytes }
+-- @return table|nil Projection, or nil and an error table
+function WheelContext:project(opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
+  local role = opts.role or WheelContext.Role.CODING
+  if not ROLE_VALUES[role] then return nil, projection_error("unknown role: " .. tostring(role)) end
+  local base = projection_commit(self, opts.base_commit)
+  local current = projection_commit(self, opts.current_commit)
+  if not current then return nil, projection_error("current_commit must resolve to a commit") end
+  if not base then base = current end
+  local scopes = opts.relevant_scopes or opts.scopes or {}
+  if type(scopes) ~= "table" then return nil, projection_error("scopes must be an array") end
+
+  local budgets = {
+    p0_max_bytes = projection_budget(opts, "p0_max_bytes", WheelContext.DEFAULT_P0_BUDGET_BYTES),
+    p1_max_bytes = projection_budget(opts, "p1_max_bytes", WheelContext.DEFAULT_P1_BUDGET_BYTES),
+    p2_max_bytes = projection_budget(opts, "p2_max_bytes", WheelContext.DEFAULT_P2_BUDGET_BYTES),
+    p3_max_bytes = projection_budget(opts, "p3_max_bytes", WheelContext.DEFAULT_P3_BUDGET_BYTES),
+    p4_max_bytes = projection_budget(opts, "p4_max_bytes", WheelContext.DEFAULT_P4_BUDGET_BYTES),
+  }
+  for name, value in pairs(budgets) do
+    if not value then return nil, projection_error(name .. " must be a non-negative integer") end
+  end
+  local total_budget = projection_budget(opts, "max_budget_bytes", WheelContext.DEFAULT_PROJECTION_BUDGET_BYTES)
+  if not total_budget then return nil, projection_error("max_budget_bytes must be a non-negative integer") end
+
+  local provenance = projection_provenance(current, opts, current.timestamp_ms)
+  local p0, p2, p4 = {}, {}, {}
+  for _, slot in ipairs((current.slots and (function()
+    local list = {}
+    for _, value in pairs(current.slots) do list[#list + 1] = value end
+    table.sort(list, function(left, right) return left.name < right.name end)
+    return list
+  end)()) or {}) do
+    local category = projection_category(slot.name)
+    local candidate = projection_slot_record(slot, current, opts)
+    if PROJECT_CATEGORIES[category] and projection_scope_matches(slot.name, category, scopes) then
+      p0[#p0 + 1] = candidate
+    end
+    local task_prefix = opts.task_id and ("tasks/" .. opts.task_id) or nil
+    if category == "tasks" and (not task_prefix or slot.name == task_prefix
+        or slot.name:sub(1, #task_prefix + 1) == task_prefix .. "/")
+      and projection_scope_matches(slot.name, category, scopes) then
+      p2[#p2 + 1] = candidate
+    end
+  end
+
+  local p1 = {}
+  for _, category in ipairs(ROLE_LENSES[role]) do
+    if projection_scope_matches(category, category, scopes) then
+      p1[#p1 + 1] = {
+        ref = "lens:" .. role .. ":" .. category,
+        role = role,
+        category = category,
+        selected = true,
+        provenance = provenance,
+      }
+    end
+  end
+
+  local current_records = opts.records or {}
+  if type(current_records) ~= "table" then return nil, projection_error("records must be an array") end
+  for index, record in ipairs(current_records) do
+    local normalized = projection_record(record, current, opts, index)
+    if normalized then
+      if normalized.task_id and opts.task_id and normalized.task_id == opts.task_id then
+        p2[#p2 + 1] = normalized
+      end
+      if normalized.session_id and opts.session_id and normalized.session_id == opts.session_id then
+        p4[#p4 + 1] = normalized
+      end
+    end
+  end
+  local recent_records = opts.recent_records or {}
+  for index, record in ipairs(recent_records) do
+    local normalized = projection_record(record, current, opts, index)
+    if normalized and role_allows_category(role, normalized.category)
+      and (not opts.task_id or not normalized.task_id or normalized.task_id == opts.task_id) then
+      p4[#p4 + 1] = normalized
+    end
+  end
+  projection_sorted_records(p0)
+  projection_sorted_records(p1)
+  projection_sorted_records(p2)
+  table.sort(p4, function(left, right)
+    local left_time = left.timestamp_ms or left.revision or 0
+    local right_time = right.timestamp_ms or right.revision or 0
+    if left_time ~= right_time then return left_time > right_time end
+    return tostring(left.ref) < tostring(right.ref)
+  end)
+
+  local delta, delta_err = self:semantic_delta(base, current, {
+    base_records = opts.base_records,
+    current_records = current_records,
+    task_id = opts.task_id,
+    session_id = opts.session_id,
+    relevant_scopes = copy_projection_value(scopes),
+    confidence = opts.confidence,
+  })
+  if not delta then return nil, delta_err end
+  local p3 = {}
+  for _, operation in ipairs({ "added", "modified", "removed" }) do
+    for _, item in ipairs(delta[operation]) do
+      local category = projection_category(item.ref:sub(6))
+      if role_allows_category(role, category)
+        and projection_scope_matches(item.ref, category, scopes) then
+        p3[#p3 + 1] = { ref = item.ref, operation = operation, category = category,
+          before = item.before, after = item.after, provenance = delta.provenance }
+      end
+    end
+  end
+  for _, operation in ipairs({ "added", "modified", "removed" }) do
+    for _, item in ipairs(delta.records[operation]) do
+      local record = item.after or item.before
+      local category = record and record.category or "project"
+      local record_task = record and record.task_id
+      local relevant_task = not opts.task_id or not record_task or record_task == opts.task_id
+      if role_allows_category(role, category) and relevant_task
+        and projection_scope_matches(item.ref, category, scopes) then
+        p3[#p3 + 1] = { ref = item.ref, operation = operation, category = category,
+          before = item.before, after = item.after, provenance = delta.provenance }
+      end
+    end
+  end
+  projection_sorted_records(p3)
+  local candidates = { p0, p1, p2, p3, p4 }
+  for _, list in ipairs(candidates) do
+    local prepared, prepare_err = prepare_projection_candidates(list)
+    if not prepared then return nil, projection_error(prepare_err) end
+  end
+
+  local layers = {}
+  for index, definition in ipairs(PROJECTION_LAYERS) do
+    layers[definition.id] = projection_layer(definition.id, definition.name,
+      budgets[definition.budget], candidates[index], provenance)
+  end
+  local total_bytes = 0
+  local omitted = {}
+  for _, definition in ipairs(PROJECTION_LAYERS) do
+    local layer = layers[definition.id]
+    total_bytes = total_bytes + layer.bytes
+    for _, reference in ipairs(layer.omitted_references) do omitted[#omitted + 1] = {
+      layer = definition.id, ref = reference.ref, reason = reference.reason, bytes = reference.bytes,
+    } end
+  end
+  for _, list in ipairs(candidates) do clean_projection_candidates(list) end
+  if total_bytes > total_budget then
+    return nil, projection_error("projection exceeds max_budget_bytes")
+  end
+  local projection = {
+    version = WheelContext.PROJECTION_VERSION,
+    base_commit = base.hash,
+    current_commit = current.hash,
+    role = role,
+    task_id = opts.task_id,
+    session_id = opts.session_id,
+    relevant_scopes = copy_projection_value(scopes),
+    budgets = budgets,
+    max_budget_bytes = total_budget,
+    total_bytes = total_bytes,
+    layers = layers,
+    omitted_references = omitted,
+    provenance = provenance,
+  }
+  local encoded, encode_err = canonical_projection_value(projection)
+  if not encoded then return nil, projection_error(encode_err) end
+  projection.canonical_bytes = encoded
+  return projection
+end
+
+WheelContext.project_context = WheelContext.project
 
 -- ---------------------------------------------------------------------------
 -- Versioned Snapshot Export and Restore
