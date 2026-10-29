@@ -728,7 +728,9 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
 - **Three-Zone Prompt Compiler**: Pinned, byte-stable **Zone 1 (Stable Prefix)**
   designed for prefix reuse, coupled with a multi-tier budget reduction
   pipeline (Tier 1 scratchpad pruning, Tier 2 bounded rationale/slot previews,
-  Tier 3 tail truncation). Provider-level cache hits are not yet implemented or
+  Tier 3 tail truncation). Any local prefix-share ratio is a design/local-reuse
+  signal only, not a provider cache hit rate; provider hit evidence requires
+  response telemetry. Provider-level cache hits are not yet implemented or
   verified; see [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
 
 ### Standardized Action Protocol & Tool Execution Engine
@@ -834,11 +836,14 @@ Wheel integrates heterogeneous large language models and autonomous ReAct execut
   - `StdioAdapter`: Subprocess CLI runner for `ollama run`, `llm`, or local model binaries. The command is parsed into argv (or supplied as an argv table), shell syntax is refused, and the prompt is delivered on stdin through the bounded `WheelHost.proc.run_program` primitive; no shell redirection or prompt temp file is used.
 - **Tool Schema Normalization**: Automatic formatting of `WheelTool` definitions to OpenAI (`type="function"`) and Anthropic (`input_schema`) function calling specifications.
 - **Bounded Completion Budget**: Every OpenAI-compatible and Anthropic HTTP provider request carries an explicit completion `max_tokens` from `WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS` (4096) or a validated `max_completion_tokens` override, bounded at 32768. The stdio adapter has no completion-token field and is outside this boundary. The context window remains a separate `context_budget`; zero, negative, non-integer, non-numeric, and oversized overrides fail with a typed `E_COMPLETION_BUDGET_INVALID` error before an HTTP request is sent.
-- **Autonomous ReAct Turn Runner**: Multi-turn execution loop (`WheelRunner.run_task`)
-  combining context compilation, streaming token callbacks, bounded Rationale
-  excerpts, path-sandboxed tool dispatch with auto-spillover, and automated
-  checkpoint commits. Bounded conversation-history compaction and complete
-  Context Projection integration are tracked follow-up work.
+- **Autonomous ReAct Turn Runner**: Multi-turn execution loop
+  (`WheelRunner.run_task`) that invokes `compile_prompt()` for local prefix
+  metadata only (`prefix_cache_key` and `cache_share_ratio`), alongside
+  streaming token callbacks, bounded Rationale excerpts, path-sandboxed tool
+  dispatch with auto-spillover, and automated checkpoint commits. The current
+  Runner does not yet place `prompt_string`, `zone2_state`, or `zone3_tail` into
+  Provider messages. Complete Context Projection integration, prompt injection,
+  and bounded conversation-history compaction are tracked follow-up work.
 
 ### Git-Inspired Context Versioning Engine
 
