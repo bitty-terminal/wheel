@@ -754,6 +754,12 @@ The projection keeps five inputs separate:
 - **P4 recent tail** — explicitly supplied recent structured records, ordered
   newest-first with a reference for every omitted record.
 
+Caller record categories are derived from the record reference prefix using
+Wheel's explicit category allowlist; caller metadata cannot widen a scope.
+Transitions are admitted only when both structured sides pass the same role and
+scope eligibility predicate. A record matching both the active task and
+session is assigned to P2 and not repeated in P4.
+
 The default per-layer budgets are 16 KiB, 8 KiB, 16 KiB, 16 KiB, and 8 KiB
 respectively. Selection is byte-bounded and deterministic: records are sorted
 by stable reference (with P4 using timestamp then reference), and records that

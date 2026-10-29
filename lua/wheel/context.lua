@@ -1507,6 +1507,9 @@ local PROJECTION_MAX_VALUE_NODES = 100000
 local PROJECTION_MAX_STRING_BYTES = 64 * 1024
 local PROJECTION_MAX_REFERENCE_BYTES = 256
 local PROJECTION_MAX_SEMANTIC_BYTES = 64 * 1024
+local PROJECTION_MAX_BUDGET_BYTES = WheelContext.MAX_TOTAL_BUDGET_BYTES
+local PROJECTION_WORK_NODES_PER_BYTE = 16
+local PROJECTION_MIN_WORK_NODES = 64
 
 local function projection_byte_less(left, right)
   local length = math.min(#left, #right)
@@ -1532,9 +1535,9 @@ end
 -- not a wire format and rejects executable/cyclic values before they can enter
 -- a caller-owned view.
 local function canonical_projection_value(value, visiting, state)
-  state = state or { nodes = 0, bytes = 0, bytes_limit = nil }
+  state = state or { nodes = 0, bytes = 0, bytes_limit = nil, nodes_limit = PROJECTION_MAX_VALUE_NODES }
   state.nodes = state.nodes + 1
-  if state.nodes > PROJECTION_MAX_VALUE_NODES then
+  if state.nodes > (state.nodes_limit or PROJECTION_MAX_VALUE_NODES) then
     return nil, "value node bound exceeded"
   end
   local function charge(bytes)
@@ -1659,9 +1662,9 @@ local function copy_projection_value(value, visiting)
 end
 
 local function validate_projection_value(value, visiting, state)
-  state = state or { nodes = 0 }
+  state = state or { nodes = 0, nodes_limit = PROJECTION_MAX_VALUE_NODES }
   state.nodes = state.nodes + 1
-  if state.nodes > PROJECTION_MAX_VALUE_NODES then return false, "value node bound exceeded" end
+  if state.nodes > (state.nodes_limit or PROJECTION_MAX_VALUE_NODES) then return false, "value node bound exceeded" end
   local value_type = type(value)
   if value_type == "nil" or value_type == "boolean" then return true end
   if value_type == "string" then
@@ -1723,7 +1726,7 @@ local function validate_projection_value(value, visiting, state)
   return true
 end
 
-local function validate_projection_records(records, label)
+local function validate_projection_records(records, label, nodes_limit, records_limit)
   if records == nil then return {}, nil end
   if type(records) ~= "table" then return nil, label .. " must be an array" end
   local count = 0
@@ -1732,7 +1735,7 @@ local function validate_projection_records(records, label)
       return nil, label .. " must be a dense array"
     end
     count = count + 1
-    if count > PROJECTION_MAX_RECORDS then
+    if count > (records_limit or PROJECTION_MAX_RECORDS) then
       return nil, label .. " exceeds the record bound"
     end
   end
@@ -1741,7 +1744,8 @@ local function validate_projection_records(records, label)
     if type(records[index]) ~= "table" then
       return nil, label .. "[" .. tostring(index) .. "] must be a table"
     end
-    local valid, validation_err = validate_projection_value(records[index])
+    local valid, validation_err = validate_projection_value(records[index], nil,
+      { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES })
     if not valid then
       return nil, label .. "[" .. tostring(index) .. "]: " .. validation_err
     end
@@ -1750,8 +1754,50 @@ local function validate_projection_records(records, label)
 end
 
 local function projection_category(name)
+  if type(name) ~= "string" then return nil end
   local prefix = name:match("^([^/]+)/")
   return prefix and PROJECTION_CATEGORY_BY_PREFIX[prefix] or nil
+end
+
+local function projection_work_nodes_for_budget(budget)
+  return math.min(PROJECTION_MAX_VALUE_NODES,
+    math.max(PROJECTION_MIN_WORK_NODES, budget * PROJECTION_WORK_NODES_PER_BYTE))
+end
+
+local function validate_projection_scalar(value, name, max_bytes)
+  if value == nil then return true end
+  if type(value) ~= "string" or #value == 0 or #value > max_bytes then
+    return false, name .. " must be a bounded non-empty string"
+  end
+  return true
+end
+
+local function validate_projection_options(opts)
+  local valid, err = validate_projection_scalar(opts.task_id, "task_id", PROJECTION_MAX_REFERENCE_BYTES)
+  if not valid then return false, err end
+  valid, err = validate_projection_scalar(opts.session_id, "session_id", PROJECTION_MAX_REFERENCE_BYTES)
+  if not valid then return false, err end
+  if opts.confidence ~= nil then
+    if type(opts.confidence) ~= "number" or opts.confidence ~= opts.confidence
+      or opts.confidence == math.huge or opts.confidence == -math.huge
+      or opts.confidence < 0 or opts.confidence > 1 then
+      return false, "confidence must be a finite number between 0 and 1"
+    end
+  end
+  return true
+end
+
+local function projection_records_for_budget(budget)
+  return math.min(PROJECTION_MAX_RECORDS, math.max(1, budget * 4 + 1))
+end
+
+local function projection_internal_limit(value, default, maximum)
+  if value == nil then return default end
+  if type(value) ~= "number" or value ~= value or value == math.huge
+    or value == -math.huge or value < 1 or value ~= math.floor(value) then
+    return nil
+  end
+  return math.min(value, maximum)
 end
 
 local function projection_scope_matches(name, category, scopes)
@@ -1854,9 +1900,10 @@ local function projection_slot_copy(slot)
   }
 end
 
-local function projection_record(record, commit, opts, index, include_provenance)
+local function projection_record(record, commit, opts, index, include_provenance, nodes_limit)
   if type(record) ~= "table" then return nil, "record must be a table" end
-  local valid, validation_err = validate_projection_value(record)
+  local valid, validation_err = validate_projection_value(record, nil,
+    { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES })
   if not valid then return nil, validation_err end
   local copy = copy_projection_value(record)
   if not copy then return nil, "cyclic value" end
@@ -1864,10 +1911,14 @@ local function projection_record(record, commit, opts, index, include_provenance
     or #copy.ref > PROJECTION_MAX_REFERENCE_BYTES then
     return nil, "record ref must be a bounded non-empty string"
   end
-  if type(copy.category) ~= "string" or #copy.category == 0
-    or #copy.category > PROJECTION_MAX_REFERENCE_BYTES then
-    return nil, "record category must be a bounded non-empty string"
+  local derived_category = projection_category(copy.ref)
+  if copy.category ~= nil and type(copy.category) ~= "string" then
+    return nil, "record category must be a string"
   end
+  if derived_category and copy.category ~= nil and copy.category ~= derived_category then
+    return nil, "record category does not match its ref prefix"
+  end
+  copy.category = derived_category
   if include_provenance then
     copy.provenance = copy.provenance or projection_provenance(commit, opts,
       copy.revision or copy.timestamp_ms or index)
@@ -1962,6 +2013,15 @@ end
 function WheelContext:semantic_delta(base_ref, current_ref, opts)
   opts = opts or {}
   if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
+  local options_valid, options_err = validate_projection_options(opts)
+  if not options_valid then return nil, projection_error(options_err) end
+  local semantic_nodes_limit = projection_internal_limit(opts._projection_nodes_limit,
+    PROJECTION_MAX_VALUE_NODES, PROJECTION_MAX_VALUE_NODES)
+  local semantic_records_limit = projection_internal_limit(opts._projection_records_limit,
+    PROJECTION_MAX_RECORDS, PROJECTION_MAX_RECORDS)
+  if not semantic_nodes_limit or not semantic_records_limit then
+    return nil, projection_error("internal projection limits are invalid")
+  end
   local base = projection_commit(self, base_ref)
   local current = projection_commit(self, current_ref)
   if not base or not current then
@@ -1996,21 +2056,25 @@ function WheelContext:semantic_delta(base_ref, current_ref, opts)
     end
   end
 
-  local base_records, base_records_err = validate_projection_records(opts.base_records, "base_records")
+  local base_records, base_records_err = validate_projection_records(
+    opts.base_records, "base_records", semantic_nodes_limit, semantic_records_limit)
   if not base_records then return nil, projection_error(base_records_err) end
   local current_records, current_records_err = validate_projection_records(
-    opts.current_records or opts.records, "current_records")
+    opts.current_records or opts.records, "current_records", semantic_nodes_limit,
+    semantic_records_limit)
   if not current_records then return nil, projection_error(current_records_err) end
   local before_by_ref, after_by_ref = {}, {}
   for index, record in ipairs(base_records) do
-    local normalized, normalize_err = projection_record(record, base, opts, index, false)
+    local normalized, normalize_err = projection_record(record, base, opts, index, false,
+      semantic_nodes_limit)
     if not normalized then
       return nil, projection_error("base_records[" .. tostring(index) .. "]: " .. normalize_err)
     end
     before_by_ref[normalized.ref] = normalized
   end
   for index, record in ipairs(current_records) do
-    local normalized, normalize_err = projection_record(record, current, opts, index, false)
+    local normalized, normalize_err = projection_record(record, current, opts, index, false,
+      semantic_nodes_limit)
     if not normalized then
       return nil, projection_error("current_records[" .. tostring(index) .. "]: " .. normalize_err)
     end
@@ -2069,6 +2133,8 @@ WheelContext.compute_semantic_delta = WheelContext.semantic_delta
 function WheelContext:project(opts)
   opts = opts or {}
   if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
+  local options_valid, options_err = validate_projection_options(opts)
+  if not options_valid then return nil, projection_error(options_err) end
   local role = opts.role or WheelContext.Role.CODING
   if not ROLE_VALUES[role] then return nil, projection_error("unknown role: " .. tostring(role)) end
   local base = projection_commit(self, opts.base_commit)
@@ -2098,10 +2164,16 @@ function WheelContext:project(opts)
     p4_max_bytes = projection_budget(opts, "p4_max_bytes", WheelContext.DEFAULT_P4_BUDGET_BYTES),
   }
   for name, value in pairs(budgets) do
-    if not value then return nil, projection_error(name .. " must be a non-negative integer") end
+    if not value or value > PROJECTION_MAX_BUDGET_BYTES then
+      return nil, projection_error(name .. " must be an integer between 0 and "
+        .. tostring(PROJECTION_MAX_BUDGET_BYTES))
+    end
   end
   local total_budget = projection_budget(opts, "max_budget_bytes", WheelContext.DEFAULT_PROJECTION_BUDGET_BYTES)
-  if not total_budget then return nil, projection_error("max_budget_bytes must be a non-negative integer") end
+  if not total_budget or total_budget > PROJECTION_MAX_BUDGET_BYTES then
+    return nil, projection_error("max_budget_bytes must be an integer between 0 and "
+      .. tostring(PROJECTION_MAX_BUDGET_BYTES))
+  end
   local layer_budget_sum = budgets.p0_max_bytes + budgets.p1_max_bytes + budgets.p2_max_bytes
     + budgets.p3_max_bytes + budgets.p4_max_bytes
   if layer_budget_sum > total_budget then
@@ -2154,14 +2226,21 @@ function WheelContext:project(opts)
     end
   end
 
-  local current_records, current_records_err = validate_projection_records(opts.records, "records")
+  local work_nodes = projection_work_nodes_for_budget(math.min(
+    budgets.p2_max_bytes, budgets.p3_max_bytes, budgets.p4_max_bytes))
+  local work_records = projection_records_for_budget(math.min(
+    budgets.p2_max_bytes, budgets.p3_max_bytes, budgets.p4_max_bytes))
+  local current_records, current_records_err = validate_projection_records(
+    opts.records, "records", work_nodes, work_records)
   if not current_records then return nil, projection_error(current_records_err) end
-  local base_records, base_records_err = validate_projection_records(opts.base_records, "base_records")
+  local base_records, base_records_err = validate_projection_records(
+    opts.base_records, "base_records", work_nodes, work_records)
   if not base_records then return nil, projection_error(base_records_err) end
-  local recent_records, recent_records_err = validate_projection_records(opts.recent_records, "recent_records")
+  local recent_records, recent_records_err = validate_projection_records(
+    opts.recent_records, "recent_records", work_nodes, work_records)
   if not recent_records then return nil, projection_error(recent_records_err) end
   for index, record in ipairs(current_records) do
-    local normalized, normalize_err = projection_record(record, current, opts, index, true)
+    local normalized, normalize_err = projection_record(record, current, opts, index, true, work_nodes)
     if not normalized then return nil, projection_error("records[" .. tostring(index) .. "]: " .. normalize_err) end
     local eligible, eligibility_reason = projection_record_eligible(role, normalized, scopes, opts, "task")
     if eligible == nil then return nil, projection_error("records[" .. tostring(index) .. "]: " .. eligibility_reason) end
@@ -2176,7 +2255,7 @@ function WheelContext:project(opts)
     end
     local session_eligible, session_reason = projection_record_eligible(role, normalized, scopes, opts, "session")
     if session_eligible == nil then return nil, projection_error("records[" .. tostring(index) .. "]: " .. session_reason) end
-    if session_eligible then
+    if session_eligible and not (eligible and normalized.task_id == opts.task_id) then
       if normalized.session_id == opts.session_id then
         p4[#p4 + 1] = normalized
       end
@@ -2185,7 +2264,7 @@ function WheelContext:project(opts)
     end
   end
   for index, record in ipairs(recent_records) do
-    local normalized, normalize_err = projection_record(record, current, opts, index, true)
+    local normalized, normalize_err = projection_record(record, current, opts, index, true, work_nodes)
     if not normalized then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. normalize_err) end
     local eligible, eligibility_reason = projection_record_eligible(role, normalized, scopes, opts)
     if eligible == nil then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. eligibility_reason) end
@@ -2212,6 +2291,8 @@ function WheelContext:project(opts)
     session_id = opts.session_id,
     relevant_scopes = copy_projection_value(scopes),
     confidence = opts.confidence,
+    _projection_nodes_limit = work_nodes,
+    _projection_records_limit = work_records,
   })
   if not delta then return nil, delta_err end
   local p3 = {}
@@ -2230,16 +2311,20 @@ function WheelContext:project(opts)
   end
   for _, operation in ipairs({ "added", "modified", "removed" }) do
     for _, item in ipairs(delta.records[operation]) do
-      local record = item.after or item.before
-      local eligible, eligibility_reason = record
-        and projection_record_eligible(role, record, scopes, opts)
-      if eligible == nil then return nil, projection_error("delta record " .. tostring(item.ref) .. ": " .. eligibility_reason) end
-      if eligible then
-        local category = record.category
+      local before_eligible, before_reason = true, nil
+      local after_eligible, after_reason = true, nil
+      if item.before then before_eligible, before_reason = projection_record_eligible(role, item.before, scopes, opts) end
+      if item.after then after_eligible, after_reason = projection_record_eligible(role, item.after, scopes, opts) end
+      if before_eligible == nil or after_eligible == nil then
+        return nil, projection_error("delta record " .. tostring(item.ref) .. ": "
+          .. tostring(before_reason or after_reason))
+      end
+      if before_eligible and after_eligible then
+        local category = (item.after or item.before).category
         p3[#p3 + 1] = { ref = item.ref, operation = operation, category = category,
           before = item.before, after = item.after, provenance = delta.provenance }
-      elseif record then
-        add_omitted(item.ref, eligibility_reason, delta.provenance)
+      else
+        add_omitted(item.ref, before_reason or after_reason, delta.provenance)
       end
     end
   end

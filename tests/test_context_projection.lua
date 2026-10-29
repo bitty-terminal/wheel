@@ -58,12 +58,12 @@ return function(run_test)
         task_id = "TASK-1",
         session_id = "SESSION-1",
         records = {
-          { ref = "record/task", category = "tasks", task_id = "TASK-1", value = "deliverable" },
-          { ref = "record/unrelated", category = "source", task_id = "OTHER", value = "unrelated" },
+          { ref = "tasks/TASK-1/record", category = "tasks", task_id = "TASK-1", value = "deliverable" },
+          { ref = "code/unrelated", category = "source", task_id = "OTHER", value = "unrelated" },
         },
         recent_records = {
-          { ref = "tail/new", category = "diagnostics", timestamp_ms = 2, value = "new" },
-          { ref = "tail/old", category = "diagnostics", timestamp_ms = 1, value = "old" },
+          { ref = "diagnostics/tail-new", category = "diagnostics", timestamp_ms = 2, value = "new" },
+          { ref = "diagnostics/tail-old", category = "diagnostics", timestamp_ms = 1, value = "old" },
         },
       }
       local projection = assert(context:project(options))
@@ -84,7 +84,7 @@ return function(run_test)
         if record.ref == "slot:tasks/TASK-1/plan" then saw_task_slot = true end
       end
       assert(saw_task_slot, role .. " must include task projection")
-      assert(not projection.canonical_bytes:find("record/unrelated", 1, true),
+      assert(not projection.canonical_bytes:find("code/unrelated", 1, true),
         role .. " must not include unrelated task records")
       assert(projection.total_bytes <= projection.max_budget_bytes)
       local repeat_projection = assert(context:project(options))
@@ -102,13 +102,13 @@ return function(run_test)
       base_commit = commit.hash, current_commit = commit.hash,
       role = WheelContext.Role.DOCUMENTATION,
       recent_records = {
-        { ref = "tail/source", category = "source", timestamp_ms = 1, value = "source" },
+        { ref = "code/tail-source", category = "source", timestamp_ms = 1, value = "source" },
       },
     }))
     assert(projection.canonical_bytes:find("docs/guide", 1, true))
     assert(not projection.canonical_bytes:find("code/src/main.lua", 1, true),
       "documentation view must exclude unrelated source code")
-    assert(not projection.canonical_bytes:find("tail/source", 1, true),
+      assert(not projection.canonical_bytes:find("code/tail-source", 1, true),
       "documentation tail must exclude unrelated source records")
   end)
 
@@ -137,12 +137,12 @@ return function(run_test)
       author = "fixture", message = "delta update", timestamp_ms = 1700000001000,
     }))
     local delta = assert(context:semantic_delta(first.hash, second.hash, {
-      base_records = { { ref = "record/a", category = "tasks", value = "same" } },
-      current_records = { { ref = "record/a", category = "tasks", value = "changed" } },
+      base_records = { { ref = "tasks/TASK-1/record", category = "tasks", value = "same" } },
+      current_records = { { ref = "tasks/TASK-1/record", category = "tasks", value = "changed" } },
     }))
     assert(delta.count == 1)
     assert(delta.modified[1].ref == "slot:tasks/TASK-1/plan")
-    assert(delta.records.modified[1].ref == "record/a")
+    assert(delta.records.modified[1].ref == "tasks/TASK-1/record")
     assert(delta.provenance.source_commit == second.hash)
     delta.modified[1].after.content = "caller mutation"
     assert(context:get_commit(second.hash).slots["tasks/TASK-1/plan"].content == "updated",
@@ -204,11 +204,12 @@ return function(run_test)
       author = "fixture", message = "provenance child", timestamp_ms = 1700000001000,
     }))
     local delta = assert(context:semantic_delta(first.hash, second.hash, {
-      base_records = { { ref = "record/a", category = "project", value = "same" } },
-      current_records = { { ref = "record/a", category = "project", value = "same" } },
+      base_records = { { ref = "workspace/record", category = "project", value = "same" } },
+      current_records = { { ref = "workspace/record", category = "project", value = "same" } },
     }))
     assert(#delta.records.modified == 0)
     assert(#delta.records.unchanged == 1)
+    assert(delta.records.unchanged[1].ref == "workspace/record")
   end)
 
   run_test("Context projections: malformed records, scopes, and values fail closed", function()
@@ -219,10 +220,10 @@ return function(run_test)
     local base = { base_commit = commit.hash, current_commit = commit.hash,
       role = WheelContext.Role.CODING }
     assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
-      role = WheelContext.Role.CODING, records = { [2] = { ref = "a", category = "project" } } }, "sparse records")
+      role = WheelContext.Role.CODING, records = { [2] = { ref = "workspace/a", category = "project" } } }, "sparse records")
     assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
       role = WheelContext.Role.CODING, recent_records = { "not a record" } }, "non-table recent record")
-    local cyclic = { ref = "cycle", category = "project" }; cyclic.self = cyclic
+    local cyclic = { ref = "workspace/cycle", category = "project" }; cyclic.self = cyclic
     assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
       role = WheelContext.Role.CODING, records = { cyclic } }, "cyclic record")
     assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
@@ -255,5 +256,92 @@ return function(run_test)
     assert(small.total_bytes <= small.max_budget_bytes)
     assert(not small.canonical_bytes:find(string.rep("x", 100), 1, true))
     assert(#small.omitted_references > 0)
+  end)
+
+  run_test("Context projections: category is derived from the record reference", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "category authority", timestamp_ms = 1700000000000,
+    }))
+    local projection = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, relevant_scopes = { "source" },
+      recent_records = {
+        { ref = "private/raw", category = "source", value = "spoofed source" },
+      },
+    }))
+    assert(not projection.canonical_bytes:find("spoofed source", 1, true))
+    assert(#projection.omitted_references > 0)
+
+    local transition = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, relevant_scopes = { "workspace" },
+      base_records = { { ref = "private/raw", category = "private", value = "SECRET_OLD" } },
+      records = { { ref = "workspace/record", category = "project", value = "new" } },
+    }))
+    assert(not transition.canonical_bytes:find("SECRET_OLD", 1, true))
+    assert_projection_error(context, {
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, relevant_scopes = { "workspace" },
+      base_records = { { ref = "workspace/record", category = "private", value = "SECRET_BEFORE" } },
+      records = { { ref = "workspace/record", category = "project", value = "allowed after" } },
+    }, "category spoof transition")
+  end)
+
+  run_test("Context projections: scalar options and budget caps fail closed", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "scalar options", timestamp_ms = 1700000000000,
+    }))
+    assert_projection_error(context, { current_commit = commit.hash, task_id = {} }, "table task_id")
+    assert_projection_error(context, { current_commit = commit.hash, session_id = {} }, "table session_id")
+    assert_projection_error(context, { current_commit = commit.hash, confidence = 2 }, "confidence above one")
+    assert_projection_error(context, { current_commit = commit.hash, confidence = 0 / 0 }, "non-finite confidence")
+    assert_projection_error(context, { current_commit = commit.hash, max_budget_bytes = 64 * 1024 + 1 },
+      "total budget above policy ceiling")
+    assert_projection_error(context, { current_commit = commit.hash, p0_max_bytes = 64 * 1024 + 1 },
+      "layer budget above policy ceiling")
+  end)
+
+  run_test("Context projections: requested budget bounds candidate work", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "work bound", timestamp_ms = 1700000000000,
+    }))
+    local nested = {}
+    local cursor = nested
+    for index = 1, 128 do
+      cursor.next = { value = index }
+      cursor = cursor.next
+    end
+    assert_projection_error(context, {
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING,
+      p0_max_bytes = 0, p1_max_bytes = 0, p2_max_bytes = 1,
+      p3_max_bytes = 0, p4_max_bytes = 0, max_budget_bytes = 1,
+      records = { { ref = "workspace/large", category = "project", value = nested } },
+    }, "one-byte candidate work")
+  end)
+
+  run_test("Context projections: task records take precedence over session tail", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "partition fixture", timestamp_ms = 1700000000000,
+    }))
+    local projection = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, task_id = "TASK-1", session_id = "SESSION-1",
+      records = {
+        { ref = "workspace/both", category = "project", task_id = "TASK-1", session_id = "SESSION-1", value = "one copy" },
+      },
+    }))
+    local p2_count, p4_count = 0, 0
+    for _, record in ipairs(projection.layers.P2.records) do
+      if record.ref == "workspace/both" then p2_count = p2_count + 1 end
+    end
+    for _, record in ipairs(projection.layers.P4.records) do
+      if record.ref == "workspace/both" then p4_count = p4_count + 1 end
+    end
+    assert(p2_count == 1 and p4_count == 0)
   end)
 end
