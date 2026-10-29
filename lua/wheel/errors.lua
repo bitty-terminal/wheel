@@ -34,6 +34,7 @@ WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
 WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
+WheelErrors.E_PROJECTION_INVALID = "E_PROJECTION_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
 WheelErrors.E_AUDIT_UNAVAILABLE = "E_AUDIT_UNAVAILABLE"
 WheelErrors.E_JOB_NOT_FOUND = "E_JOB_NOT_FOUND"
@@ -212,6 +213,21 @@ function WheelErrors.snapshot_invalid(detail)
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_SNAPSHOT_INVALID,
     "invalid context snapshot: " .. reason
+  )
+end
+
+--- Build a typed invalid Context projection failure.
+-- Projection inputs are caller-owned and may be malformed or oversized. The
+-- detail is bounded and sanitized before it crosses the error boundary.
+-- @param detail string
+-- @return table
+function WheelErrors.projection_invalid(detail)
+  local reason = type(detail) == "string" and detail or "invalid projection"
+  reason = reason:gsub("%c", "?")
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_PROJECTION_INVALID,
+    "invalid context projection: " .. reason
   )
 end
 

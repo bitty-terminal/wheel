@@ -500,6 +500,7 @@ of the public error contract.
 | `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                        |
 | `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                       |
 | `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.             |
+| `E_PROJECTION_INVALID`        | `validation` | A role-aware Context projection received malformed, cyclic, unsupported, out-of-scope, or over-budget input and failed closed.    |
 | `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                        |
 | `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic.      |
 | `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                                  |
@@ -526,6 +527,12 @@ configuration; stash event slot payloads are redacted on export and again by
 validation on import, so a crafted or pre-fix unredacted snapshot cannot restore
 them. The format and bounds are documented in
 [CONTEXT-SNAPSHOT.md](CONTEXT-SNAPSHOT.md).
+
+`E_PROJECTION_INVALID` is raised by `WheelContext:project` and
+`WheelContext:semantic_delta` when caller-owned records, scopes, or budgets do
+not satisfy the bounded plain-data projection contract. Unknown slot prefixes
+and records excluded by a role lens or explicit scope are omitted with bounded
+references and provenance; malformed values are rejected before projection.
 
 `E_MODULE_LOAD_FAILED` is raised at activation when a required Wheel submodule
 cannot be loaded, or on first use when an optional lazy submodule fails. The
@@ -738,8 +745,9 @@ The projection keeps five inputs separate:
 
 - **P0 project knowledge** — eligible architecture, accepted decisions,
   documentation, security facts, and workspace knowledge.
-- **P1 role lens** — deterministic category selection for Planner,
-  Documentation, Coding, Debug, Research, and Reviewer.
+- **P1 role lens** — marker-only deterministic category selection for Planner,
+  Documentation, Coding, Debug, Research, and Reviewer; it is not caller
+  content.
 - **P2 task projection** — task-scoped slots and structured records.
 - **P3 session delta** — structured added/modified/removed records between
   immutable commits, never raw string subtraction.
@@ -751,7 +759,10 @@ respectively. Selection is byte-bounded and deterministic: records are sorted
 by stable reference (with P4 using timestamp then reference), and records that
 do not fit are omitted rather than silently truncated. `semantic_delta` is
 available independently when a structured change set is needed before prompt
-compilation. These are Wheel context budgets, not provider cache controls.
+compilation. `total_bytes` and `canonical_bytes` describe the rendered,
+selected layer content; projection metadata remains separately structured and
+does not silently consume the layer content budget. These are Wheel context
+budgets, not provider cache controls.
 
 ### Standardized Action Protocol & Tool Execution Engine
 

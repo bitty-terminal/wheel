@@ -25,6 +25,14 @@ local function fixed_context()
   return context
 end
 
+local function assert_projection_error(context, options, label)
+  local projection, err = context:project(options)
+  assert(projection == nil, label .. " must be rejected")
+  assert(type(err) == "table" and err.class == "validation"
+    and err.code == "E_PROJECTION_INVALID", label .. " must return typed projection error")
+  return err
+end
+
 return function(run_test)
   run_test("Context projections: all role fixtures are deterministic and layered", function()
     local context = fixed_context()
@@ -139,5 +147,113 @@ return function(run_test)
     delta.modified[1].after.content = "caller mutation"
     assert(context:get_commit(second.hash).slots["tasks/TASK-1/plan"].content == "updated",
       "semantic delta must not expose mutable commit storage")
+  end)
+
+  run_test("Context projections: caller records require role and explicit scope eligibility", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "eligibility fixture", timestamp_ms = 1700000000000,
+    }))
+    local projection = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING,
+      task_id = "TASK-1", session_id = "SESSION-1",
+      relevant_scopes = { "workspace" },
+      records = {
+        { ref = "workspace/task", category = "project", task_id = "TASK-1", value = "allowed" },
+        { ref = "source/matching-session", category = "source", session_id = "SESSION-1", value = "source leak" },
+        { ref = "private/raw", category = "private", session_id = "SESSION-1", value = "private leak" },
+      },
+      recent_records = {
+        { ref = "diagnostics/out-of-scope", category = "diagnostics", value = "diagnostic leak" },
+      },
+    }))
+    assert(projection.canonical_bytes:find("allowed", 1, true))
+    assert(not projection.canonical_bytes:find("source leak", 1, true))
+    assert(not projection.canonical_bytes:find("private leak", 1, true))
+    assert(not projection.canonical_bytes:find("diagnostic leak", 1, true))
+    assert(#projection.omitted_references >= 2)
+  end)
+
+  run_test("Context projections: forbidden slot prefixes never enter project knowledge", function()
+    local context = fixed_context()
+    assert(context:put_slot("transcript/raw", "transcript leak").success)
+    assert(context:put_slot("provider-cache/raw", "cache leak").success)
+    assert(context:put_slot("bittyd/raw", "daemon leak").success)
+    assert(context:put_slot("lifecycle/panel", "lifecycle leak").success)
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "boundary fixture", timestamp_ms = 1700000000000,
+    }))
+    local projection = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING,
+    }))
+    assert(not projection.canonical_bytes:find("transcript leak", 1, true))
+    assert(not projection.canonical_bytes:find("cache leak", 1, true))
+    assert(not projection.canonical_bytes:find("daemon leak", 1, true))
+    assert(not projection.canonical_bytes:find("lifecycle leak", 1, true))
+    assert(#projection.omitted_references >= 4)
+  end)
+
+  run_test("Context projections: identical caller records ignore generated provenance", function()
+    local context = fixed_context()
+    local first = assert(context:commit_checkpoint({
+      author = "fixture", message = "provenance root", timestamp_ms = 1700000000000,
+    }))
+    local second = assert(context:commit_checkpoint({
+      author = "fixture", message = "provenance child", timestamp_ms = 1700000001000,
+    }))
+    local delta = assert(context:semantic_delta(first.hash, second.hash, {
+      base_records = { { ref = "record/a", category = "project", value = "same" } },
+      current_records = { { ref = "record/a", category = "project", value = "same" } },
+    }))
+    assert(#delta.records.modified == 0)
+    assert(#delta.records.unchanged == 1)
+  end)
+
+  run_test("Context projections: malformed records, scopes, and values fail closed", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "validation fixture", timestamp_ms = 1700000000000,
+    }))
+    local base = { base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING }
+    assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, records = { [2] = { ref = "a", category = "project" } } }, "sparse records")
+    assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, recent_records = { "not a record" } }, "non-table recent record")
+    local cyclic = { ref = "cycle", category = "project" }; cyclic.self = cyclic
+    assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, records = { cyclic } }, "cyclic record")
+    assert_projection_error(context, { base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING, scopes = { 42 } }, "non-string scope")
+    local delta, delta_err = context:semantic_delta(commit.hash, commit.hash,
+      { base_records = "not an array" })
+    assert(delta == nil and delta_err.code == "E_PROJECTION_INVALID")
+    assert(base.role == WheelContext.Role.CODING)
+  end)
+
+  run_test("Context projections: zero and small budgets bound returned bytes", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "budget boundary", timestamp_ms = 1700000000000,
+    }))
+    local zero = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING,
+      p0_max_bytes = 0, p1_max_bytes = 0, p2_max_bytes = 0,
+      p3_max_bytes = 0, p4_max_bytes = 0, max_budget_bytes = 0,
+    }))
+    assert(zero.total_bytes == 0 and #zero.canonical_bytes == 0)
+    local small = assert(context:project({
+      base_commit = commit.hash, current_commit = commit.hash,
+      role = WheelContext.Role.CODING,
+      p0_max_bytes = 1, p1_max_bytes = 1, p2_max_bytes = 1,
+      p3_max_bytes = 1, p4_max_bytes = 1, max_budget_bytes = 5,
+      records = { { ref = "workspace/large", category = "project", value = string.rep("x", 1000) } },
+    }))
+    assert(small.total_bytes <= small.max_budget_bytes)
+    assert(not small.canonical_bytes:find(string.rep("x", 100), 1, true))
+    assert(#small.omitted_references > 0)
   end)
 end

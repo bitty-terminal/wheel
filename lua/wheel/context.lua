@@ -1484,6 +1484,30 @@ local PROJECT_CATEGORIES = {
   security = true,
 }
 
+local PROJECTION_CATEGORY_BY_PREFIX = {
+  workspace = "project",
+  architecture = "architecture",
+  decisions = "decisions",
+  docs = "documentation",
+  security = "security",
+  tasks = "tasks",
+  code = "source",
+  diagnostics = "diagnostics",
+  logs = "logs",
+  research = "research",
+}
+
+local PROJECTION_CATEGORY_VALUES = {}
+for _, category in pairs(PROJECTION_CATEGORY_BY_PREFIX) do
+  PROJECTION_CATEGORY_VALUES[category] = true
+end
+
+local PROJECTION_MAX_RECORDS = 4096
+local PROJECTION_MAX_VALUE_NODES = 100000
+local PROJECTION_MAX_STRING_BYTES = 64 * 1024
+local PROJECTION_MAX_REFERENCE_BYTES = 256
+local PROJECTION_MAX_SEMANTIC_BYTES = 64 * 1024
+
 local function projection_byte_less(left, right)
   local length = math.min(#left, #right)
   for index = 1, length do
@@ -1507,16 +1531,48 @@ end
 -- Canonical plain-data encoding is intentionally local to projections. It is
 -- not a wire format and rejects executable/cyclic values before they can enter
 -- a caller-owned view.
-local function canonical_projection_value(value, visiting)
+local function canonical_projection_value(value, visiting, state)
+  state = state or { nodes = 0, bytes = 0, bytes_limit = nil }
+  state.nodes = state.nodes + 1
+  if state.nodes > PROJECTION_MAX_VALUE_NODES then
+    return nil, "value node bound exceeded"
+  end
+  local function charge(bytes)
+    if state.bytes_limit and state.bytes + bytes > state.bytes_limit then
+      return nil, "value byte bound exceeded"
+    end
+    state.bytes = state.bytes + bytes
+    return true
+  end
   local value_type = type(value)
-  if value_type == "nil" then return "null" end
-  if value_type == "string" then return '"' .. projection_escape(value) .. '"' end
-  if value_type == "boolean" then return value and "true" or "false" end
+  if value_type == "nil" then
+    local ok, err = charge(4)
+    if not ok then return nil, err end
+    return "null"
+  end
+  if value_type == "string" then
+    if #value > PROJECTION_MAX_STRING_BYTES then return nil, "string byte bound exceeded" end
+    if state.bytes_limit and state.bytes + #value + 2 > state.bytes_limit then
+      return nil, "value byte bound exceeded"
+    end
+    local encoded = projection_escape(value)
+    local ok, err = charge(#encoded + 2)
+    if not ok then return nil, err end
+    return '"' .. encoded .. '"'
+  end
+  if value_type == "boolean" then
+    local ok, err = charge(value and 4 or 5)
+    if not ok then return nil, err end
+    return value and "true" or "false"
+  end
   if value_type == "number" then
     if value ~= value or value == math.huge or value == -math.huge then
       return nil, "non-finite number"
     end
-    return string.format("%.17g", value)
+    local encoded = string.format("%.17g", value)
+    local ok, err = charge(#encoded)
+    if not ok then return nil, err end
+    return encoded
   end
   if value_type ~= "table" then return nil, "unsupported value type" end
 
@@ -1541,12 +1597,20 @@ local function canonical_projection_value(value, visiting)
   end
 
   local encoded = {}
+  local opening_ok, opening_err = charge(array and 1 or 1)
+  if not opening_ok then visiting[value] = nil; return nil, opening_err end
   if array then
     for index = 1, count do
-      local item, err = canonical_projection_value(value[index], visiting)
+      local item, err = canonical_projection_value(value[index], visiting, state)
       if not item then visiting[value] = nil; return nil, err end
+      if index > 1 then
+        local separator_ok, separator_err = charge(1)
+        if not separator_ok then visiting[value] = nil; return nil, separator_err end
+      end
       encoded[index] = item
     end
+    local closing_ok, closing_err = charge(1)
+    if not closing_ok then visiting[value] = nil; return nil, closing_err end
     visiting[value] = nil
     return "[" .. table.concat(encoded, ",") .. "]"
   end
@@ -1559,10 +1623,19 @@ local function canonical_projection_value(value, visiting)
   end
   table.sort(keys, projection_byte_less)
   for _, key in ipairs(keys) do
-    local item, err = canonical_projection_value(value[key], visiting)
+    local item, err = canonical_projection_value(value[key], visiting, state)
     if not item then visiting[value] = nil; return nil, err end
-    encoded[#encoded + 1] = '"' .. projection_escape(key) .. '":' .. item
+    local key_encoded = projection_escape(key)
+    local key_ok, key_err = charge(#key_encoded + 4)
+    if not key_ok then visiting[value] = nil; return nil, key_err end
+    if #encoded > 0 then
+      local separator_ok, separator_err = charge(1)
+      if not separator_ok then visiting[value] = nil; return nil, separator_err end
+    end
+    encoded[#encoded + 1] = '"' .. key_encoded .. '":' .. item
   end
+  local closing_ok, closing_err = charge(1)
+  if not closing_ok then visiting[value] = nil; return nil, closing_err end
   visiting[value] = nil
   return "{" .. table.concat(encoded, ",") .. "}"
 end
@@ -1585,20 +1658,100 @@ local function copy_projection_value(value, visiting)
   return copy
 end
 
+local function validate_projection_value(value, visiting, state)
+  state = state or { nodes = 0 }
+  state.nodes = state.nodes + 1
+  if state.nodes > PROJECTION_MAX_VALUE_NODES then return false, "value node bound exceeded" end
+  local value_type = type(value)
+  if value_type == "nil" or value_type == "boolean" then return true end
+  if value_type == "string" then
+    if #value > PROJECTION_MAX_STRING_BYTES then return false, "string byte bound exceeded" end
+    return true
+  end
+  if value_type == "number" then
+    if value ~= value or value == math.huge or value == -math.huge then
+      return false, "non-finite number"
+    end
+    return true
+  end
+  if value_type ~= "table" then return false, "unsupported value type" end
+  visiting = visiting or {}
+  if visiting[value] then return false, "cyclic value" end
+  visiting[value] = true
+  local keys = {}
+  local numeric = true
+  local string_keys = false
+  local count = 0
+  for key in pairs(value) do
+    count = count + 1
+    if type(key) == "number" and key >= 1 and key == math.floor(key) then
+      keys[#keys + 1] = key
+    elseif type(key) == "string" and #key <= PROJECTION_MAX_REFERENCE_BYTES then
+      numeric = false
+      string_keys = true
+      keys[#keys + 1] = key
+    else
+      visiting[value] = nil
+      return false, "invalid map key"
+    end
+  end
+  if numeric == false and #keys ~= count then
+    visiting[value] = nil
+    return false, "invalid map key"
+  end
+  if string_keys then
+    for _, key in ipairs(keys) do
+      if type(key) ~= "string" then
+        visiting[value] = nil
+        return false, "mixed array and map keys"
+      end
+    end
+  end
+  if numeric then
+    for index = 1, count do
+      if rawget(value, index) == nil then
+        visiting[value] = nil
+        return false, "sparse array"
+      end
+    end
+  end
+  for _, key in ipairs(keys) do
+    local ok, err = validate_projection_value(value[key], visiting, state)
+    if not ok then visiting[value] = nil; return false, err end
+  end
+  visiting[value] = nil
+  return true
+end
+
+local function validate_projection_records(records, label)
+  if records == nil then return {}, nil end
+  if type(records) ~= "table" then return nil, label .. " must be an array" end
+  local count = 0
+  for key in pairs(records) do
+    if type(key) ~= "number" or key < 1 or key ~= math.floor(key) then
+      return nil, label .. " must be a dense array"
+    end
+    count = count + 1
+    if count > PROJECTION_MAX_RECORDS then
+      return nil, label .. " exceeds the record bound"
+    end
+  end
+  for index = 1, count do
+    if rawget(records, index) == nil then return nil, label .. " must be a dense array" end
+    if type(records[index]) ~= "table" then
+      return nil, label .. "[" .. tostring(index) .. "] must be a table"
+    end
+    local valid, validation_err = validate_projection_value(records[index])
+    if not valid then
+      return nil, label .. "[" .. tostring(index) .. "]: " .. validation_err
+    end
+  end
+  return records, nil
+end
+
 local function projection_category(name)
   local prefix = name:match("^([^/]+)/")
-  if prefix == "code" then return "source" end
-  if prefix == "docs" then return "documentation" end
-  if prefix == "research" then return "research" end
-  if prefix == "logs" then return "logs" end
-  if prefix == "diagnostics" then return "diagnostics" end
-  if prefix == "tasks" then return "tasks" end
-  if prefix == "decisions" then return "decisions" end
-  if prefix == "workspace" then return "project" end
-  if prefix == "architecture" then return "architecture" end
-  if prefix == "security" then return "security" end
-  if prefix == "scratch" then return "scratch" end
-  return "project"
+  return prefix and PROJECTION_CATEGORY_BY_PREFIX[prefix] or nil
 end
 
 local function projection_scope_matches(name, category, scopes)
@@ -1617,6 +1770,41 @@ local function role_allows_category(role, category)
     if allowed == category then return true end
   end
   return false
+end
+
+local function projection_record_eligible(role, record, scopes, opts, requirement)
+  local category = record.category
+  if type(record.ref) ~= "string" or #record.ref == 0
+    or #record.ref > PROJECTION_MAX_REFERENCE_BYTES then
+    return false, "invalid_reference"
+  end
+  if type(category) ~= "string" or not PROJECTION_CATEGORY_VALUES[category] then
+    return false, "unknown_category"
+  end
+  if not role_allows_category(role, category) then return false, "role_lens" end
+  if record.scope ~= nil and type(record.scope) ~= "string" then
+    return nil, "record scope must be a string"
+  end
+  if record.scope_path ~= nil and type(record.scope_path) ~= "string" then
+    return nil, "record scope_path must be a string"
+  end
+  local scope_name = record.ref
+  if record.scope_path and not projection_scope_matches(record.scope_path, category, scopes) then
+    return false, "scope"
+  end
+  if record.scope and not projection_scope_matches(record.scope, category, scopes) then
+    return false, "scope"
+  end
+  if not projection_scope_matches(scope_name, category, scopes) then return false, "scope" end
+  if requirement == "task" and (not opts.task_id or record.task_id ~= opts.task_id) then
+    return false, "task"
+  end
+  if requirement == "session" and (not opts.session_id or record.session_id ~= opts.session_id) then
+    return false, "session"
+  end
+  if opts.task_id and record.task_id and record.task_id ~= opts.task_id then return false, "task" end
+  if opts.session_id and record.session_id and record.session_id ~= opts.session_id then return false, "session" end
+  return true
 end
 
 local function projection_commit(context, reference)
@@ -1666,13 +1854,26 @@ local function projection_slot_copy(slot)
   }
 end
 
-local function projection_record(record, commit, opts, index)
+local function projection_record(record, commit, opts, index, include_provenance)
+  if type(record) ~= "table" then return nil, "record must be a table" end
+  local valid, validation_err = validate_projection_value(record)
+  if not valid then return nil, validation_err end
   local copy = copy_projection_value(record)
-  if not copy then return nil end
-  copy.ref = copy.ref or copy.id or string.format("record:%06d", index)
-  copy.category = copy.category or copy.kind or "project"
-  copy.provenance = copy.provenance or projection_provenance(commit, opts,
-    copy.revision or copy.timestamp_ms or index)
+  if not copy then return nil, "cyclic value" end
+  if type(copy.ref) ~= "string" or #copy.ref == 0
+    or #copy.ref > PROJECTION_MAX_REFERENCE_BYTES then
+    return nil, "record ref must be a bounded non-empty string"
+  end
+  if type(copy.category) ~= "string" or #copy.category == 0
+    or #copy.category > PROJECTION_MAX_REFERENCE_BYTES then
+    return nil, "record category must be a bounded non-empty string"
+  end
+  if include_provenance then
+    copy.provenance = copy.provenance or projection_provenance(commit, opts,
+      copy.revision or copy.timestamp_ms or index)
+  else
+    copy.provenance = nil
+  end
   return copy
 end
 
@@ -1688,15 +1889,17 @@ local function projection_layer(id, name, budget, candidates, provenance)
   local used = 0
   for _, candidate in ipairs(candidates) do
     local encoded = candidate._encoded
-    local size = #encoded
-    if used + size <= budget then
+    local size = encoded and #encoded or (budget + 1)
+    local separator = #selected > 0 and 1 or 0
+    if encoded and used + separator + size <= budget then
       selected[#selected + 1] = candidate
-      used = used + size
+      used = used + separator + size
     else
       omitted[#omitted + 1] = {
         ref = candidate.ref,
         reason = "byte_budget",
         bytes = size,
+        provenance = candidate.provenance,
       }
     end
   end
@@ -1714,28 +1917,39 @@ local function projection_layer(id, name, budget, candidates, provenance)
   }
 end
 
-local function prepare_projection_candidates(candidates)
+local function prepare_projection_candidates(candidates, byte_limit)
   for _, candidate in ipairs(candidates) do
-    local encoded, err = canonical_projection_value(candidate)
-    if not encoded then return nil, err end
-    candidate._encoded = encoded
+    local state = { nodes = 0, bytes = 0, bytes_limit = byte_limit and byte_limit + 1 or nil }
+    local encoded, err = canonical_projection_value(candidate, nil, state)
+    if not encoded and err == "value byte bound exceeded" then
+      candidate._projection_oversized = true
+      candidate._encoded = nil
+    elseif not encoded then
+      return nil, err
+    else
+      candidate._encoded = encoded
+    end
   end
   return candidates
 end
 
 local function clean_projection_candidates(candidates)
-  for _, candidate in ipairs(candidates) do candidate._encoded = nil end
+  for _, candidate in ipairs(candidates) do
+    candidate._encoded = nil
+    candidate._projection_oversized = nil
+  end
 end
 
 local function projection_budget(opts, name, default)
   local value = opts[name]
   if value == nil then return default end
-  if type(value) ~= "number" or value < 0 or value ~= math.floor(value) then return nil end
+  if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge
+    or value < 0 or value ~= math.floor(value) then return nil end
   return value
 end
 
 local function projection_error(message)
-  return { error = "invalid_projection", message = message }
+  return WheelErrors.projection_invalid(message)
 end
 
 --- Compute a structured semantic delta between two immutable commits.
@@ -1782,16 +1996,25 @@ function WheelContext:semantic_delta(base_ref, current_ref, opts)
     end
   end
 
-  local base_records = opts.base_records or {}
-  local current_records = opts.current_records or opts.records or {}
+  local base_records, base_records_err = validate_projection_records(opts.base_records, "base_records")
+  if not base_records then return nil, projection_error(base_records_err) end
+  local current_records, current_records_err = validate_projection_records(
+    opts.current_records or opts.records, "current_records")
+  if not current_records then return nil, projection_error(current_records_err) end
   local before_by_ref, after_by_ref = {}, {}
   for index, record in ipairs(base_records) do
-    local normalized = projection_record(record, base, opts, index)
-    if normalized then before_by_ref[normalized.ref] = normalized end
+    local normalized, normalize_err = projection_record(record, base, opts, index, false)
+    if not normalized then
+      return nil, projection_error("base_records[" .. tostring(index) .. "]: " .. normalize_err)
+    end
+    before_by_ref[normalized.ref] = normalized
   end
   for index, record in ipairs(current_records) do
-    local normalized = projection_record(record, current, opts, index)
-    if normalized then after_by_ref[normalized.ref] = normalized end
+    local normalized, normalize_err = projection_record(record, current, opts, index, false)
+    if not normalized then
+      return nil, projection_error("current_records[" .. tostring(index) .. "]: " .. normalize_err)
+    end
+    after_by_ref[normalized.ref] = normalized
   end
   local record_refs = {}
   for ref in pairs(before_by_ref) do record_refs[ref] = true end
@@ -1802,8 +2025,16 @@ function WheelContext:semantic_delta(base_ref, current_ref, opts)
   delta.records = { added = {}, modified = {}, removed = {}, unchanged = {} }
   for _, ref in ipairs(sorted_record_refs) do
     local before_record, after_record = before_by_ref[ref], after_by_ref[ref]
-    local before_encoded = before_record and canonical_projection_value(before_record)
-    local after_encoded = after_record and canonical_projection_value(after_record)
+    local before_encoded, before_encode_err = before_record
+      and canonical_projection_value(before_record, nil,
+        { nodes = 0, bytes = 0, bytes_limit = PROJECTION_MAX_SEMANTIC_BYTES })
+    local after_encoded, after_encode_err = after_record
+      and canonical_projection_value(after_record, nil,
+        { nodes = 0, bytes = 0, bytes_limit = PROJECTION_MAX_SEMANTIC_BYTES })
+    if (before_record and not before_encoded) or (after_record and not after_encoded) then
+      return nil, projection_error("semantic record exceeds bounded canonical size: "
+        .. tostring(before_encode_err or after_encode_err))
+    end
     if not before_record then
       delta.records.added[#delta.records.added + 1] = { ref = ref, after = after_record }
     elseif not after_record then
@@ -1846,6 +2077,18 @@ function WheelContext:project(opts)
   if not base then base = current end
   local scopes = opts.relevant_scopes or opts.scopes or {}
   if type(scopes) ~= "table" then return nil, projection_error("scopes must be an array") end
+  local scope_count = 0
+  for key, scope in pairs(scopes) do
+    if type(key) ~= "number" or key < 1 or key ~= math.floor(key)
+      or type(scope) ~= "string" or #scope == 0
+      or #scope > PROJECTION_MAX_REFERENCE_BYTES then
+      return nil, projection_error("scopes must be a dense array of bounded strings")
+    end
+    scope_count = scope_count + 1
+  end
+  for index = 1, scope_count do
+    if rawget(scopes, index) == nil then return nil, projection_error("scopes must be a dense array") end
+  end
 
   local budgets = {
     p0_max_bytes = projection_budget(opts, "p0_max_bytes", WheelContext.DEFAULT_P0_BUDGET_BYTES),
@@ -1859,9 +2102,22 @@ function WheelContext:project(opts)
   end
   local total_budget = projection_budget(opts, "max_budget_bytes", WheelContext.DEFAULT_PROJECTION_BUDGET_BYTES)
   if not total_budget then return nil, projection_error("max_budget_bytes must be a non-negative integer") end
+  local layer_budget_sum = budgets.p0_max_bytes + budgets.p1_max_bytes + budgets.p2_max_bytes
+    + budgets.p3_max_bytes + budgets.p4_max_bytes
+  if layer_budget_sum > total_budget then
+    return nil, projection_error("max_budget_bytes must cover the layer budgets")
+  end
 
   local provenance = projection_provenance(current, opts, current.timestamp_ms)
   local p0, p2, p4 = {}, {}, {}
+  local omitted_input = {}
+  local function add_omitted(ref, reason, provenance_source)
+    omitted_input[#omitted_input + 1] = {
+      ref = type(ref) == "string" and ref:sub(1, PROJECTION_MAX_REFERENCE_BYTES) or "(invalid)",
+      reason = reason,
+      provenance = provenance_source,
+    }
+  end
   for _, slot in ipairs((current.slots and (function()
     local list = {}
     for _, value in pairs(current.slots) do list[#list + 1] = value end
@@ -1872,6 +2128,10 @@ function WheelContext:project(opts)
     local candidate = projection_slot_record(slot, current, opts)
     if PROJECT_CATEGORIES[category] and projection_scope_matches(slot.name, category, scopes) then
       p0[#p0 + 1] = candidate
+    elseif not category then
+      add_omitted("slot:" .. slot.name, "unknown_category", projection_provenance(current, opts, slot.version))
+    elseif not PROJECT_CATEGORIES[category] then
+      add_omitted("slot:" .. slot.name, "role_lens", projection_provenance(current, opts, slot.version))
     end
     local task_prefix = opts.task_id and ("tasks/" .. opts.task_id) or nil
     if category == "tasks" and (not task_prefix or slot.name == task_prefix
@@ -1894,25 +2154,45 @@ function WheelContext:project(opts)
     end
   end
 
-  local current_records = opts.records or {}
-  if type(current_records) ~= "table" then return nil, projection_error("records must be an array") end
+  local current_records, current_records_err = validate_projection_records(opts.records, "records")
+  if not current_records then return nil, projection_error(current_records_err) end
+  local base_records, base_records_err = validate_projection_records(opts.base_records, "base_records")
+  if not base_records then return nil, projection_error(base_records_err) end
+  local recent_records, recent_records_err = validate_projection_records(opts.recent_records, "recent_records")
+  if not recent_records then return nil, projection_error(recent_records_err) end
   for index, record in ipairs(current_records) do
-    local normalized = projection_record(record, current, opts, index)
-    if normalized then
-      if normalized.task_id and opts.task_id and normalized.task_id == opts.task_id then
+    local normalized, normalize_err = projection_record(record, current, opts, index, true)
+    if not normalized then return nil, projection_error("records[" .. tostring(index) .. "]: " .. normalize_err) end
+    local eligible, eligibility_reason = projection_record_eligible(role, normalized, scopes, opts, "task")
+    if eligible == nil then return nil, projection_error("records[" .. tostring(index) .. "]: " .. eligibility_reason) end
+    if eligible then
+      if normalized.task_id == opts.task_id then
         p2[#p2 + 1] = normalized
       end
-      if normalized.session_id and opts.session_id and normalized.session_id == opts.session_id then
-        p4[#p4 + 1] = normalized
+    else
+      if eligibility_reason ~= "task" and eligibility_reason ~= "session" then
+        add_omitted(normalized.ref, eligibility_reason, normalized.provenance)
       end
     end
+    local session_eligible, session_reason = projection_record_eligible(role, normalized, scopes, opts, "session")
+    if session_eligible == nil then return nil, projection_error("records[" .. tostring(index) .. "]: " .. session_reason) end
+    if session_eligible then
+      if normalized.session_id == opts.session_id then
+        p4[#p4 + 1] = normalized
+      end
+    elseif session_reason ~= "task" and session_reason ~= "session" then
+      add_omitted(normalized.ref, session_reason, normalized.provenance)
+    end
   end
-  local recent_records = opts.recent_records or {}
   for index, record in ipairs(recent_records) do
-    local normalized = projection_record(record, current, opts, index)
-    if normalized and role_allows_category(role, normalized.category)
-      and (not opts.task_id or not normalized.task_id or normalized.task_id == opts.task_id) then
+    local normalized, normalize_err = projection_record(record, current, opts, index, true)
+    if not normalized then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. normalize_err) end
+    local eligible, eligibility_reason = projection_record_eligible(role, normalized, scopes, opts)
+    if eligible == nil then return nil, projection_error("recent_records[" .. tostring(index) .. "]: " .. eligibility_reason) end
+    if eligible then
       p4[#p4 + 1] = normalized
+    else
+      add_omitted(normalized.ref, eligibility_reason, normalized.provenance)
     end
   end
   projection_sorted_records(p0)
@@ -1938,30 +2218,37 @@ function WheelContext:project(opts)
   for _, operation in ipairs({ "added", "modified", "removed" }) do
     for _, item in ipairs(delta[operation]) do
       local category = projection_category(item.ref:sub(6))
+      local slot_name = item.ref:sub(6)
       if role_allows_category(role, category)
-        and projection_scope_matches(item.ref, category, scopes) then
+        and projection_scope_matches(slot_name, category, scopes) then
         p3[#p3 + 1] = { ref = item.ref, operation = operation, category = category,
           before = item.before, after = item.after, provenance = delta.provenance }
+      elseif not category then
+        add_omitted(item.ref, "unknown_category", delta.provenance)
       end
     end
   end
   for _, operation in ipairs({ "added", "modified", "removed" }) do
     for _, item in ipairs(delta.records[operation]) do
       local record = item.after or item.before
-      local category = record and record.category or "project"
-      local record_task = record and record.task_id
-      local relevant_task = not opts.task_id or not record_task or record_task == opts.task_id
-      if role_allows_category(role, category) and relevant_task
-        and projection_scope_matches(item.ref, category, scopes) then
+      local eligible, eligibility_reason = record
+        and projection_record_eligible(role, record, scopes, opts)
+      if eligible == nil then return nil, projection_error("delta record " .. tostring(item.ref) .. ": " .. eligibility_reason) end
+      if eligible then
+        local category = record.category
         p3[#p3 + 1] = { ref = item.ref, operation = operation, category = category,
           before = item.before, after = item.after, provenance = delta.provenance }
+      elseif record then
+        add_omitted(item.ref, eligibility_reason, delta.provenance)
       end
     end
   end
   projection_sorted_records(p3)
   local candidates = { p0, p1, p2, p3, p4 }
-  for _, list in ipairs(candidates) do
-    local prepared, prepare_err = prepare_projection_candidates(list)
+  local candidate_budgets = { budgets.p0_max_bytes, budgets.p1_max_bytes,
+    budgets.p2_max_bytes, budgets.p3_max_bytes, budgets.p4_max_bytes }
+  for index, list in ipairs(candidates) do
+    local prepared, prepare_err = prepare_projection_candidates(list, candidate_budgets[index])
     if not prepared then return nil, projection_error(prepare_err) end
   end
 
@@ -1977,8 +2264,18 @@ function WheelContext:project(opts)
     total_bytes = total_bytes + layer.bytes
     for _, reference in ipairs(layer.omitted_references) do omitted[#omitted + 1] = {
       layer = definition.id, ref = reference.ref, reason = reference.reason, bytes = reference.bytes,
+      provenance = reference.provenance,
     } end
   end
+  for _, reference in ipairs(omitted_input) do
+    omitted[#omitted + 1] = reference
+  end
+  local canonical_parts = {}
+  for _, definition in ipairs(PROJECTION_LAYERS) do
+    canonical_parts[#canonical_parts + 1] = layers[definition.id].text
+  end
+  local canonical_bytes = table.concat(canonical_parts)
+  total_bytes = #canonical_bytes
   for _, list in ipairs(candidates) do clean_projection_candidates(list) end
   if total_bytes > total_budget then
     return nil, projection_error("projection exceeds max_budget_bytes")
@@ -1998,9 +2295,10 @@ function WheelContext:project(opts)
     omitted_references = omitted,
     provenance = provenance,
   }
-  local encoded, encode_err = canonical_projection_value(projection)
-  if not encoded then return nil, projection_error(encode_err) end
-  projection.canonical_bytes = encoded
+  if total_bytes > total_budget then
+    return nil, projection_error("projection exceeds max_budget_bytes")
+  end
+  projection.canonical_bytes = canonical_bytes
   return projection
 end
 
