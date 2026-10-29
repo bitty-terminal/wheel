@@ -30,6 +30,11 @@ The design must not weaken:
 
 ## 2. Independent entities
 
+The independent identifier set below is the target architecture, not a
+complete current runtime model. Current Wheel primitives cover only portions
+of these concepts; the distinct identity and lifecycle boundaries described
+here must not be read as implemented behavior.
+
 The following identifiers are intentionally different:
 
 ```text
@@ -233,7 +238,8 @@ it cannot grant a capability that the runtime did not grant.
 
 ## 7. High-density Prompt compilation
 
-The current `WheelContext:compile_prompt()` already provides the foundation:
+The current `WheelContext:compile_prompt()` provides a foundation toward these
+target budgets and intended bounds:
 
 ```text
 Zone 1: stable prefix, default 16 KiB
@@ -241,6 +247,14 @@ Zone 2: cognitive state, default 32 KiB
 Zone 3: dynamic tail, default 16 KiB
 Total: 64 KiB
 ```
+
+Zone 1 remains fail-closed when its stable prefix exceeds its configured
+budget. Zone 2 and the total are not guaranteed current enforcement limits:
+large `workspace/*` slots are retained during the current reduction pipeline,
+so they can leave Zone 2 over its target budget. If Zone 1 and Zone 2 already
+consume more than the total target, the minimum Zone 3 tail can also leave the
+final prompt over the total target. In either case, `compile_prompt()` can
+still report `success = true`.
 
 Its reduction order is intentionally asymmetric:
 
@@ -255,9 +269,11 @@ wheel#110 upgrades these into deterministic structured projections and semantic
 delta references. Issue #111 bounds the autonomous conversation history and
 replaces old messages with ContextRefs.
 
-The provider-level cache key currently identifies Wheel's local Zone 1 hash. It
-does not prove a provider cache hit. Issue #118 owns provider capability
-negotiation and measured cache telemetry.
+The provider-level cache key currently identifies Wheel's local Zone 1 hash.
+Any local prefix-share ratio is a design/local-reuse signal, not a provider
+cache hit rate; neither proves a provider cache hit. Provider hit evidence
+requires response telemetry. Issue #118 owns provider capability negotiation
+and measured cache telemetry.
 
 ## 8. Output and reasoning density
 
