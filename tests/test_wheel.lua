@@ -8,6 +8,7 @@ local WheelAgent = require("wheel.agent")
 local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
 local WheelTool = require("wheel.tool")
+local WheelAction = require("wheel.action")
 local WheelHost = require("wheel.host")
 local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
@@ -278,6 +279,55 @@ run_test("WheelKernel: action auto-spillover", function()
 
   kernel:clear_recent_actions()
   assert(#kernel:recent_actions() == 0)
+end)
+
+run_test("WheelAction: deterministic diagnostics cover noisy success and middle-log failure", function()
+  local noisy = WheelAction.normalize({
+    action_id = "diag-success",
+    stdout = string.rep("build progress\n", 500),
+    stderr = "warning: src/lib.rs:7:3 unused variable",
+    exit_code = 0,
+  })
+  assert(noisy.success == true)
+  assert(noisy.spilled == true)
+  assert(#noisy.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#noisy.diagnostics.warnings == 1)
+
+  local failed = WheelAction.normalize({
+    action_id = "diag-failure",
+    stdout = "start\n" .. string.rep("noise\n", 500) .. "src/main.rs:42:9: error: expected expression\nend\n",
+    exit_code = 1,
+  })
+  assert(failed.success == false)
+  assert(#failed.diagnostics.errors > 0, "middle compiler failure must be retained")
+  assert(failed.diagnostics.locations[1].file == "src/main.rs")
+  assert(failed.diagnostics.final_failure_stage == "compiler")
+end)
+
+run_test("WheelAction: stderr, truncation, timeout and spillover metadata", function()
+  local blobs = {}
+  local timeout = WheelAction.normalize({
+    action_id = "diag-timeout",
+    stdout = "running\n",
+    stderr = "panic: deadline exceeded\n",
+    exit_code = 124,
+    timed_out = true,
+    truncated = true,
+  })
+  assert(timeout.timed_out == true)
+  assert(timeout.diagnostics.final_failure_stage == "timeout")
+  assert(timeout.stderr_preview:find("panic", 1, true) ~= nil)
+  assert(timeout.truncated == true)
+
+  local large = WheelAction.normalize({
+    action_id = "diag-spill",
+    stdout = string.rep("x", WheelAction.SPILLOVER_THRESHOLD_BYTES + 1),
+    exit_code = 0,
+  }, function(hash, content) blobs[hash] = content end)
+  assert(large.blob_hash ~= nil)
+  assert(blobs[large.blob_hash] ~= nil)
+  assert(large.raw_stdout == nil and large.raw_stderr == nil)
+  assert(large.size_bytes > WheelAction.SPILLOVER_THRESHOLD_BYTES)
 end)
 
 run_test("WheelKernel: context compilation", function()
@@ -8799,6 +8849,5 @@ cleanup_test_run_root()
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
-
 
 

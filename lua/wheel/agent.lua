@@ -528,8 +528,21 @@ function WheelAgent:execute_task(task_id, step_fn)
         success = (act.exit_code == nil or act.exit_code == 0),
         exit_code = act.exit_code or 0,
         duration_ms = act.duration_ms or 10,
-        raw_stdout = act.stdout or "",
-        raw_stderr = act.stderr or "",
+        tool = act.tool,
+        intent = act.intent,
+        preview = act.preview or act.stdout_preview or act.stdout or "",
+        stdout_preview = act.stdout_preview or act.stdout or "",
+        stderr_preview = act.stderr_preview or act.stderr or "",
+        size_bytes = act.size_bytes or (#(act.stdout or "") + #(act.stderr or "")),
+        stdout_bytes = act.stdout_bytes,
+        stderr_bytes = act.stderr_bytes,
+        spilled = act.spilled,
+        blob_hash = act.blob_hash or act.spillover_hash,
+        spillover_bytes = act.spillover_bytes,
+        diagnostics = act.diagnostics,
+        timed_out = act.timed_out,
+        truncated = act.truncated,
+        outcome = act.outcome,
       })
     end
 

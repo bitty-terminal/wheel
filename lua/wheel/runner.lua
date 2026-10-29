@@ -291,8 +291,21 @@ function WheelRunner.run_task(agent, task, opts)
             success = outcome.success,
             exit_code = outcome.exit_code,
             duration_ms = outcome.duration_ms,
-            raw_stdout = outcome.stdout or "",
-            raw_stderr = outcome.stderr or "",
+            tool = outcome.tool,
+            intent = outcome.intent,
+            preview = outcome.preview,
+            stdout_preview = outcome.stdout_preview,
+            stderr_preview = outcome.stderr_preview,
+            size_bytes = (outcome.spillover_bytes or 0) > 0 and outcome.spillover_bytes or 0,
+            stdout_bytes = outcome.stdout_bytes,
+            stderr_bytes = outcome.stderr_bytes,
+            spilled = outcome.spilled,
+            blob_hash = outcome.spillover_hash,
+            spillover_bytes = outcome.spillover_bytes,
+            diagnostics = outcome.diagnostics,
+            timed_out = outcome.timed_out,
+            truncated = outcome.truncated,
+            outcome = outcome.outcome,
           })
         end
 

@@ -6,6 +6,9 @@
 local WheelKernel = {}
 WheelKernel.__index = WheelKernel
 
+local ok_action, WheelAction = pcall(require, "wheel.action")
+if not ok_action then WheelAction = nil end
+
 -- ---------------------------------------------------------------------------
 -- JSON Codec Resolution (bitty.json -> cjson -> pure-Lua fallback)
 -- ---------------------------------------------------------------------------
@@ -567,20 +570,30 @@ local function create_mock_dispatcher()
       return json_codec.encode({ success = true, data = list })
 
     elseif command == "action.record" then
-      local raw_out = payload.raw_stdout or ""
-      local raw_err = payload.raw_stderr or ""
-      local is_spill = (#raw_out > 4096 or #raw_err > 4096)
-      local action = {
-        action_id = payload.action_id,
-        success = payload.success ~= false,
-        exit_code = payload.exit_code or 0,
-        duration_ms = payload.duration_ms or 0,
-        raw_stdout = raw_out,
-        raw_stderr = raw_err,
-        spilled = is_spill,
-      }
+      local action
+      if WheelAction then
+        action = WheelAction.normalize(payload, function(hash, content)
+          local slot_name = "blobs/" .. hash
+          if not state.slots[slot_name] then
+            local h = mock_hash(content)
+            state.slots[slot_name] = {
+              name = slot_name, hash = h, content = content, size_bytes = #content,
+            }
+            state.tree_hash = mock_hash(state.tree_hash .. slot_name .. h)
+          end
+        end)
+      else
+        action = {
+          action_id = payload.action_id,
+          success = payload.success ~= false,
+          exit_code = payload.exit_code or 0,
+          duration_ms = payload.duration_ms or 0,
+          preview = (payload.raw_stdout or ""):sub(1, 256),
+          size_bytes = #(payload.raw_stdout or "") + #(payload.raw_stderr or ""),
+        }
+      end
       table.insert(state.recent_actions, action)
-      if #state.recent_actions > 16 then
+      if #state.recent_actions > state.spillover_config.max_recent_actions then
         table.remove(state.recent_actions, 1)
       end
       return json_codec.encode({ success = true, data = action })
@@ -610,7 +623,7 @@ local function create_mock_dispatcher()
 
       local act_lines = {}
       for _, a in ipairs(state.recent_actions) do
-        table.insert(act_lines, string.format("Action %s [exit=%s]: %s", a.action_id, tostring(a.exit_code), a.raw_stdout:sub(1, 100)))
+        table.insert(act_lines, string.format("Action %s [exit=%s]: %s", a.action_id, tostring(a.exit_code), a.preview or a.stdout_preview or ""))
       end
       table.insert(act_lines, payload.turn_prompt or "")
       local z3 = table.concat(act_lines, "\n")

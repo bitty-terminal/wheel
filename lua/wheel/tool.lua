@@ -41,6 +41,8 @@ end
 
 local WheelTool = {}
 local WheelErrors = load_errors()
+local ok_action, WheelAction = pcall(require, "wheel.action")
+if not ok_action then WheelAction = nil end
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end
@@ -398,6 +400,10 @@ function ActionOutcome:to_table()
     outcome = self.outcome,
     timed_out = self.timed_out,
     truncated = self.truncated,
+    diagnostics = self.diagnostics,
+    size_bytes = #(self.stdout or "") + #(self.stderr or ""),
+    stdout_bytes = #(self.stdout or ""),
+    stderr_bytes = #(self.stderr or ""),
   }
 end
 
@@ -429,6 +435,7 @@ function WheelTool.process_spillover(raw, opts)
   self.outcome = raw.outcome
   self.timed_out = raw.timed_out == true
   self.truncated = raw.truncated == true
+  self.diagnostics = WheelAction and WheelAction.extract_diagnostics(stdout, stderr, self.exit_code, self.timed_out) or {}
 
   if total_bytes > threshold then
     local full_payload = stdout
@@ -1196,8 +1203,21 @@ function WheelToolRegistry:dispatch(name, args, env)
         success = outcome.success,
         exit_code = outcome.exit_code,
         duration_ms = outcome.duration_ms,
-        raw_stdout = outcome.stdout,
-        raw_stderr = outcome.stderr,
+        tool = outcome.tool,
+        intent = outcome.intent,
+        preview = outcome.preview,
+        stdout_preview = outcome.stdout and outcome.stdout:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
+        stderr_preview = outcome.stderr and outcome.stderr:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
+        size_bytes = (outcome.spillover_bytes or 0) > 0 and outcome.spillover_bytes or #(outcome.stdout or "") + #(outcome.stderr or ""),
+        stdout_bytes = #(outcome.stdout or ""),
+        stderr_bytes = #(outcome.stderr or ""),
+        spilled = outcome.spilled,
+        blob_hash = outcome.spillover_hash,
+        spillover_bytes = outcome.spillover_bytes,
+        diagnostics = outcome.diagnostics,
+        timed_out = outcome.timed_out,
+        truncated = outcome.truncated,
+        outcome = outcome.outcome,
       })
     end)
   end

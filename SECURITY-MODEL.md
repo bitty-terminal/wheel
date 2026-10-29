@@ -159,6 +159,12 @@ not receive it.
   output spills to a content-addressed artifact inside the workspace or is
   truncated with an explicit marker; it is never silently buffered without
   bound.
+- Recent action records retain only bounded previews (including separate stdout
+  and stderr previews), byte counts, truncation/timeout state, exit status, a
+  bounded deterministic diagnostic summary, and an optional blob reference.
+  Complete output is retained only in the existing content-addressed spillover
+  blob and remains subject to the process capture and retention bounds; raw
+  stdout/stderr are not long-lived action-record fields.
 
 ### Arbitrary argv
 
