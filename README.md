@@ -760,6 +760,11 @@ Transitions are admitted only when both structured sides pass the same role and
 scope eligibility predicate. A record matching both the active task and
 session is assigned to P2 and not repeated in P4.
 
+Caller-owned projection values use the snapshot plain-data depth and node
+policies. Validation, copying, and canonicalization all enforce the named
+`WheelContext.MAX_PROJECTION_VALUE_DEPTH` depth bound and fail with
+`E_PROJECTION_INVALID` before deeply nested data can exhaust the Lua stack.
+
 The default per-layer budgets are 16 KiB, 8 KiB, 16 KiB, 16 KiB, and 8 KiB
 respectively. Selection is byte-bounded and deterministic: records are sorted
 by stable reference (with P4 using timestamp then reference), and records that

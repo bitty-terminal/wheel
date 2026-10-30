@@ -323,6 +323,30 @@ return function(run_test)
     }, "one-byte candidate work")
   end)
 
+  run_test("Context projections: candidate work uses the largest active layer budget", function()
+    local context = fixed_context()
+    local first = assert(context:commit_checkpoint({
+      author = "fixture", message = "large-layer work root", timestamp_ms = 1700000000000,
+    }))
+    assert(context:put_slot("workspace/large-layer", "updated").success)
+    local second = assert(context:commit_checkpoint({
+      author = "fixture", message = "large-layer work update", timestamp_ms = 1700000001000,
+    }))
+    local projection = assert(context:project({
+      base_commit = first.hash, current_commit = second.hash,
+      role = WheelContext.Role.CODING,
+      p0_max_bytes = 0, p1_max_bytes = 0, p2_max_bytes = 0,
+      p3_max_bytes = 1024, p4_max_bytes = 0, max_budget_bytes = 1024,
+      base_records = { { ref = "workspace/record", category = "project", value = "old" } },
+      records = { { ref = "workspace/record", category = "project", value = "new" } },
+    }))
+    local saw_record = false
+    for _, record in ipairs(projection.layers.P3.records) do
+      if record.ref == "workspace/record" then saw_record = true end
+    end
+    assert(saw_record)
+  end)
+
   run_test("Context projections: task records take precedence over session tail", function()
     local context = fixed_context()
     local commit = assert(context:commit_checkpoint({
@@ -383,6 +407,34 @@ return function(run_test)
     assert(delta == nil and err.code == "E_PROJECTION_INVALID")
     local valid_table = context:get_commit(commit.hash)
     assert(context:project({ current_commit = valid_table }).current_commit == commit.hash)
+  end)
+
+  run_test("Context projections: explicit unresolved bases fail with typed errors", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "base resolution", timestamp_ms = 1700000000000,
+    }))
+    assert_projection_error(context, {
+      base_commit = "missing-base", current_commit = commit.hash,
+    }, "unresolved explicit base")
+    assert(context:project({ current_commit = commit.hash }).base_commit == commit.hash)
+  end)
+
+  run_test("Context projections: deeply nested records fail before copy or encoding", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "depth boundary", timestamp_ms = 1700000000000,
+    }))
+    local nested = {}
+    local cursor = nested
+    for _ = 1, 64 do
+      cursor.next = {}
+      cursor = cursor.next
+    end
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      records = { { ref = "workspace/deep", category = "project", value = nested } },
+    }, "deeply nested record")
   end)
 
   run_test("Context projections: timestamp and revision fields are finite numbers", function()

@@ -140,6 +140,7 @@ WheelContext.MAX_SNAPSHOT_BYTES = WheelSnapshot.MAX_TOTAL_BYTES
 WheelContext.MAX_REFLOG_INDEX = WheelSnapshot.MAX_REFLOG_INDEX
 WheelContext.MAX_SLOT_VERSION = WheelSnapshot.MAX_SLOT_VERSION
 WheelContext.MAX_REF_NAME_BYTES = WheelSnapshot.MAX_REF_NAME_BYTES
+WheelContext.MAX_PROJECTION_VALUE_DEPTH = WheelSnapshot.MAX_VALUE_DEPTH
 
 WheelContext.SlotKind = {
   WORKSPACE = "workspace",
@@ -1511,6 +1512,7 @@ local PROJECTION_MAX_BUDGET_BYTES = WheelContext.MAX_TOTAL_BUDGET_BYTES
 local PROJECTION_WORK_NODES_PER_BYTE = 16
 local PROJECTION_MIN_WORK_NODES = 64
 local PROJECTION_MAX_SCALAR = 9007199254740991
+local PROJECTION_MAX_VALUE_DEPTH = WheelContext.MAX_PROJECTION_VALUE_DEPTH
 
 local function projection_byte_less(left, right)
   local length = math.min(#left, #right)
@@ -1535,8 +1537,18 @@ end
 -- Canonical plain-data encoding is intentionally local to projections. It is
 -- not a wire format and rejects executable/cyclic values before they can enter
 -- a caller-owned view.
-local function canonical_projection_value(value, visiting, state)
-  state = state or { nodes = 0, bytes = 0, bytes_limit = nil, nodes_limit = PROJECTION_MAX_VALUE_NODES }
+local function canonical_projection_value(value, visiting, state, depth)
+  state = state or {
+    nodes = 0,
+    bytes = 0,
+    bytes_limit = nil,
+    nodes_limit = PROJECTION_MAX_VALUE_NODES,
+    max_depth = PROJECTION_MAX_VALUE_DEPTH,
+  }
+  depth = depth or 0
+  if depth > (state.max_depth or PROJECTION_MAX_VALUE_DEPTH) then
+    return nil, "value depth bound exceeded"
+  end
   state.nodes = state.nodes + 1
   if state.nodes > (state.nodes_limit or PROJECTION_MAX_VALUE_NODES) then
     return nil, "value node bound exceeded"
@@ -1605,7 +1617,7 @@ local function canonical_projection_value(value, visiting, state)
   if not opening_ok then visiting[value] = nil; return nil, opening_err end
   if array then
     for index = 1, count do
-      local item, err = canonical_projection_value(value[index], visiting, state)
+      local item, err = canonical_projection_value(value[index], visiting, state, depth + 1)
       if not item then visiting[value] = nil; return nil, err end
       if index > 1 then
         local separator_ok, separator_err = charge(1)
@@ -1627,7 +1639,7 @@ local function canonical_projection_value(value, visiting, state)
   end
   table.sort(keys, projection_byte_less)
   for _, key in ipairs(keys) do
-    local item, err = canonical_projection_value(value[key], visiting, state)
+    local item, err = canonical_projection_value(value[key], visiting, state, depth + 1)
     if not item then visiting[value] = nil; return nil, err end
     local key_encoded = projection_escape(key)
     local key_ok, key_err = charge(#key_encoded + 4)
@@ -1644,17 +1656,19 @@ local function canonical_projection_value(value, visiting, state)
   return "{" .. table.concat(encoded, ",") .. "}"
 end
 
-local function copy_projection_value(value, visiting)
+local function copy_projection_value(value, visiting, depth)
   if type(value) ~= "table" then return value end
+  depth = depth or 0
+  if depth > PROJECTION_MAX_VALUE_DEPTH then return nil, "value depth bound exceeded" end
   visiting = visiting or {}
-  if visiting[value] then return nil end
+  if visiting[value] then return nil, "cyclic value" end
   visiting[value] = true
   local copy = {}
   for key, item in pairs(value) do
-    local item_copy = copy_projection_value(item, visiting)
+    local item_copy, copy_err = copy_projection_value(item, visiting, depth + 1)
     if item_copy == nil and item ~= nil then
       visiting[value] = nil
-      return nil
+      return nil, copy_err or "invalid value"
     end
     copy[key] = item_copy
   end
@@ -1662,8 +1676,16 @@ local function copy_projection_value(value, visiting)
   return copy
 end
 
-local function validate_projection_value(value, visiting, state)
-  state = state or { nodes = 0, nodes_limit = PROJECTION_MAX_VALUE_NODES }
+local function validate_projection_value(value, visiting, state, depth)
+  state = state or {
+    nodes = 0,
+    nodes_limit = PROJECTION_MAX_VALUE_NODES,
+    max_depth = PROJECTION_MAX_VALUE_DEPTH,
+  }
+  depth = depth or 0
+  if depth > (state.max_depth or PROJECTION_MAX_VALUE_DEPTH) then
+    return false, "value depth bound exceeded"
+  end
   state.nodes = state.nodes + 1
   if state.nodes > (state.nodes_limit or PROJECTION_MAX_VALUE_NODES) then return false, "value node bound exceeded" end
   local value_type = type(value)
@@ -1720,7 +1742,7 @@ local function validate_projection_value(value, visiting, state)
     end
   end
   for _, key in ipairs(keys) do
-    local ok, err = validate_projection_value(value[key], visiting, state)
+    local ok, err = validate_projection_value(value[key], visiting, state, depth + 1)
     if not ok then visiting[value] = nil; return false, err end
   end
   visiting[value] = nil
@@ -1746,7 +1768,8 @@ local function validate_projection_records(records, label, nodes_limit, records_
       return nil, label .. "[" .. tostring(index) .. "] must be a table"
     end
     local valid, validation_err = validate_projection_value(records[index], nil,
-      { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES })
+      { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES,
+        max_depth = PROJECTION_MAX_VALUE_DEPTH })
     if not valid then
       return nil, label .. "[" .. tostring(index) .. "]: " .. validation_err
     end
@@ -1909,10 +1932,11 @@ end
 local function projection_record(record, commit, opts, index, include_provenance, nodes_limit)
   if type(record) ~= "table" then return nil, "record must be a table" end
   local valid, validation_err = validate_projection_value(record, nil,
-    { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES })
+    { nodes = 0, nodes_limit = nodes_limit or PROJECTION_MAX_VALUE_NODES,
+      max_depth = PROJECTION_MAX_VALUE_DEPTH })
   if not valid then return nil, validation_err end
-  local copy = copy_projection_value(record)
-  if not copy then return nil, "cyclic value" end
+  local copy, copy_err = copy_projection_value(record)
+  if not copy then return nil, copy_err or "invalid value" end
   if type(copy.ref) ~= "string" or #copy.ref == 0
     or #copy.ref > PROJECTION_MAX_REFERENCE_BYTES then
     return nil, "record ref must be a bounded non-empty string"
@@ -1944,7 +1968,7 @@ end
 
 local function projection_sorted_records(records)
   table.sort(records, function(left, right)
-    return tostring(left.ref) < tostring(right.ref)
+    return projection_byte_less(left.ref, right.ref)
   end)
 end
 
@@ -2151,10 +2175,15 @@ function WheelContext:project(opts)
   if not options_valid then return nil, projection_error(options_err) end
   local role = opts.role or WheelContext.Role.CODING
   if not ROLE_VALUES[role] then return nil, projection_error("unknown role: " .. tostring(role)) end
-  local base = projection_commit(self, opts.base_commit)
   local current = projection_commit(self, opts.current_commit)
   if not current then return nil, projection_error("current_commit must resolve to a commit") end
-  if not base then base = current end
+  local base
+  if opts.base_commit == nil then
+    base = current
+  else
+    base = projection_commit(self, opts.base_commit)
+    if not base then return nil, projection_error("base_commit must resolve to a commit") end
+  end
   local scopes = opts.relevant_scopes or opts.scopes or {}
   if type(scopes) ~= "table" then return nil, projection_error("scopes must be an array") end
   local scope_count = 0
@@ -2208,7 +2237,7 @@ function WheelContext:project(opts)
   for _, slot in ipairs((current.slots and (function()
     local list = {}
     for _, value in pairs(current.slots) do list[#list + 1] = value end
-    table.sort(list, function(left, right) return left.name < right.name end)
+    table.sort(list, function(left, right) return projection_byte_less(left.name, right.name) end)
     return list
   end)()) or {}) do
     local category = projection_category(slot.name)
@@ -2241,9 +2270,9 @@ function WheelContext:project(opts)
     end
   end
 
-  local work_nodes = projection_work_nodes_for_budget(math.min(
+  local work_nodes = projection_work_nodes_for_budget(math.max(
     budgets.p2_max_bytes, budgets.p3_max_bytes, budgets.p4_max_bytes))
-  local work_records = projection_records_for_budget(math.min(
+  local work_records = projection_records_for_budget(math.max(
     budgets.p2_max_bytes, budgets.p3_max_bytes, budgets.p4_max_bytes))
   local current_records, current_records_err = validate_projection_records(
     opts.records, "records", work_nodes, work_records)
@@ -2312,7 +2341,7 @@ function WheelContext:project(opts)
     local left_time = left.timestamp_ms or left.revision or 0
     local right_time = right.timestamp_ms or right.revision or 0
     if left_time ~= right_time then return left_time > right_time end
-    return tostring(left.ref) < tostring(right.ref)
+    return projection_byte_less(left.ref, right.ref)
   end)
 
   local delta, delta_err = self:semantic_delta(base, current, {
