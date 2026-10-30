@@ -91,6 +91,30 @@ end
 
 local parse_value
 
+local function append_utf8(chars, codepoint)
+  if codepoint <= 0x7f then
+    table.insert(chars, string.char(codepoint))
+  elseif codepoint <= 0x7ff then
+    table.insert(chars, string.char(
+      0xc0 + math.floor(codepoint / 0x40),
+      0x80 + codepoint % 0x40
+    ))
+  elseif codepoint <= 0xffff then
+    table.insert(chars, string.char(
+      0xe0 + math.floor(codepoint / 0x1000),
+      0x80 + math.floor(codepoint / 0x40) % 0x40,
+      0x80 + codepoint % 0x40
+    ))
+  else
+    table.insert(chars, string.char(
+      0xf0 + math.floor(codepoint / 0x40000),
+      0x80 + math.floor(codepoint / 0x1000) % 0x40,
+      0x80 + math.floor(codepoint / 0x40) % 0x40,
+      0x80 + codepoint % 0x40
+    ))
+  end
+end
+
 local function parse_string(str, pos)
   local i = pos + 1
   local chars = {}
@@ -112,9 +136,29 @@ local function parse_string(str, pos)
       elseif esc == 't' then table.insert(chars, '\t')
       elseif esc == 'u' then
         local hex = str:sub(i + 1, i + 4)
-        local code = tonumber(hex, 16) or 63
-        table.insert(chars, string.char(code % 256))
+        if not hex:match("^%x%x%x%x$") then
+          error("invalid Unicode escape at pos " .. i)
+        end
+        local codepoint = tonumber(hex, 16)
         i = i + 4
+        if codepoint >= 0xd800 and codepoint <= 0xdbff then
+          if str:sub(i + 1, i + 2) ~= "\\u" then
+            error("missing low surrogate at pos " .. i)
+          end
+          local low_hex = str:sub(i + 3, i + 6)
+          if not low_hex:match("^%x%x%x%x$") then
+            error("invalid low surrogate at pos " .. (i + 2))
+          end
+          local low = tonumber(low_hex, 16)
+          if low < 0xdc00 or low > 0xdfff then
+            error("invalid low surrogate at pos " .. (i + 2))
+          end
+          codepoint = 0x10000 + (codepoint - 0xd800) * 0x400 + (low - 0xdc00)
+          i = i + 6
+        elseif codepoint >= 0xdc00 and codepoint <= 0xdfff then
+          error("unexpected low surrogate at pos " .. i)
+        end
+        append_utf8(chars, codepoint)
       else
         table.insert(chars, esc)
       end
