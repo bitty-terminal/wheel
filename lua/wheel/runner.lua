@@ -335,7 +335,8 @@ function WheelRunner.run_task(agent, task, opts)
       -- Publish deliverables to semantic slot
       if agent.context and type(agent.context.put_slot) == "function" then
         agent.context:put_slot("tasks/" .. task_id .. "/artifacts", final_artifacts)
-        local encoded = WheelProvider.JSON.encode(rationale)
+        local persisted_rationale = WheelProvider.Rationale.for_persistence(rationale)
+        local encoded = WheelProvider.JSON.encode(persisted_rationale)
         agent.context:put_slot("tasks/" .. task_id .. "/rationale", encoded)
       end
 

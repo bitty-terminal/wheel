@@ -8,6 +8,8 @@ WheelKernel.__index = WheelKernel
 
 local ok_action, WheelAction = pcall(require, "wheel.action")
 if not ok_action then WheelAction = nil end
+local ok_rationale, Rationale = pcall(require, "wheel.rationale")
+if not ok_rationale then Rationale = nil end
 
 -- ---------------------------------------------------------------------------
 -- JSON Codec Resolution (bitty.json -> cjson -> pure-Lua fallback)
@@ -535,7 +537,8 @@ local function create_mock_dispatcher()
       return json_codec.encode({ success = true, data = list })
 
     elseif command == "checkpoint.commit" then
-      local rat = payload.rationale or {}
+      local rat = Rationale and Rationale.for_persistence(payload.rationale)
+        or { why = "Provider rationale unavailable", what = "Continue task execution" }
       local h = mock_hash(json_codec.encode(rat) .. state.tree_hash)
       local cp = {
         hash = h,
@@ -846,8 +849,10 @@ end
 --- @param now_ms number?
 --- @return table
 function WheelKernel:commit_checkpoint(rationale, branch, now_ms)
+  local persisted_rationale = Rationale and Rationale.for_persistence(rationale)
+    or { why = "Provider rationale unavailable", what = "Continue task execution" }
   return self:call("checkpoint.commit", {
-    rationale = rationale,
+    rationale = persisted_rationale,
     branch = branch,
     now_ms = now_ms or 0,
   })
