@@ -161,28 +161,60 @@ local function strict_json_document(text)
   local function string_token()
     if text:sub(position, position) ~= '"' then return false end
     position = position + 1
+    local decoded = {}
+    local function append_codepoint(codepoint)
+      if codepoint <= 0x7f then
+        decoded[#decoded + 1] = string.char(codepoint)
+      elseif codepoint <= 0x7ff then
+        decoded[#decoded + 1] = string.char(0xc0 + math.floor(codepoint / 0x40), 0x80 + codepoint % 0x40)
+      elseif codepoint <= 0xffff then
+        decoded[#decoded + 1] = string.char(0xe0 + math.floor(codepoint / 0x1000),
+          0x80 + math.floor(codepoint / 0x40) % 0x40, 0x80 + codepoint % 0x40)
+      else
+        decoded[#decoded + 1] = string.char(0xf0 + math.floor(codepoint / 0x40000),
+          0x80 + math.floor(codepoint / 0x1000) % 0x40,
+          0x80 + math.floor(codepoint / 0x40) % 0x40, 0x80 + codepoint % 0x40)
+      end
+    end
     while position <= #text do
       local byte = text:byte(position)
       if byte == 34 then
         position = position + 1
-        return true
+        return table.concat(decoded)
       elseif byte == 92 then
         position = position + 1
         local escape = text:sub(position, position)
-        if escape == '"' or escape == "\\" or escape == "/"
-          or escape == "b" or escape == "f" or escape == "n"
-          or escape == "r" or escape == "t" then
+        local simple_escapes = {
+          ['"'] = '"', ["\\"] = "\\", ["/"] = "/",
+          b = "\b", f = "\f", n = "\n", r = "\r", t = "\t",
+        }
+        if simple_escapes[escape] then
+          decoded[#decoded + 1] = simple_escapes[escape]
           position = position + 1
         elseif escape == "u" then
           local hex = text:sub(position + 1, position + 4)
           if not hex:match("^%x%x%x%x$") then return false end
+          local codepoint = tonumber(hex, 16)
           position = position + 5
+          if codepoint >= 0xd800 and codepoint <= 0xdbff then
+            if text:sub(position, position + 1) ~= "\\u" then return false end
+            local low_hex = text:sub(position + 2, position + 5)
+            if not low_hex:match("^%x%x%x%x$") then return false end
+            local low = tonumber(low_hex, 16)
+            if low < 0xdc00 or low > 0xdfff then return false end
+            codepoint = 0x10000 + (codepoint - 0xd800) * 0x400 + (low - 0xdc00)
+            position = position + 6
+          elseif codepoint >= 0xdc00 and codepoint <= 0xdfff then
+            return false
+          end
+          append_codepoint(codepoint)
         else
           return false
         end
       elseif byte < 32 then
         return false
       else
+        decoded[#decoded + 1] = text:sub(position, position)
         position = position + 1
       end
     end
@@ -232,9 +264,8 @@ local function strict_json_document(text)
       local keys = {}
       while true do
         whitespace()
-        local key_start = position
-        if not string_token() then return false end
-        local key = text:sub(key_start + 1, position - 2)
+        local key = string_token()
+        if key == false then return false end
         if keys[key] then return false end
         keys[key] = true
         whitespace()
