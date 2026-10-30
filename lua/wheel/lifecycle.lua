@@ -404,6 +404,30 @@ local function valid_event_transition(event)
   return transitions[kind] and transitions[kind][tostring(from or "nil") .. ":" .. tostring(to or "nil")] == true
 end
 
+local function has_later_transfer_detach(events, event_index, session_id, panel_id)
+  for index = event_index + 1, #events do
+    local event = events[index]
+    if event.type == "panel.detached" and event.reason == "transfer"
+      and event.transfer == true and event.session_id == session_id and event.panel_id == panel_id then
+      return true
+    end
+  end
+  return false
+end
+
+local function has_later_detach(events, event_index, session_id, panel_id)
+  for index = event_index + 1, #events do
+    local event = events[index]
+    if event.type == "panel.detached" and event.panel_id == panel_id then
+      if event.session_id == session_id then return true end
+      -- Older detach records identify only the panel. They remain valid
+      -- history, but cannot authorize a cross-panel transfer claim.
+      if event.session_id == nil and event.transfer ~= true then return true end
+    end
+  end
+  return false
+end
+
 local function registry_shape(value)
   if type(value) ~= "table" or value.version ~= 1 or not exact_keys(value, {
     version = true, revision = true, policy = true, next_counter = true,
@@ -471,7 +495,7 @@ local function registry_shape(value)
   if not events_ok then return false, "event collection is not a dense array" end
   if event_count > MAX_EVENTS then return false, "event aggregate is too large" end
   local event_seen = {}
-  for _, event in ipairs(value.events) do
+  for event_index, event in ipairs(value.events) do
     if type(event) ~= "table" or not event.event_id or not id(event.event_id, "event_id", true)
       or event_seen[event.event_id] or type(event.type) ~= "string" or not EVENT_TYPES[event.type]
       or not timestamp(event.timestamp_ms) then return false, "event schema is invalid" end
@@ -507,23 +531,46 @@ local function registry_shape(value)
       return false, "session event lacks identity"
     end
     if event.type:match("^panel%.") and not event.panel_id then return false, "panel event lacks identity" end
-    if event.type == "panel.observer_attached" then
-      local observer = value.sessions[event.observer_session_id]
-      if not observer then
-        return false, "observer event/session identity mismatch"
+    if event.type:match("^agent_session%.") then
+      local session = value.sessions[event.session_id]
+      if event.panel_id ~= session.panel_id
+        and not has_later_transfer_detach(value.events, event_index, event.session_id, event.panel_id) then
+        return false, "session event/panel mismatch"
+      end
+      if event.agent_id ~= session.agent_id or event.task_id ~= session.task_id then
+        return false, "session event/owner mismatch"
       end
     end
-    if event.type == "panel.attached" and not value.sessions[event.controller_session_id] then
-      return false, "controller event/session identity mismatch"
+    if event.type == "panel.attached" or event.type == "panel.observer_attached" then
+      local observer_event = event.type == "panel.observer_attached"
+      local referenced_id = observer_event and event.observer_session_id or event.controller_session_id
+      local expected_mode = observer_event and "observer" or "controller"
+      local attached_session = value.sessions[referenced_id]
+      local panel = value.panels[event.panel_id]
+      if not panel or not attached_session then return false, "attachment event references unknown panel or session" end
+      if event.session_id ~= nil and event.session_id ~= referenced_id then
+        return false, "attachment event/session identity mismatch"
+      end
+      if event.agent_id ~= nil and event.agent_id ~= attached_session.agent_id then
+        return false, "attachment event/session identity mismatch"
+      end
+      if event.task_id ~= nil and event.task_id ~= attached_session.task_id then
+        return false, "attachment event/session identity mismatch"
+      end
+      if attached_session.attachment_mode ~= expected_mode
+        and not (attached_session.attachment_mode == nil
+          and has_later_detach(value.events, event_index, referenced_id, event.panel_id)) then
+        return false, "attachment event/session mode mismatch"
+      end
+      if attached_session.panel_id ~= event.panel_id
+        and not has_later_transfer_detach(value.events, event_index, referenced_id, event.panel_id) then
+        return false, "attachment event/session panel mismatch"
+      end
     end
     if event.session_id then
       local owner = value.sessions[event.session_id]
       if event.agent_id and event.agent_id ~= owner.agent_id then return false, "event/session agent mismatch" end
       if event.task_id ~= owner.task_id then return false, "event/session task mismatch" end
-    end
-    if event.controller_session_id then
-      local controller = value.sessions[event.controller_session_id]
-      if not controller then return false, "controller event/session identity mismatch" end
     end
   end
   -- Relationship and uniqueness invariants are checked after all IDs exist.
@@ -934,7 +981,7 @@ function Lifecycle:attach_session(session_id, panel_id, opts)
     else panel.attached_session_id = session_id end
     record.panel_id, record.attachment_mode, record.updated_at_ms = panel.panel_id, mode, now_ms(); local from = panel.state
     if panel.state == P.READY or panel.state == P.DETACHED then panel.state = P.ATTACHED end; panel.updated_at_ms = now_ms()
-    local kind = mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached"; new_event(state, kind, panel, from, panel.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=opts.transfer == true }, function(prefix) return self:_next_id(state, prefix) end); return copy(record)
+    local kind = mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached"; new_event(state, kind, record, from, panel.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=opts.transfer == true }, function(prefix) return self:_next_id(state, prefix) end); return copy(record)
   end)
 end
 function Lifecycle:transfer_session(session_id, panel_id, opts)
@@ -993,7 +1040,7 @@ function Lifecycle:transfer_session(session_id, panel_id, opts)
     elseif target.state == P.CREATED or target.state == P.READY or target.state == P.DETACHED then target.state = P.ATTACHED end
     target.updated_at_ms = now_ms()
     new_event(state, mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached",
-      target, target_from, target.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=true },
+      record, target_from, target.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=true },
       function(prefix) return self:_next_id(state, prefix) end)
     return copy(record)
   end)

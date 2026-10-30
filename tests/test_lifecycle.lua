@@ -127,6 +127,26 @@ local ok, err = pcall(function()
     assert(life:get_panel("p2").attached_session_id == nil)
   end)
 
+  run_test("Lifecycle: persisted transfer and detach history remains valid", function()
+    local path = root .. "/transfer-history.json"
+    local life = Lifecycle.new({ path = path })
+    assert(life:create_panel({ panel_id = "history-p1" }))
+    assert(life:ready_panel("history-p1"))
+    assert(life:create_panel({ panel_id = "history-p2" }))
+    assert(life:ready_panel("history-p2"))
+    assert(life:create_agent_session({
+      session_id = "history-session", agent_id = "history-agent", panel_id = "history-p1",
+    }))
+    assert(life:activate_session("history-session"))
+    assert(life:transfer_session("history-session", "history-p2"))
+    assert(life:detach_session("history-session"))
+
+    local loaded = Lifecycle.new({ path = path })
+    assert(loaded:get_session("history-session").panel_id == "history-p2")
+    assert(loaded:get_session("history-session").attachment_mode == nil)
+    assert(#loaded:events() >= 8)
+  end)
+
   run_test("Lifecycle: observers cannot promote and are cleaned on every exit", function()
     for _, ending in ipairs({ "detach_session", "end_session", "abandon_session" }) do
       local life = fixture()
@@ -282,6 +302,10 @@ local ok, err = pcall(function()
     local life = fixture()
     assert(life:attach_session("s1", "p1"))
     assert(life:attach_session("s2", "p1", { mode = "observer" }))
+    assert(life:create_agent_session({ session_id = "s3", agent_id = "agent3", panel_id = "p2" }))
+    assert(life:attach_session("s3", "p2"))
+    assert(life:create_agent_session({ session_id = "s4", agent_id = "agent4", panel_id = "p2" }))
+    assert(life:attach_session("s4", "p2", { mode = "observer" }))
     local good = life:_state(); good.version = 1
     local mutations = {
       function(value)
@@ -298,9 +322,51 @@ local ok, err = pcall(function()
       end,
       function(value)
         for _, event in ipairs(value.events) do
-          if event.type == "agent_session.created" then event.panel_id = "absent"; return end
+          if event.type == "agent_session.created" and event.session_id == "s1" then event.panel_id = "p2"; return end
         end
         error("session event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" and event.panel_id == "p1" then event.controller_session_id = "s3"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" and event.panel_id == "p1" then event.panel_id = "p2"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" and event.panel_id == "p1" then event.agent_id = "forged-agent"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" and event.panel_id == "p1" then event.task_id = "forged-task"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.panel_id = "p2"; return end
+        end
+        error("observer event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.observer_session_id = "s4"; return end
+        end
+        error("observer event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.observer_session_id = "s1"; return end
+        end
+        error("observer event fixture missing")
       end,
       function(value)
         for _, event in ipairs(value.events) do
@@ -311,6 +377,33 @@ local ok, err = pcall(function()
       function(value)
         for _, event in ipairs(value.events) do
           if event.type == "panel.observer_attached" then event.observer_session_id = "unknown-observer"; return end
+        end
+        error("observer event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" then event.panel_id = "p2"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" then event.panel_id = "p2"; return end
+        end
+        error("observer event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" then event.mode = "observer"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        value.sessions.s1.attachment_mode = "observer"
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" then event.session_id = "s1"; return end
         end
         error("observer event fixture missing")
       end,
