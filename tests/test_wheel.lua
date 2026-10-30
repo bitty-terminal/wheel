@@ -8,6 +8,8 @@ local WheelAgent = require("wheel.agent")
 local WheelUI = require("wheel.ui")
 local WheelConfig = require("wheel.config")
 local WheelTool = require("wheel.tool")
+local WheelAction = require("wheel.action")
+local WheelContext = require("wheel.context")
 local WheelHost = require("wheel.host")
 local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
@@ -278,6 +280,259 @@ run_test("WheelKernel: action auto-spillover", function()
 
   kernel:clear_recent_actions()
   assert(#kernel:recent_actions() == 0)
+end)
+
+run_test("WheelAction: deterministic diagnostics cover noisy success and middle-log failure", function()
+  local noisy = WheelAction.normalize({
+    action_id = "diag-success",
+    stdout = string.rep("build progress\n", 500),
+    stderr = "warning: src/lib.rs:7:3 unused variable",
+    exit_code = 0,
+  })
+  assert(noisy.success == true)
+  assert(noisy.spilled == true)
+  assert(#noisy.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#noisy.diagnostics.warnings == 1)
+
+  local failed = WheelAction.normalize({
+    action_id = "diag-failure",
+    stdout = "start\n" .. string.rep("noise\n", 500) .. "src/main.rs:42:9: error: expected expression\nend\n",
+    exit_code = 1,
+  })
+  assert(failed.success == false)
+  assert(#failed.diagnostics.errors > 0, "middle compiler failure must be retained")
+  assert(failed.diagnostics.locations[1].file == "src/main.rs")
+  assert(failed.diagnostics.final_failure_stage == "compiler")
+end)
+
+run_test("WheelAction: stderr, truncation, timeout and spillover metadata", function()
+  local blobs = {}
+  local timeout = WheelAction.normalize({
+    action_id = "diag-timeout",
+    stdout = "running\n",
+    stderr = "panic: deadline exceeded\n",
+    exit_code = 124,
+    timed_out = true,
+    truncated = true,
+  })
+  assert(timeout.timed_out == true)
+  assert(timeout.diagnostics.final_failure_stage == "timeout")
+  assert(timeout.stderr_preview:find("panic", 1, true) ~= nil)
+  assert(timeout.truncated == true)
+
+  local large = WheelAction.normalize({
+    action_id = "diag-spill",
+    stdout = string.rep("x", WheelAction.SPILLOVER_THRESHOLD_BYTES + 1),
+    exit_code = 0,
+  }, function(hash, content) blobs[hash] = content end)
+  assert(large.blob_hash ~= nil)
+  assert(blobs[large.blob_hash] ~= nil)
+  assert(large.raw_stdout == nil and large.raw_stderr == nil)
+  assert(large.size_bytes > WheelAction.SPILLOVER_THRESHOLD_BYTES)
+end)
+
+run_test("WheelAction: review regressions stay bounded, redacted and content-addressed", function()
+  local secret = "sk-action-review-secret-9f4e2d7c"
+  local supplied = WheelAction.normalize({
+    action_id = "preview-only",
+    spilled = true,
+    blob_hash = string.rep("a", 64),
+    preview = "useful existing preview",
+    stdout_preview = "token=" .. secret,
+    stderr_preview = "password=" .. secret,
+    diagnostics = {
+      errors = { "error: token=" .. secret .. string.rep("x", 1000) },
+      locations = {{ file = "src/main.lua", line = 7, text = "token=" .. secret }},
+      final_failure_stage = "compiler",
+    },
+  })
+  assert(supplied.preview == "useful existing preview")
+  assert(not supplied.diagnostics.errors[1]:find(secret, 1, true))
+  assert(not supplied.diagnostics.locations[1].text:find(secret, 1, true))
+  assert(not supplied.stdout_preview:find(secret, 1, true))
+  assert(not supplied.stderr_preview:find(secret, 1, true))
+  assert(#supplied.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+
+  local empty_writes = 0
+  local invalid = WheelAction.normalize({
+    spilled = true,
+    blob_hash = "not-a-sha256",
+    preview = "keep this preview",
+  }, function() empty_writes = empty_writes + 1 end)
+  assert(invalid.preview == "keep this preview")
+  assert(invalid.blob_hash == nil)
+  assert(empty_writes == 0)
+
+  local diag = WheelAction.extract_diagnostics("server:8080\n", "", 1, false)
+  assert(#diag.locations == 0, "server:port is not a file location")
+end)
+
+run_test("WheelTool: non-spilled outcomes carry exact byte counts", function()
+  local outcome = WheelTool.process_spillover({
+    tool = "run_command",
+    stdout = "12345",
+    stderr = "678",
+    success = true,
+  }, { threshold_bytes = 4096 })
+  assert(outcome.stdout_bytes == 5)
+  assert(outcome.stderr_bytes == 3)
+  assert(outcome.size_bytes == 8)
+  local serialized = outcome:to_table()
+  assert(serialized.stdout_bytes == 5 and serialized.stderr_bytes == 3)
+  assert(serialized.size_bytes == 8)
+end)
+
+run_test("WheelTool: every supplied preview is bounded and redacted", function()
+  local secret = "sk-preview-review-secret-7c3d9e"
+  local raw_preview = "Bearer " .. secret .. string.rep("x", 512)
+  local large_output = string.rep("output\n", 900)
+
+  local spilled = WheelTool.process_spillover({
+    stdout = large_output,
+    preview = raw_preview,
+    success = true,
+  })
+  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not spilled.preview:find(secret, 1, true))
+  assert(not spilled:format_observation():find(secret, 1, true))
+
+  local small = WheelTool.process_spillover({
+    stdout = "ok",
+    preview = raw_preview,
+    success = true,
+  })
+  assert(#small.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not small.preview:find(secret, 1, true))
+  assert(not small:format_observation():find(secret, 1, true))
+
+  local original_hash = WheelTool.compute_hash
+  WheelTool.compute_hash = function() return nil end
+  local fallback = WheelTool.process_spillover({
+    stdout = large_output,
+    preview = raw_preview,
+    success = true,
+  })
+  WheelTool.compute_hash = original_hash
+  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not fallback.preview:find(secret, 1, true))
+  assert(not fallback:format_observation():find(secret, 1, true))
+end)
+
+run_test("WheelTool: empty supplied previews never expose raw output", function()
+  local non_spilled_output = string.rep("non-spilled-output\n", 40)
+  local non_spilled = WheelTool.process_spillover({
+    stdout = non_spilled_output,
+    preview = "",
+    success = true,
+  })
+  local non_spilled_observation = non_spilled:format_observation()
+  assert(#non_spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#non_spilled_observation < #non_spilled_output)
+  assert(not non_spilled_observation:find(non_spilled_output, 1, true))
+  assert(non_spilled_observation:find("non-spilled-output", 1, true) ~= nil)
+
+  local spilled_output = string.rep("spilled-output\n", 500)
+  local spilled = WheelTool.process_spillover({
+    stdout = spilled_output,
+    preview = "",
+    success = true,
+  })
+  local spilled_observation = spilled:format_observation()
+  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#spilled_observation < #spilled_output)
+  assert(not spilled_observation:find(spilled_output, 1, true))
+  assert(spilled_observation:find("spilled-output", 1, true) ~= nil)
+
+  local original_hash = WheelTool.compute_hash
+  WheelTool.compute_hash = function() return nil end
+  local fallback = WheelTool.process_spillover({
+    stdout = spilled_output,
+    preview = "",
+    success = true,
+  })
+  WheelTool.compute_hash = original_hash
+  local fallback_observation = fallback:format_observation()
+  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#fallback_observation < #spilled_output)
+  assert(not fallback_observation:find(spilled_output, 1, true))
+  assert(fallback_observation:find("spilled-output", 1, true) ~= nil)
+end)
+
+run_test("WheelAction: file locations reject URLs and dotted hosts", function()
+  local diagnostics = WheelAction.extract_diagnostics(table.concat({
+    "error: example.com:8080",
+    "error: https://example.com:8080/api",
+    "note: server.example.com:8080",
+    "error: example.com/path:42:9",
+    "note: example.com/path:42",
+    "error: example.com:8080/path:42:9",
+    "error: foo.example.com:8080/main.lua:42:9",
+    "error: example.com:8080/path:42",
+    "error: foo.example.com:8080/main.lua:42",
+    "src/main.lua:42:9: error: expected expression",
+    "./src/main.lua:43:2: warning: unused value",
+  }, "\n"), "", 1, false)
+  assert(#diagnostics.locations == 2)
+  assert(diagnostics.locations[1].file == "src/main.lua")
+  assert(diagnostics.locations[1].line == 42)
+  assert(diagnostics.locations[2].file == "./src/main.lua")
+  assert(diagnostics.locations[2].line == 43)
+end)
+
+run_test("WheelAction: bare source filenames use the extension allowlist", function()
+  local diagnostics = WheelAction.extract_diagnostics(table.concat({
+    "main.py:12: error: invalid syntax",
+    "foo.cpp:3:5: error: expected ';'",
+    "app.js:10: warning: unused value",
+    "Main.java:5: error: cannot find symbol",
+    "lib.go:7: error: undefined name",
+    "foo.c: error: implicit declaration",
+    "example.com:12: error: not a file",
+    "example.com/path:42: error: not a file",
+    "https://example.com:8080/api:42: error: not a file",
+  }, "\n"), "", 1, false)
+  assert(#diagnostics.locations == 6)
+  assert(diagnostics.locations[1].file == "main.py" and diagnostics.locations[1].line == 12)
+  assert(diagnostics.locations[2].file == "foo.cpp" and diagnostics.locations[2].column == 5)
+  assert(diagnostics.locations[3].file == "app.js" and diagnostics.locations[3].line == 10)
+  assert(diagnostics.locations[4].file == "Main.java" and diagnostics.locations[4].line == 5)
+  assert(diagnostics.locations[5].file == "lib.go" and diagnostics.locations[5].line == 7)
+  assert(diagnostics.locations[6].file == "foo.c")
+end)
+
+run_test("WheelAction: spill previews redact before selecting the tail", function()
+  local secret = "sk-tail-window-regression-8f3a1c"
+  local stdout = string.rep("ordinary output\n", 400)
+    .. "Bearer " .. secret .. string.rep("x", 60)
+  local record = WheelAction.normalize({
+    stdout = stdout,
+    exit_code = 0,
+  })
+  assert(record.spilled == true)
+  assert(not record.preview:find(secret, 1, true),
+    "a secret before the retained tail must not survive into the preview")
+  assert(not record.preview:find(secret:sub(-8), 1, true),
+    "a secret suffix in the retained tail must not survive into the preview")
+end)
+
+run_test("WheelAction: existing blob identity preserves authoritative content", function()
+  local payload = string.rep("blob-content\n", 500)
+  local hash = WheelTool.compute_hash(payload)
+  local kernel = WheelKernel.new({ in_memory = true })
+  local context = WheelContext.new({ kernel = kernel })
+  context:put_slot("blobs/" .. hash, payload)
+  local writes = {}
+  local record = WheelAction.normalize({
+    spilled = true,
+    blob_hash = hash,
+    stdout = payload,
+    preview = "existing preview",
+  }, function(key, content) writes[key] = content end)
+  assert(record.blob_hash == hash)
+  assert(writes[hash] == payload)
+  assert(record.preview == "existing preview")
+  local recovered = context:get_slot("blobs/" .. hash)
+  assert(recovered.found == true and recovered.content == payload)
 end)
 
 run_test("WheelKernel: context compilation", function()
@@ -5762,6 +6017,109 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   assert(string.find(art_slot.content, "Verified test_core()", 1, true) ~= nil)
 end)
 
+run_test("WheelRunner: action records retain non-spilled output byte counts", function()
+  local recorded
+  local agent = {
+    name = "runner-bytes",
+    role = WheelAgent.Role.CODING,
+    kernel = {
+      record_action = function(_, action) recorded = action end,
+      commit_checkpoint = function() return nil end,
+    },
+    execute_tool = function()
+      return WheelTool.process_spillover({
+        tool = "inspect_file", stdout = "abcd", stderr = "ef", success = true,
+      }, { threshold_bytes = 4096 })
+    end,
+  }
+  local provider = WheelProvider.MockProvider.new({
+    responses = {
+      { tool_calls = {{ id = "bytes-1", name = "inspect_file", arguments = {} }} },
+      { content = "done", tool_calls = {} },
+    },
+  })
+  local task = { id = "T-BYTES", title = "byte counts" }
+  local result = WheelRunner.run_task(agent, task, {
+    provider = provider, max_turns = 2, commit_checkpoints = false,
+  })
+  assert(result.success == true)
+  assert(recorded.stdout_bytes == 4 and recorded.stderr_bytes == 2)
+  assert(recorded.size_bytes == 6)
+end)
+
+run_test("WheelAgent: execute_task action records derive missing byte counts", function()
+  local recorded
+  local kernel = WheelKernel.new_mock()
+  local original_record = kernel.record_action
+  kernel.record_action = function(self, action)
+    recorded = action
+    return original_record(self, action)
+  end
+  local worker = WheelAgent.new({
+    name = "worker-byte-fallback",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+  })
+  local task = kernel:create_task({ id = "T-BYTE-FALLBACK", title = "byte fallback" })
+  local result = worker:execute_task(task.id, function()
+    return {
+      action = { tool = "read_file", stdout = "abcd", stderr = "efg" },
+      done = true,
+    }
+  end)
+  assert(result.success == true)
+  assert(recorded.stdout_bytes == 4 and recorded.stderr_bytes == 3)
+end)
+
+run_test("WheelRunner: synthetic failures preserve normalized stderr diagnostics", function()
+  local kernel = WheelKernel.new_mock()
+  local task = kernel:create_task({
+    id = "T-RUNNER-FALLBACK", title = "fallback", description = "exercise fallback", priority = 1,
+  })
+  local agent = {
+    name = "runner-fallback-error",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    execute_tool = function()
+      error("secret-shaped failure: token=sk-runner-fallback-regression")
+    end,
+  }
+  local provider = WheelProvider.MockProvider.new({
+    responses = {
+      { tool_calls = {{ id = "fallback-1", name = "broken_tool", arguments = {} }} },
+      { content = "done", tool_calls = {} },
+    },
+  })
+  local result = WheelRunner.run_task(agent, task, {
+    provider = provider, max_turns = 2, commit_checkpoints = false,
+  })
+  assert(result.success == true)
+  local recent = kernel:recent_actions()
+  local recorded = recent[#recent]
+  assert(recorded.stderr_bytes > 0)
+  assert(recorded.stderr_preview:find("Tool execution failed", 1, true) ~= nil)
+  assert(recorded.raw_stderr == nil and recorded.raw_stdout == nil)
+end)
+
+run_test("WheelToolRegistry: action recording uses outcome previews", function()
+  local recorded
+  local secret = "sk-registry-preview-regression-4a7c2e"
+  local registry = WheelTool.Registry.new()
+  registry:register_tool({
+    name = "preview_recording",
+    execute = function()
+      return { success = true, stdout = "token=" .. secret, stderr = "raw stderr" }
+    end,
+  })
+  local result = registry:dispatch("preview_recording", {}, {
+    kernel = { record_action = function(_, action) recorded = action end },
+  })
+  assert(result.success == true)
+  assert(recorded.stdout_preview == result.stdout_preview)
+  assert(recorded.stderr_preview == result.stderr_preview)
+  assert(not recorded.stdout_preview:find(secret, 1, true))
+end)
+
 run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })
@@ -8799,6 +9157,3 @@ cleanup_test_run_root()
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
-
-
-

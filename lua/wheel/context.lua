@@ -2723,15 +2723,17 @@ function WheelContext:compile_prompt(opts)
     if #acts > 0 then
       table.insert(z3_parts, "## Recent Action Outcomes")
       for _, a in ipairs(acts) do
-        local summary = a.summary or a.raw_stdout or ""
+        local summary = a.summary or a.preview or a.stdout_preview or a.raw_stdout or ""
         if a.spilled then
           summary = string.format("[Output spilled > %s bytes; ref=%s preview=%s]",
             tostring(a.size_bytes or 4096), a.blob_hash or "blob", summary:sub(1, 120))
         elseif #summary > 300 then
           summary = summary:sub(1, 300) .. " ...[truncated]"
         end
-        table.insert(z3_parts, string.format("- Action [%s] (exit=%s, %sms): %s",
-          a.action_id or a.tool or "cmd", tostring(a.exit_code or 0), tostring(a.duration_ms or 0), summary))
+        local stage = a.diagnostics and a.diagnostics.final_failure_stage
+        local stage_suffix = stage and stage ~= "success" and ", stage=" .. stage or ""
+        table.insert(z3_parts, string.format("- Action [%s] (exit=%s, %sms%s): %s",
+          a.action_id or a.tool or "cmd", tostring(a.exit_code or 0), tostring(a.duration_ms or 0), stage_suffix, summary))
       end
     end
 

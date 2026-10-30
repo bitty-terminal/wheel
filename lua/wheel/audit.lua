@@ -235,7 +235,10 @@ end
 local function redaction_marker(value)
   local value_hash = digest(value)
   if not value_hash then
-    return nil
+    -- Redaction must fail closed even when the digest provider is unavailable.
+    -- Audit command hashes still fail closed separately, but diagnostic/action
+    -- previews must never retain a secret-shaped value in that case.
+    return "[redacted]"
   end
   return "[redacted:" .. value_hash:sub(1, 16) .. "]"
 end
@@ -657,6 +660,33 @@ local function sanitize_meta(value, limit, counter)
     return nil
   end
   if #redacted > limit then
+    redacted = redacted:sub(1, limit - 3) .. "..."
+  end
+  return redacted
+end
+
+--- Redact and bound an untrusted diagnostic or preview string.
+-- This is the same redaction path used by the execution-audit sink. It is
+-- exported for action-record normalization so every persistence sink applies
+-- identical secret handling before writing a record.
+-- @param value any
+-- @param limit number
+-- @return string
+function WheelAudit.redact_bounded(value, limit)
+  if type(value) ~= "string" then
+    return ""
+  end
+  limit = tonumber(limit) or LIMITS.MAX_METADATA_BYTES
+  if limit < 1 then return "" end
+  local counter = { n = 0 }
+  local redacted = redact_preview(value, counter, limit)
+  if type(redacted) ~= "string" then
+    return "[redacted]"
+  end
+  if #redacted > limit then
+    if limit <= 3 then
+      return redacted:sub(1, limit)
+    end
     redacted = redacted:sub(1, limit - 3) .. "..."
   end
   return redacted

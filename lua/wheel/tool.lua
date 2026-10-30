@@ -41,6 +41,10 @@ end
 
 local WheelTool = {}
 local WheelErrors = load_errors()
+local ok_action, WheelAction = pcall(require, "wheel.action")
+if not ok_action then WheelAction = nil end
+local ok_audit, WheelAudit = pcall(require, "wheel.audit")
+if not ok_audit then WheelAudit = nil end
 
 local ok_config, WheelConfig = pcall(require, "wheel.config")
 if not ok_config then WheelConfig = nil end
@@ -159,17 +163,75 @@ function WheelTool.compute_hash(str)
   if WheelContext and type(WheelContext.compute_hash) == "function" then
     return WheelContext.compute_hash(str)
   end
-  local h1 = 0x811c9dc5
-  local h2 = 0x27d4eb2f
-  local len = #str
-  for i = 1, len do
-    local b = string.byte(str, i)
-    h1 = (h1 * 16777619 + b) % 4294967296
-    h2 = (h2 * 2166136261 + b) % 4294967296
+  return nil
+end
+
+local function safe_preview(value, limit)
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    return WheelAudit.redact_bounded(value, limit)
   end
-  return string.format("%08x%08x%08x%08x%08x%08x%08x%08x",
-    h1, h2, (h1 + h2) % 4294967296, (h1 * 31 + h2) % 4294967296,
-    h2, h1, (h2 * 17 + h1) % 4294967296, (h1 * 13 + h2 * 7) % 4294967296)
+  if type(value) ~= "string" then return "" end
+  if value == "" then return "" end
+  return "[redacted]"
+end
+
+local function redact_complete(value)
+  if type(value) ~= "string" or value == "" then return "" end
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    -- Pass the complete stream in one call so a secret's prefix cannot fall
+    -- outside the redaction window before head/tail slices are selected. The
+    -- audit helper folds newlines for single-line metadata, so preserve line
+    -- boundaries with a control separator while it scans the complete stream.
+    local separator = "\v"
+    local scan_value = value:gsub("\r\n", "\n"):gsub("[\r\n]", separator)
+    return WheelAudit.redact_bounded(scan_value, #scan_value):gsub(separator, "\n")
+  end
+  return "[redacted]"
+end
+
+local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
+  local stream = stdout or ""
+  if stderr and stderr ~= "" then
+    stream = stream .. (#stream > 0 and "\n" or "") .. "STDERR: " .. stderr
+  end
+  stream = redact_complete(stream)
+  if #stream <= limit then
+    return safe_preview(stream, limit)
+  end
+  local marker = string.format(
+    "\n[... %d bytes spilled to blob: %s (use read_blob to inspect full content) ...]\n",
+    total_bytes, hash)
+  local fragments = split_content_lines(stream)
+  local fragment_limit = 32
+  local selected = {}
+  if #fragments > 0 then selected[#selected + 1] = fragments[1] end
+  if #fragments >= 10 then selected[#selected + 1] = fragments[10] end
+  if #fragments > 1 then selected[#selected + 1] = fragments[#fragments] end
+  if #selected > 0 then
+    -- Reserve space for the complete redacted marker and keep all selected
+    -- fragments visible instead of truncating the preview in its middle.
+    local separators = #selected - 1
+    fragment_limit = math.floor((limit - #marker - separators) / #selected)
+    fragment_limit = math.max(1, math.min(fragment_limit, 32))
+  end
+  local parts = {}
+  for _, fragment in ipairs(selected) do
+    parts[#parts + 1] = safe_preview(fragment, fragment_limit)
+  end
+  parts[#parts + 1] = marker
+  local preview = table.concat(parts, "\n")
+  if #preview > limit then
+    return preview:sub(1, limit)
+  end
+  return preview
+end
+
+local function supplied_or_derived_preview(supplied, derived, limit)
+  if type(supplied) == "string" then
+    local safe = safe_preview(supplied, limit)
+    if safe ~= "" then return safe end
+  end
+  return safe_preview(derived, limit)
 end
 
 -- ---------------------------------------------------------------------------
@@ -365,14 +427,12 @@ function ActionOutcome:format_observation()
     flags)
   table.insert(lines, header)
 
-  if self.preview and #self.preview > 0 then
-    table.insert(lines, self.preview)
-  elseif self.stdout and #self.stdout > 0 then
-    table.insert(lines, self.stdout)
-  end
-
-  if self.stderr and #self.stderr > 0 and not self.spilled then
-    table.insert(lines, "STDERR: " .. self.stderr)
+  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
+  local safe = safe_preview(self.preview, preview_limit)
+  if safe ~= "" then
+    table.insert(lines, safe)
+  else
+    table.insert(lines, "[no output]")
   end
 
   return table.concat(lines, "\n")
@@ -398,6 +458,12 @@ function ActionOutcome:to_table()
     outcome = self.outcome,
     timed_out = self.timed_out,
     truncated = self.truncated,
+    diagnostics = self.diagnostics,
+    stdout_preview = self.stdout_preview,
+    stderr_preview = self.stderr_preview,
+    size_bytes = self.size_bytes,
+    stdout_bytes = self.stdout_bytes,
+    stderr_bytes = self.stderr_bytes,
   }
 end
 
@@ -411,6 +477,7 @@ WheelTool.ActionOutcome = ActionOutcome
 -- @return table ActionOutcome instance
 function WheelTool.process_spillover(raw, opts)
   opts = opts or {}
+  raw = raw or {}
   local threshold = opts.threshold_bytes or WheelTool.DEFAULT_SPILLOVER_THRESHOLD
   local stdout = raw.stdout or ""
   local stderr = raw.stderr or ""
@@ -426,9 +493,16 @@ function WheelTool.process_spillover(raw, opts)
   self.duration_ms = raw.duration_ms or 0
   self.stdout = stdout
   self.stderr = stderr
+  self.stdout_bytes = tonumber(raw.stdout_bytes) or #stdout
+  self.stderr_bytes = tonumber(raw.stderr_bytes) or #stderr
+  self.size_bytes = tonumber(raw.size_bytes) or total_bytes
+  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
+  self.stdout_preview = safe_preview(raw.stdout_preview or stdout, preview_limit)
+  self.stderr_preview = safe_preview(raw.stderr_preview or stderr, preview_limit)
   self.outcome = raw.outcome
   self.timed_out = raw.timed_out == true
   self.truncated = raw.truncated == true
+  self.diagnostics = WheelAction and WheelAction.extract_diagnostics(stdout, stderr, self.exit_code, self.timed_out) or {}
 
   if total_bytes > threshold then
     local full_payload = stdout
@@ -436,6 +510,14 @@ function WheelTool.process_spillover(raw, opts)
       full_payload = full_payload .. "\n--- STDERR ---\n" .. stderr
     end
     local hash = WheelTool.compute_hash(full_payload)
+    if type(hash) ~= "string" or #hash ~= 64 or full_payload == "" then
+      self.spilled = false
+      self.spillover_hash = nil
+      self.spillover_bytes = 0
+      self.preview = supplied_or_derived_preview(
+        raw.preview, raw.stdout_preview or stdout, preview_limit)
+      return self
+    end
 
     -- Persist blob into context if context available
     if opts.context and type(opts.context.put_slot) == "function" then
@@ -475,7 +557,16 @@ function WheelTool.process_spillover(raw, opts)
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
-    self.preview = table.concat(preview_lines, "\n")
+    local derived_preview = bounded_spill_preview(
+      stdout, stderr, hash, total_bytes, preview_limit)
+    if type(raw.preview) == "string" and raw.preview ~= "" then
+      self.preview = supplied_or_derived_preview(raw.preview, derived_preview, preview_limit)
+    else
+      -- The derived spill preview has already been completely redacted and
+      -- budgeted.  Do not run it through a prefix-only bound a second time,
+      -- which would discard the selected middle and tail fragments.
+      self.preview = derived_preview
+    end
   else
     self.spilled = false
     self.spillover_hash = nil
@@ -484,7 +575,7 @@ function WheelTool.process_spillover(raw, opts)
     if #stderr > 0 then
       p = p .. (#p > 0 and "\n" or "") .. "STDERR: " .. stderr
     end
-    self.preview = p
+    self.preview = supplied_or_derived_preview(raw.preview, p, preview_limit)
   end
 
   return self
@@ -1196,8 +1287,25 @@ function WheelToolRegistry:dispatch(name, args, env)
         success = outcome.success,
         exit_code = outcome.exit_code,
         duration_ms = outcome.duration_ms,
+        tool = outcome.tool,
+        intent = outcome.intent,
+        preview = outcome.preview,
+        stdout_preview = outcome.stdout_preview or "",
+        stderr_preview = outcome.stderr_preview or "",
+        -- Raw output is transient input to Action.normalize only; recent
+        -- records retain the bounded/redacted preview fields above.
         raw_stdout = outcome.stdout,
         raw_stderr = outcome.stderr,
+        size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
+        stdout_bytes = outcome.stdout_bytes,
+        stderr_bytes = outcome.stderr_bytes,
+        spilled = outcome.spilled,
+        blob_hash = outcome.spillover_hash,
+        spillover_bytes = outcome.spillover_bytes,
+        diagnostics = outcome.diagnostics,
+        timed_out = outcome.timed_out,
+        truncated = outcome.truncated,
+        outcome = outcome.outcome,
       })
     end)
   end
