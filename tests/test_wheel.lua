@@ -5502,6 +5502,11 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   })
   assert(valid_thinking.source == "provider", "versioned rationale object must be accepted")
   assert(valid_thinking.decision == "Use bounded output")
+  local escaped_thinking_key = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","\\u0064ecision":"Use decoded key"}',
+  })
+  assert(escaped_thinking_key.source == "provider", "escaped allowlisted key must be interpreted after decoding")
+  assert(escaped_thinking_key.decision == "Use decoded key")
 
   local rejected_thinking_json = {
     ["empty object"] = "{}",
@@ -5509,6 +5514,8 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
     ["unversioned object"] = '{"decision":"unversioned"}',
     ["schema-only object"] = '{"schema":"wheel-rationale/1"}',
     ["wrong schema"] = '{"schema":"wheel-rationale/2","decision":"wrong"}',
+    ["escaped duplicate schema"] = '{"schema":"wheel-rationale/2","\\u0073chema":"wheel-rationale/1","decision":"bad"}',
+    ["escaped duplicate decision"] = '{"schema":"wheel-rationale/1","decision":"good","\\u0064ecision":"bad"}',
     ["string"] = '"not an object"',
     ["number"] = "42",
     ["boolean"] = "true",
