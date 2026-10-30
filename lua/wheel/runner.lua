@@ -12,6 +12,24 @@
 local WheelRunner = {}
 WheelRunner.__index = WheelRunner
 
+local ok_audit, WheelAudit = pcall(require, "wheel.audit")
+if not ok_audit then
+  local ok_audit_alt, WheelAuditAlt = pcall(require, "lua.wheel.audit")
+  WheelAudit = ok_audit_alt and WheelAuditAlt or nil
+end
+
+local ok_provider, WheelProvider = pcall(require, "wheel.provider")
+if not ok_provider then
+  local ok_p2, WheelP2 = pcall(require, "lua.wheel.provider")
+  WheelProvider = ok_p2 and WheelP2 or nil
+end
+
+local ok_config, WheelConfig = pcall(require, "wheel.config")
+if not ok_config then
+  local ok_config_alt, WheelConfigAlt = pcall(require, "lua.wheel.config")
+  WheelConfig = ok_config_alt and WheelConfigAlt or nil
+end
+
 -- Conversation policy is deliberately separate from provider budgets. These
 -- bounds apply to the in-memory request history and to the structured state
 -- written into WheelContext, so a provider cannot make a run grow without
@@ -23,12 +41,47 @@ WheelRunner.MAX_CONTEXT_REF_BYTES = 12 * 1024
 WheelRunner.MAX_EVIDENCE_BYTES = 2048
 WheelRunner.MAX_EVIDENCE_ITEMS = 8
 WheelRunner.MAX_STATE_FIELD_BYTES = 1024
+WheelRunner.MAX_REQUEST_BYTES = 48 * 1024
+WheelRunner.MAX_REQUEST_MESSAGES = 12
+WheelRunner.MAX_REQUEST_MESSAGE_BYTES = 4096
+WheelRunner.MAX_REQUEST_VALUE_BYTES = 2048
+WheelRunner.MAX_REQUEST_ARGUMENT_BYTES = 4096
+WheelRunner.MAX_REQUEST_VALUE_NODES = 256
+WheelRunner.MAX_REQUEST_NODES = 512
 
 local function bound_text(value, limit)
   local text = type(value) == "string" and value or tostring(value or "")
   if #text <= limit then return text end
   if limit <= 3 then return text:sub(1, limit) end
   return text:sub(1, limit - 3) .. "..."
+end
+
+local function redact_bounded(value, limit)
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    return WheelAudit.redact_bounded(value, limit)
+  end
+  return "[omitted:redaction-unavailable]"
+end
+
+local function persistence_failure()
+  return {
+    class = "runtime",
+    code = "E_CONTEXT_PERSISTENCE_FAILED",
+    message = "context persistence failed; history was not compacted",
+  }
+end
+
+local function safe_checkpoint_rationale(rationale)
+  local safe = {}
+  if type(rationale) ~= "table" then
+    return redact_bounded(rationale or "", WheelRunner.MAX_STATE_FIELD_BYTES)
+  end
+  for _, field in ipairs({ "why", "what", "where_focus", "how", "expected", "observed" }) do
+    if rationale[field] ~= nil then
+      safe[field] = redact_bounded(rationale[field], WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+  end
+  return safe
 end
 
 local function message_bytes(value, seen)
@@ -47,12 +100,31 @@ end
 
 local function append_unique_bounded(target, value, limit)
   if #target >= WheelRunner.MAX_EVIDENCE_ITEMS then return end
-  local text = bound_text(value, limit)
-  if #text == 0 then return end
+  local text = redact_bounded(value, limit)
+  if type(text) ~= "string" or #text == 0 then return end
   for _, existing in ipairs(target) do
     if existing == text then return end
   end
   target[#target + 1] = text
+end
+
+local function append_labeled_state(text, state)
+  if type(text) ~= "string" then return end
+  local bounded = redact_bounded(text, WheelRunner.MAX_EVIDENCE_BYTES)
+  for line in bounded:gmatch("[^\n]+") do
+    local field, value = line:match("^%s*[Dd]ecision%s*:%s*(.-)%s*$")
+    if field then
+      append_unique_bounded(state.decisions, value, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    field, value = line:match("^%s*[Rr]isk%s*:%s*(.-)%s*$")
+    if field then
+      append_unique_bounded(state.risks, value, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    field, value = line:match("^%s*[Nn]ext[ %-][Aa]ction%s*:%s*(.-)%s*$")
+    if field then
+      append_unique_bounded(state.next_actions, value, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+  end
 end
 
 local function extract_state(turn_record, state)
@@ -69,6 +141,28 @@ local function extract_state(turn_record, state)
   end
   if response.content then
     append_unique_bounded(state.evidence, response.content, WheelRunner.MAX_EVIDENCE_BYTES)
+    append_labeled_state(response.content, state)
+  end
+  if response.thinking_content then
+    append_labeled_state(response.thinking_content, state)
+  end
+  local rationale = response.rationale
+  if type(rationale) == "string" then
+    append_labeled_state(rationale, state)
+  elseif type(rationale) == "table" then
+    for _, field in ipairs({ "decision", "decisions", "risk", "risks", "next_action", "next_actions" }) do
+      local target = field:find("decision", 1, true) and state.decisions
+        or field:find("risk", 1, true) and state.risks
+        or state.next_actions
+      local values = rationale[field]
+      if type(values) == "table" then
+        for _, value in ipairs(values) do
+          append_unique_bounded(target, value, WheelRunner.MAX_STATE_FIELD_BYTES)
+        end
+      elseif values ~= nil then
+        append_unique_bounded(target, values, WheelRunner.MAX_STATE_FIELD_BYTES)
+      end
+    end
   end
   for _, tool in ipairs(turn_record.tools or {}) do
     if tool.call then
@@ -80,13 +174,49 @@ local function extract_state(turn_record, state)
     if outcome.success == false or (outcome.exit_code and outcome.exit_code ~= 0) then
       append_unique_bounded(state.failures,
         string.format("%s (exit=%s): %s", tostring(tool.call and tool.call.name or outcome.tool or "tool"),
-          tostring(outcome.exit_code or 1), outcome.stderr or "tool failed"), WheelRunner.MAX_STATE_FIELD_BYTES)
+          tostring(outcome.exit_code or 1), redact_bounded(outcome.stderr or "tool failed", WheelRunner.MAX_STATE_FIELD_BYTES)),
+        WheelRunner.MAX_STATE_FIELD_BYTES)
     end
     local evidence = (outcome.blob_hash or outcome.spillover_hash)
       and ("ref=" .. tostring(outcome.blob_hash or outcome.spillover_hash))
       or outcome.stdout or outcome.stderr
     if evidence then append_unique_bounded(state.evidence, evidence, WheelRunner.MAX_EVIDENCE_BYTES) end
   end
+end
+
+local sorted_keys
+local canonical_value
+
+local function canonical_state(state, retained)
+  local parts = {}
+  for _, field in ipairs({ "tool_calls", "failures", "decisions", "evidence", "risks", "next_actions" }) do
+    parts[#parts + 1] = field
+    for _, value in ipairs(state[field] or {}) do
+      local text = redact_bounded(value, WheelRunner.MAX_EVIDENCE_BYTES)
+      parts[#parts + 1] = string.format("%d:%s", #text, text)
+    end
+    parts[#parts + 1] = ";"
+  end
+  for index, record in ipairs(retained or {}) do
+    parts[#parts + 1] = "record:" .. tostring(index)
+    for _, message in ipairs(record.messages or {}) do
+      local role = redact_bounded(message.role or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+      local content = redact_bounded(message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
+      parts[#parts + 1] = string.format("%d:%s:%d:%s", #role, role, #content, content)
+      for _, call in ipairs(message.tool_calls or {}) do
+        local name = redact_bounded(call.name or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+        local id = redact_bounded(call.id or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+        local args
+        if type(call.arguments) == "table" then
+          args = canonical_value(call.arguments)
+        else
+          args = redact_bounded(call.arguments or "", WheelRunner.MAX_REQUEST_ARGUMENT_BYTES)
+        end
+        parts[#parts + 1] = string.format("call:%d:%s:%d:%s:%d:%s", #name, name, #id, id, #args, args)
+      end
+    end
+  end
+  return table.concat(parts, "\0")
 end
 
 local function serialize_state(state, context_ref)
@@ -111,7 +241,7 @@ local function serialize_state(state, context_ref)
   for _, field in ipairs(fields) do
     if not append_line("[" .. field .. "]") then break end
     for _, value in ipairs(state[field] or {}) do
-      if not append_line(bound_text(value, WheelRunner.MAX_STATE_FIELD_BYTES)) then break end
+      if not append_line(redact_bounded(value, WheelRunner.MAX_STATE_FIELD_BYTES)) then break end
     end
     if truncated then break end
   end
@@ -119,16 +249,160 @@ local function serialize_state(state, context_ref)
   return table.concat(lines, "\n")
 end
 
-local function copy_message(message)
-  local copy = {}
-  for key, value in pairs(message) do
-    if key == "content" then
-      copy[key] = bound_text(value, WheelRunner.MAX_EVIDENCE_BYTES)
-    else
-      copy[key] = value
+sorted_keys = function(value)
+  local keys = {}
+  for key in pairs(value) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys
+end
+
+canonical_value = function(value, depth)
+  depth = depth or 0
+  if depth >= WheelRunner.MAX_REQUEST_VALUE_NODES then return "[omitted:depth]" end
+  local value_type = type(value)
+  if value_type == "string" then
+    local text = redact_bounded(value, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+    return string.format("s%d:%s", #text, text)
+  end
+  if value_type ~= "table" then return value_type .. ":" .. tostring(value) end
+  local parts = { "{" }
+  for _, key in ipairs(sorted_keys(value)) do
+    parts[#parts + 1] = canonical_value(key, depth + 1)
+    parts[#parts + 1] = "="
+    parts[#parts + 1] = canonical_value(value[key], depth + 1)
+    parts[#parts + 1] = ";"
+  end
+  parts[#parts + 1] = "}"
+  return table.concat(parts)
+end
+
+local function bounded_value(value, byte_limit, node_budget, seen)
+  if type(value) == "string" then
+    return redact_bounded(value, byte_limit)
+  end
+  if type(value) ~= "table" then
+    if type(value) == "number" or type(value) == "boolean" then return value end
+    return nil
+  end
+  seen = seen or {}
+  if seen[value] then return "[omitted:cycle]" end
+  seen[value] = true
+  local result = {}
+  local nodes = 1
+  for _, key in ipairs(sorted_keys(value)) do
+    if nodes >= node_budget then break end
+    local bounded_key = type(key) == "string" and redact_bounded(key, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+      or tostring(key)
+    local bounded_item = bounded_value(value[key], byte_limit, node_budget - nodes, seen)
+    if bounded_item ~= nil then
+      result[bounded_key] = bounded_item
+      nodes = nodes + 1
     end
   end
-  return copy
+  seen[value] = nil
+  return result
+end
+
+local function encoded_request(request)
+  local codec = WheelProvider and WheelProvider.JSON
+  if not codec or type(codec.encode) ~= "function" then return nil end
+  local ok, encoded = pcall(codec.encode, request)
+  return ok and type(encoded) == "string" and encoded or nil
+end
+
+local function bounded_message(message)
+  local bounded = {
+    role = redact_bounded(message.role or "user", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+    content = redact_bounded(message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
+  }
+  if message.tool_call_id then
+    bounded.tool_call_id = redact_bounded(message.tool_call_id, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+  end
+  if type(message.tool_calls) == "table" then
+    bounded.tool_calls = {}
+    for index, call in ipairs(message.tool_calls) do
+      if index > WheelRunner.MAX_REQUEST_VALUE_NODES then break end
+      local arguments
+      if type(call.arguments) == "table" then
+        arguments = bounded_value(call.arguments, WheelRunner.MAX_REQUEST_VALUE_BYTES,
+          WheelRunner.MAX_REQUEST_VALUE_NODES)
+        local argument_request = encoded_request(arguments)
+        if argument_request and #argument_request > WheelRunner.MAX_REQUEST_ARGUMENT_BYTES then
+          arguments = {}
+        end
+      elseif type(call.arguments) == "string" then
+        arguments = #call.arguments <= WheelRunner.MAX_REQUEST_ARGUMENT_BYTES
+          and redact_bounded(call.arguments, WheelRunner.MAX_REQUEST_ARGUMENT_BYTES) or {}
+      else
+        arguments = {}
+      end
+      bounded.tool_calls[#bounded.tool_calls + 1] = {
+        id = redact_bounded(call.id or "call", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+        name = redact_bounded(call.name or "tool", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+        arguments = arguments,
+      }
+    end
+  end
+  return bounded
+end
+
+local function bound_provider_request(request)
+  local bounded = {
+    model = redact_bounded(request.model or "default-model", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+    messages = {},
+    tools = bounded_value(request.tools or {}, WheelRunner.MAX_REQUEST_VALUE_BYTES,
+      WheelRunner.MAX_REQUEST_NODES),
+    temperature = request.temperature,
+    thinking = bounded_value(request.thinking, WheelRunner.MAX_REQUEST_VALUE_BYTES,
+      WheelRunner.MAX_REQUEST_NODES),
+    max_completion_tokens = request.max_completion_tokens,
+  }
+
+  local source_messages = request.messages or {}
+  local first_system = nil
+  for _, message in ipairs(source_messages) do
+    if message.role == "system" then first_system = message; break end
+  end
+  if first_system then bounded.messages[#bounded.messages + 1] = bounded_message(first_system) end
+  local start = math.max(1, #source_messages - WheelRunner.MAX_REQUEST_MESSAGES + 2)
+  for index = start, #source_messages do
+    local message = source_messages[index]
+    if message ~= first_system then bounded.messages[#bounded.messages + 1] = bounded_message(message) end
+  end
+
+  local encoded = encoded_request(bounded)
+  while encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES do
+    local removable = nil
+    for index = 1, #bounded.messages do
+      if bounded.messages[index].role ~= "system" then removable = index; break end
+    end
+    if not removable then break end
+    table.remove(bounded.messages, removable)
+    encoded = encoded_request(bounded)
+  end
+  if encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES then
+    bounded.messages = {
+      { role = "user", content = "[request content omitted: request byte bound]" },
+    }
+    bounded.tools = {}
+    bounded.thinking = nil
+    encoded = encoded_request(bounded)
+  end
+  if not encoded or #encoded > WheelRunner.MAX_REQUEST_BYTES then
+    bounded = {
+      model = "default-model",
+      messages = { { role = "user", content = "[request omitted: request byte bound]" } },
+      tools = {},
+      max_completion_tokens = request.max_completion_tokens,
+    }
+  end
+  return bounded
+end
+
+WheelRunner.bound_provider_request = bound_provider_request
+
+local function copy_message(message)
+  return bounded_message(message)
 end
 
 --- Compact a conversation while retaining complete recent turns. Assistant tool
@@ -163,8 +437,16 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
     if keep then retained[#retained + 1] = record end
   end
 
-  local ref_seed = table.concat({ task_id, tostring(#turn_records), tostring(old_bytes), tostring(#state.evidence) }, ":")
-  local ref_hash = context and context.compute_hash and context.compute_hash(ref_seed)
+  local ref_seed = table.concat({
+    "ContextRef seed v2",
+    redact_bounded(task_id, WheelRunner.MAX_STATE_FIELD_BYTES),
+    tostring(#turn_records),
+    tostring(old_bytes),
+    canonical_state(state, retained),
+  }, "\0")
+  local hash_function = context and context.compute_hash
+    or (WheelConfig and WheelConfig.compute_hash)
+  local ref_hash = hash_function and hash_function(ref_seed)
     or string.format("%08x", #ref_seed)
   local context_ref = {
     id = "contextref:" .. ref_hash:sub(1, 16),
@@ -191,19 +473,26 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
 
   if context and type(context.put_slot) == "function" then
     local slot_name = "tasks/" .. task_id .. "/context_ref"
-    context:put_slot(slot_name, encoded)
+    local put_ok, put_result = pcall(context.put_slot, context, slot_name, encoded)
+    if not put_ok or type(put_result) ~= "table" or put_result.success ~= true then
+      return messages, nil, nil, persistence_failure()
+    end
     if type(context.commit_checkpoint) == "function" then
-      local commit = context:commit_checkpoint({
+      local commit_ok, commit = pcall(context.commit_checkpoint, context, {
         author = opts.author or "wheel:runner",
         task_id = task_id,
         message = "ContextRef compaction " .. context_ref.id,
         rationale = {
-          why = "Bound autonomous conversation history",
-          what = context_ref.id,
-          observed = string.format("retained %d of %d turns", #retained, #turn_records),
+          why = redact_bounded("Bound autonomous conversation history", WheelRunner.MAX_STATE_FIELD_BYTES),
+          what = redact_bounded(context_ref.id, WheelRunner.MAX_STATE_FIELD_BYTES),
+          observed = redact_bounded(string.format("retained %d of %d turns", #retained, #turn_records),
+            WheelRunner.MAX_STATE_FIELD_BYTES),
         },
       })
-      context_ref.commit_hash = commit and commit.hash or nil
+      if not commit_ok or type(commit) ~= "table" or type(commit.hash) ~= "string" then
+        return messages, nil, nil, persistence_failure()
+      end
+      context_ref.commit_hash = commit.hash
     end
   end
 
@@ -227,13 +516,7 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
       compacted[#compacted + 1] = copy_message(message)
     end
   end
-  return compacted, context_ref, retained
-end
-
-local ok_provider, WheelProvider = pcall(require, "wheel.provider")
-if not ok_provider then
-  local ok_p2, WheelP2 = pcall(require, "lua.wheel.provider")
-  WheelProvider = ok_p2 and WheelP2 or nil
+  return compacted, context_ref, retained, nil
 end
 
 local ok_kernel, WheelKernel = pcall(require, "wheel.kernel")
@@ -393,6 +676,7 @@ function WheelRunner.run_task(agent, task, opts)
   local final_artifacts = nil
   local loop_success = false
   local final_error = nil
+  local final_error_code = nil
 
   while turn < max_turns do
     turn = turn + 1
@@ -463,6 +747,7 @@ function WheelRunner.run_task(agent, task, opts)
       end
     end
 
+    req = bound_provider_request(req)
     local res, stream_err = provider:stream(req, stream_cb, opts)
     if not res then
       final_error = "Provider streaming failed: " .. tostring(stream_err)
@@ -573,7 +858,7 @@ function WheelRunner.run_task(agent, task, opts)
 
       -- Commit turn checkpoint if enabled
       if commit_checkpoints and agent.kernel and type(agent.kernel.commit_checkpoint) == "function" then
-        local cp = agent.kernel:commit_checkpoint(rationale)
+        local cp = agent.kernel:commit_checkpoint(safe_checkpoint_rationale(rationale))
         if cp and cp.hash then
           table.insert(checkpoints, cp.hash)
         end
@@ -584,13 +869,21 @@ function WheelRunner.run_task(agent, task, opts)
 
       -- Publish deliverables to semantic slot
       if agent.context and type(agent.context.put_slot) == "function" then
-        agent.context:put_slot("tasks/" .. task_id .. "/artifacts", final_artifacts)
+        local safe_artifacts = redact_bounded(final_artifacts, WheelRunner.MAX_CONTEXT_REF_BYTES)
+        local put_ok, put_result = pcall(agent.context.put_slot, agent.context,
+          "tasks/" .. task_id .. "/artifacts", safe_artifacts)
+        if not put_ok or type(put_result) ~= "table" or put_result.success ~= true then
+          local failure = persistence_failure()
+          final_error = failure.message
+          final_error_code = failure.code
+          break
+        end
       end
 
       -- Commit completion checkpoint
       if commit_checkpoints and agent.kernel and type(agent.kernel.commit_checkpoint) == "function" then
         rationale.what = "Final deliverables produced for " .. task_id
-        local cp = agent.kernel:commit_checkpoint(rationale)
+        local cp = agent.kernel:commit_checkpoint(safe_checkpoint_rationale(rationale))
         if cp and cp.hash then
           table.insert(checkpoints, cp.hash)
         end
@@ -602,11 +895,16 @@ function WheelRunner.run_task(agent, task, opts)
 
     table.insert(turn_records, turn_record)
     extract_state(turn_record, retained_state)
-    local compacted_messages, compacted_ref, retained_records = WheelRunner.compact_history(messages, turn_records, retained_state, {
+    local compacted_messages, compacted_ref, retained_records, compact_error = WheelRunner.compact_history(messages, turn_records, retained_state, {
       context = agent.context,
       task_id = task_id,
       author = agent.name,
     })
+    if compact_error then
+      final_error = compact_error.message
+      final_error_code = compact_error.code
+      break
+    end
     messages = compacted_messages
     if compacted_ref then
       context_ref = compacted_ref
@@ -624,6 +922,7 @@ function WheelRunner.run_task(agent, task, opts)
     checkpoints = checkpoints,
     iterations = turn,
     error = final_error,
+    error_code = final_error_code,
     usage = total_usage,
     context_ref = context_ref,
   }

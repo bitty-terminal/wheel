@@ -147,4 +147,139 @@ return function(run_test)
     assert(first[1].content == second[1].content, "system prefix bytes must not change")
     assert(compacted[1].role == "system", "ContextRef compaction must preserve the stable prefix")
   end)
+
+  run_test("WheelRunner history: persistence failures preserve the original messages", function()
+    local messages = { message("user", "original") }
+    local records = {
+      { messages = { message("assistant", "turn") }, response = { content = "evidence" }, tools = {} },
+    }
+    local state = { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} }
+    local put_calls = 0
+    local commit_calls = 0
+    local put_failed = {
+      put_slot = function()
+        put_calls = put_calls + 1
+        return nil, { error = "storage_unavailable" }
+      end,
+      commit_checkpoint = function()
+        commit_calls = commit_calls + 1
+        return { hash = "unexpected" }
+      end,
+    }
+    local retained_messages, ref, _, put_error = WheelRunner.compact_history(messages, records, state, {
+      context = put_failed,
+      task_id = "T-put-failure",
+      force = true,
+    })
+    assert(retained_messages == messages, "put_slot failure must preserve the original message table")
+    assert(ref == nil and put_error.code == "E_CONTEXT_PERSISTENCE_FAILED",
+      "put_slot failure must return the static typed persistence error")
+    assert(put_calls == 1 and commit_calls == 0, "checkpoint must not run after put_slot failure")
+
+    local checkpoint_failed = {
+      put_slot = function()
+        return { success = true }
+      end,
+      commit_checkpoint = function()
+        commit_calls = commit_calls + 1
+        return nil, { error = "checkpoint_unavailable" }
+      end,
+    }
+    retained_messages, ref, _, put_error = WheelRunner.compact_history(messages, records, state, {
+      context = checkpoint_failed,
+      task_id = "T-checkpoint-failure",
+      force = true,
+    })
+    assert(retained_messages == messages, "checkpoint failure must preserve the original message table")
+    assert(ref == nil and put_error.code == "E_CONTEXT_PERSISTENCE_FAILED",
+      "checkpoint failure must return the static typed persistence error")
+    assert(commit_calls == 1, "checkpoint must be attempted after a successful slot write")
+  end)
+
+  run_test("WheelRunner history: persisted state is redacted and extracts rationale records", function()
+    local WheelContext = require("wheel.context")
+    local context = WheelContext.new()
+    local messages = { message("user", "start") }
+    local records = {
+      {
+        messages = { message("assistant", "Decision: keep the bounded path") },
+        response = {
+          content = "Decision: keep the bounded path\nRisk: model_content_api_key=MODEL_CONTENT_SENTINEL\nNext-Action: run the regression",
+          thinking_content = "Risk: inspect provider limits",
+        },
+        tools = {},
+      },
+    }
+    local state = { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} }
+    local compacted, context_ref = WheelRunner.compact_history(messages, records, state, {
+      context = context,
+      task_id = "T-redacted-state",
+      author = "test",
+      force = true,
+    })
+    local slot = context:get_slot("tasks/T-redacted-state/context_ref")
+    assert(compacted ~= messages and context_ref.commit_hash, "successful persistence must compact and checkpoint")
+    assert(slot.found and not slot.content:find("MODEL_CONTENT_SENTINEL", 1, true),
+      "ContextRef slots must not contain raw model content")
+    assert(slot.content:find("decisions", 1, true), "bounded rationale decisions must be persisted")
+    assert(slot.content:find("risks", 1, true), "bounded rationale risks must be persisted")
+    assert(slot.content:find("next_actions", 1, true), "bounded rationale next actions must be persisted")
+    local checkpoint = context:get_commit(context_ref.commit_hash)
+    local rationale = checkpoint and checkpoint.rationale or {}
+    assert(not tostring(rationale):find("MODEL_CONTENT_SENTINEL", 1, true),
+      "checkpoint rationale must not contain raw model content")
+  end)
+
+  run_test("WheelRunner history: equal-size histories receive distinct ContextRefs", function()
+    local function compact(content)
+      local messages = { message("user", "start") }
+      local assistant = message("assistant", content)
+      local records = { { messages = { assistant }, response = { content = content }, tools = {} } }
+      local state = { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} }
+      return WheelRunner.compact_history(messages, records, state, { task_id = "T-collision", force = true })
+    end
+    local _, first = compact("same-size-A")
+    local _, second = compact("same-size-B")
+    assert(#"same-size-A" == #"same-size-B", "the collision fixture must use equal-size content")
+    assert(first.id ~= second.id, "ContextRef IDs must include canonical history content")
+  end)
+
+  run_test("WheelRunner history: provider requests bound nested arguments and retained messages", function()
+    local huge = string.rep("nested-content", 2000)
+    local request = {
+      model = string.rep("model", 1000),
+      messages = {},
+      tools = { { type = "function", ["function"] = { name = "inspect", parameters = { huge = huge } } } },
+      thinking = { enabled = true, details = { huge = huge } },
+      max_completion_tokens = 128,
+    }
+    for index = 1, 30 do
+      request.messages[#request.messages + 1] = {
+        role = index % 2 == 0 and "assistant" or "user",
+        content = huge,
+      }
+    end
+    request.messages[#request.messages + 1] = {
+      role = "assistant",
+      content = huge,
+      tool_calls = {
+        { id = "call-1", name = "inspect", arguments = { nested = { value = huge } } },
+      },
+    }
+    local bounded = WheelRunner.bound_provider_request(request)
+    local provider = require("wheel.provider")
+    local encoded = assert(provider.JSON.encode(bounded))
+    assert(#encoded <= WheelRunner.MAX_REQUEST_BYTES, "provider request must stay within the exact byte bound")
+    assert(#bounded.messages <= WheelRunner.MAX_REQUEST_MESSAGES, "provider message count must stay bounded")
+    local last = bounded.messages[#bounded.messages]
+    if last and last.tool_calls then
+      local args = assert(provider.JSON.encode(last.tool_calls[1].arguments))
+      assert(#args <= WheelRunner.MAX_REQUEST_ARGUMENT_BYTES,
+        "nested tool-call arguments must stay within their byte bound")
+    end
+    for _, retained in ipairs(bounded.messages) do
+      assert(#(retained.content or "") <= WheelRunner.MAX_REQUEST_MESSAGE_BYTES,
+        "retained message content must stay within its node bound")
+    end
+  end)
 end
