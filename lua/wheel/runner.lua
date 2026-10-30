@@ -1149,7 +1149,7 @@ function WheelRunner.run_task(agent, task, opts)
           final_error_code = failure.code
           break
         end
-        local encoded = WheelProvider.JSON.encode(rationale)
+        local encoded = WheelProvider.JSON.encode(WheelProvider.Rationale.for_persistence(rationale))
         local rationale_ok, rationale_result = pcall(agent.context.put_slot, agent.context,
           "tasks/" .. task_id .. "/rationale", encoded)
         if not rationale_ok or type(rationale_result) ~= "table" or rationale_result.success ~= true then

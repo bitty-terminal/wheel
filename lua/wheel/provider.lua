@@ -113,7 +113,7 @@ WheelProvider.JSON = json
 -- @param opts table? { task_id = string?, session_id = string? }
 -- @return table bounded rationale
 function WheelProvider.parse_rationale(response, opts)
-  return Rationale.from_response(response, json, opts)
+  return Rationale.with_legacy_labels(Rationale.from_response(response, json, opts))
 end
 
 -- ---------------------------------------------------------------------------

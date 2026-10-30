@@ -45,6 +45,9 @@ local function bounded_string(value, limit)
   if #value == 0 then
     return nil
   end
+  if #value > limit then
+    return nil
+  end
   return value:sub(1, limit or MAX_FIELD_BYTES)
 end
 
@@ -194,13 +197,146 @@ end
 -- These labels are derived from the bounded record and never from raw thinking.
 function Rationale.with_legacy_labels(record)
   record = record or copy_fallback()
-  record.why = record.decision
-  record.what = record.next_action
-  record.where_focus = record.task_id and ("task " .. record.task_id) or "task"
-  record.how = "bounded provider rationale"
-  record.expected = record.next_action
-  record.observed = record.decision
+  local decision = record.decision or record.goal or record.why or FALLBACK.decision
+  local next_action = record.next_action or record.what or record.approach or FALLBACK.next_action
+  record.why = record.why or decision
+  record.what = record.what or next_action
+  record.where_focus = record.where_focus or (record.task_id and ("task " .. record.task_id) or "task")
+  record.how = record.how or "bounded provider rationale"
+  record.expected = record.expected or next_action
+  record.observed = record.observed or decision
   return record
+end
+
+local function load_audit()
+  local ok, audit = pcall(require, "wheel.audit")
+  if not ok then
+    ok, audit = pcall(require, "lua.wheel.audit")
+  end
+  if ok and type(audit) == "table" and type(audit.redact_bounded) == "function" then
+    return audit
+  end
+  return nil
+end
+
+local function redact_value(audit, value, limit)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local ok, redacted = pcall(audit.redact_bounded, value, limit)
+  if not ok or type(redacted) ~= "string" then
+    return nil
+  end
+  if value ~= "" and redacted == "" then
+    return nil
+  end
+  return redacted
+end
+
+local function sanitize_record(record, audit)
+  local result = {
+    schema = Rationale.SCHEMA,
+    source = "provider",
+    evidence = {},
+    rejected_alternatives = {},
+  }
+  for _, field in ipairs({ "decision", "uncertainty", "risk", "next_action" }) do
+    result[field] = redact_value(audit, record[field], MAX_FIELD_BYTES)
+    if not result[field] then
+      return nil
+    end
+  end
+  for _, field in ipairs({ "evidence", "rejected_alternatives" }) do
+    for index, item in ipairs(record[field] or {}) do
+      local redacted = redact_value(audit, item, MAX_LIST_ITEM_BYTES)
+      if not redacted then
+        return nil
+      end
+      result[field][index] = redacted
+    end
+  end
+  for _, field in ipairs({ "task_id", "session_id" }) do
+    if record[field] ~= nil then
+      local limit = field == "task_id" and MAX_TASK_ID_BYTES or MAX_SESSION_ID_BYTES
+      result[field] = redact_value(audit, record[field], limit)
+      if not result[field] then
+        return nil
+      end
+    end
+  end
+  return Rationale.with_legacy_labels(result)
+end
+
+local function sanitize_legacy(value, audit, depth)
+  if depth > 4 then
+    return nil
+  end
+  if type(value) == "string" then
+    return redact_value(audit, value, MAX_FIELD_BYTES)
+  end
+  if type(value) ~= "table" then
+    if type(value) == "number" or type(value) == "boolean" then
+      return value
+    end
+    return nil
+  end
+  local result = {}
+  for key, item in pairs(value) do
+    if type(key) ~= "string" and type(key) ~= "number" then
+      return nil
+    end
+    local safe = sanitize_legacy(item, audit, depth + 1)
+    if safe == nil and item ~= nil then
+      return nil
+    end
+    result[key] = safe
+  end
+  return result
+end
+
+--- Prepare rationale for a durable checkpoint or Context sink.
+-- Every persisted string, including list items and compatibility labels, passes
+-- through the shared audit redaction boundary. If that boundary is unavailable
+-- or rejects a value, a static fallback is returned instead of raw input.
+-- @param value string|table|nil
+-- @return string|table bounded, redacted rationale
+function Rationale.for_persistence(value)
+  local audit = load_audit()
+  if not audit then
+    if type(value) == "string" then
+      return "Provider rationale unavailable"
+    end
+    return Rationale.with_legacy_labels(copy_fallback("fallback"))
+  end
+  if type(value) == "string" then
+    return redact_value(audit, value, MAX_FIELD_BYTES) or "Provider rationale unavailable"
+  end
+  if type(value) ~= "table" then
+    return Rationale.with_legacy_labels(copy_fallback("fallback"))
+  end
+  if value.schema == Rationale.SCHEMA then
+    local candidate = {}
+    for _, field in ipairs({
+      "schema", "decision", "evidence", "uncertainty", "risk",
+      "rejected_alternatives", "next_action",
+    }) do
+      candidate[field] = value[field]
+    end
+    if candidate.decision == nil and value.why ~= nil then
+      candidate.decision = value.why
+    end
+    if candidate.next_action == nil and value.what ~= nil then
+      candidate.next_action = value.what
+    end
+    local normalized = Rationale.normalize(candidate, {
+      task_id = value.task_id,
+      session_id = value.session_id,
+    })
+    return (normalized and sanitize_record(normalized, audit))
+      or Rationale.with_legacy_labels(copy_fallback("fallback"))
+  end
+  local legacy = sanitize_legacy(value, audit, 0)
+  return legacy and Rationale.with_legacy_labels(legacy)
 end
 
 return Rationale

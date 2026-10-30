@@ -2310,7 +2310,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   -- so every rooted `wheel.<dep>` lookup is a real not-found result.
   local alternate_cases = {
     { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host" } },
-    { parent = "context", deps = { "errors", "config", "host", "context_snapshot" } },
+    { parent = "context", deps = { "errors", "config", "host", "context_snapshot", "rationale" } },
     {
       parent = "tool",
       deps = { "errors", "host" },
@@ -5469,12 +5469,12 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
     thinking_content = "private reasoning that must remain transient",
     rationale = {
       schema = WheelProvider.Rationale.SCHEMA,
-      decision = long,
-      evidence = { long, "second" },
-      uncertainty = long,
-      risk = long,
-      rejected_alternatives = { long },
-      next_action = long,
+      decision = "Use the visible answer",
+      evidence = { "bounded evidence", "second" },
+      uncertainty = "limited",
+      risk = "bounded",
+      rejected_alternatives = { "replay private thinking" },
+      next_action = "Continue verification",
     },
   }
   local rationale = WheelProvider.parse_rationale(response, {
@@ -5482,8 +5482,8 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
     session_id = "S-BOUND",
   })
   assert(rationale.schema == WheelProvider.Rationale.SCHEMA)
-  assert(#rationale.decision == WheelProvider.Rationale.MAX_FIELD_BYTES)
-  assert(#rationale.evidence[1] == WheelProvider.Rationale.MAX_LIST_ITEM_BYTES)
+  assert(rationale.decision == "Use the visible answer")
+  assert(rationale.evidence[1] == "bounded evidence")
   assert(rationale.task_id == "R-BOUND" and rationale.session_id == "S-BOUND")
   assert(rationale.decision:find("private", 1, true) == nil)
   assert(rationale.thinking_content == nil, "rationale must not retain thinking content")
@@ -5501,6 +5501,35 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
     thinking_content = '{"schema":"wheel-rationale/1","decision":{}}',
   })
   assert(malformed.source == "fallback", "malformed structured thinking must use fallback")
+
+  local oversized_scalar = WheelProvider.parse_rationale({
+    rationale = { decision = string.rep("s", WheelProvider.Rationale.MAX_FIELD_BYTES + 1) },
+  })
+  assert(oversized_scalar.source == "fallback", "oversized scalar must use fallback")
+  assert(oversized_scalar.decision == "Provider response processed")
+
+  local oversized_item = WheelProvider.parse_rationale({
+    rationale = { evidence = { string.rep("i", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES + 1) } },
+  })
+  assert(oversized_item.source == "fallback", "oversized list item must use fallback")
+
+  local token = "Bearer sk-rationale-persistence-token-0001"
+  local persisted = WheelProvider.Rationale.for_persistence(WheelProvider.Rationale.with_legacy_labels({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "provider",
+    decision = token,
+    evidence = { token },
+    uncertainty = "none",
+    risk = token,
+    rejected_alternatives = { token },
+    next_action = token,
+    task_id = "RATIONALE-TOKEN",
+  }))
+  local persisted_json = WheelProvider.JSON.encode(persisted)
+  assert(persisted_json:find(token, 1, true) == nil, "redacted rationale must not retain token-shaped input")
+  assert(persisted_json:find("[redacted", 1, true) ~= nil, "redacted rationale must contain a marker")
+  assert(persisted.why == persisted.decision and persisted.what == persisted.next_action,
+    "persisted rationale must retain legacy labels")
 end)
 
 run_test("WheelProvider: opt-in caller attribution is absent by default and strictly validated", function()
@@ -6014,9 +6043,12 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
         rationale = {
           schema = WheelProvider.Rationale.SCHEMA,
           decision = "Deliver the verified implementation",
-          evidence = { "inspect_file completed", "verification confirmed" },
+          evidence = {
+            "inspect_file completed",
+            "Bearer sk-rationale-test-token-0001",
+          },
           uncertainty = "No remaining uncertainty",
-          risk = "No known regression",
+          risk = "Bearer sk-rationale-test-token-0001",
           rejected_alternatives = { "Do not replay private thinking" },
           next_action = "Request independent verification",
         },
@@ -6070,6 +6102,8 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   assert(string.find(rationale_slot.content, "Deliver the verified implementation", 1, true) ~= nil)
   assert(string.find(rationale_slot.content, "Verification confirmed. Preparing final delivery.", 1, true) == nil,
     "private thinking must not reach the Context persistence sink")
+  assert(string.find(rationale_slot.content, "sk-rationale-test-token-0001", 1, true) == nil,
+    "token-shaped rationale input must not reach the Context persistence sink")
   for _, message in ipairs(mock.call_history[2].messages or {}) do
     assert(string.find(message.content or "", "Verification confirmed. Preparing final delivery.", 1, true) == nil,
       "private thinking must not be replayed into a later prompt")
@@ -6077,6 +6111,30 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   local checkpoint = kernel:get_checkpoint(runner_res.checkpoints[#runner_res.checkpoints])
   assert(checkpoint.rationale.task_id == task.id, "checkpoint rationale must link to the active task")
   assert(checkpoint.rationale.decision == "Deliver the verified implementation")
+  assert(string.find(checkpoint.rationale.evidence[2] or "", "sk-rationale-test-token-0001", 1, true) == nil,
+    "token-shaped rationale input must not reach the checkpoint sink")
+  assert(checkpoint.rationale.why == checkpoint.rationale.decision)
+  assert(checkpoint.rationale.what == checkpoint.rationale.next_action)
+end)
+
+run_test("WheelContext: rationale checkpoints retain legacy message compatibility", function()
+  local context = WheelContext.new()
+  local commit = context:commit_checkpoint({
+    task_id = "TASK-COMPAT",
+    rationale = {
+      schema = WheelProvider.Rationale.SCHEMA,
+      decision = "Choose bounded persistence",
+      evidence = { "checkpoint consumer" },
+      uncertainty = "none",
+      risk = "bounded",
+      rejected_alternatives = {},
+      next_action = "Continue verification",
+    },
+  })
+  assert(commit.rationale.why == "Choose bounded persistence")
+  assert(commit.rationale.what == "Continue verification")
+  assert(commit.message == "Choose bounded persistence",
+    "context checkpoint message must derive from the compatibility label")
 end)
 
 run_test("WheelRunner: action records retain non-spilled output byte counts", function()
