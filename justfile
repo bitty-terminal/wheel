@@ -91,6 +91,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/audit.lua
     bun run luaparse --quiet --file lua/wheel/job.lua
     bun run luaparse --quiet --file lua/wheel/agent.lua
+    bun run luaparse --quiet --file lua/wheel/lifecycle.lua
     bun run luaparse --quiet --file lua/wheel/team.lua
     bun run luaparse --quiet --file lua/wheel/context.lua
     bun run luaparse --quiet --file lua/wheel/context_snapshot.lua
@@ -122,6 +123,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/test_provider_stub.lua
     bun run luaparse --quiet --file tests/test_session.lua
+    bun run luaparse --quiet --file tests/test_lifecycle.lua
     bun run luaparse --quiet --file tests/test_audit.lua
     bun run luaparse --quiet --file tests/test_cancel.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
@@ -146,6 +148,18 @@ test-session: deps
     else \
         echo "No lua interpreter found; skipping session-daemon tests" >&2; \
     fi
+
+# Unit and cross-process lifecycle registry tests. The child process reloads
+# the registry and performs a transition, proving persistence is not only an
+# in-memory projection.
+test-lifecycle: deps
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-lifecycle requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_lifecycle.lua
 
 # Run the execution-audit suite: private modes, bounded records, rotation,
 # hash chain, redaction, fail-closed high-risk spawns, and non-high-risk
@@ -322,10 +336,15 @@ e2e: deps
 # recipe that lost its `--file` argument would silently pass rather than parse
 # the generated entry point.
 lua-control: deps
-    @! bun run luaparse --quiet --code 'local ='
+    @if bun run luaparse --quiet --code 'local =' >/dev/null 2>&1; then \
+        echo "luaparse accepted invalid Lua" >&2; \
+        exit 1; \
+    else \
+        exit 0; \
+    fi
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-audit test-cancel test test-bench test-session lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-audit test-cancel test test-bench test-session test-lifecycle lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

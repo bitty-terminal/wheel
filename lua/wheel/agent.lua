@@ -27,6 +27,13 @@ if not ok_runner then
 end
 WheelAgent.Runner = WheelRunner
 
+local ok_lifecycle, WheelLifecycle = pcall(require, "wheel.lifecycle")
+if not ok_lifecycle then
+  local ok_l2, WheelL2 = pcall(require, "lua.wheel.lifecycle")
+  WheelLifecycle = ok_l2 and WheelL2 or nil
+end
+WheelAgent.Lifecycle = WheelLifecycle
+
 --- Agent role definitions.
 WheelAgent.Role = {
   COMMANDER = "commander",
@@ -190,6 +197,7 @@ function WheelAgent.new(opts)
 
   local self = setmetatable({}, WheelAgent)
   self.name = opts.name
+  self.agent_id = opts.agent_id or self.name
   self.role = role
   self.kernel = opts.kernel
 
@@ -253,12 +261,97 @@ function WheelAgent.new(opts)
   self.last_prefix_cache_key = nil
   self.last_cache_share_ratio = nil
 
+  -- Lifecycle records are opt-in so existing in-process agents remain
+  -- compatible. When supplied, the registry keeps identity, session, panel,
+  -- task, context, role, model, and worktree references separate.
+  self.lifecycle = opts.lifecycle
+  self.session_id = opts.session_id
+  self.worktree_id = opts.worktree_id
+
   self.provider = opts.provider
   if not self.provider and WheelProvider and self.model_profile then
     self.provider = WheelProvider.create(self.model_profile)
   end
 
   return self
+end
+
+--- Create the explicit runtime AgentSession and Headless Panel records for
+--- this agent. The lifecycle registry stores references only; prompt/context
+--- content remains in WheelContext and is never copied into bittyd metadata.
+--- @param opts table? lifecycle record overrides
+--- @return table session, table panel
+function WheelAgent:create_runtime_session(opts)
+  if not self.lifecycle or not WheelLifecycle then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "no lifecycle registry configured" }
+  end
+  opts = opts or {}
+  local panel = self.lifecycle:get_panel(opts.panel_id or self.panel_id)
+  if not panel then
+    panel = self.lifecycle:create_panel({
+      panel_id = opts.panel_id or self.panel_id,
+      agent_id = self.agent_id,
+      headless = self.headless,
+      kind = opts.panel_kind or "headless",
+    })
+    if not panel then
+      return nil, { code = "E_LIFECYCLE_PANEL", message = "cannot create panel" }
+    end
+    panel = self.lifecycle:ready_panel(panel.panel_id)
+  end
+  local session, session_err = self.lifecycle:create_agent_session({
+    session_id = opts.session_id,
+    agent_id = self.agent_id,
+    panel_id = panel.panel_id,
+    task_id = opts.task_id or self.active_task_id,
+    context_branch = opts.context_branch or self:current_branch(),
+    context_head = opts.context_head,
+    role_binding = opts.role_binding or { role = self.role },
+    model_profile = opts.model_profile or self.model_profile,
+    worktree_id = opts.worktree_id or self.worktree_id,
+  })
+  if not session then
+    return nil, session_err
+  end
+  self.session_id = session.session_id
+  self.panel_id = panel.panel_id
+  return session, panel
+end
+
+--- Start this agent's runtime session after its panel is ready.
+function WheelAgent:activate_runtime_session()
+  if not self.lifecycle or not self.session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return self.lifecycle:activate_session(self.session_id)
+end
+
+function WheelAgent:pause_runtime_session(reason)
+  if not self.lifecycle or not self.session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return self.lifecycle:pause_session(self.session_id, reason)
+end
+
+function WheelAgent:checkpoint_runtime_session(checkpoint)
+  if not self.lifecycle or not self.session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return self.lifecycle:checkpoint_session(self.session_id, checkpoint)
+end
+
+function WheelAgent:detach_runtime_session(opts)
+  if not self.lifecycle or not self.session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return self.lifecycle:detach_session(self.session_id, opts)
+end
+
+function WheelAgent:attach_runtime_session(panel_id, opts)
+  if not self.lifecycle or not self.session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return self.lifecycle:attach_session(self.session_id, panel_id, opts)
 end
 
 --- Get the active LLM Provider adapter.
