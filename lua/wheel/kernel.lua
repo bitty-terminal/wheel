@@ -542,6 +542,7 @@ local function create_mock_dispatcher()
         tree_hash = state.tree_hash,
         parents = state.head_checkpoint and { state.head_checkpoint } or {},
         rationale = rat,
+        task_id = rat.task_id,
         branch = payload.branch or "main",
         timestamp_ms = payload.now_ms or 0,
       }

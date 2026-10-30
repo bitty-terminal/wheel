@@ -233,15 +233,14 @@ function WheelRunner.run_task(agent, task, opts)
       total_usage.total_tokens = total_usage.total_tokens + (res.usage.total_tokens or 0)
     end
 
-    -- Construct Structured Rationale
-    local rationale = {
-      why = string.format("Autonomous execution turn %d for task %s", turn, task_id),
-      what = (res.content and #res.content > 0) and res.content:sub(1, 300) or ("Completed turn " .. turn),
-      where_focus = "task " .. task_id,
-      how = "autonomous LLM ReAct turn loop",
-      expected = "Task deliverables and verification",
-      observed = (res.thinking_content and #res.thinking_content > 0) and res.thinking_content:sub(1, 300) or "Model response processed",
-    }
+    -- Construct a bounded rationale.  Provider thinking is intentionally not
+    -- copied here: it remains transient on `res` and cannot enter a prompt,
+    -- checkpoint, or Context slot unless the provider returned a complete
+    -- structured rationale object.
+    local rationale = WheelProvider.parse_rationale(res, {
+      task_id = task_id,
+      session_id = opts.session_id or agent.session_id,
+    })
 
     -- Handle tool calls
     local tool_calls = res.tool_calls or {}
@@ -336,11 +335,12 @@ function WheelRunner.run_task(agent, task, opts)
       -- Publish deliverables to semantic slot
       if agent.context and type(agent.context.put_slot) == "function" then
         agent.context:put_slot("tasks/" .. task_id .. "/artifacts", final_artifacts)
+        local encoded = WheelProvider.JSON.encode(rationale)
+        agent.context:put_slot("tasks/" .. task_id .. "/rationale", encoded)
       end
 
       -- Commit completion checkpoint
       if commit_checkpoints and agent.kernel and type(agent.kernel.commit_checkpoint) == "function" then
-        rationale.what = "Final deliverables produced for " .. task_id
         local cp = agent.kernel:commit_checkpoint(rationale)
         if cp and cp.hash then
           table.insert(checkpoints, cp.hash)

@@ -492,6 +492,12 @@ local function main()
   check(result.content == STUB_CONTENT,
     "the stub completion content drifted: " .. safe_diagnostic(result.content))
   check(result.finish_reason == "stop", "the stub finish reason drifted")
+  local bounded = WheelProvider.parse_rationale(result, { task_id = "stub-task" })
+  check(bounded.source == "fallback" or bounded.decision == "Use the deterministic stub response",
+    "provider-stub rationale must be deterministic")
+  check(bounded.task_id == "stub-task", "provider-stub rationale must carry the task link")
+  check((bounded.thinking_content or ""):find("loopback request accepted", 1, true) == nil,
+    "provider-stub rationale must not retain the thinking stream")
   capture("completion content", result.content)
   pass("provider-stub: deterministic completion through the loopback stub")
 
