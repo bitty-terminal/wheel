@@ -200,7 +200,7 @@ run_test("WheelLifecycle: explicit AgentSession and Headless Panel lifecycle", f
   local conflict_ok, conflict_err = lifecycle:activate_session(conflicting.session_id)
   assert(not conflict_ok and conflict_err.code == "E_LIFECYCLE_PANEL_BUSY")
 
-  session = assert(lifecycle:mark_stale(session.session_id, "owner_lost"))
+  session = assert(lifecycle:mark_stale(session.session_id, "stale"))
   assert(session.state == WheelLifecycle.AgentSessionState.STALE)
   session = assert(lifecycle:recover_session(session.session_id, { recovery = "checkpoint" }))
   assert(session.state == WheelLifecycle.AgentSessionState.PAUSED)
