@@ -27,11 +27,20 @@ if not ok_runner then
 end
 WheelAgent.Runner = WheelRunner
 
-local ok_lifecycle, WheelLifecycle = pcall(require, "wheel.lifecycle")
-if not ok_lifecycle then
-  local ok_l2, WheelL2 = pcall(require, "lua.wheel.lifecycle")
-  WheelLifecycle = ok_l2 and WheelL2 or nil
+local function load_lifecycle()
+  local rooted = "wheel.lifecycle"
+  local ok, value = pcall(require, rooted)
+  if ok then return value end
+  package.loaded[rooted] = nil
+  if type(value) ~= "string" or not value:find("module '" .. rooted .. "' not found", 1, true) then error(value, 0) end
+  local alternate = "lua." .. rooted
+  ok, value = pcall(require, alternate)
+  if ok then return value end
+  package.loaded[alternate] = nil
+  if type(value) ~= "string" or not value:find("module '" .. alternate .. "' not found", 1, true) then error(value, 0) end
+  return nil
 end
+local WheelLifecycle = load_lifecycle()
 WheelAgent.Lifecycle = WheelLifecycle
 
 --- Agent role definitions.
@@ -287,17 +296,21 @@ function WheelAgent:create_runtime_session(opts)
   end
   opts = opts or {}
   local panel = self.lifecycle:get_panel(opts.panel_id or self.panel_id)
+  local panel_err
   if not panel then
-    panel = self.lifecycle:create_panel({
+    panel, panel_err = self.lifecycle:create_panel({
       panel_id = opts.panel_id or self.panel_id,
       agent_id = self.agent_id,
       headless = self.headless,
       kind = opts.panel_kind or "headless",
     })
     if not panel then
-      return nil, { code = "E_LIFECYCLE_PANEL", message = "cannot create panel" }
+      return nil, panel_err
     end
-    panel = self.lifecycle:ready_panel(panel.panel_id)
+  end
+  if panel.state == WheelLifecycle.PanelState.CREATED then
+    panel, panel_err = self.lifecycle:ready_panel(panel.panel_id)
+    if not panel then return nil, panel_err end
   end
   local session, session_err = self.lifecycle:create_agent_session({
     session_id = opts.session_id,

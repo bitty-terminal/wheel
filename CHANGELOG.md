@@ -6,6 +6,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
+  schema validation, loaded-data sanitization, private registry persistence,
+  exact revision conflicts, exception-safe lock cleanup, bounded recent history,
+  alternate module roots, and runtime-session error propagation. Add hostile,
+  capacity, rollback, and cross-process regressions; no daemon authority change.
+
 ### Added
 
 - Explicit AgentSession and Headless Panel lifecycle records (CTX-0045 /
@@ -318,8 +326,6 @@ test-provider-stub` starts a real `ThreadingHTTPServer` on `127.0.0.1:0`
   from the official plugin set (bitty-plugins #98); descriptors, documentation,
   and the GitHub repository description aligned with the independence direction
   (wheel #45). No behavior changes.
-
-### Fixed
 
 - CTX-0028 / wheel#93 snapshot and session hardening: snapshot validation now
   sanitizes `stash_pushed`/`stash_popped` bus events on import and canonical
