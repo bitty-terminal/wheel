@@ -5502,6 +5502,23 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   })
   assert(malformed.source == "fallback", "malformed structured thinking must use fallback")
 
+  local trailing = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID"} TRAILING_PRIVATE',
+  })
+  assert(trailing.source == "fallback", "trailing private text must use fallback")
+  local null_risk = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID","risk":null}',
+  })
+  assert(null_risk.source == "fallback", "null scalar must use fallback")
+  local null_evidence = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID","evidence":[null]}',
+  })
+  assert(null_evidence.source == "fallback", "null list item must use fallback")
+  for _, private_text in ipairs({ "TRAILING_PRIVATE", "RETAINED_INVALID" }) do
+    assert(trailing.decision:find(private_text, 1, true) == nil,
+      "rejected thinking text must not enter static fallback")
+  end
+
   local oversized_scalar = WheelProvider.parse_rationale({
     rationale = { decision = string.rep("s", WheelProvider.Rationale.MAX_FIELD_BYTES + 1) },
   })
@@ -5565,6 +5582,62 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   assert(nested_result.source == "fallback", "nested legacy values must use fallback")
   assert(#WheelProvider.JSON.encode(nested_result) <= WheelProvider.Rationale.MAX_LEGACY_AGGREGATE_BYTES,
     "legacy fallback must remain within the aggregate bound")
+
+  local tagged_extra = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = "RETAINED_INVALID",
+    extra = "unknown",
+  }
+  local tagged_token_key = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = "RETAINED_INVALID",
+    ["Bearer sk-review-key-0001"] = "unknown",
+  }
+  local tagged_huge = { schema = WheelProvider.Rationale.SCHEMA, decision = "RETAINED_INVALID" }
+  for index = 1, 5000 do tagged_huge["extra_" .. tostring(index)] = "unknown" end
+  local tagged_nested = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = { nested = "RETAINED_INVALID" },
+  }
+  local tagged_aggregate_overflow = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = string.rep("d", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    uncertainty = string.rep("u", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    risk = string.rep("r", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    next_action = string.rep("n", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    evidence = {
+      string.rep("e", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES),
+      string.rep("f", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES),
+    },
+    rejected_alternatives = { string.rep("a", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES) },
+  }
+  for _, invalid_tagged in ipairs({
+    tagged_extra, tagged_token_key, tagged_huge, tagged_nested, tagged_aggregate_overflow,
+  }) do
+    local direct = WheelProvider.Rationale.for_persistence(invalid_tagged)
+    assert(direct.source == "fallback", "invalid tagged map must use fallback")
+    assert(direct.decision ~= "RETAINED_INVALID")
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(invalid_tagged)
+    local kernel_record = kernel:get_checkpoint(kernel_cp.hash)
+    assert(kernel_record.rationale.source == "fallback")
+    assert(kernel_record.rationale.decision ~= "RETAINED_INVALID")
+
+    local bridge_kernel = WheelKernel.new_mock()
+    local bridge_cp = bridge_kernel:call("checkpoint.commit", { rationale = invalid_tagged })
+    assert(bridge_cp.rationale.source == "fallback")
+    assert(bridge_cp.rationale.decision ~= "RETAINED_INVALID")
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = invalid_tagged })
+    assert(context_cp.rationale.source == "fallback")
+    assert(context_cp.rationale.decision ~= "RETAINED_INVALID")
+
+    local slot_rationale = WheelProvider.Rationale.for_persistence(invalid_tagged)
+    context:put_slot("tasks/tagged/rationale", WheelProvider.JSON.encode(slot_rationale))
+    local slot = context:get_slot("tasks/tagged/rationale")
+    assert(slot.found and slot.content:find("RETAINED_INVALID", 1, true) == nil,
+      "Context rationale slot must contain only the sanitized fallback")
+  end
 
   local huge_sink_map = {}
   for index = 1, 5000 do

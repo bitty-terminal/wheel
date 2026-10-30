@@ -14,6 +14,10 @@ local MAX_TASK_ID_BYTES = 128
 local MAX_SESSION_ID_BYTES = 128
 local MAX_LEGACY_FIELDS = 8
 local MAX_LEGACY_AGGREGATE_BYTES = 2048
+local MAX_TAGGED_FIELDS = MAX_LEGACY_FIELDS + 6 + 4
+local MAX_THINKING_JSON_BYTES = 16 * 1024
+local MAX_JSON_DEPTH = 8
+local MAX_JSON_NODES = 128
 
 Rationale.SCHEMA = "wheel-rationale/1"
 Rationale.MAX_FIELD_BYTES = MAX_FIELD_BYTES
@@ -23,6 +27,7 @@ Rationale.MAX_TASK_ID_BYTES = MAX_TASK_ID_BYTES
 Rationale.MAX_SESSION_ID_BYTES = MAX_SESSION_ID_BYTES
 Rationale.MAX_LEGACY_FIELDS = MAX_LEGACY_FIELDS
 Rationale.MAX_LEGACY_AGGREGATE_BYTES = MAX_LEGACY_AGGREGATE_BYTES
+Rationale.MAX_THINKING_JSON_BYTES = MAX_THINKING_JSON_BYTES
 
 local FIELDS = {
   decision = true,
@@ -42,6 +47,14 @@ local LEGACY_FIELDS = {
   observed = true,
   goal = true,
   approach = true,
+}
+
+local TAGGED_FIELDS = {
+  schema = true, source = true, task_id = true, session_id = true,
+  decision = true, evidence = true, uncertainty = true, risk = true,
+  rejected_alternatives = true, next_action = true, why = true, what = true,
+  where_focus = true, how = true, expected = true, observed = true,
+  goal = true, approach = true,
 }
 
 local FALLBACK = {
@@ -122,6 +135,184 @@ local function is_plain_table(value)
   return type(value) == "table" and getmetatable(value) == nil
 end
 
+local function strict_json_document(text)
+  if type(text) ~= "string" or #text == 0 or #text > MAX_THINKING_JSON_BYTES then
+    return false
+  end
+  local position = 1
+  local nodes = 0
+
+  local function whitespace()
+    while true do
+      local byte = text:byte(position)
+      if byte == 32 or byte == 9 or byte == 10 or byte == 13 then
+        position = position + 1
+      else
+        return
+      end
+    end
+  end
+
+  local function string_token()
+    if text:sub(position, position) ~= '"' then return false end
+    position = position + 1
+    while position <= #text do
+      local byte = text:byte(position)
+      if byte == 34 then
+        position = position + 1
+        return true
+      elseif byte == 92 then
+        position = position + 1
+        local escape = text:sub(position, position)
+        if escape == '"' or escape == "\\" or escape == "/"
+          or escape == "b" or escape == "f" or escape == "n"
+          or escape == "r" or escape == "t" then
+          position = position + 1
+        elseif escape == "u" then
+          local hex = text:sub(position + 1, position + 4)
+          if not hex:match("^%x%x%x%x$") then return false end
+          position = position + 5
+        else
+          return false
+        end
+      elseif byte < 32 then
+        return false
+      else
+        position = position + 1
+      end
+    end
+    return false
+  end
+
+  local parse_value
+  local function number_token()
+    local start = position
+    if text:sub(position, position) == "-" then position = position + 1 end
+    local first = text:sub(position, position)
+    if first == "0" then
+      position = position + 1
+      if text:sub(position, position):match("%d") then return false end
+    elseif first:match("[1-9]") then
+      repeat position = position + 1 until not text:sub(position, position):match("%d")
+    else
+      return false
+    end
+    if text:sub(position, position) == "." then
+      position = position + 1
+      if not text:sub(position, position):match("%d") then return false end
+      repeat position = position + 1 until not text:sub(position, position):match("%d")
+    end
+    local exponent = text:sub(position, position)
+    if exponent == "e" or exponent == "E" then
+      position = position + 1
+      local sign = text:sub(position, position)
+      if sign == "+" or sign == "-" then position = position + 1 end
+      if not text:sub(position, position):match("%d") then return false end
+      repeat position = position + 1 until not text:sub(position, position):match("%d")
+    end
+    return position > start
+  end
+
+  parse_value = function(depth)
+    if depth > MAX_JSON_DEPTH then return false end
+    nodes = nodes + 1
+    if nodes > MAX_JSON_NODES then return false end
+    whitespace()
+    local current = text:sub(position, position)
+    if current == '"' then return string_token() end
+    if current == "{" then
+      position = position + 1
+      whitespace()
+      if text:sub(position, position) == "}" then position = position + 1; return true end
+      local keys = {}
+      while true do
+        whitespace()
+        local key_start = position
+        if not string_token() then return false end
+        local key = text:sub(key_start + 1, position - 2)
+        if keys[key] then return false end
+        keys[key] = true
+        whitespace()
+        if text:sub(position, position) ~= ":" then return false end
+        position = position + 1
+        if not parse_value(depth + 1) then return false end
+        whitespace()
+        local delimiter = text:sub(position, position)
+        if delimiter == "}" then position = position + 1; return true end
+        if delimiter ~= "," then return false end
+        position = position + 1
+      end
+    end
+    if current == "[" then
+      position = position + 1
+      whitespace()
+      if text:sub(position, position) == "]" then position = position + 1; return true end
+      while true do
+        if not parse_value(depth + 1) then return false end
+        whitespace()
+        local delimiter = text:sub(position, position)
+        if delimiter == "]" then position = position + 1; return true end
+        if delimiter ~= "," then return false end
+        position = position + 1
+      end
+    end
+    for _, literal in ipairs({ "true", "false" }) do
+      if text:sub(position, position + #literal - 1) == literal then
+        position = position + #literal
+        return true
+      end
+    end
+    -- JSON null is not admissible in any rationale field. Reject it here
+    -- before a lossy decoder can collapse it into a missing Lua value.
+    if text:sub(position, position + 3) == "null" then return false end
+    return number_token()
+  end
+
+  if not parse_value(0) then return false end
+  whitespace()
+  return position > #text
+end
+
+local function validate_tagged_map(value)
+  if not is_plain_table(value) then return false end
+  local count = 0
+  local aggregate_bytes = 2
+  for key, item in pairs(value) do
+    count = count + 1
+    if count > MAX_TAGGED_FIELDS then return false end
+    if type(key) ~= "string"
+      or #key > 64 or not TAGGED_FIELDS[key] then
+      return false
+    end
+    aggregate_bytes = aggregate_bytes + #key + 6
+    if key == "evidence" or key == "rejected_alternatives" then
+      if item == nil then return false end
+      local list = bounded_list(item)
+      if not list then return false end
+      for _, entry in ipairs(list) do aggregate_bytes = aggregate_bytes + #entry + 4 end
+    elseif key == "schema" then
+      if item ~= Rationale.SCHEMA then return false end
+      aggregate_bytes = aggregate_bytes + #item
+    elseif key == "source" then
+      if item ~= "provider" and item ~= "legacy" and item ~= "fallback" then return false end
+      aggregate_bytes = aggregate_bytes + #item
+    elseif key == "task_id" or key == "session_id" then
+      local limit = key == "task_id" and MAX_TASK_ID_BYTES or MAX_SESSION_ID_BYTES
+      if item ~= nil then
+        if not bounded_string(item, limit) then return false end
+        aggregate_bytes = aggregate_bytes + #item
+      end
+    else
+      if item == nil or not bounded_string(item, MAX_FIELD_BYTES) then return false end
+      aggregate_bytes = aggregate_bytes + #item
+    end
+    if aggregate_bytes > MAX_LEGACY_AGGREGATE_BYTES then
+      return false
+    end
+  end
+  return true
+end
+
 --- Normalize an explicitly structured rationale object.
 -- @param value table Provider-supplied structured object
 -- @param opts table? { task_id = string?, session_id = string? }
@@ -195,9 +386,11 @@ function Rationale.from_response(response, json, opts)
   if candidate == nil and type(response) == "table" then
     local thinking = response.thinking_content or response.reasoning_content
     if type(thinking) == "string" and #thinking > 0 and json and type(json.decode) == "function" then
-      local ok, decoded = pcall(json.decode, thinking)
-      if ok then
-        candidate = decoded
+      if strict_json_document(thinking) then
+        local ok, decoded = pcall(json.decode, thinking)
+        if ok and type(decoded) == "table" then
+          candidate = decoded
+        end
       end
     end
   end
@@ -409,6 +602,9 @@ function Rationale.for_persistence(value)
     return legacy_fallback()
   end
   if value.schema == Rationale.SCHEMA then
+    if not validate_tagged_map(value) then
+      return legacy_fallback()
+    end
     local candidate = {}
     for _, field in ipairs({
       "schema", "decision", "evidence", "uncertainty", "risk",
