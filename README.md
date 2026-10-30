@@ -77,6 +77,28 @@ tool-output content are not lifecycle or `bittyd` records. The local
 `wheel-session` daemon remains a subordinate development/transport prototype;
 final session hosting and attach/detach authority belong to `bittyd`.
 
+File-backed registries require an absolute path under an existing private,
+same-user directory. Symlinked path components, non-regular files, hard links,
+foreign ownership, and weak file permissions are refused. Writers use the
+existing ownership-checked session lock (including validated dead-owner
+reclamation), compare exact revisions, stage a private file, and atomically
+rename it. A stale writer must explicitly reload before retrying. Failed
+publication leaves the previous in-memory state unchanged. Publication closes
+and checks the staged file but does not fsync files or directories: this is
+process-restart persistence, not a power-loss durability guarantee. Invalid
+registries fail closed and are quarantined without replacing another path.
+
+The registry retains at most 2,048 recent events and 512 session records. On
+session admission at capacity, the oldest terminal session and its related
+events are pruned together; live sessions, checkpoints, and recovery references
+are retained. This bounded recent history is not a permanent audit archive.
+Reasons and recovery labels use approved codes, not arbitrary prose. Role/model
+metadata is typed, bounded, allowlisted, and sanitized again on load. Missing
+creation-time metadata uses `coding` and `unconfigured` reference defaults;
+missing persisted metadata is invalid. Controller detach always pauses active
+work, observers cannot promote through activation or transfer, and an explicit
+transfer moves an existing attachment without changing its authority mode.
+
 ### Scope
 
 Wheel is the agent harness for the Bitty terminal, scoped to software
