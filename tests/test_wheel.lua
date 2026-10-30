@@ -5508,6 +5508,30 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   assert(escaped_thinking_key.source == "provider", "escaped allowlisted key must be interpreted after decoding")
   assert(escaped_thinking_key.decision == "Use decoded key")
 
+  local unicode_thinking = {
+    { json = '{"schema":"wheel-rationale/1","decision":"caf\\u00e9"}',
+      expected = "caf\195\169", label = "BMP escape" },
+    { json = '{"schema":"wheel-rationale/1","decision":"\\ud83d\\ude00"}',
+      expected = "\240\159\152\128", label = "surrogate-pair escape" },
+  }
+  for _, case in ipairs(unicode_thinking) do
+    local parsed = WheelProvider.parse_rationale({ thinking_content = case.json })
+    assert(parsed.source == "provider", case.label .. " rationale must be accepted")
+    assert(parsed.decision == case.expected, case.label .. " must decode to UTF-8")
+    local persisted = WheelProvider.Rationale.for_persistence(parsed)
+    assert(persisted.decision == case.expected, case.label .. " must survive rationale persistence")
+
+    local kernel = WheelKernel.new_mock()
+    local checkpoint = kernel:commit_checkpoint(parsed)
+    assert(kernel:get_checkpoint(checkpoint.hash).rationale.decision == case.expected,
+      case.label .. " must survive Kernel checkpoint persistence")
+
+    local context = WheelContext.new()
+    local context_checkpoint = context:commit_checkpoint({ rationale = parsed })
+    assert(context_checkpoint.rationale.decision == case.expected,
+      case.label .. " must survive Context checkpoint persistence")
+  end
+
   local rejected_thinking_json = {
     ["empty object"] = "{}",
     ["array"] = "[]",
