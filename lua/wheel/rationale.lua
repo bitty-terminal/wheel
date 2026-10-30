@@ -153,6 +153,11 @@ local function strict_json_document(text)
     end
   end
 
+  whitespace()
+  if text:sub(position, position) ~= "{" then
+    return false
+  end
+
   local function string_token()
     if text:sub(position, position) ~= '"' then return false end
     position = position + 1
@@ -388,8 +393,17 @@ function Rationale.from_response(response, json, opts)
     if type(thinking) == "string" and #thinking > 0 and json and type(json.decode) == "function" then
       if strict_json_document(thinking) then
         local ok, decoded = pcall(json.decode, thinking)
-        if ok and type(decoded) == "table" then
-          candidate = decoded
+        if ok and is_plain_table(decoded) and decoded.schema == Rationale.SCHEMA then
+          local has_rationale_field = false
+          for key in pairs(decoded) do
+            if key ~= "schema" then
+              has_rationale_field = true
+              break
+            end
+          end
+          if has_rationale_field then
+            candidate = decoded
+          end
         end
       end
     end

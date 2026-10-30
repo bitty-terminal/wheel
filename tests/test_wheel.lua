@@ -5497,6 +5497,27 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   assert(fallback.uncertainty == "Provider rationale unavailable")
   assert(fallback.next_action == "Continue task execution")
 
+  local valid_thinking = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"Use bounded output"}',
+  })
+  assert(valid_thinking.source == "provider", "versioned rationale object must be accepted")
+  assert(valid_thinking.decision == "Use bounded output")
+
+  local rejected_thinking_json = {
+    ["empty object"] = "{}",
+    ["array"] = "[]",
+    ["unversioned object"] = '{"decision":"unversioned"}',
+    ["schema-only object"] = '{"schema":"wheel-rationale/1"}',
+    ["wrong schema"] = '{"schema":"wheel-rationale/2","decision":"wrong"}',
+    ["string"] = '"not an object"',
+    ["number"] = "42",
+    ["boolean"] = "true",
+  }
+  for label, thinking_content in pairs(rejected_thinking_json) do
+    local rejected = WheelProvider.parse_rationale({ thinking_content = thinking_content })
+    assert(rejected.source == "fallback", label .. " provider thinking must use fallback")
+  end
+
   local malformed = WheelProvider.parse_rationale({
     thinking_content = '{"schema":"wheel-rationale/1","decision":{}}',
   })
