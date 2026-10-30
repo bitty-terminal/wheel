@@ -70,6 +70,18 @@ local WheelTool = load_submodule("tool")
 local WheelUI = load_submodule("ui")
 
 local WheelHost = load_submodule("host")
+local ok_lifecycle, WheelLifecycle = pcall(load_submodule, "lifecycle")
+if not ok_lifecycle then
+  local lifecycle_error = WheelLifecycle
+  local missing_root = type(lifecycle_error) == "string"
+    and lifecycle_error:find("cannot load submodule 'wheel.lifecycle'", 1, true)
+    and lifecycle_error:find("module 'wheel.lifecycle' not found", 1, true)
+  if missing_root then
+    WheelLifecycle = nil
+  else
+    error(lifecycle_error, 0)
+  end
+end
 
 local WheelTeam = {}
 WheelTeam.__index = WheelTeam
@@ -105,6 +117,10 @@ function WheelTeam.new(opts)
   })
 
   self.tool_registry = opts.tool_registry or (WheelTool and WheelTool.get_default_registry())
+  self.lifecycle = opts.lifecycle
+  if not self.lifecycle and WheelLifecycle then
+    self.lifecycle = WheelLifecycle.new(opts.lifecycle_options)
+  end
 
   return self
 end
@@ -155,9 +171,29 @@ function WheelTeam:spawn_agent(opts)
   opts.config = opts.config or self.config
   opts.context = opts.context or self.context
   opts.tool_registry = opts.tool_registry or self.tool_registry
+  opts.lifecycle = opts.lifecycle or self.lifecycle
   opts.workspace = opts.workspace or { root = self.workspace_root }
   local agent = WheelAgent.new(opts)
   return self:register_agent(agent)
+end
+
+--- Create a runtime AgentSession and Headless Panel for a registered agent.
+--- Lifecycle records contain references only; context and prompt data remain
+--- in the context engine and are not sent to the bittyd boundary.
+function WheelTeam:create_runtime_session(agent_name, opts)
+  local agent = self.agents[agent_name]
+  if not agent then
+    return nil, "agent not found: " .. tostring(agent_name)
+  end
+  return agent:create_runtime_session(opts)
+end
+
+function WheelTeam:runtime_sessions(agent_id)
+  return self.lifecycle:list_sessions(agent_id)
+end
+
+function WheelTeam:runtime_panels()
+  return self.lifecycle:list_panels()
 end
 
 --- Get a registered agent by name.
