@@ -341,7 +341,7 @@ end
 
 local function event_allowed(key)
   return key == "reason" or key == "recovery" or key == "checkpoint"
-    or key == "mode" or key == "observer_session_id" or key == "transfer"
+    or key == "mode" or key == "observer_session_id" or key == "controller_session_id" or key == "transfer"
 end
 local function event_extra(extra, loaded)
   local result = {}
@@ -349,7 +349,7 @@ local function event_extra(extra, loaded)
     if not event_allowed(key) then return nil, "event contains unknown metadata" end
     if key == "reason" or key == "recovery" then
       local clean, err = reason(value, key, loaded); if not clean then return nil, err end; result[key] = clean
-    elseif key == "checkpoint" or key == "observer_session_id" then
+    elseif key == "checkpoint" or key == "observer_session_id" or key == "controller_session_id" then
       local clean, err = id(value, key, true); if not clean then return nil, err end; result[key] = clean
     elseif key == "mode" then
       if value ~= Lifecycle.AttachMode.CONTROLLER and value ~= Lifecycle.AttachMode.OBSERVER then
@@ -486,14 +486,20 @@ local function registry_shape(value)
       event_id=true, type=true, timestamp_ms=true, session_id=true, panel_id=true,
       agent_id=true, task_id=true, from_state=true, to_state=true, reason=true,
       recovery=true, checkpoint=true, mode=true, observer_session_id=true, transfer=true,
+      controller_session_id=true,
     }) then return false, "event contains unknown fields" end
     local extras = {}
-    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "transfer" }) do
+    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "controller_session_id", "transfer" }) do
       if event[key] ~= nil then extras[key] = event[key] end
     end
     local clean, err = event_extra(extras, true); if not clean then return false, err end
     if not valid_event_transition(event) then return false, "event transition is illegal" end
     for key, item in pairs(clean) do event[key] = item end
+    if event.type == "panel.attached" and (event.mode ~= "controller" or not event.controller_session_id) then return false, "controller event mode or identity invalid" end
+    if event.type == "panel.observer_attached"
+      and (event.mode ~= "observer" or not event.observer_session_id) then return false, "observer event identity invalid" end
+    if event.type == "agent_session.checkpointed" and not event.checkpoint then return false, "checkpoint event value missing" end
+    if event.type == "agent_session.recovered" and not event.recovery then return false, "recovery event value missing" end
     if event.session_id ~= nil and not value.sessions[event.session_id] then return false, "event references unknown session" end
     if event.panel_id ~= nil and not value.panels[event.panel_id] then return false, "event references unknown panel" end
     if event.observer_session_id ~= nil and not value.sessions[event.observer_session_id] then return false, "event references unknown observer" end
@@ -501,6 +507,24 @@ local function registry_shape(value)
       return false, "session event lacks identity"
     end
     if event.type:match("^panel%.") and not event.panel_id then return false, "panel event lacks identity" end
+    if event.type == "panel.observer_attached" then
+      local observer = value.sessions[event.observer_session_id]
+      if not observer then
+        return false, "observer event/session identity mismatch"
+      end
+    end
+    if event.type == "panel.attached" and not value.sessions[event.controller_session_id] then
+      return false, "controller event/session identity mismatch"
+    end
+    if event.session_id then
+      local owner = value.sessions[event.session_id]
+      if event.agent_id and event.agent_id ~= owner.agent_id then return false, "event/session agent mismatch" end
+      if event.task_id ~= owner.task_id then return false, "event/session task mismatch" end
+    end
+    if event.controller_session_id then
+      local controller = value.sessions[event.controller_session_id]
+      if not controller then return false, "controller event/session identity mismatch" end
+    end
   end
   -- Relationship and uniqueness invariants are checked after all IDs exist.
   local controllers, observers = {}, {}
@@ -910,7 +934,7 @@ function Lifecycle:attach_session(session_id, panel_id, opts)
     else panel.attached_session_id = session_id end
     record.panel_id, record.attachment_mode, record.updated_at_ms = panel.panel_id, mode, now_ms(); local from = panel.state
     if panel.state == P.READY or panel.state == P.DETACHED then panel.state = P.ATTACHED end; panel.updated_at_ms = now_ms()
-    local kind = mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached"; new_event(state, kind, panel, from, panel.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, transfer=opts.transfer == true }, function(prefix) return self:_next_id(state, prefix) end); return copy(record)
+    local kind = mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached"; new_event(state, kind, panel, from, panel.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=opts.transfer == true }, function(prefix) return self:_next_id(state, prefix) end); return copy(record)
   end)
 end
 function Lifecycle:transfer_session(session_id, panel_id, opts)
@@ -945,19 +969,31 @@ function Lifecycle:transfer_session(session_id, panel_id, opts)
     local source_from = source.state
     reconcile_panel(source)
     source.updated_at_ms = now_ms()
-    new_event(state, "panel.detached", source, source_from, source.state, { reason="transfer", transfer=true }, function(prefix) return self:_next_id(state, prefix) end)
+    local source_record = {
+      panel_id = source.panel_id,
+      session_id = record.session_id,
+      agent_id = record.agent_id,
+      task_id = record.task_id,
+    }
+    local target_panel_id = target.panel_id
+    new_event(state, "panel.detached", {
+      panel_id = source_record.panel_id,
+      session_id = source_record.session_id,
+      agent_id = source_record.agent_id,
+      task_id = source_record.task_id,
+    }, source_from, source.state, { reason="transfer", transfer=true }, function(prefix) return self:_next_id(state, prefix) end)
     if mode == Lifecycle.AttachMode.OBSERVER then
       if not array_has(target.observer_session_ids, session_id) then target.observer_session_ids[#target.observer_session_ids + 1] = session_id end
     else
       target.attached_session_id = session_id
     end
-    record.panel_id, record.attachment_mode, record.updated_at_ms = target.panel_id, mode, now_ms()
+    record.panel_id, record.attachment_mode, record.updated_at_ms = target_panel_id, mode, now_ms()
     local target_from = target.state
     if record.state == S.ACTIVE and mode == Lifecycle.AttachMode.CONTROLLER then target.state = P.ACTIVE
     elseif target.state == P.CREATED or target.state == P.READY or target.state == P.DETACHED then target.state = P.ATTACHED end
     target.updated_at_ms = now_ms()
     new_event(state, mode == Lifecycle.AttachMode.OBSERVER and "panel.observer_attached" or "panel.attached",
-      target, target_from, target.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, transfer=true },
+      target, target_from, target.state, { mode=mode, observer_session_id=mode == "observer" and session_id or nil, controller_session_id=mode == "controller" and session_id or nil, transfer=true },
       function(prefix) return self:_next_id(state, prefix) end)
     return copy(record)
   end)

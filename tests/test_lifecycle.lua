@@ -37,6 +37,23 @@ if arg[1] == "writer" then
   if not value then assert(err.code == "E_LIFECYCLE_LIMIT"); os.exit(3) end
   os.exit(0)
 end
+if arg[1] == "writer-race" then
+  local path, barrier, name = arg[2], arg[3], arg[4]
+  local life = Lifecycle.new({ path = path })
+  assert(WheelHost.fs.create_private_file(barrier .. "/" .. name, "ready"))
+  local peer = name == "race-a" and "race-b" or "race-a"
+  local ready = false
+  for _ = 1, 20000 do
+    if WheelHost.fs.stat(barrier .. "/" .. peer).exists then ready = true; break end
+  end
+  if not ready then os.exit(5) end
+  local value, err = life:create_panel({ panel_id = name })
+  if not value then
+    assert(err.code == "E_LIFECYCLE_CONFLICT" or err.code == "E_LIFECYCLE_BUSY")
+    os.exit(4)
+  end
+  os.exit(0)
+end
 if arg[1] == "alternate-root" then
   for name in pairs(package.loaded) do
     if name:match("^wheel%.") or name:match("^lua%.wheel%.") then package.loaded[name] = nil end
@@ -261,6 +278,54 @@ local ok, err = pcall(function()
     end
   end)
 
+  run_test("Lifecycle: loaded events reject forged session and attachment identities", function()
+    local life = fixture()
+    assert(life:attach_session("s1", "p1"))
+    assert(life:attach_session("s2", "p1", { mode = "observer" }))
+    local good = life:_state(); good.version = 1
+    local mutations = {
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "agent_session.created" then event.agent_id = "forged-agent"; return end
+        end
+        error("session event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "agent_session.created" then event.task_id = "forged-task"; return end
+        end
+        error("session event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "agent_session.created" then event.panel_id = "absent"; return end
+        end
+        error("session event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.attached" then event.mode = "observer"; return end
+        end
+        error("controller event fixture missing")
+      end,
+      function(value)
+        for _, event in ipairs(value.events) do
+          if event.type == "panel.observer_attached" then event.observer_session_id = "unknown-observer"; return end
+        end
+        error("observer event fixture missing")
+      end,
+    }
+    local path = root .. "/invalid-events.json"
+    for index, change in ipairs(mutations) do
+      local value = Session.json_decode(Session.json_encode(good))
+      change(value)
+      assert(WheelHost.fs.create_private_file(path, Session.json_encode(value)))
+      local accepted, failure = pcall(Lifecycle.new, { path = path })
+      assert(not accepted and failure.code == "E_LIFECYCLE_INVALID", "invalid event " .. index)
+      assert(not WheelHost.fs.stat(path).exists)
+    end
+  end)
+
   run_test("Lifecycle: loaded sanitizers replace credentials before getters and save", function()
     local life = fixture()
     assert(life:activate_session("s1"))
@@ -303,6 +368,27 @@ local ok, err = pcall(function()
     local capped = WheelHost.proc.run_program(interpreter(), { script_path, "writer", path, "capped" })
     assert(capped.exit_code == 3)
     assert(not last:get_panel("capped"))
+  end)
+
+  run_test("Lifecycle: concurrent processes serialize one revision update", function()
+    local path, barrier = root .. "/race.json", root .. "/race-barrier"
+    assert(WheelHost.fs.mkdir(barrier))
+    assert(Lifecycle.new({ path = path }):create_panel({ panel_id = "base" }))
+    local command = table.concat({
+      shell_quote(interpreter()), shell_quote(script_path), "writer-race", shell_quote(path),
+      shell_quote(barrier), "race-a", "& a=$!;",
+      shell_quote(interpreter()), shell_quote(script_path), "writer-race", shell_quote(path),
+      shell_quote(barrier), "race-b", "& b=$!; wait \"$a\"; a_status=$?; wait \"$b\"; b_status=$?;",
+      "if [ \"$a_status\" -eq 0 ] && [ \"$b_status\" -eq 4 ]; then exit 0; fi;",
+      "if [ \"$b_status\" -eq 0 ] && [ \"$a_status\" -eq 4 ]; then exit 0; fi; exit 1",
+    }, " ")
+    local result = WheelHost.proc.run_program("bash", { "-c", command }, { cwd = "." })
+    assert(result.ok and result.exit_code == 0,
+      "race command failed " .. tostring(result.exit_code) .. ": " .. tostring(result.stderr))
+    local loaded = Lifecycle.new({ path = path })
+    assert(loaded:get_panel("base"))
+    assert((loaded:get_panel("race-a") ~= nil) ~= (loaded:get_panel("race-b") ~= nil))
+    assert(loaded.revision == 2)
   end)
 
   run_test("Lifecycle: commit exceptions release owned locks and preserve retry state", function()
