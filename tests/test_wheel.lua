@@ -5566,6 +5566,124 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
     thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID","evidence":[null]}',
   })
   assert(null_evidence.source == "fallback", "null list item must use fallback")
+
+  local linked_fallback_inputs = {
+    {
+      label = "malformed prose",
+      task_id = "TASK-LINK-PROSE",
+      session_id = "SESSION-LINK-PROSE",
+      response = { thinking_content = "private reasoning in prose" },
+    },
+    {
+      label = "malformed structured rationale",
+      task_id = "TASK-LINK-STRUCTURED",
+      session_id = "SESSION-LINK-STRUCTURED",
+      response = { rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        decision = "RETAINED_INVALID",
+        extra = "unknown field",
+      } },
+    },
+    {
+      label = "explicit fallback",
+      task_id = "TASK-LINK-FALLBACK",
+      session_id = "SESSION-LINK-FALLBACK",
+      rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        source = "fallback",
+        task_id = "TASK-LINK-FALLBACK",
+        session_id = "SESSION-LINK-FALLBACK",
+      },
+    },
+    {
+      label = "malformed tagged persistence input",
+      task_id = "TASK-LINK-MALFORMED",
+      session_id = "SESSION-LINK-MALFORMED",
+      rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        source = "provider",
+        decision = "RETAINED_INVALID",
+        task_id = "TASK-LINK-MALFORMED",
+        session_id = "SESSION-LINK-MALFORMED",
+        extra = "unknown field",
+      },
+    },
+  }
+  for _, case in ipairs(linked_fallback_inputs) do
+    local rationale = case.rationale or WheelProvider.parse_rationale(case.response, {
+      task_id = case.task_id,
+      session_id = case.session_id,
+    })
+    if case.rationale then
+      rationale.task_id = case.task_id
+      rationale.session_id = case.session_id
+    end
+    local task_id = rationale.task_id
+    local session_id = rationale.session_id
+    local direct = WheelProvider.Rationale.for_persistence(rationale)
+    assert(direct.source == "fallback", case.label .. " must persist as fallback")
+    assert(direct.task_id == task_id and direct.session_id == session_id,
+      case.label .. " IDs must survive direct rationale persistence")
+
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(rationale)
+    local kernel_record = kernel:get_checkpoint(kernel_cp.hash)
+    assert(kernel_record.rationale.task_id == task_id and kernel_record.rationale.session_id == session_id,
+      case.label .. " IDs must survive Kernel checkpoint persistence")
+
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = rationale })
+    assert(context_cp.rationale.task_id == task_id and context_cp.rationale.session_id == session_id,
+      case.label .. " IDs must survive Context checkpoint persistence")
+  end
+
+  local oversized_id = string.rep("T", WheelProvider.Rationale.MAX_TASK_ID_BYTES + 1)
+  local oversized_session = string.rep("S", WheelProvider.Rationale.MAX_SESSION_ID_BYTES + 1)
+  local rejected_ids = WheelProvider.Rationale.for_persistence({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  assert(rejected_ids.task_id == nil and rejected_ids.session_id == nil,
+    "oversized fallback IDs must be omitted rather than truncated or persisted")
+  local invalid_ids = WheelProvider.Rationale.for_persistence({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = {},
+    session_id = 42,
+  })
+  assert(invalid_ids.task_id == nil and invalid_ids.session_id == nil,
+    "non-string fallback IDs must be omitted")
+  local oversized_parsed = WheelProvider.parse_rationale({ thinking_content = "private prose" }, {
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  assert(oversized_parsed.task_id == oversized_id:sub(1, WheelProvider.Rationale.MAX_TASK_ID_BYTES)
+      and oversized_parsed.session_id == oversized_session:sub(1, WheelProvider.Rationale.MAX_SESSION_ID_BYTES),
+    "parser IDs must retain the established bounded truncation behavior")
+  local oversized_kernel = WheelKernel.new_mock()
+  local oversized_kernel_cp = oversized_kernel:commit_checkpoint({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  local oversized_kernel_record = oversized_kernel:get_checkpoint(oversized_kernel_cp.hash)
+  assert(oversized_kernel_record.rationale.task_id == nil
+      and oversized_kernel_record.rationale.session_id == nil,
+    "Kernel checkpoint must omit oversized rationale IDs")
+  local oversized_context = WheelContext.new()
+  local oversized_context_cp = oversized_context:commit_checkpoint({ rationale = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  } })
+  assert(oversized_context_cp.rationale.task_id == nil
+      and oversized_context_cp.rationale.session_id == nil,
+    "Context checkpoint must omit oversized rationale IDs")
+
   for _, private_text in ipairs({ "TRAILING_PRIVATE", "RETAINED_INVALID" }) do
     assert(trailing.decision:find(private_text, 1, true) == nil,
       "rejected thinking text must not enter static fallback")
