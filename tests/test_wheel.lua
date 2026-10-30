@@ -5462,6 +5462,47 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.usage.output_tokens == 20)
 end)
 
+run_test("WheelProvider: rationale is bounded, structured, and never replays thinking", function()
+  local long = string.rep("x", WheelProvider.Rationale.MAX_FIELD_BYTES + 80)
+  local response = {
+    content = "visible answer",
+    thinking_content = "private reasoning that must remain transient",
+    rationale = {
+      schema = WheelProvider.Rationale.SCHEMA,
+      decision = long,
+      evidence = { long, "second" },
+      uncertainty = long,
+      risk = long,
+      rejected_alternatives = { long },
+      next_action = long,
+    },
+  }
+  local rationale = WheelProvider.parse_rationale(response, {
+    task_id = "R-BOUND",
+    session_id = "S-BOUND",
+  })
+  assert(rationale.schema == WheelProvider.Rationale.SCHEMA)
+  assert(#rationale.decision == WheelProvider.Rationale.MAX_FIELD_BYTES)
+  assert(#rationale.evidence[1] == WheelProvider.Rationale.MAX_LIST_ITEM_BYTES)
+  assert(rationale.task_id == "R-BOUND" and rationale.session_id == "S-BOUND")
+  assert(rationale.decision:find("private", 1, true) == nil)
+  assert(rationale.thinking_content == nil, "rationale must not retain thinking content")
+
+  local fallback = WheelProvider.parse_rationale({
+    content = "answer",
+    thinking_content = "not-json private reasoning",
+  }, { task_id = "R-FALLBACK" })
+  assert(fallback.source == "fallback")
+  assert(fallback.task_id == "R-FALLBACK")
+  assert(fallback.uncertainty == "Provider rationale unavailable")
+  assert(fallback.next_action == "Continue task execution")
+
+  local malformed = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":{}}',
+  })
+  assert(malformed.source == "fallback", "malformed structured thinking must use fallback")
+end)
+
 run_test("WheelProvider: opt-in caller attribution is absent by default and strictly validated", function()
   local OpenAIAdapter = WheelProvider.OpenAIAdapter
   local REFERER_MAX = WheelProvider.ATTRIBUTION_REFERER_MAX
@@ -5970,6 +6011,15 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
       {
         content = "Verified test_core() implementation successfully. All tests passing.",
         thinking_content = "Verification confirmed. Preparing final delivery.",
+        rationale = {
+          schema = WheelProvider.Rationale.SCHEMA,
+          decision = "Deliver the verified implementation",
+          evidence = { "inspect_file completed", "verification confirmed" },
+          uncertainty = "No remaining uncertainty",
+          risk = "No known regression",
+          rejected_alternatives = { "Do not replay private thinking" },
+          next_action = "Request independent verification",
+        },
         tool_calls = {},
         finish_reason = "stop",
         usage = { prompt_tokens = 150, completion_tokens = 25, thinking_tokens = 10, total_tokens = 185 },
@@ -6015,6 +6065,18 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   local art_slot = context:get_slot("tasks/" .. task.id .. "/artifacts")
   assert(art_slot.found == true, "artifacts slot must be created in context")
   assert(string.find(art_slot.content, "Verified test_core()", 1, true) ~= nil)
+  local rationale_slot = context:get_slot("tasks/" .. task.id .. "/rationale")
+  assert(rationale_slot.found == true, "bounded rationale slot must be created in context")
+  assert(string.find(rationale_slot.content, "Deliver the verified implementation", 1, true) ~= nil)
+  assert(string.find(rationale_slot.content, "Verification confirmed. Preparing final delivery.", 1, true) == nil,
+    "private thinking must not reach the Context persistence sink")
+  for _, message in ipairs(mock.call_history[2].messages or {}) do
+    assert(string.find(message.content or "", "Verification confirmed. Preparing final delivery.", 1, true) == nil,
+      "private thinking must not be replayed into a later prompt")
+  end
+  local checkpoint = kernel:get_checkpoint(runner_res.checkpoints[#runner_res.checkpoints])
+  assert(checkpoint.rationale.task_id == task.id, "checkpoint rationale must link to the active task")
+  assert(checkpoint.rationale.decision == "Deliver the verified implementation")
 end)
 
 run_test("WheelRunner: action records retain non-spilled output byte counts", function()

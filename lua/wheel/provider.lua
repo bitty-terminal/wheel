@@ -15,6 +15,16 @@
 
 local WheelProvider = {}
 local WheelErrors = require("wheel.errors")
+local ok_rationale, Rationale = pcall(require, "wheel.rationale")
+if not ok_rationale then
+  local ok_rationale2, Rationale2 = pcall(require, "lua.wheel.rationale")
+  Rationale = ok_rationale2 and Rationale2 or nil
+end
+if not Rationale then
+  error("wheel.provider: cannot load bounded rationale schema", 0)
+end
+
+WheelProvider.Rationale = Rationale
 
 local ok_kernel, WheelKernel = pcall(require, "wheel.kernel")
 if not ok_kernel then
@@ -95,6 +105,16 @@ if not json then
 end
 
 WheelProvider.JSON = json
+
+--- Convert a provider response into a bounded rationale record.
+-- Provider thinking remains on the transient response object and is never
+-- copied into this record unless it is a complete, schema-valid JSON object.
+-- @param response table|nil
+-- @param opts table? { task_id = string?, session_id = string? }
+-- @return table bounded rationale
+function WheelProvider.parse_rationale(response, opts)
+  return Rationale.from_response(response, json, opts)
+end
 
 -- ---------------------------------------------------------------------------
 -- Completion Budget
