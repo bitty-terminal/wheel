@@ -567,7 +567,23 @@ local function sanitize_record(record, audit)
   return within_aggregate_bound(result) and result or nil
 end
 
-local function legacy_fallback()
+local function persistence_fallback(audit, task_id, session_id)
+  local result = copy_fallback("fallback", task_id, session_id)
+  if audit then
+    for _, field in ipairs({ "task_id", "session_id" }) do
+      if result[field] ~= nil then
+        local limit = field == "task_id" and MAX_TASK_ID_BYTES or MAX_SESSION_ID_BYTES
+        result[field] = redact_value(audit, result[field], limit)
+      end
+    end
+  else
+    result.task_id = nil
+    result.session_id = nil
+  end
+  result = Rationale.with_legacy_labels(result)
+  if within_aggregate_bound(result) then
+    return result
+  end
   return Rationale.with_legacy_labels(copy_fallback("fallback"))
 end
 
@@ -635,20 +651,22 @@ function Rationale.for_persistence(value)
     if type(value) == "string" then
       return "Provider rationale unavailable"
     end
-    return Rationale.with_legacy_labels(copy_fallback("fallback"))
+    return persistence_fallback(nil)
   end
   if type(value) == "string" then
     return redact_value(audit, value, MAX_FIELD_BYTES) or "Provider rationale unavailable"
   end
   if type(value) ~= "table" then
-    return Rationale.with_legacy_labels(copy_fallback("fallback"))
+    return persistence_fallback(audit)
   end
+  local task_id = bounded_string(value.task_id, MAX_TASK_ID_BYTES)
+  local session_id = bounded_string(value.session_id, MAX_SESSION_ID_BYTES)
   if value.source == "fallback" then
-    return legacy_fallback()
+    return persistence_fallback(audit, task_id, session_id)
   end
   if value.schema == Rationale.SCHEMA then
     if not validate_tagged_map(value) then
-      return legacy_fallback()
+      return persistence_fallback(audit, task_id, session_id)
     end
     local candidate = {}
     for _, field in ipairs({
@@ -668,9 +686,9 @@ function Rationale.for_persistence(value)
       session_id = value.session_id,
     })
     return (normalized and sanitize_record(normalized, audit))
-      or Rationale.with_legacy_labels(copy_fallback("fallback"))
+      or persistence_fallback(audit, task_id, session_id)
   end
-  return sanitize_legacy(value, audit) or legacy_fallback()
+  return sanitize_legacy(value, audit) or persistence_fallback(audit, task_id, session_id)
 end
 
 return Rationale
