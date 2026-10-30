@@ -533,9 +533,10 @@ function WheelAgent:execute_task(task_id, step_fn)
         preview = act.preview or act.stdout_preview or act.stdout or "",
         stdout_preview = act.stdout_preview or act.stdout or "",
         stderr_preview = act.stderr_preview or act.stderr or "",
-        size_bytes = act.size_bytes or (#(act.stdout or "") + #(act.stderr or "")),
-        stdout_bytes = act.stdout_bytes,
-        stderr_bytes = act.stderr_bytes,
+        size_bytes = act.size_bytes ~= nil and act.size_bytes
+          or (#(act.stdout or "") + #(act.stderr or "")),
+        stdout_bytes = act.stdout_bytes ~= nil and act.stdout_bytes or #(act.stdout or ""),
+        stderr_bytes = act.stderr_bytes ~= nil and act.stderr_bytes or #(act.stderr or ""),
         spilled = act.spilled,
         blob_hash = act.blob_hash or act.spillover_hash,
         spillover_bytes = act.spillover_bytes,

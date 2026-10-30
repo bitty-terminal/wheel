@@ -15,6 +15,21 @@ Action.MAX_INLINE_PREVIEW_BYTES = 256
 Action.MAX_DIAGNOSTICS_ITEMS = 32
 Action.MAX_DIAGNOSTIC_TEXT_BYTES = 256
 
+-- Bare source filenames are accepted only for extensions that are commonly
+-- emitted by compiler and test diagnostics.  A named allowlist prevents a
+-- dotted host, URL, or other arbitrary token from becoming a file location.
+local SOURCE_EXTENSIONS = {
+  bash = true, c = true, cc = true, cpp = true, cxx = true,
+  cs = true, dart = true, ex = true, exs = true, fish = true,
+  go = true, h = true, hh = true, hpp = true, hxx = true,
+  java = true, js = true, jsx = true, jl = true, json = true,
+  kt = true, kts = true, lhs = true, lua = true, m = true,
+  mm = true, pas = true, php = true, pl = true, pm = true,
+  py = true, pyw = true, r = true, rb = true, rs = true,
+  scala = true, sh = true, sql = true, swift = true, t = true,
+  ts = true, tsx = true, vb = true, zig = true,
+}
+
 local function text(value)
   return type(value) == "string" and value or ""
 end
@@ -50,6 +65,21 @@ local function redact_bounded(value, limit)
     return WheelAudit.redact_bounded(value, limit)
   end
   if text(value) == "" then return "" end
+  return "[redacted]"
+end
+
+local function redact_complete(value)
+  value = text(value)
+  if value == "" then return "" end
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    -- Pass the complete stream in one call so a secret's prefix cannot fall
+    -- outside the redaction window before head/tail slices are selected. The
+    -- audit helper folds newlines for single-line metadata, so preserve line
+    -- boundaries with a control separator while it scans the complete stream.
+    local separator = "\v"
+    local scan_value = value:gsub("\r\n", "\n"):gsub("[\r\n]", separator)
+    return WheelAudit.redact_bounded(scan_value, #scan_value):gsub(separator, "\n")
+  end
   return "[redacted]"
 end
 
@@ -93,21 +123,29 @@ local function classify_line(line)
 end
 
 local function location_from_line(line)
+  -- Do not let the location pattern discard a dotted host and its port,
+  -- leaving a URL/path suffix that looks like a source location.
+  if line:find("://", 1, true) ~= nil
+    or line:match("[%w%-]+%.[%w%.-]+:%d+/") ~= nil then
+    return nil
+  end
   local file, line_number, column = line:match("([%w%._/%-]+):(%d+):(%d+)")
   if not file then
     file, line_number = line:match("([%w%._/%-]+):(%d+)")
   end
+  if not file then
+    file = line:match("([%w%-]+%.[%w_]+)")
+  end
   local has_path_separator = file and file:find("/", 1, true) ~= nil
-  local bare_source_file = file and file:match("%.[%w_]+$")
-    and file:match("%.[cC][cC]?$") ~= nil
-  local bare_lua_or_rust = file and file:match("%.[lL][uU][aA]$") ~= nil
-    or file and file:match("%.[rR][sS]$") ~= nil
+  local extension = file and file:match("%.([%w_]+)$")
+  local bare_source_file = not has_path_separator and extension ~= nil
+    and SOURCE_EXTENSIONS[extension:lower()] == true
   local looks_like_hostname = file and file:match("^[%w%-]+%.[%w%-]+$") ~= nil
+    and not bare_source_file
   local hostname_path = file and file:match("^[%w%-]+%.[%w%.-]+/") ~= nil
-  if not file or (not has_path_separator and not bare_source_file and not bare_lua_or_rust)
+  if not file or (not has_path_separator and not bare_source_file)
     or (not has_path_separator and looks_like_hostname)
     or hostname_path
-    or line:find("://", 1, true) ~= nil
     or file:match("^https?$") or file:match("^localhost$")
     or file:match("^%d+$") then
     return nil
@@ -117,12 +155,15 @@ local function location_from_line(line)
     line = tonumber(line_number),
     column = column and tonumber(column) or nil,
     text = redact_bounded(line, Action.MAX_DIAGNOSTIC_TEXT_BYTES),
-  }, file .. ":" .. line_number
+  }, file .. (line_number and (":" .. line_number) or "")
 end
 
 local function looks_like_file(file)
-  return type(file) == "string"
-    and (file:find("/", 1, true) ~= nil or file:find("%.") ~= nil)
+  if type(file) ~= "string" then return false end
+  local has_path_separator = file:find("/", 1, true) ~= nil
+  local extension = file:match("%.([%w_]+)$")
+  return (has_path_separator or (extension and SOURCE_EXTENSIONS[extension:lower()] == true))
+    and not file:find("://", 1, true)
     and not file:match("^[%w%-]+%.[%w%.-]+/")
     and not file:match("^https?$")
     and not file:match("^localhost$")
@@ -244,6 +285,7 @@ end
 local function head_tail_preview(stdout, stderr, hash, total_bytes)
   local stream = stdout
   if stderr ~= "" then stream = stream .. (#stream > 0 and "\n" or "") .. "STDERR: " .. stderr end
+  stream = redact_complete(stream)
   if #stream <= Action.MAX_INLINE_PREVIEW_BYTES then
     return redact_bounded(stream, Action.MAX_INLINE_PREVIEW_BYTES)
   end

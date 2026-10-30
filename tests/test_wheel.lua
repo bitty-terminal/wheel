@@ -465,6 +465,8 @@ run_test("WheelAction: file locations reject URLs and dotted hosts", function()
     "note: server.example.com:8080",
     "error: example.com/path:42:9",
     "note: example.com/path:42",
+    "error: example.com:8080/path:42:9",
+    "error: foo.example.com:8080/main.lua:42:9",
     "src/main.lua:42:9: error: expected expression",
     "./src/main.lua:43:2: warning: unused value",
   }, "\n"), "", 1, false)
@@ -473,6 +475,42 @@ run_test("WheelAction: file locations reject URLs and dotted hosts", function()
   assert(diagnostics.locations[1].line == 42)
   assert(diagnostics.locations[2].file == "./src/main.lua")
   assert(diagnostics.locations[2].line == 43)
+end)
+
+run_test("WheelAction: bare source filenames use the extension allowlist", function()
+  local diagnostics = WheelAction.extract_diagnostics(table.concat({
+    "main.py:12: error: invalid syntax",
+    "foo.cpp:3:5: error: expected ';'",
+    "app.js:10: warning: unused value",
+    "Main.java:5: error: cannot find symbol",
+    "lib.go:7: error: undefined name",
+    "foo.c: error: implicit declaration",
+    "example.com:12: error: not a file",
+    "example.com/path:42: error: not a file",
+    "https://example.com:8080/api:42: error: not a file",
+  }, "\n"), "", 1, false)
+  assert(#diagnostics.locations == 6)
+  assert(diagnostics.locations[1].file == "main.py" and diagnostics.locations[1].line == 12)
+  assert(diagnostics.locations[2].file == "foo.cpp" and diagnostics.locations[2].column == 5)
+  assert(diagnostics.locations[3].file == "app.js" and diagnostics.locations[3].line == 10)
+  assert(diagnostics.locations[4].file == "Main.java" and diagnostics.locations[4].line == 5)
+  assert(diagnostics.locations[5].file == "lib.go" and diagnostics.locations[5].line == 7)
+  assert(diagnostics.locations[6].file == "foo.c")
+end)
+
+run_test("WheelAction: spill previews redact before selecting the tail", function()
+  local secret = "sk-tail-window-regression-8f3a1c"
+  local stdout = string.rep("ordinary output\n", 400)
+    .. "Bearer " .. secret .. string.rep("x", 60)
+  local record = WheelAction.normalize({
+    stdout = stdout,
+    exit_code = 0,
+  })
+  assert(record.spilled == true)
+  assert(not record.preview:find(secret, 1, true),
+    "a secret before the retained tail must not survive into the preview")
+  assert(not record.preview:find(secret:sub(-8), 1, true),
+    "a secret suffix in the retained tail must not survive into the preview")
 end)
 
 run_test("WheelAction: existing blob identity preserves authoritative content", function()
@@ -6005,6 +6043,79 @@ run_test("WheelRunner: action records retain non-spilled output byte counts", fu
   assert(result.success == true)
   assert(recorded.stdout_bytes == 4 and recorded.stderr_bytes == 2)
   assert(recorded.size_bytes == 6)
+end)
+
+run_test("WheelAgent: execute_task action records derive missing byte counts", function()
+  local recorded
+  local kernel = WheelKernel.new_mock()
+  local original_record = kernel.record_action
+  kernel.record_action = function(self, action)
+    recorded = action
+    return original_record(self, action)
+  end
+  local worker = WheelAgent.new({
+    name = "worker-byte-fallback",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+  })
+  local task = kernel:create_task({ id = "T-BYTE-FALLBACK", title = "byte fallback" })
+  local result = worker:execute_task(task.id, function()
+    return {
+      action = { tool = "read_file", stdout = "abcd", stderr = "efg" },
+      done = true,
+    }
+  end)
+  assert(result.success == true)
+  assert(recorded.stdout_bytes == 4 and recorded.stderr_bytes == 3)
+end)
+
+run_test("WheelRunner: synthetic failures preserve normalized stderr diagnostics", function()
+  local kernel = WheelKernel.new_mock()
+  local task = kernel:create_task({
+    id = "T-RUNNER-FALLBACK", title = "fallback", description = "exercise fallback", priority = 1,
+  })
+  local agent = {
+    name = "runner-fallback-error",
+    role = WheelAgent.Role.CODING,
+    kernel = kernel,
+    execute_tool = function()
+      error("secret-shaped failure: token=sk-runner-fallback-regression")
+    end,
+  }
+  local provider = WheelProvider.MockProvider.new({
+    responses = {
+      { tool_calls = {{ id = "fallback-1", name = "broken_tool", arguments = {} }} },
+      { content = "done", tool_calls = {} },
+    },
+  })
+  local result = WheelRunner.run_task(agent, task, {
+    provider = provider, max_turns = 2, commit_checkpoints = false,
+  })
+  assert(result.success == true)
+  local recent = kernel:recent_actions()
+  local recorded = recent[#recent]
+  assert(recorded.stderr_bytes > 0)
+  assert(recorded.stderr_preview:find("Tool execution failed", 1, true) ~= nil)
+  assert(recorded.raw_stderr == nil and recorded.raw_stdout == nil)
+end)
+
+run_test("WheelToolRegistry: action recording uses outcome previews", function()
+  local recorded
+  local secret = "sk-registry-preview-regression-4a7c2e"
+  local registry = WheelTool.Registry.new()
+  registry:register_tool({
+    name = "preview_recording",
+    execute = function()
+      return { success = true, stdout = "token=" .. secret, stderr = "raw stderr" }
+    end,
+  })
+  local result = registry:dispatch("preview_recording", {}, {
+    kernel = { record_action = function(_, action) recorded = action end },
+  })
+  assert(result.success == true)
+  assert(recorded.stdout_preview == result.stdout_preview)
+  assert(recorded.stderr_preview == result.stderr_preview)
+  assert(not recorded.stdout_preview:find(secret, 1, true))
 end)
 
 run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", function()

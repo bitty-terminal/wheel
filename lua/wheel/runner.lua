@@ -296,6 +296,10 @@ function WheelRunner.run_task(agent, task, opts)
             preview = outcome.preview,
             stdout_preview = outcome.stdout_preview,
             stderr_preview = outcome.stderr_preview,
+            -- These fields are transient input to Action.normalize.  The
+            -- normalized action retains only bounded, redacted previews.
+            raw_stdout = outcome.stdout,
+            raw_stderr = outcome.stderr,
             size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
             stdout_bytes = outcome.stdout_bytes,
             stderr_bytes = outcome.stderr_bytes,

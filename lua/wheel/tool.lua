@@ -175,26 +175,45 @@ local function safe_preview(value, limit)
   return "[redacted]"
 end
 
+local function redact_complete(value)
+  if type(value) ~= "string" or value == "" then return "" end
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    -- Pass the complete stream in one call so a secret's prefix cannot fall
+    -- outside the redaction window before head/tail slices are selected. The
+    -- audit helper folds newlines for single-line metadata, so preserve line
+    -- boundaries with a control separator while it scans the complete stream.
+    local separator = "\v"
+    local scan_value = value:gsub("\r\n", "\n"):gsub("[\r\n]", separator)
+    return WheelAudit.redact_bounded(scan_value, #scan_value):gsub(separator, "\n")
+  end
+  return "[redacted]"
+end
+
 local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
   local stream = stdout or ""
   if stderr and stderr ~= "" then
     stream = stream .. (#stream > 0 and "\n" or "") .. "STDERR: " .. stderr
   end
+  stream = redact_complete(stream)
   if #stream <= limit then
     return safe_preview(stream, limit)
   end
   local marker = string.format(
     "\n[... %d bytes spilled to blob: %s (use read_blob to inspect full content) ...]\n",
     total_bytes, hash)
-  local fragments = {}
-  for line in stream:gmatch("([^\r\n]*)\r?\n?") do
-    if line ~= "" then fragments[#fragments + 1] = line end
-  end
+  local fragments = split_content_lines(stream)
   local fragment_limit = 32
   local selected = {}
   if #fragments > 0 then selected[#selected + 1] = fragments[1] end
   if #fragments >= 10 then selected[#selected + 1] = fragments[10] end
   if #fragments > 1 then selected[#selected + 1] = fragments[#fragments] end
+  if #selected > 0 then
+    -- Reserve space for the complete redacted marker and keep all selected
+    -- fragments visible instead of truncating the preview in its middle.
+    local separators = #selected - 1
+    fragment_limit = math.floor((limit - #marker - separators) / #selected)
+    fragment_limit = math.max(1, math.min(fragment_limit, 32))
+  end
   local parts = {}
   for _, fragment in ipairs(selected) do
     parts[#parts + 1] = safe_preview(fragment, fragment_limit)
@@ -538,9 +557,16 @@ function WheelTool.process_spillover(raw, opts)
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
-    self.preview = supplied_or_derived_preview(
-      raw.preview, bounded_spill_preview(stdout, stderr, hash, total_bytes, preview_limit),
-      preview_limit)
+    local derived_preview = bounded_spill_preview(
+      stdout, stderr, hash, total_bytes, preview_limit)
+    if type(raw.preview) == "string" and raw.preview ~= "" then
+      self.preview = supplied_or_derived_preview(raw.preview, derived_preview, preview_limit)
+    else
+      -- The derived spill preview has already been completely redacted and
+      -- budgeted.  Do not run it through a prefix-only bound a second time,
+      -- which would discard the selected middle and tail fragments.
+      self.preview = derived_preview
+    end
   else
     self.spilled = false
     self.spillover_hash = nil
@@ -1264,8 +1290,12 @@ function WheelToolRegistry:dispatch(name, args, env)
         tool = outcome.tool,
         intent = outcome.intent,
         preview = outcome.preview,
-        stdout_preview = outcome.stdout and outcome.stdout:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
-        stderr_preview = outcome.stderr and outcome.stderr:sub(1, WheelAction.MAX_INLINE_PREVIEW_BYTES) or "",
+        stdout_preview = outcome.stdout_preview or "",
+        stderr_preview = outcome.stderr_preview or "",
+        -- Raw output is transient input to Action.normalize only; recent
+        -- records retain the bounded/redacted preview fields above.
+        raw_stdout = outcome.stdout,
+        raw_stderr = outcome.stderr,
         size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
         stdout_bytes = outcome.stdout_bytes,
         stderr_bytes = outcome.stderr_bytes,

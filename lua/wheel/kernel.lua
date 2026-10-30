@@ -584,13 +584,22 @@ local function create_mock_dispatcher()
           end
         end)
       else
+        local preview = payload.preview or payload.stdout_preview or payload.stderr_preview or ""
+        local raw_stdout = type(payload.raw_stdout) == "string" and payload.raw_stdout or ""
+        local raw_stderr = type(payload.raw_stderr) == "string" and payload.raw_stderr or ""
         action = {
           action_id = payload.action_id,
           success = payload.success ~= false,
           exit_code = payload.exit_code or 0,
           duration_ms = payload.duration_ms or 0,
-          preview = (payload.raw_stdout or ""):sub(1, 256),
-          size_bytes = #(payload.raw_stdout or "") + #(payload.raw_stderr or ""),
+          preview = preview:sub(1, 256),
+          stdout_preview = (payload.stdout_preview or ""):sub(1, 256),
+          stderr_preview = (payload.stderr_preview or ""):sub(1, 256),
+          size_bytes = payload.size_bytes
+            or (tonumber(payload.stdout_bytes) or #raw_stdout)
+              + (tonumber(payload.stderr_bytes) or #raw_stderr),
+          stdout_bytes = tonumber(payload.stdout_bytes) or #raw_stdout,
+          stderr_bytes = tonumber(payload.stderr_bytes) or #raw_stderr,
         }
       end
       table.insert(state.recent_actions, action)
