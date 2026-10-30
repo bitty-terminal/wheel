@@ -8789,13 +8789,16 @@ end)
 local run_context_snapshot_tests = assert(loadfile("tests/test_context_snapshot.lua"))()
 run_context_snapshot_tests(run_test)
 
+-- CTX-0037: role-aware Context graph projections and structured semantic deltas.
+local run_context_projection_tests = assert(loadfile("tests/test_context_projection.lua"))()
+run_context_projection_tests(run_test)
+
 -- Remove only this run's root; any caller-owned WHEEL_TEST_TMP base remains.
 cleanup_test_run_root()
 
 print("\n==========================================")
 print("  All Wheel tests PASSED successfully! 🚀 ")
 print("==========================================")
-
 
 
 
