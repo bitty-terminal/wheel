@@ -207,6 +207,14 @@ local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
   return preview
 end
 
+local function supplied_or_derived_preview(supplied, derived, limit)
+  if type(supplied) == "string" then
+    local safe = safe_preview(supplied, limit)
+    if safe ~= "" then return safe end
+  end
+  return safe_preview(derived, limit)
+end
+
 -- ---------------------------------------------------------------------------
 -- Path Sandboxing & Canonicalization
 -- ---------------------------------------------------------------------------
@@ -400,14 +408,12 @@ function ActionOutcome:format_observation()
     flags)
   table.insert(lines, header)
 
-  if self.preview and #self.preview > 0 then
-    table.insert(lines, self.preview)
-  elseif self.stdout and #self.stdout > 0 then
-    table.insert(lines, self.stdout)
-  end
-
-  if self.stderr and #self.stderr > 0 and not self.spilled then
-    table.insert(lines, "STDERR: " .. self.stderr)
+  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
+  local safe = safe_preview(self.preview, preview_limit)
+  if safe ~= "" then
+    table.insert(lines, safe)
+  else
+    table.insert(lines, "[no output]")
   end
 
   return table.concat(lines, "\n")
@@ -489,7 +495,8 @@ function WheelTool.process_spillover(raw, opts)
       self.spilled = false
       self.spillover_hash = nil
       self.spillover_bytes = 0
-      self.preview = safe_preview(raw.preview or raw.stdout_preview or stdout, preview_limit)
+      self.preview = supplied_or_derived_preview(
+        raw.preview, raw.stdout_preview or stdout, preview_limit)
       return self
     end
 
@@ -531,8 +538,9 @@ function WheelTool.process_spillover(raw, opts)
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
-    self.preview = raw.preview and safe_preview(raw.preview, preview_limit)
-      or bounded_spill_preview(stdout, stderr, hash, total_bytes, preview_limit)
+    self.preview = supplied_or_derived_preview(
+      raw.preview, bounded_spill_preview(stdout, stderr, hash, total_bytes, preview_limit),
+      preview_limit)
   else
     self.spilled = false
     self.spillover_hash = nil
@@ -541,7 +549,7 @@ function WheelTool.process_spillover(raw, opts)
     if #stderr > 0 then
       p = p .. (#p > 0 and "\n" or "") .. "STDERR: " .. stderr
     end
-    self.preview = safe_preview(raw.preview or p, preview_limit)
+    self.preview = supplied_or_derived_preview(raw.preview, p, preview_limit)
   end
 
   return self

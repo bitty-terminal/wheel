@@ -418,11 +418,53 @@ run_test("WheelTool: every supplied preview is bounded and redacted", function()
   assert(not fallback:format_observation():find(secret, 1, true))
 end)
 
+run_test("WheelTool: empty supplied previews never expose raw output", function()
+  local non_spilled_output = string.rep("non-spilled-output\n", 40)
+  local non_spilled = WheelTool.process_spillover({
+    stdout = non_spilled_output,
+    preview = "",
+    success = true,
+  })
+  local non_spilled_observation = non_spilled:format_observation()
+  assert(#non_spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#non_spilled_observation < #non_spilled_output)
+  assert(not non_spilled_observation:find(non_spilled_output, 1, true))
+  assert(non_spilled_observation:find("non-spilled-output", 1, true) ~= nil)
+
+  local spilled_output = string.rep("spilled-output\n", 500)
+  local spilled = WheelTool.process_spillover({
+    stdout = spilled_output,
+    preview = "",
+    success = true,
+  })
+  local spilled_observation = spilled:format_observation()
+  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#spilled_observation < #spilled_output)
+  assert(not spilled_observation:find(spilled_output, 1, true))
+  assert(spilled_observation:find("spilled-output", 1, true) ~= nil)
+
+  local original_hash = WheelTool.compute_hash
+  WheelTool.compute_hash = function() return nil end
+  local fallback = WheelTool.process_spillover({
+    stdout = spilled_output,
+    preview = "",
+    success = true,
+  })
+  WheelTool.compute_hash = original_hash
+  local fallback_observation = fallback:format_observation()
+  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#fallback_observation < #spilled_output)
+  assert(not fallback_observation:find(spilled_output, 1, true))
+  assert(fallback_observation:find("spilled-output", 1, true) ~= nil)
+end)
+
 run_test("WheelAction: file locations reject URLs and dotted hosts", function()
   local diagnostics = WheelAction.extract_diagnostics(table.concat({
     "error: example.com:8080",
     "error: https://example.com:8080/api",
     "note: server.example.com:8080",
+    "error: example.com/path:42:9",
+    "note: example.com/path:42",
     "src/main.lua:42:9: error: expected expression",
     "./src/main.lua:43:2: warning: unused value",
   }, "\n"), "", 1, false)

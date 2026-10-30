@@ -103,8 +103,10 @@ local function location_from_line(line)
   local bare_lua_or_rust = file and file:match("%.[lL][uU][aA]$") ~= nil
     or file and file:match("%.[rR][sS]$") ~= nil
   local looks_like_hostname = file and file:match("^[%w%-]+%.[%w%-]+$") ~= nil
+  local hostname_path = file and file:match("^[%w%-]+%.[%w%.-]+/") ~= nil
   if not file or (not has_path_separator and not bare_source_file and not bare_lua_or_rust)
     or (not has_path_separator and looks_like_hostname)
+    or hostname_path
     or line:find("://", 1, true) ~= nil
     or file:match("^https?$") or file:match("^localhost$")
     or file:match("^%d+$") then
@@ -121,6 +123,7 @@ end
 local function looks_like_file(file)
   return type(file) == "string"
     and (file:find("/", 1, true) ~= nil or file:find("%.") ~= nil)
+    and not file:match("^[%w%-]+%.[%w%.-]+/")
     and not file:match("^https?$")
     and not file:match("^localhost$")
     and not file:match("^%d+$")
