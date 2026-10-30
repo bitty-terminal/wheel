@@ -12,6 +12,8 @@ local MAX_LIST_ITEMS = 4
 local MAX_LIST_ITEM_BYTES = 256
 local MAX_TASK_ID_BYTES = 128
 local MAX_SESSION_ID_BYTES = 128
+local MAX_LEGACY_FIELDS = 8
+local MAX_LEGACY_AGGREGATE_BYTES = 2048
 
 Rationale.SCHEMA = "wheel-rationale/1"
 Rationale.MAX_FIELD_BYTES = MAX_FIELD_BYTES
@@ -19,6 +21,8 @@ Rationale.MAX_LIST_ITEMS = MAX_LIST_ITEMS
 Rationale.MAX_LIST_ITEM_BYTES = MAX_LIST_ITEM_BYTES
 Rationale.MAX_TASK_ID_BYTES = MAX_TASK_ID_BYTES
 Rationale.MAX_SESSION_ID_BYTES = MAX_SESSION_ID_BYTES
+Rationale.MAX_LEGACY_FIELDS = MAX_LEGACY_FIELDS
+Rationale.MAX_LEGACY_AGGREGATE_BYTES = MAX_LEGACY_AGGREGATE_BYTES
 
 local FIELDS = {
   decision = true,
@@ -27,6 +31,17 @@ local FIELDS = {
   risk = true,
   rejected_alternatives = true,
   next_action = true,
+}
+
+local LEGACY_FIELDS = {
+  why = true,
+  what = true,
+  where_focus = true,
+  how = true,
+  expected = true,
+  observed = true,
+  goal = true,
+  approach = true,
 }
 
 local FALLBACK = {
@@ -233,6 +248,52 @@ local function redact_value(audit, value, limit)
   return redacted
 end
 
+local function within_aggregate_bound(record)
+  local bytes = 2
+  local fields = 0
+  local function string_size(value)
+    local size = #value + 2
+    for index = 1, #value do
+      local byte = value:byte(index)
+      if byte == 34 or byte == 92 then
+        size = size + 1
+      elseif byte < 32 then
+        size = size + 5
+      end
+    end
+    return size
+  end
+  for key, value in pairs(record) do
+    if type(key) ~= "string" then
+      return false
+    end
+    fields = fields + 1
+    bytes = bytes + string_size(key) + 1
+    if type(value) == "string" then
+      bytes = bytes + string_size(value)
+    elseif type(value) == "table" then
+      bytes = bytes + 2
+      for index, item in ipairs(value) do
+        if index > MAX_LIST_ITEMS or type(item) ~= "string" then
+          return false
+        end
+        if index > 1 then bytes = bytes + 1 end
+        bytes = bytes + string_size(item)
+      end
+    else
+      return false
+    end
+    if fields > 32 then
+      return false
+    end
+    if fields > 1 then bytes = bytes + 1 end
+    if bytes > MAX_LEGACY_AGGREGATE_BYTES then
+      return false
+    end
+  end
+  return true
+end
+
 local function sanitize_record(record, audit)
   local result = {
     schema = Rationale.SCHEMA,
@@ -264,34 +325,64 @@ local function sanitize_record(record, audit)
       end
     end
   end
-  return Rationale.with_legacy_labels(result)
+  result = Rationale.with_legacy_labels(result)
+  return within_aggregate_bound(result) and result or nil
 end
 
-local function sanitize_legacy(value, audit, depth)
-  if depth > 4 then
+local function legacy_fallback()
+  return Rationale.with_legacy_labels(copy_fallback("fallback"))
+end
+
+local function sanitize_legacy(value, audit)
+  if not is_plain_table(value) then
     return nil
   end
-  if type(value) == "string" then
-    return redact_value(audit, value, MAX_FIELD_BYTES)
-  end
-  if type(value) ~= "table" then
-    if type(value) == "number" or type(value) == "boolean" then
-      return value
-    end
-    return nil
-  end
-  local result = {}
+
+  local field_count = 0
+  local fields = {}
   for key, item in pairs(value) do
-    if type(key) ~= "string" and type(key) ~= "number" then
+    field_count = field_count + 1
+    if field_count > MAX_LEGACY_FIELDS
+      or type(key) ~= "string"
+      or not LEGACY_FIELDS[key]
+      or type(item) ~= "string"
+      or #item == 0
+      or #item > MAX_FIELD_BYTES then
       return nil
     end
-    local safe = sanitize_legacy(item, audit, depth + 1)
-    if safe == nil and item ~= nil then
+    fields[key] = redact_value(audit, item, MAX_FIELD_BYTES)
+    if not fields[key] then
       return nil
     end
-    result[key] = safe
   end
-  return result
+
+  local aggregate_bytes = 2
+  for key, item in pairs(fields) do
+    -- This is a conservative JSON-size bound: it includes both quoted key
+    -- and value bytes plus separators. Unknown keys never reach this point.
+    aggregate_bytes = aggregate_bytes + #key + #item + 6
+    if aggregate_bytes > MAX_LEGACY_AGGREGATE_BYTES then
+      return nil
+    end
+  end
+
+  local decision = fields.why or fields.goal or FALLBACK.decision
+  local next_action = fields.what or fields.approach or FALLBACK.next_action
+  local result = {
+    schema = Rationale.SCHEMA,
+    source = "legacy",
+    decision = decision,
+    evidence = fields.observed and { fields.observed } or {},
+    uncertainty = fields.expected or FALLBACK.uncertainty,
+    risk = FALLBACK.risk,
+    rejected_alternatives = {},
+    next_action = next_action,
+  }
+  for key, item in pairs(fields) do
+    result[key] = item
+  end
+  result = Rationale.with_legacy_labels(result)
+  return within_aggregate_bound(result) and result or nil
 end
 
 --- Prepare rationale for a durable checkpoint or Context sink.
@@ -314,6 +405,9 @@ function Rationale.for_persistence(value)
   if type(value) ~= "table" then
     return Rationale.with_legacy_labels(copy_fallback("fallback"))
   end
+  if value.source == "fallback" then
+    return legacy_fallback()
+  end
   if value.schema == Rationale.SCHEMA then
     local candidate = {}
     for _, field in ipairs({
@@ -335,8 +429,7 @@ function Rationale.for_persistence(value)
     return (normalized and sanitize_record(normalized, audit))
       or Rationale.with_legacy_labels(copy_fallback("fallback"))
   end
-  local legacy = sanitize_legacy(value, audit, 0)
-  return legacy and Rationale.with_legacy_labels(legacy)
+  return sanitize_legacy(value, audit) or legacy_fallback()
 end
 
 return Rationale

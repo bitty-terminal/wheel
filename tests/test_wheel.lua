@@ -5530,6 +5530,69 @@ run_test("WheelProvider: rationale is bounded, structured, and never replays thi
   assert(persisted_json:find("[redacted", 1, true) ~= nil, "redacted rationale must contain a marker")
   assert(persisted.why == persisted.decision and persisted.what == persisted.next_action,
     "persisted rationale must retain legacy labels")
+
+  local legacy = WheelProvider.Rationale.for_persistence({
+    why = "Legacy decision",
+    what = "Legacy next action",
+    where_focus = "task LEGACY-1",
+    how = "deterministic adapter",
+    expected = "bounded record",
+    observed = "legacy consumer",
+  })
+  assert(legacy.decision == "Legacy decision")
+  assert(legacy.next_action == "Legacy next action")
+  assert(legacy.why == legacy.decision and legacy.what == legacy.next_action,
+    "allowlisted legacy rationale fields must map to the canonical schema")
+
+  local huge_map = {}
+  for index = 1, WheelProvider.Rationale.MAX_LEGACY_FIELDS + 1 do
+    huge_map["field_" .. tostring(index)] = "value"
+  end
+  local huge_map_result = WheelProvider.Rationale.for_persistence(huge_map)
+  assert(huge_map_result.source == "fallback", "legacy key-count overflow must use fallback")
+
+  local token_key = {}
+  token_key["Bearer sk-legacy-key-leak-0001"] = "value"
+  local token_key_result = WheelProvider.Rationale.for_persistence(token_key)
+  local token_key_json = WheelProvider.JSON.encode(token_key_result)
+  assert(token_key_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+    "legacy keys must never reach persistence")
+  assert(token_key_result.source == "fallback", "unknown token-shaped key must use fallback")
+
+  local nested_result = WheelProvider.Rationale.for_persistence({
+    why = { nested = string.rep("n", 1024) },
+  })
+  assert(nested_result.source == "fallback", "nested legacy values must use fallback")
+  assert(#WheelProvider.JSON.encode(nested_result) <= WheelProvider.Rationale.MAX_LEGACY_AGGREGATE_BYTES,
+    "legacy fallback must remain within the aggregate bound")
+
+  local huge_sink_map = {}
+  for index = 1, 5000 do
+    huge_sink_map["legacy_" .. tostring(index)] = string.rep("v", WheelProvider.Rationale.MAX_FIELD_BYTES)
+  end
+  huge_sink_map["Bearer sk-legacy-key-leak-0001"] = "value"
+  local huge_nested_value = {
+    why = { nested = string.rep("n", WheelProvider.Rationale.MAX_LEGACY_AGGREGATE_BYTES * 4) },
+  }
+
+  local invalid_legacy_inputs = { token_key, huge_sink_map, huge_nested_value }
+  for _, invalid_input in ipairs(invalid_legacy_inputs) do
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(invalid_input)
+    local kernel_json = WheelProvider.JSON.encode(kernel:get_checkpoint(kernel_cp.hash))
+    assert(kernel_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+      "kernel checkpoint sink must discard token-shaped legacy keys")
+    assert(kernel:get_checkpoint(kernel_cp.hash).rationale.source == "fallback",
+      "kernel checkpoint sink must reject unbounded or non-canonical legacy rationale")
+
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = invalid_input })
+    local context_json = WheelProvider.JSON.encode(context_cp)
+    assert(context_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+      "Context checkpoint sink must discard token-shaped legacy keys")
+    assert(context_cp.rationale.source == "fallback",
+      "Context checkpoint sink must reject unbounded or non-canonical legacy rationale")
+  end
 end)
 
 run_test("WheelProvider: opt-in caller attribution is absent by default and strictly validated", function()
