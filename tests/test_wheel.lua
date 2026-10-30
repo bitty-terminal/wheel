@@ -382,6 +382,57 @@ run_test("WheelTool: non-spilled outcomes carry exact byte counts", function()
   assert(serialized.size_bytes == 8)
 end)
 
+run_test("WheelTool: every supplied preview is bounded and redacted", function()
+  local secret = "sk-preview-review-secret-7c3d9e"
+  local raw_preview = "Bearer " .. secret .. string.rep("x", 512)
+  local large_output = string.rep("output\n", 900)
+
+  local spilled = WheelTool.process_spillover({
+    stdout = large_output,
+    preview = raw_preview,
+    success = true,
+  })
+  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not spilled.preview:find(secret, 1, true))
+  assert(not spilled:format_observation():find(secret, 1, true))
+
+  local small = WheelTool.process_spillover({
+    stdout = "ok",
+    preview = raw_preview,
+    success = true,
+  })
+  assert(#small.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not small.preview:find(secret, 1, true))
+  assert(not small:format_observation():find(secret, 1, true))
+
+  local original_hash = WheelTool.compute_hash
+  WheelTool.compute_hash = function() return nil end
+  local fallback = WheelTool.process_spillover({
+    stdout = large_output,
+    preview = raw_preview,
+    success = true,
+  })
+  WheelTool.compute_hash = original_hash
+  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(not fallback.preview:find(secret, 1, true))
+  assert(not fallback:format_observation():find(secret, 1, true))
+end)
+
+run_test("WheelAction: file locations reject URLs and dotted hosts", function()
+  local diagnostics = WheelAction.extract_diagnostics(table.concat({
+    "error: example.com:8080",
+    "error: https://example.com:8080/api",
+    "note: server.example.com:8080",
+    "src/main.lua:42:9: error: expected expression",
+    "./src/main.lua:43:2: warning: unused value",
+  }, "\n"), "", 1, false)
+  assert(#diagnostics.locations == 2)
+  assert(diagnostics.locations[1].file == "src/main.lua")
+  assert(diagnostics.locations[1].line == 42)
+  assert(diagnostics.locations[2].file == "./src/main.lua")
+  assert(diagnostics.locations[2].line == 43)
+end)
+
 run_test("WheelAction: existing blob identity preserves authoritative content", function()
   local payload = string.rep("blob-content\n", 500)
   local hash = WheelTool.compute_hash(payload)

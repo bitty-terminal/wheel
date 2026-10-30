@@ -171,7 +171,40 @@ local function safe_preview(value, limit)
     return WheelAudit.redact_bounded(value, limit)
   end
   if type(value) ~= "string" then return "" end
-  return value:sub(1, limit)
+  if value == "" then return "" end
+  return "[redacted]"
+end
+
+local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
+  local stream = stdout or ""
+  if stderr and stderr ~= "" then
+    stream = stream .. (#stream > 0 and "\n" or "") .. "STDERR: " .. stderr
+  end
+  if #stream <= limit then
+    return safe_preview(stream, limit)
+  end
+  local marker = string.format(
+    "\n[... %d bytes spilled to blob: %s (use read_blob to inspect full content) ...]\n",
+    total_bytes, hash)
+  local fragments = {}
+  for line in stream:gmatch("([^\r\n]*)\r?\n?") do
+    if line ~= "" then fragments[#fragments + 1] = line end
+  end
+  local fragment_limit = 32
+  local selected = {}
+  if #fragments > 0 then selected[#selected + 1] = fragments[1] end
+  if #fragments >= 10 then selected[#selected + 1] = fragments[10] end
+  if #fragments > 1 then selected[#selected + 1] = fragments[#fragments] end
+  local parts = {}
+  for _, fragment in ipairs(selected) do
+    parts[#parts + 1] = safe_preview(fragment, fragment_limit)
+  end
+  parts[#parts + 1] = marker
+  local preview = table.concat(parts, "\n")
+  if #preview > limit then
+    return preview:sub(1, limit)
+  end
+  return preview
 end
 
 -- ---------------------------------------------------------------------------
@@ -456,7 +489,7 @@ function WheelTool.process_spillover(raw, opts)
       self.spilled = false
       self.spillover_hash = nil
       self.spillover_bytes = 0
-      self.preview = raw.preview or raw.stdout_preview or stdout:sub(1, preview_limit)
+      self.preview = safe_preview(raw.preview or raw.stdout_preview or stdout, preview_limit)
       return self
     end
 
@@ -498,7 +531,8 @@ function WheelTool.process_spillover(raw, opts)
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
-    self.preview = raw.preview or table.concat(preview_lines, "\n")
+    self.preview = raw.preview and safe_preview(raw.preview, preview_limit)
+      or bounded_spill_preview(stdout, stderr, hash, total_bytes, preview_limit)
   else
     self.spilled = false
     self.spillover_hash = nil
@@ -507,7 +541,7 @@ function WheelTool.process_spillover(raw, opts)
     if #stderr > 0 then
       p = p .. (#p > 0 and "\n" or "") .. "STDERR: " .. stderr
     end
-    self.preview = raw.preview or p
+    self.preview = safe_preview(raw.preview or p, preview_limit)
   end
 
   return self
