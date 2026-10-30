@@ -123,18 +123,22 @@ local function classify_line(line)
 end
 
 local function location_from_line(line)
-  -- Do not let the location pattern discard a dotted host and its port,
-  -- leaving a URL/path suffix that looks like a source location.
-  if line:find("://", 1, true) ~= nil
-    or line:match("[%w%-]+%.[%w%.-]+:%d+/") ~= nil then
-    return nil
+  -- Match only a complete location token at the start of the line or after
+  -- whitespace.  An unanchored search can restart after a host colon and
+  -- misread `example.com:8080/path:42:9` as `8080/path:42`.
+  local function match_token(pattern)
+    local file, line_number, column = line:match("^" .. pattern)
+    if file then return file, line_number, column end
+    return line:match("%s" .. pattern)
   end
-  local file, line_number, column = line:match("([%w%._/%-]+):(%d+):(%d+)")
+
+  local token = "([%w%._/%-]+):(%d+):(%d+)"
+  local file, line_number, column = match_token(token)
   if not file then
-    file, line_number = line:match("([%w%._/%-]+):(%d+)")
+    file, line_number = match_token("([%w%._/%-]+):(%d+)")
   end
   if not file then
-    file = line:match("([%w%-]+%.[%w_]+)")
+    file = match_token("([%w%-]+%.[%w_]+)")
   end
   local has_path_separator = file and file:find("/", 1, true) ~= nil
   local extension = file and file:match("%.([%w_]+)$")

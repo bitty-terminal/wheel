@@ -467,6 +467,8 @@ run_test("WheelAction: file locations reject URLs and dotted hosts", function()
     "note: example.com/path:42",
     "error: example.com:8080/path:42:9",
     "error: foo.example.com:8080/main.lua:42:9",
+    "error: example.com:8080/path:42",
+    "error: foo.example.com:8080/main.lua:42",
     "src/main.lua:42:9: error: expected expression",
     "./src/main.lua:43:2: warning: unused value",
   }, "\n"), "", 1, false)
