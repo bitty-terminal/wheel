@@ -211,6 +211,40 @@ return function(run_test)
     assert(commander_reason:find("lacks 'modify' capability", 1, true) ~= nil)
   end)
 
+  run_test("Agent identity: exported Capability mutations cannot grant unregistered mutation", function()
+    local agent = WheelAgent.new({
+      name = "capability-table-agent",
+      role = WheelAgent.Role.REVIEWER,
+      tools = { "unregistered_mutating_tool" },
+      kernel = WheelKernel.new_mock(),
+    })
+    local exported = WheelAgent.Capability
+    local original = {}
+    for name, value in pairs(exported) do
+      original[name] = value
+      exported[name] = "inspect"
+      local allowed, reason = agent:is_tool_allowed("unregistered_mutating_tool")
+      assert(allowed == false, "mutating " .. name .. " must not grant mutation")
+      assert(reason:find("read-only authority", 1, true) ~= nil,
+        "denial must remain read-only after " .. name .. " mutation")
+    end
+    for name, value in pairs(original) do exported[name] = value end
+
+    local replacement = WheelAgent.Capability
+    WheelAgent.Capability = {
+      INSPECT = "inspect",
+      VERIFY = "inspect",
+      ORCHESTRATE = "inspect",
+      MODIFY = "inspect",
+      EXECUTE = "inspect",
+    }
+    local allowed, reason = agent:is_tool_allowed("unregistered_mutating_tool")
+    assert(allowed == false, "replacing Capability must not grant mutation")
+    assert(reason:find("read-only authority", 1, true) ~= nil,
+      "replacing Capability must preserve read-only denial")
+    WheelAgent.Capability = replacement
+  end)
+
   run_test("Agent identity: fork from an immutable ContextCommit keeps references only", function()
     local kernel = WheelKernel.new_mock()
     local context = fixed_context(kernel)

@@ -85,21 +85,28 @@ WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
 
 -- Capability vocabulary. Authorization is decided from the granted capability
 -- set on the current RoleBinding, never from a role word in prompt or identity
--- text. The role matrix remains private to this module.
+-- text. Keep the canonical values private: the exported table remains for
+-- compatibility inspection, but is not an authorization source.
+local CAPABILITY_INSPECT = "inspect"
+local CAPABILITY_VERIFY = "verify"
+local CAPABILITY_ORCHESTRATE = "orchestrate"
+local CAPABILITY_MODIFY = "modify"
+local CAPABILITY_EXECUTE = "execute"
+
 WheelAgent.Capability = {
-  INSPECT = "inspect",
-  VERIFY = "verify",
-  ORCHESTRATE = "orchestrate",
-  MODIFY = "modify",
-  EXECUTE = "execute",
+  INSPECT = CAPABILITY_INSPECT,
+  VERIFY = CAPABILITY_VERIFY,
+  ORCHESTRATE = CAPABILITY_ORCHESTRATE,
+  MODIFY = CAPABILITY_MODIFY,
+  EXECUTE = CAPABILITY_EXECUTE,
 }
 
 local CAPABILITY_ORDER = {
-  WheelAgent.Capability.INSPECT,
-  WheelAgent.Capability.VERIFY,
-  WheelAgent.Capability.ORCHESTRATE,
-  WheelAgent.Capability.MODIFY,
-  WheelAgent.Capability.EXECUTE,
+  CAPABILITY_INSPECT,
+  CAPABILITY_VERIFY,
+  CAPABILITY_ORCHESTRATE,
+  CAPABILITY_MODIFY,
+  CAPABILITY_EXECUTE,
 }
 local CAPABILITY_VALUES = {}
 for _, capability in ipairs(CAPABILITY_ORDER) do CAPABILITY_VALUES[capability] = true end
@@ -698,7 +705,7 @@ function WheelAgent:is_tool_allowed(tool_name)
         required = intent
         mutating = true
       elseif intent == WheelTool.ActionIntent.CUSTOM then
-        required = tool_def.read_only and WheelAgent.Capability.INSPECT or WheelAgent.Capability.MODIFY
+        required = tool_def.read_only and CAPABILITY_INSPECT or CAPABILITY_MODIFY
         mutating = not tool_def.read_only
       else
         return false, "tool '" .. tool_name .. "' has an unknown intent"
@@ -720,7 +727,7 @@ function WheelAgent:is_tool_allowed(tool_name)
   end
 
   -- 3. Unregistered tools still obey the same capability state.
-  if granted[WheelAgent.Capability.MODIFY] or granted[WheelAgent.Capability.EXECUTE] then
+  if granted[CAPABILITY_MODIFY] or granted[CAPABILITY_EXECUTE] then
     return true, nil
   end
   if not READ_ONLY_TOOLS[tool_name] then
@@ -730,7 +737,7 @@ function WheelAgent:is_tool_allowed(tool_name)
     end
     return false, "role '" .. role .. "' lacks 'modify' capability; denied: " .. tool_name
   end
-  if not granted[WheelAgent.Capability.INSPECT] then
+  if not granted[CAPABILITY_INSPECT] then
     return false, "role '" .. role .. "' lacks 'inspect' capability; denied: " .. tool_name
   end
   return true, nil
