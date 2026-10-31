@@ -6460,18 +6460,24 @@ end)
 
 run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming SSE", function()
   -- 1. Test OpenAIAdapter with mocked HTTP client emitting SSE stream
+  local cache_usage_order = "hit_first"
   local mock_http_openai = function(req)
     assert(req.method == "POST")
     assert(string.find(req.url, "/chat/completions", 1, true) ~= nil)
     assert(req.headers["Authorization"] == "Bearer mock-token")
 
+    local hit_usage = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":0}}}\n\n"
+    local miss_usage = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}\n\n"
+    local cache_usage_chunks = cache_usage_order == "hit_first"
+      and { hit_usage, miss_usage } or { miss_usage, hit_usage }
     local chunks = {
       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"DeepSeek reasoner thinking...\"}}]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \",\"tool_calls\":[{\"index\":0,\"id\":\"call_01\",\"function\":{\"name\":\"search_code\",\"arguments\":\"{\\\"pattern\\\"\"}}]}}]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"content\":\"world!\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"main\\\"}\"}}]}}]}\n\n",
       "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
-      "data: [DONE]\n\n",
     }
+    for _, usage_chunk in ipairs(cache_usage_chunks) do table.insert(chunks, usage_chunk) end
+    table.insert(chunks, "data: [DONE]\n\n")
 
     if req.stream and req.on_stream_chunk then
       for _, ch in ipairs(chunks) do
@@ -6502,6 +6508,15 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(oai_res.tool_calls[1].arguments.pattern == "main")
   assert(oai_res.finish_reason == "tool_calls")
   assert(oai_res.usage.total_tokens == 25)
+  assert(oai_res.usage.provider_cache_status == "verified_hit",
+    "a later streaming miss must not overwrite an earlier cache hit")
+  cache_usage_order = "miss_first"
+  local oai_reverse, oai_reverse_err = oai_adapter:stream({
+    messages = { { role = "user", content = "Test query" } },
+    tools = { { name = "search_code", description = "search", parameters = { type = "object" } } },
+  })
+  assert(oai_reverse_err == nil and oai_reverse.usage.provider_cache_status == "verified_hit",
+    "streaming cache hit must remain dominant when it arrives after a miss")
 
   -- 2. Test AnthropicAdapter with mocked HTTP client emitting Anthropic SSE events
   local mock_http_anthropic = function(req)
@@ -6548,7 +6563,8 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.finish_reason == "end_turn")
   assert(ant_res.usage.output_tokens == 20)
   assert(ant_res.usage.prompt_tokens == 40 and ant_res.usage.cache_read_tokens == 12
-    and ant_res.usage.cache_creation_tokens == 4,
+    and ant_res.usage.cache_creation_tokens == 4
+    and ant_res.usage.uncached_input_tokens == 40,
     "Anthropic stream must merge input/cache and output usage events")
   assert(ant_res.usage.provider_cache_status == "verified_hit",
     "explicit stream cache-read tokens must be a verified hit")

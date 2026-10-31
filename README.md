@@ -864,9 +864,16 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
   pipeline (Tier 1 scratchpad pruning, Tier 2 bounded rationale/slot previews,
   Tier 3 tail truncation). Any local prefix-share ratio is a design/local-reuse
   signal only, not a provider cache hit rate; provider hit evidence requires
-  explicit response telemetry. Provider cache negotiation uses a bounded,
-  domain-bound key and reports cache usage separately from local prefix reuse;
-  unsupported providers continue without cache controls. See
+  explicit response telemetry. Normalized `prompt_tokens` preserves each
+  provider's reported prompt/input count: OpenAI includes cached reads when
+  reported, while Anthropic `input_tokens` excludes cache reads. The separate
+  `uncached_input_tokens` field makes the uncached count explicit; cached-read
+  counts are a subset of OpenAI `prompt_tokens` and must not be added to it.
+  Provider cache negotiation uses a bounded, domain-bound key and reports
+  cache usage separately from local prefix reuse; unsupported providers
+  continue without cache controls. Across turns, status aggregation retains
+  the strongest evidence in this order: `error`, `verified_hit`, `write_only`,
+  `verified_miss`, `unknown`, `not_requested`, `unsupported`. See
   [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
 
 ### Context Graph Projections (CTX-0037)

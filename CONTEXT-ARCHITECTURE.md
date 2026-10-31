@@ -284,6 +284,16 @@ counts are reported only from explicit provider response usage, and are kept
 separate from local prefix telemetry. Wheel does not persist provider KV cache
 contents, and `bittyd` owns neither prompt content nor provider cache state.
 
+Normalized `prompt_tokens` preserves the provider's reported prompt/input
+count. OpenAI `usage.prompt_tokens` includes cached tokens when reported, with
+`prompt_tokens_details.cached_tokens` describing a subset of that count;
+Anthropic `usage.input_tokens` is uncached input, with cache-read and
+cache-creation counts reported separately. `uncached_input_tokens` is the
+cross-provider uncached count. Consumers must not add OpenAI cache-read tokens
+to `prompt_tokens`. Runner cache status is independent of token totals and
+aggregates by evidence priority: `error` > `verified_hit` > `write_only` >
+`verified_miss` > `unknown` > `not_requested` > `unsupported`.
+
 ## 8. Output and reasoning density
 
 The intended storage split is:

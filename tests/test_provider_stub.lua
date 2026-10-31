@@ -605,6 +605,8 @@ local function main()
     cache_creation_input_tokens = 8, cache_read_input_tokens = 0 }, "anthropic")
   check(anthropic_usage.cache_creation_tokens == 8 and anthropic_usage.cache_read_tokens == 0,
     "explicit provider cache miss/create evidence must normalize")
+  check(anthropic_usage.prompt_tokens == 20 and anthropic_usage.uncached_input_tokens == 20,
+    "Anthropic input_tokens must remain uncached input; cache creation is separate")
   check(anthropic_usage.provider_cache_status == "write_only",
     "cache creation without reads must remain write-only, not a hit")
   local openai_usage = WheelProvider.normalize_usage({
@@ -614,6 +616,11 @@ local function main()
   check(openai_usage.cache_read_tokens == 16 and openai_usage.cache_creation_tokens == 4
     and openai_usage.provider_cache_status == "verified_hit",
     "OpenAI explicit cached and cache-write usage must normalize as verified evidence")
+  check(openai_usage.prompt_tokens == 40 and openai_usage.uncached_input_tokens == 24,
+    "OpenAI prompt_tokens must include cached reads and expose uncached input separately")
+  check(openai_usage.uncached_input_tokens + openai_usage.cache_read_tokens
+      == openai_usage.prompt_tokens,
+    "OpenAI cached reads must be a subset of prompt_tokens, not counted twice")
   local explicit_miss = WheelProvider.normalize_usage({
     prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0, cache_write_tokens = 0 },
   }, "openai")
@@ -627,6 +634,33 @@ local function main()
   }, "openai")
   check(invalid_usage.provider_cache_status == "error",
     "malformed cache usage must not be reported as a miss or hit")
+
+  local status_order = { "unsupported", "not_requested", "unknown", "verified_miss",
+    "write_only", "verified_hit", "error" }
+  for _, stronger in ipairs(status_order) do
+    for _, weaker in ipairs(status_order) do
+      local forward = WheelProvider.aggregate_cache_status(stronger, weaker)
+      local reverse = WheelProvider.aggregate_cache_status(weaker, stronger)
+      local expected = 1
+      for index, status in ipairs(status_order) do
+        if status == stronger or status == weaker then
+          expected = math.max(expected, index)
+        end
+      end
+      check(forward == status_order[expected] and reverse == status_order[expected],
+        "cache status aggregation must be order independent: " .. stronger .. ", " .. weaker)
+    end
+  end
+  local function aggregate_sequence(first, second)
+    return WheelProvider.aggregate_cache_status(
+      WheelProvider.aggregate_cache_status("unknown", first), second)
+  end
+  check(aggregate_sequence("verified_hit", "verified_miss") == "verified_hit"
+    and aggregate_sequence("verified_miss", "verified_hit") == "verified_hit",
+    "mixed stream/turn cache statuses must preserve a hit in either order")
+  check(aggregate_sequence("error", "verified_hit") == "error"
+    and aggregate_sequence("verified_hit", "error") == "error",
+    "mixed stream/turn cache statuses must preserve an error in either order")
 
   local anthropic = AnthropicAdapter.new({
     api_key = SYNTHETIC_KEY,

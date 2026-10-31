@@ -200,13 +200,18 @@ function WheelProvider.normalize_usage(usage, provider)
     end
   end
   if provider == "anthropic" then
+    -- Anthropic input_tokens excludes cache-read tokens; retain that exact
+    -- uncached-input meaning in the explicit cross-provider field.
     copy("prompt_tokens", "input_tokens")
+    copy("uncached_input_tokens", "input_tokens")
     copy("completion_tokens", "output_tokens")
     copy("input_tokens", "input_tokens")
     copy("output_tokens", "output_tokens")
     read_raw = usage.cache_read_input_tokens
     write_raw = usage.cache_creation_input_tokens
   else
+    -- OpenAI prompt_tokens includes cached tokens when the provider reports
+    -- them. The uncached field removes cache reads; cache writes are not reads.
     copy("prompt_tokens", "prompt_tokens")
     local details = type(usage.prompt_tokens_details) == "table" and usage.prompt_tokens_details or {}
     read_raw = details.cached_tokens
@@ -233,6 +238,16 @@ function WheelProvider.normalize_usage(usage, provider)
     if normalized.cache_creation_tokens == nil then copy("cache_creation_tokens", "cache_creation_tokens") end
     copy("cache_read_tokens", "cache_read_tokens")
   end
+  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil then
+    local cached = normalized.cache_read_tokens or 0
+    local cached_raw = type(usage.prompt_tokens_details) == "table"
+      and usage.prompt_tokens_details.cached_tokens or nil
+    if (cached_raw == nil or (type(cached_raw) == "number" and cached_raw >= 0
+        and cached_raw % 1 == 0))
+      and cached <= normalized.prompt_tokens then
+      normalized.uncached_input_tokens = normalized.prompt_tokens - cached
+    end
+  end
   local function valid_cache_count(value)
     return type(value) == "number" and value >= 0 and value % 1 == 0
   end
@@ -255,11 +270,34 @@ end
 local function merge_usage(current, incoming)
   current = current or {}
   for field, value in pairs(incoming or {}) do
-    if field ~= "provider_cache_status" or current.provider_cache_status == nil
-      or value ~= "unknown" then
+    if field == "provider_cache_status" then
+      current.provider_cache_status = WheelProvider.aggregate_cache_status(
+        current.provider_cache_status, value)
+    else
       current[field] = value
     end
   end
+  return current
+end
+
+-- Aggregated cache status reports the strongest evidence seen across turns.
+-- Errors dominate positive evidence; then a hit, write-only, verified miss,
+-- unknown, not-requested, and unsupported. This field is independent of token
+-- totals, which are always accumulated separately by the runner.
+local CACHE_STATUS_PRIORITY = {
+  unsupported = 1,
+  not_requested = 2,
+  unknown = 3,
+  verified_miss = 4,
+  write_only = 5,
+  verified_hit = 6,
+  error = 7,
+}
+
+function WheelProvider.aggregate_cache_status(current, incoming)
+  local current_priority = CACHE_STATUS_PRIORITY[current] or 0
+  local incoming_priority = CACHE_STATUS_PRIORITY[incoming] or 0
+  if incoming_priority > current_priority then return incoming end
   return current
 end
 

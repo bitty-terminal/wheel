@@ -1028,6 +1028,7 @@ function WheelRunner.run_task(agent, task, opts)
   local context_ref = nil
   local total_usage = {
     prompt_tokens = 0,
+    uncached_input_tokens = 0,
     completion_tokens = 0,
     thinking_tokens = 0,
     total_tokens = 0,
@@ -1131,6 +1132,8 @@ function WheelRunner.run_task(agent, task, opts)
     -- Accumulate usage telemetry
     if res.usage then
       total_usage.prompt_tokens = total_usage.prompt_tokens + (res.usage.prompt_tokens or 0)
+      total_usage.uncached_input_tokens = total_usage.uncached_input_tokens
+        + (res.usage.uncached_input_tokens or res.usage.prompt_tokens or 0)
       total_usage.completion_tokens = total_usage.completion_tokens + (res.usage.completion_tokens or 0)
       total_usage.thinking_tokens = total_usage.thinking_tokens + (res.usage.thinking_tokens or 0)
       total_usage.total_tokens = total_usage.total_tokens + (res.usage.total_tokens or 0)
@@ -1138,11 +1141,8 @@ function WheelRunner.run_task(agent, task, opts)
       total_usage.cache_read_tokens = total_usage.cache_read_tokens + (res.usage.cache_read_tokens or 0)
     end
     local cache_status = WheelProvider.cache_usage_status(res.usage, req, provider)
-    if cache_status ~= "unknown" and cache_status ~= "not_requested" then
-      total_usage.provider_cache_status = cache_status
-    elseif total_usage.provider_cache_status == "unknown" then
-      total_usage.provider_cache_status = cache_status
-    end
+    total_usage.provider_cache_status = WheelProvider.aggregate_cache_status(
+      total_usage.provider_cache_status, cache_status)
 
     -- Construct a bounded rationale.  Provider thinking is intentionally not
     -- copied here: it remains transient on `res` and cannot enter a prompt,

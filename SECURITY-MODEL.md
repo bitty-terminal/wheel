@@ -980,6 +980,13 @@ secret environment reads.
   prefix hashes and ratios are theoretical stability telemetry, not evidence
   of a provider cache hit. Cache keys are domain-bound to provider, model,
   endpoint, policy/tool-schema versions, and capability version.
+  Usage preserves provider meanings: OpenAI `prompt_tokens` includes cached
+  reads when reported, while Anthropic `input_tokens` excludes them. Consumers
+  use `uncached_input_tokens` for comparable uncached-input totals and never
+  add OpenAI cached-read tokens to `prompt_tokens`. Aggregated cache status is
+  independent of token totals and preserves the strongest evidence in this
+  order: `error` > `verified_hit` > `write_only` > `verified_miss` > `unknown`
+  > `not_requested` > `unsupported`.
 - Third-party tools and dependencies run with user authority.
 - The audit log and trust store are same-user files, not a tamper-proof record.
 - No release artifact, signature, or update channel exists yet; none may be
