@@ -54,12 +54,18 @@ local WheelLifecycle = load_lifecycle()
 WheelAgent.Lifecycle = WheelLifecycle
 
 --- Agent role definitions.
+local ROLE_COMMANDER = "commander"
+local ROLE_CODING = "coding"
+local ROLE_DEBUG = "debug"
+local ROLE_RESEARCH = "research"
+local ROLE_REVIEWER = "reviewer"
+
 WheelAgent.Role = {
-  COMMANDER = "commander",
-  CODING = "coding",
-  DEBUG = "debug",
-  RESEARCH = "research",
-  REVIEWER = "reviewer",
+  COMMANDER = ROLE_COMMANDER,
+  CODING = ROLE_CODING,
+  DEBUG = ROLE_DEBUG,
+  RESEARCH = ROLE_RESEARCH,
+  REVIEWER = ROLE_REVIEWER,
 }
 
 --- Read-only tool allowlist enforced for Research and Reviewer roles.
@@ -114,24 +120,29 @@ for _, capability in ipairs(CAPABILITY_ORDER) do CAPABILITY_VALUES[capability] =
 --- Canonical role capability matrix. Read-only roles never hold Modify or
 -- Execute, and Commander orchestrates without direct code modification.
 local ROLE_CAPABILITIES = {
-  [WheelAgent.Role.COMMANDER] = {
-    inspect = true, verify = true, orchestrate = true,
+  [ROLE_COMMANDER] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_ORCHESTRATE] = true,
   },
-  [WheelAgent.Role.CODING] = {
-    inspect = true, verify = true, modify = true, execute = true,
+  [ROLE_CODING] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_MODIFY] = true, [CAPABILITY_EXECUTE] = true,
   },
-  [WheelAgent.Role.DEBUG] = {
-    inspect = true, verify = true, modify = true, execute = true,
+  [ROLE_DEBUG] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_MODIFY] = true, [CAPABILITY_EXECUTE] = true,
   },
-  [WheelAgent.Role.RESEARCH] = {
-    inspect = true, verify = true,
+  [ROLE_RESEARCH] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
   },
-  [WheelAgent.Role.REVIEWER] = {
-    inspect = true, verify = true,
+  [ROLE_REVIEWER] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
   },
 }
 local ROLE_VALUES = {}
-for _, role in pairs(WheelAgent.Role) do ROLE_VALUES[role] = true end
+for _, role in ipairs({ ROLE_COMMANDER, ROLE_CODING, ROLE_DEBUG, ROLE_RESEARCH, ROLE_REVIEWER }) do
+  ROLE_VALUES[role] = true
+end
 
 local MAX_IDENTITY_BYTES = 128
 local MAX_REASON_BYTES = 256
@@ -143,10 +154,7 @@ local IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/%-]*$"
 local COMMIT_HASH_PATTERN = "^[0-9a-f]+$"
 local COMMIT_HASH_BYTES = 64
 
---- Return a defensive ordered copy of a capability set for a role.
--- @param role string Role from WheelAgent.Role
--- @return table|nil capabilities
-function WheelAgent.role_capabilities(role)
+local function canonical_role_capabilities(role)
   local matrix = ROLE_CAPABILITIES[role]
   if not matrix then return nil end
   local result = {}
@@ -154,6 +162,14 @@ function WheelAgent.role_capabilities(role)
     if matrix[capability] then result[#result + 1] = capability end
   end
   return result
+end
+
+--- Return a defensive ordered copy of a capability set for a role.
+-- This compatibility view is not consulted by authorization.
+-- @param role string Role from WheelAgent.Role
+-- @return table|nil capabilities
+function WheelAgent.role_capabilities(role)
+  return canonical_role_capabilities(role)
 end
 
 local function bounded_string(value, limit)
@@ -179,7 +195,7 @@ end
 
 local function normalize_capabilities(role, requested)
   local matrix = ROLE_CAPABILITIES[role]
-  local canonical = WheelAgent.role_capabilities(role)
+  local canonical = canonical_role_capabilities(role)
   if not matrix or not canonical then return nil, "unknown role: " .. tostring(role) end
   if requested == nil then return canonical end
   if type(requested) ~= "table" then return nil, "capabilities must be an array" end
@@ -1018,7 +1034,7 @@ end
 --- @return table[] List of created task records
 function WheelAgent:decompose_plan(plan_items)
   local role = self.role_binding.role
-  if role ~= WheelAgent.Role.COMMANDER then
+  if role ~= ROLE_COMMANDER then
     error("Only Commander role may decompose project plans (current role: " .. role .. ")")
   end
   local created = {}
@@ -1035,7 +1051,7 @@ end
 --- @return table { approved: boolean, reason: string?, checkpoint: string? }
 function WheelAgent:review_task(task_id, review_fn)
   local role = self.role_binding.role
-  if role ~= WheelAgent.Role.REVIEWER then
+  if role ~= ROLE_REVIEWER then
     error("Only Reviewer role may review tasks (current role: " .. role .. ")")
   end
   local task = self.kernel:get_task(task_id)

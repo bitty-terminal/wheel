@@ -245,6 +245,28 @@ return function(run_test)
     WheelAgent.Capability = replacement
   end)
 
+  run_test("Agent identity: replacing role capability export cannot grant unregistered mutation", function()
+    local original = WheelAgent.role_capabilities
+    WheelAgent.role_capabilities = function()
+      return { "inspect", "verify", "modify", "execute" }
+    end
+
+    local ok, reviewer = pcall(WheelAgent.new, {
+      name = "replaced-role-capabilities-agent",
+      role = WheelAgent.Role.REVIEWER,
+      tools = { "unregistered_mutating_tool" },
+      kernel = WheelKernel.new_mock(),
+    })
+    WheelAgent.role_capabilities = original
+
+    assert(ok, "Reviewer construction must not depend on the compatibility export")
+    assert(not reviewer:has_capability(WheelAgent.Capability.MODIFY))
+    local allowed, reason = reviewer:is_tool_allowed("unregistered_mutating_tool")
+    assert(allowed == false, "replacing role_capabilities must not grant mutation")
+    assert(reason:find("read-only authority", 1, true) ~= nil,
+      "unregistered mutation must remain denied after role_capabilities replacement")
+  end)
+
   run_test("Agent identity: fork from an immutable ContextCommit keeps references only", function()
     local kernel = WheelKernel.new_mock()
     local context = fixed_context(kernel)
