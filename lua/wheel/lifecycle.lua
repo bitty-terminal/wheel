@@ -404,30 +404,6 @@ local function valid_event_transition(event)
   return transitions[kind] and transitions[kind][tostring(from or "nil") .. ":" .. tostring(to or "nil")] == true
 end
 
-local function has_later_transfer_detach(events, event_index, session_id, panel_id)
-  for index = event_index + 1, #events do
-    local event = events[index]
-    if event.type == "panel.detached" and event.reason == "transfer"
-      and event.transfer == true and event.session_id == session_id and event.panel_id == panel_id then
-      return true
-    end
-  end
-  return false
-end
-
-local function has_later_detach(events, event_index, session_id, panel_id)
-  for index = event_index + 1, #events do
-    local event = events[index]
-    if event.type == "panel.detached" and event.panel_id == panel_id then
-      if event.session_id == session_id then return true end
-      -- Older detach records identify only the panel. They remain valid
-      -- history, but cannot authorize a cross-panel transfer claim.
-      if event.session_id == nil and event.transfer ~= true then return true end
-    end
-  end
-  return false
-end
-
 local function registry_shape(value)
   if type(value) ~= "table" or value.version ~= 1 or not exact_keys(value, {
     version = true, revision = true, policy = true, next_counter = true,
@@ -495,6 +471,84 @@ local function registry_shape(value)
   if not events_ok then return false, "event collection is not a dense array" end
   if event_count > MAX_EVENTS then return false, "event aggregate is too large" end
   local event_seen = {}
+  -- Reconstruct the authority-bearing portion of the lifecycle while walking
+  -- the event log. Final records cannot authorize an earlier event: a session
+  -- may have moved or detached several times after that event was emitted.
+  local replay_sessions, replay_panels = {}, {}
+  local panel_creations, session_creations = {}, {}
+  for _, event in ipairs(value.events) do
+    if type(event) == "table" then
+      if event.type == "panel.created" and event.panel_id then
+        panel_creations[event.panel_id] = (panel_creations[event.panel_id] or 0) + 1
+      elseif event.type == "agent_session.created" and event.session_id then
+        session_creations[event.session_id] = (session_creations[event.session_id] or 0) + 1
+      end
+    end
+  end
+  local complete_history = true
+  for panel_id in pairs(value.panels) do
+    if panel_creations[panel_id] ~= 1 then complete_history = false; break end
+  end
+  if complete_history then
+    for session_id in pairs(value.sessions) do
+      if session_creations[session_id] ~= 1 then complete_history = false; break end
+    end
+  end
+  local function replay_session(session_id)
+    local result = replay_sessions[session_id]
+    if result then return result end
+    local record = value.sessions[session_id]
+    if not record then return nil end
+    result = { panel_id = nil, state = nil, mode = nil, created = false }
+    replay_sessions[session_id] = result
+    return result
+  end
+  local function replay_panel(panel_id)
+    local result = replay_panels[panel_id]
+    if result then return result end
+    if not value.panels[panel_id] then return nil end
+    result = { state = nil, controller = nil, observers = {} }
+    replay_panels[panel_id] = result
+    return result
+  end
+  local function replay_remove(panel, session_id)
+    if panel.controller == session_id then
+      panel.controller = nil
+      return true
+    end
+    if panel.observers[session_id] then
+      panel.observers[session_id] = nil
+      return true
+    end
+    return false
+  end
+  local function replay_observer_count(panel)
+    local count = 0
+    for _ in pairs(panel.observers) do count = count + 1 end
+    return count
+  end
+  local function replay_detach_candidate(panel, event)
+    -- The panel state transition identifies controller detaches whenever the
+    -- controller's active/paused state is being reconciled. Observer-only
+    -- transitions are identified by the observer list. Legacy detach events
+    -- have no session ID, so use the smallest remaining observer for the
+    -- otherwise ambiguous observer-only case; subsequent attach events still
+    -- verify that session's historical mode and panel.
+    if event.from_state == P.ACTIVE or event.from_state == P.PAUSED then
+      if event.to_state == P.ATTACHED or event.to_state == P.DETACHED then
+        return panel.controller
+      end
+    end
+    if event.to_state == P.DETACHED and panel.controller then
+      if replay_observer_count(panel) == 0 then return panel.controller end
+    end
+    local candidate
+    for session_id in pairs(panel.observers) do
+      if not candidate or session_id < candidate then candidate = session_id end
+    end
+    if candidate then return candidate end
+    return panel.controller
+  end
   for event_index, event in ipairs(value.events) do
     if type(event) ~= "table" or not event.event_id or not id(event.event_id, "event_id", true)
       or event_seen[event.event_id] or type(event.type) ~= "string" or not EVENT_TYPES[event.type]
@@ -531,40 +585,127 @@ local function registry_shape(value)
       return false, "session event lacks identity"
     end
     if event.type:match("^panel%.") and not event.panel_id then return false, "panel event lacks identity" end
-    if event.type:match("^agent_session%.") then
-      local session = value.sessions[event.session_id]
-      if event.panel_id ~= session.panel_id
-        and not has_later_transfer_detach(value.events, event_index, event.session_id, event.panel_id) then
-        return false, "session event/panel mismatch"
+    if event.type == "panel.created" then
+      if replay_panels[event.panel_id] then
+        if complete_history then return false, "panel history contains duplicate creation" end
+        replay_panels[event.panel_id].incomplete = true
+      else
+        replay_panels[event.panel_id] = { state = event.to_state, controller = nil, observers = {} }
       end
-      if event.agent_id ~= session.agent_id or event.task_id ~= session.task_id then
-        return false, "session event/owner mismatch"
+    elseif event.type == "agent_session.created" then
+      if replay_sessions[event.session_id] and replay_sessions[event.session_id].created then
+        if complete_history then return false, "session history contains duplicate creation" end
+        replay_sessions[event.session_id].incomplete = true
+      else
+        local session = replay_session(event.session_id)
+        if not session then return false, "session history references unknown session" end
+        session.panel_id, session.state, session.mode, session.created = event.panel_id, event.to_state, nil, true
       end
-    end
-    if event.type == "panel.attached" or event.type == "panel.observer_attached" then
-      local observer_event = event.type == "panel.observer_attached"
-      local referenced_id = observer_event and event.observer_session_id or event.controller_session_id
-      local expected_mode = observer_event and "observer" or "controller"
-      local attached_session = value.sessions[referenced_id]
-      local panel = value.panels[event.panel_id]
-      if not panel or not attached_session then return false, "attachment event references unknown panel or session" end
-      if event.session_id ~= nil and event.session_id ~= referenced_id then
-        return false, "attachment event/session identity mismatch"
+    elseif event.type:match("^agent_session%.") then
+      local session = replay_session(event.session_id)
+      if not session then return false, "session event references unknown session" end
+      if not session.created then
+        if complete_history then return false, "session event has no historical creation" end
+        session.incomplete = true
+      elseif not session.incomplete then
+        if session.panel_id ~= event.panel_id then return false, "session event/panel mismatch" end
+        if session.state ~= event.from_state then return false, "session event state mismatch" end
+        if event.agent_id ~= value.sessions[event.session_id].agent_id
+          or event.task_id ~= value.sessions[event.session_id].task_id then
+          return false, "session event/owner mismatch"
+        end
+        if event.type == "agent_session.active" and session.mode == nil then
+          local panel = replay_panel(event.panel_id)
+          if not panel or panel.incomplete
+            or (panel.state ~= P.READY and panel.state ~= P.DETACHED and panel.state ~= P.ATTACHED)
+            or panel.controller then
+            return false, "active session cannot establish controller authority"
+          end
+          panel.controller, session.mode = event.session_id, Lifecycle.AttachMode.CONTROLLER
+        elseif event.type == "agent_session.active" and session.mode ~= Lifecycle.AttachMode.CONTROLLER then
+          return false, "active session is not a controller"
+        end
+        session.state = event.to_state
       end
-      if event.agent_id ~= nil and event.agent_id ~= attached_session.agent_id then
-        return false, "attachment event/session identity mismatch"
+    elseif event.type == "panel.attached" or event.type == "panel.observer_attached" then
+      local panel = replay_panel(event.panel_id)
+      local referenced_id = event.type == "panel.observer_attached"
+        and event.observer_session_id or event.controller_session_id
+      local expected_mode = event.type == "panel.observer_attached"
+        and Lifecycle.AttachMode.OBSERVER or Lifecycle.AttachMode.CONTROLLER
+      local session = replay_session(referenced_id)
+      if not panel or not session or not session.created then
+        if complete_history then return false, "attachment event has no historical panel or session" end
+        if panel then panel.incomplete = true end
+        if session then session.incomplete = true end
+      elseif not panel.incomplete and not session.incomplete then
+        if event.session_id ~= referenced_id then return false, "attachment event/session identity mismatch" end
+        if event.agent_id ~= value.sessions[referenced_id].agent_id
+          or event.task_id ~= value.sessions[referenced_id].task_id then
+          return false, "attachment event/session identity mismatch"
+        end
+        if panel.state ~= event.from_state then return false, "attachment event panel state mismatch" end
+        if session.mode ~= nil then return false, "session was already attached at event time" end
+        if event.transfer ~= true and session.panel_id ~= event.panel_id then
+          return false, "attachment event/session panel mismatch"
+        end
+        if event.transfer == true and session.panel_id ~= nil and session.panel_id ~= event.panel_id then
+          return false, "transfer attachment event/session panel mismatch"
+        end
+        if expected_mode == Lifecycle.AttachMode.CONTROLLER then
+          if panel.controller then return false, "panel already had a controller at event time" end
+          panel.controller = referenced_id
+        else
+          if panel.observers[referenced_id] then return false, "session was already an observer at event time" end
+          panel.observers[referenced_id] = true
+        end
+        session.panel_id, session.mode = event.panel_id, expected_mode
+        panel.state = event.to_state
       end
-      if event.task_id ~= nil and event.task_id ~= attached_session.task_id then
-        return false, "attachment event/session identity mismatch"
+    elseif event.type == "panel.detached" then
+      local panel = replay_panel(event.panel_id)
+      if not panel then return false, "detach event has no historical panel" end
+      if not panel.incomplete then
+        if panel.state ~= event.from_state then return false, "detach event panel state mismatch" end
+        local detached_id = event.session_id
+        if detached_id then
+          local session = replay_session(detached_id)
+          if not session or not session.created or session.incomplete
+            or session.panel_id ~= event.panel_id or not session.mode then
+            return false, "transfer detach event/session mismatch"
+          end
+          if not replay_remove(panel, detached_id) then return false, "transfer detach session was not attached" end
+          session.mode = nil
+          if event.transfer == true then session.panel_id = nil end
+        else
+          detached_id = replay_detach_candidate(panel, event)
+          if not detached_id or not replay_remove(panel, detached_id) then
+            return false, "detach event has no historical attachment"
+          end
+          local session = replay_sessions[detached_id]
+          if not session then return false, "detach event has no historical session" end
+          session.mode = nil
+        end
+        panel.state = event.to_state
       end
-      if attached_session.attachment_mode ~= expected_mode
-        and not (attached_session.attachment_mode == nil
-          and has_later_detach(value.events, event_index, referenced_id, event.panel_id)) then
-        return false, "attachment event/session mode mismatch"
-      end
-      if attached_session.panel_id ~= event.panel_id
-        and not has_later_transfer_detach(value.events, event_index, referenced_id, event.panel_id) then
-        return false, "attachment event/session panel mismatch"
+    elseif event.type == "panel.ready" or event.type == "panel.active"
+      or event.type == "panel.paused" or event.type == "panel.closed" then
+      local panel = replay_panel(event.panel_id)
+      if not panel then return false, "panel event references unknown panel" end
+      if not panel.incomplete then
+        if panel.state ~= event.from_state then return false, "panel event state mismatch" end
+        if event.type == "panel.active" then
+          if not panel.controller then return false, "active panel has no historical controller" end
+          local controller = replay_sessions[panel.controller]
+          if not controller or controller.incomplete or controller.state ~= S.ACTIVE then return false, "active panel controller state mismatch" end
+        elseif event.type == "panel.paused" then
+          if not panel.controller then return false, "paused panel has no historical controller" end
+          local controller = replay_sessions[panel.controller]
+          if not controller or controller.incomplete or controller.state ~= S.PAUSED then return false, "paused panel controller state mismatch" end
+        elseif event.type == "panel.closed" and (panel.controller or replay_observer_count(panel) > 0) then
+          return false, "closed panel has historical attachments"
+        end
+        panel.state = event.to_state
       end
     end
     if event.session_id then

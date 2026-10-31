@@ -129,7 +129,7 @@ local ok, err = pcall(function()
 
   run_test("Lifecycle: persisted transfer and detach history remains valid", function()
     local path = root .. "/transfer-history.json"
-    local life = Lifecycle.new({ path = path })
+    local life = Lifecycle.new({ path = path, max_sessions_per_agent = 2 })
     assert(life:create_panel({ panel_id = "history-p1" }))
     assert(life:ready_panel("history-p1"))
     assert(life:create_panel({ panel_id = "history-p2" }))
@@ -145,6 +145,73 @@ local ok, err = pcall(function()
     assert(loaded:get_session("history-session").panel_id == "history-p2")
     assert(loaded:get_session("history-session").attachment_mode == nil)
     assert(#loaded:events() >= 8)
+  end)
+
+  run_test("Lifecycle: replay rejects controller event rewritten to detached observer", function()
+    local path = root .. "/attachment-event-replay.json"
+    local life = Lifecycle.new({ path = path, max_sessions_per_agent = 2 })
+    assert(life:create_panel({ panel_id = "replay-panel" }))
+    assert(life:ready_panel("replay-panel"))
+    assert(life:create_agent_session({
+      session_id = "replay-controller", agent_id = "replay-agent", task_id = "replay-task", panel_id = "replay-panel",
+    }))
+    assert(life:create_agent_session({
+      session_id = "replay-observer", agent_id = "replay-agent", task_id = "replay-task", panel_id = "replay-panel",
+    }))
+    assert(life:attach_session("replay-controller", "replay-panel"))
+    assert(life:detach_session("replay-controller"))
+    assert(life:attach_session("replay-observer", "replay-panel", { mode = "observer" }))
+    assert(life:detach_session("replay-observer"))
+
+    local clean = Lifecycle.new({ path = path })
+    assert(clean:get_session("replay-controller").attachment_mode == nil)
+    assert(clean:get_session("replay-observer").attachment_mode == nil)
+    local value = clean:_state(); value.version = 1
+    for _, event in ipairs(value.events) do
+      if event.type == "panel.attached" then
+        event.controller_session_id = "replay-observer"
+        break
+      end
+    end
+    assert(WheelHost.fs.write_file(path, Session.json_encode(value)))
+    local accepted, failure = pcall(Lifecycle.new, { path = path })
+    assert(not accepted and failure.code == "E_LIFECYCLE_INVALID")
+    assert(not WheelHost.fs.stat(path).exists)
+  end)
+
+  run_test("Lifecycle: replay rejects session panel substitutions across transfers", function()
+    local path = root .. "/transfer-event-replay.json"
+    local life = Lifecycle.new({ path = path })
+    for _, panel_id in ipairs({ "replay-p1", "replay-p2", "replay-p3" }) do
+      assert(life:create_panel({ panel_id = panel_id }))
+      assert(life:ready_panel(panel_id))
+    end
+    assert(life:create_agent_session({
+      session_id = "replay-transfer", agent_id = "replay-transfer-agent", panel_id = "replay-p1",
+    }))
+    assert(life:activate_session("replay-transfer"))
+    assert(life:transfer_session("replay-transfer", "replay-p2"))
+    assert(life:transfer_session("replay-transfer", "replay-p3"))
+    local valid = Lifecycle.new({ path = path })
+    assert(valid:get_session("replay-transfer").panel_id == "replay-p3")
+
+    for _, event_type in ipairs({ "agent_session.created", "agent_session.active" }) do
+      local value = valid:_state(); value.version = 1
+      for _, event in ipairs(value.events) do
+        if event.type == event_type and event.session_id == "replay-transfer" then
+          event.panel_id = "replay-p2"
+          break
+        end
+      end
+      assert(WheelHost.fs.write_file(path, Session.json_encode(value)))
+      local accepted, failure = pcall(Lifecycle.new, { path = path })
+      assert(not accepted and failure.code == "E_LIFECYCLE_INVALID",
+        event_type .. " panel substitution accepted: " .. tostring(accepted) .. ", " .. tostring(failure and failure.message))
+      assert(not WheelHost.fs.stat(path).exists)
+      -- The loader quarantines a bad registry; restore a valid persisted history
+      -- before testing the next independently mutated event.
+      assert(WheelHost.fs.create_private_file(path, Session.json_encode(valid:_state())))
+    end
   end)
 
   run_test("Lifecycle: observers cannot promote and are cleaned on every exit", function()
