@@ -526,6 +526,33 @@ local function main()
   local variant_payload = assert(cache_adapter:_format_payload(cache_request_variant, false))
   check(cache_payload.prompt_cache_key ~= variant_payload.prompt_cache_key,
     "provider cache key must bind the stable prefix")
+  local mismatched_prefix_request = {}
+  for key, value in pairs(cache_request) do mismatched_prefix_request[key] = value end
+  mismatched_prefix_request.messages = {
+    { role = "system", content = "different serialized prefix" },
+    { role = "user", content = "miss" },
+  }
+  local mismatched_prefix_payload = assert(cache_adapter:_format_payload(mismatched_prefix_request, false))
+  check(mismatched_prefix_payload.prompt_cache_key == nil,
+    "cache key must be omitted when the declared prefix differs from serialized system bytes")
+  mismatched_prefix_request.prompt_cache_policy = "required"
+  local required_mismatch_payload, required_mismatch_err = cache_adapter:_format_payload(mismatched_prefix_request, false)
+  check(required_mismatch_payload == nil and required_mismatch_err:find("does not match", 1, true),
+    "required cache policy must fail closed on a serialized-prefix mismatch")
+  local oversized_prefix = string.rep("x", WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES + 1)
+  local max_bounded_prefix = string.rep("x", WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES)
+  local max_bounded_payload = assert(cache_adapter:_format_payload({
+    messages = { { role = "system", content = max_bounded_prefix } },
+    stable_context_prefix = max_bounded_prefix,
+  }, false))
+  check(type(max_bounded_payload.prompt_cache_key) == "string",
+    "cache key must bind a wire prefix exactly at the configured byte bound")
+  local bounded_prefix_payload = assert(cache_adapter:_format_payload({
+    messages = { { role = "system", content = oversized_prefix } },
+    stable_context_prefix = oversized_prefix,
+  }, false))
+  check(bounded_prefix_payload.prompt_cache_key == nil,
+    "cache key must be omitted when the declared system prefix exceeds its byte bound")
   local domain_a = WheelProvider.cache_domain(cache_request, "openai", STUB_MODEL, base_url, "prefer")
   local domain_b = WheelProvider.cache_domain(cache_request, "openai", STUB_MODEL, base_url, "required")
   check(domain_a ~= domain_b, "cache domain must include policy")
@@ -537,6 +564,12 @@ local function main()
   local unsupported_payload, unsupported_err = unsupported:_format_payload(cache_request, false)
   check(unsupported_payload == nil and unsupported_err:find("unsupported", 1, true),
     "required mode must fail closed when cache capability is unavailable")
+  local unsupported_stream = OpenAIAdapter.new({ base_url = base_url })
+  local unsupported_stream_payload = assert(unsupported_stream:_format_payload(cache_request, true))
+  check(unsupported_stream_payload.prompt_cache_key == nil
+    and unsupported_stream_payload.stream_options
+    and unsupported_stream_payload.stream_options.include_usage == true,
+    "providers without cache capability must still request streaming usage telemetry")
   local false_policy, false_policy_err = cache_adapter:_format_payload({
     messages = cache_request.messages, stable_context_prefix = "stable", prompt_cache_policy = false,
   }, false)
@@ -555,9 +588,16 @@ local function main()
   local custom_payload = assert(custom:_format_payload(cache_request, false))
   check(custom_payload.prompt_cache_key == nil,
     "custom endpoints must not receive cache controls without explicit capability")
+  local custom_stream_payload = assert(custom:_format_payload(cache_request, true))
+  check(custom_stream_payload.stream_options and custom_stream_payload.stream_options.include_usage == true,
+    "custom OpenAI endpoints must still request streaming usage telemetry")
   local off_adapter = OpenAIAdapter.new({ prompt_cache_policy = "off", prompt_cache_supported = true })
   local off_payload = assert(off_adapter:_format_payload(cache_request, false))
   check(off_payload.prompt_cache_key == nil, "off policy must not attach cache controls")
+  local off_stream_payload = assert(off_adapter:_format_payload(cache_request, true))
+  check(off_stream_payload.prompt_cache_key == nil
+    and off_stream_payload.stream_options and off_stream_payload.stream_options.include_usage == true,
+    "cache off policy must preserve streaming usage telemetry without cache controls")
   local normalized = WheelProvider.normalize_usage({ prompt_tokens = "bad", prompt_tokens_details = { cached_tokens = -1 } }, "openai")
   check(normalized.provider_cache_status == "error" and normalized.prompt_tokens == nil,
     "malformed usage must be surfaced as error without inventing token counts")

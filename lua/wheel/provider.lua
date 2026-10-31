@@ -294,9 +294,26 @@ local function apply_prompt_cache(payload, request, adapter, provider, endpoint)
     if policy == "required" then return nil, "required prompt caching is unsupported by this provider" end
     return payload
   end
-  local key_prefix = prefix
+  local wire_system
+  if provider == "anthropic" then
+    wire_system = type(payload.system) == "string" and payload.system or nil
+  else
+    for _, message in ipairs(payload.messages or {}) do
+      if message.role == "system" then
+        wire_system = type(message.content) == "string" and message.content or nil
+        break
+      end
+    end
+  end
+  local wire_prefix = wire_system and wire_system:sub(1, #prefix) or nil
+  if wire_prefix ~= prefix then
+    if policy == "required" then
+      return nil, "required stable Context prefix does not match the serialized system prefix"
+    end
+    return payload
+  end
   local domain = WheelProvider.cache_domain(request, provider, request.model or adapter.model or "", endpoint, policy)
-  local cache_key = domain and prompt_cache_digest(table.concat({ domain, key_prefix }, "\0")) or nil
+  local cache_key = domain and prompt_cache_digest(table.concat({ domain, wire_prefix }, "\0")) or nil
   if not cache_key then
     if policy == "required" then return nil, "required prompt caching needs a stable SHA-256 implementation" end
     return payload
@@ -1211,7 +1228,7 @@ function OpenAIAdapter:_format_payload(request, stream)
   local cache_payload, cache_err = apply_prompt_cache(payload, request, self, self.name, endpoint)
   if not cache_payload then return nil, cache_err end
   payload = cache_payload
-  if stream and self.prompt_cache_supported then
+  if stream then
     payload.stream_options = { include_usage = true }
   end
 
