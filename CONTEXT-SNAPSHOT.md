@@ -216,3 +216,21 @@ budget policy is supported; the caller owns that policy decision.
 The session daemon does not consume this API yet. A follow-up task owns the
 transport, storage location, lifecycle, and protocol versioning. Until then,
 this module is an in-memory primitive with unit evidence only.
+
+## Autonomous runner history
+
+`WheelRunner` applies a separate bounded conversation policy before each
+provider request. The named defaults are 48 KiB of message history, 10 turns,
+four retained recent turns, a 12 KiB `ContextRef`, eight structured evidence
+items, and 2 KiB per raw-evidence preview. When a byte or turn bound is
+reached, older messages are replaced by a deterministic `ContextRef` stored at
+`tasks/<task-id>/context_ref` and committed through the existing
+`WheelContext:commit_checkpoint` API. Complete assistant/tool observation pairs
+remain together; an unfinished tool call is retained rather than dropped.
+
+The retained state records tool-call identities, failures, decisions, evidence,
+risks, and next actions. Large tool output remains addressable through the
+existing bounded action `blob_hash`/preview representation instead of being
+copied into the provider request. The runner sends the compiler's Zone 1 as
+the system prefix and Zone 2/3 as the dynamic tail, so tail-only compaction does
+not change the stable prefix bytes.
