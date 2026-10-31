@@ -1335,8 +1335,7 @@ function WheelAgent:context_projection(opts)
     if not supplied or supplied.agent_id ~= expected_binding.agent_id
       or supplied.role ~= expected_binding.role
       or supplied.binding_id ~= expected_binding.binding_id
-      or supplied.policy_generation ~= expected_binding.policy_generation
-      or not capabilities_equal(supplied.capabilities, expected_binding.capabilities) then
+      or supplied.policy_generation ~= expected_binding.policy_generation then
       return nil, { code = "E_IDENTITY_PROJECTION", message = "projection RoleBinding conflicts with Agent authority" }
     end
   else
