@@ -76,6 +76,24 @@ return function(run_test)
         capabilities = { "inspect", "verify", "modify", "execute" },
       }
     end))
+    local exposed_binding = agent.role_binding
+    exposed_binding.capabilities = { "inspect", "verify", "modify", "execute", "orchestrate" }
+    exposed_binding.policy_generation = 99
+    assert(not agent:has_capability(WheelAgent.Capability.ORCHESTRATE),
+      "mutating a returned RoleBinding must not widen authority")
+    assert(agent.role_binding.policy_generation == 1,
+      "mutating a returned RoleBinding must not change policy generation")
+    assert(WheelAgent.ROLE_CAPABILITIES == nil,
+      "the mutable authorization matrix must not be exported")
+    assert(rawget(agent, "_authority") == nil and rawget(agent, "_identity") == nil,
+      "authoritative identity and policy state must not be stored on the public Agent table")
+    rawset(agent, "_authority", { role_binding = { role = WheelAgent.Role.CODING,
+      capabilities = { "inspect", "verify", "modify", "execute" }, policy_generation = 99 } })
+    rawset(agent, "_identity", { agent_id = "forged", lineage = nil })
+    assert(agent:current_role() == WheelAgent.Role.CODING)
+    assert(agent.agent_id == "identity-agent")
+    assert(not agent:has_capability(WheelAgent.Capability.ORCHESTRATE),
+      "shadow backing fields must not affect authoritative authorization")
     assert(agent.agent_id == "identity-agent")
     assert(agent.role_binding.policy_generation == 1)
   end)
@@ -83,18 +101,23 @@ return function(run_test)
   run_test("Agent identity: audited role transition preserves AgentId and never widens silently", function()
     local kernel = WheelKernel.new_mock()
     local context = fixed_context(kernel)
+    local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4 })
     local agent = WheelAgent.new({
       name = "transition-agent",
       role = WheelAgent.Role.CODING,
       kernel = kernel,
       context = context,
+      lifecycle = lifecycle,
     })
     local stable_id = agent.agent_id
     checkpoint(context, "role baseline")
+    assert(agent:create_runtime_session())
+    assert(agent:activate_runtime_session())
 
-    local narrowed = assert(agent:transition_role(WheelAgent.Role.REVIEWER, {
+    local narrowed, transition_err = agent:transition_role(WheelAgent.Role.REVIEWER, {
       reason = "independent verification assignment",
-    }))
+    })
+    assert(narrowed, transition_err and transition_err.message or "role transition failed")
     assert(agent.agent_id == stable_id)
     assert(narrowed.role == WheelAgent.Role.REVIEWER)
     assert(narrowed.policy_generation == 2)
@@ -139,6 +162,19 @@ return function(run_test)
     assert(no_checkpoint == nil and checkpoint_err.code == "E_ROLE_CHECKPOINT")
     assert(no_context.role_binding.role == WheelAgent.Role.CODING)
     assert(no_context.role_binding.policy_generation == 1)
+
+    local no_lifecycle_context = fixed_context(kernel)
+    checkpoint(no_lifecycle_context, "role baseline without lifecycle")
+    local no_lifecycle = WheelAgent.new({
+      name = "no-lifecycle-agent", role = WheelAgent.Role.CODING,
+      kernel = kernel, context = no_lifecycle_context,
+    })
+    local unaudited, audit_err = no_lifecycle:transition_role(WheelAgent.Role.REVIEWER, {
+      reason = "must have an audit record",
+    })
+    assert(unaudited == nil and audit_err.code == "E_ROLE_AUDIT")
+    assert(no_lifecycle.role_binding.role == WheelAgent.Role.CODING)
+    assert(no_lifecycle.role_binding.policy_generation == 1)
   end)
 
   run_test("Agent identity: runtime authorization ignores prompt identity text", function()
@@ -361,6 +397,36 @@ return function(run_test)
     assert(projection.identity.lineage.base_context_commit == base.hash)
     assert(projection.provenance.agent_id == child.agent_id)
     assert(projection.provenance.policy_generation == 1)
+
+    local forged_identity, identity_err = child:context_projection({
+      base_commit = base.hash,
+      current_commit = base.hash,
+      role = WheelContext.Role.REVIEWER,
+      task_id = "TASK-PROJECTION",
+      agent_id = parent.agent_id,
+    })
+    assert(forged_identity == nil and identity_err.code == "E_IDENTITY_PROJECTION")
+    local forged_binding, binding_err = child:context_projection({
+      base_commit = base.hash,
+      current_commit = base.hash,
+      role = WheelContext.Role.REVIEWER,
+      task_id = "TASK-PROJECTION",
+      role_binding = WheelAgent.binding_reference(parent.role_binding),
+    })
+    assert(forged_binding == nil and binding_err.code == "E_IDENTITY_PROJECTION")
+    local forged_lineage, lineage_err = child:context_projection({
+      base_commit = base.hash,
+      current_commit = base.hash,
+      role = WheelContext.Role.REVIEWER,
+      task_id = "TASK-PROJECTION",
+      lineage = {
+        forked_from_agent = "forged-parent",
+        forked_from_session = child.lineage.forked_from_session,
+        base_context_commit = base.hash,
+        reason = child.lineage.reason,
+      },
+    })
+    assert(forged_lineage == nil and lineage_err.code == "E_IDENTITY_PROJECTION")
 
     local replay = assert(child:context_projection({
       base_commit = base.hash,

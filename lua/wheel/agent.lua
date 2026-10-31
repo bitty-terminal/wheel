@@ -4,6 +4,17 @@
 -- Roles vary by configuration inside that domain, bounded by budgets and permissions.
 
 local WheelAgent = {}
+local AGENT_IDENTITY = setmetatable({}, { __mode = "k" })
+local AGENT_AUTHORITY = setmetatable({}, { __mode = "k" })
+
+local function authoritative_identity(agent)
+  return AGENT_IDENTITY[agent]
+end
+
+local function authoritative_binding(agent)
+  local authority = AGENT_AUTHORITY[agent]
+  return authority and authority.role_binding or nil
+end
 
 local ok_tool, WheelTool = pcall(require, "wheel.tool")
 if not ok_tool then
@@ -72,9 +83,9 @@ local READ_ONLY_TOOLS = {
 
 WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
 
---- Capability vocabulary. Authorization is decided from the granted capability
+-- Capability vocabulary. Authorization is decided from the granted capability
 -- set on the current RoleBinding, never from a role word in prompt or identity
--- text. `WheelAgent.ROLE_CAPABILITIES` is the only role-to-capability matrix.
+-- text. The role matrix remains private to this module.
 WheelAgent.Capability = {
   INSPECT = "inspect",
   VERIFY = "verify",
@@ -112,8 +123,6 @@ local ROLE_CAPABILITIES = {
     inspect = true, verify = true,
   },
 }
-WheelAgent.ROLE_CAPABILITIES = ROLE_CAPABILITIES
-
 local ROLE_VALUES = {}
 for _, role in pairs(WheelAgent.Role) do ROLE_VALUES[role] = true end
 
@@ -437,8 +446,8 @@ function WheelAgent.new(opts)
   end
 
   local self = setmetatable({}, WheelAgent)
-  rawset(self, "_identity", { agent_id = agent_id, lineage = lineage })
-  rawset(self, "_authority", { role_binding = role_binding })
+  AGENT_IDENTITY[self] = { agent_id = agent_id, lineage = lineage }
+  AGENT_AUTHORITY[self] = { role_binding = role_binding }
   self.name = opts.name
   self.role = role_binding.role
   self.policy_generation = role_binding.policy_generation
@@ -656,7 +665,7 @@ end
 -- @param tool_name string
 -- @return boolean, string?
 function WheelAgent:is_tool_allowed(tool_name)
-  local binding = self.role_binding
+  local binding = authoritative_binding(self)
   if type(binding) ~= "table" then
     return false, "agent '" .. tostring(self.name) .. "' has no role binding"
   end
@@ -1144,21 +1153,24 @@ end
 --- Current authoritative role, read from the RoleBinding.
 -- @return string|nil
 function WheelAgent:current_role()
-  return self.role_binding and self.role_binding.role or nil
+  local binding = authoritative_binding(self)
+  return binding and binding.role or nil
 end
 
 --- Check whether the current RoleBinding grants a capability.
 -- @param capability string WheelAgent.Capability value
 -- @return boolean
 function WheelAgent:has_capability(capability)
-  return capability_map(self.role_binding and self.role_binding.capabilities)[capability] == true
+  local binding = authoritative_binding(self)
+  return capability_map(binding and binding.capabilities)[capability] == true
 end
 
 --- Get a defensive copy of the granted capability set.
 -- @return table
 function WheelAgent:capabilities()
   local result = {}
-  for index, capability in ipairs(self.role_binding and self.role_binding.capabilities or {}) do
+  local binding = authoritative_binding(self)
+  for index, capability in ipairs(binding and binding.capabilities or {}) do
     result[index] = capability
   end
   return result
@@ -1179,7 +1191,8 @@ function WheelAgent:transition_role(target, opts)
   if not reason then
     return nil, { code = "E_ROLE_INVALID", message = "role transition requires a bounded reason" }
   end
-  local current = self.role_binding
+  local current = authoritative_binding(self)
+  local identity = authoritative_identity(self)
   if type(current) ~= "table" then
     return nil, { code = "E_ROLE_INVALID", message = "agent has no role binding" }
   end
@@ -1189,7 +1202,7 @@ function WheelAgent:transition_role(target, opts)
     capabilities = requested.capabilities or opts.capabilities,
     binding_id = requested.binding_id,
     policy_generation = generation,
-  }, self.agent_id)
+  }, identity and identity.agent_id)
   if not normalized then
     return nil, { code = "E_ROLE_INVALID", message = tostring(binding_err) }
   end
@@ -1214,7 +1227,7 @@ function WheelAgent:transition_role(target, opts)
   end
   local task_id = self.kernel and self.kernel.active_task_id or nil
   local checkpoint = self.context:commit_checkpoint({
-    author = self.agent_id,
+    author = identity and identity.agent_id,
     task_id = task_id,
     message = string.format("Role transition %s -> %s (policy generation %d)",
       current.role, normalized.role, generation),
@@ -1222,7 +1235,7 @@ function WheelAgent:transition_role(target, opts)
       why = "Role transition requested: " .. reason,
       what = string.format("Reissued RoleBinding %s at policy generation %d",
         tostring(normalized.binding_id), generation),
-      where_focus = "agent " .. self.agent_id,
+      where_focus = "agent " .. tostring(identity and identity.agent_id),
       how = #added > 0
         and ("explicit widening approval granted for: " .. table.concat(added, ","))
         or "narrowed or re-scoped capabilities without widening authority",
@@ -1236,20 +1249,25 @@ function WheelAgent:transition_role(target, opts)
   -- The checkpoint is immutable and may remain if a later record fails; the
   -- in-memory binding is not applied until the lifecycle record succeeds, so a
   -- failure never widens authority.
-  if self.lifecycle and self.session_id then
-    local recorded, record_err = self.lifecycle:record_role_transition(self.session_id, {
-      role_binding = WheelAgent.binding_reference(normalized),
-      checkpoint = checkpoint.hash,
-      reason = #added > 0 and "role_widening" or "role_transition",
-    })
-    if not recorded then
-      return nil, record_err or {
-        code = "E_ROLE_CHECKPOINT",
-        message = "role transition could not be recorded in the lifecycle registry",
-      }
-    end
+  if not self.lifecycle or not self.session_id
+    or type(self.lifecycle.record_role_transition) ~= "function" then
+    return nil, {
+      code = "E_ROLE_AUDIT",
+      message = "role transition requires a lifecycle session for audit",
+    }
   end
-  rawset(self, "_authority", { role_binding = normalized })
+  local recorded, record_err = self.lifecycle:record_role_transition(self.session_id, {
+    role_binding = WheelAgent.binding_reference(normalized),
+    checkpoint = checkpoint.hash,
+    reason = #added > 0 and "role_widening" or "role_transition",
+  })
+  if not recorded then
+    return nil, record_err or {
+      code = "E_ROLE_AUDIT",
+      message = "role transition could not be recorded in the lifecycle registry",
+    }
+  end
+  AGENT_AUTHORITY[self] = { role_binding = normalized }
   self.role = normalized.role
   self.policy_generation = normalized.policy_generation
   self.last_role_checkpoint = checkpoint.hash
@@ -1305,12 +1323,38 @@ function WheelAgent:context_projection(opts)
   end
   local projection_opts = {}
   for key, value in pairs(opts) do projection_opts[key] = value end
-  projection_opts.agent_id = projection_opts.agent_id or self.agent_id
-  projection_opts.role_binding = projection_opts.role_binding
-    or WheelAgent.binding_reference(self.role_binding)
-  if projection_opts.lineage == nil and self.lineage then
-    projection_opts.lineage = copy_lineage(self.lineage)
+  local identity = authoritative_identity(self)
+  local authoritative_id = identity and identity.agent_id
+  local expected_binding = WheelAgent.binding_reference(authoritative_binding(self))
+  local expected_lineage = identity and copy_lineage(identity.lineage) or nil
+  if projection_opts.agent_id ~= nil and projection_opts.agent_id ~= authoritative_id then
+    return nil, { code = "E_IDENTITY_PROJECTION", message = "projection agent_id conflicts with Agent identity" }
   end
+  if projection_opts.role_binding ~= nil then
+    local supplied = WheelAgent.binding_reference(projection_opts.role_binding)
+    if not supplied or supplied.agent_id ~= expected_binding.agent_id
+      or supplied.role ~= expected_binding.role
+      or supplied.binding_id ~= expected_binding.binding_id
+      or supplied.policy_generation ~= expected_binding.policy_generation
+      or not capabilities_equal(supplied.capabilities, expected_binding.capabilities) then
+      return nil, { code = "E_IDENTITY_PROJECTION", message = "projection RoleBinding conflicts with Agent authority" }
+    end
+  else
+    projection_opts.role_binding = expected_binding
+  end
+  if projection_opts.lineage ~= nil then
+    local supplied = WheelAgent.validate_lineage(projection_opts.lineage)
+    if not supplied or not expected_lineage
+      or supplied.forked_from_agent ~= expected_lineage.forked_from_agent
+      or supplied.forked_from_session ~= expected_lineage.forked_from_session
+      or supplied.base_context_commit ~= expected_lineage.base_context_commit
+      or supplied.reason ~= expected_lineage.reason then
+      return nil, { code = "E_IDENTITY_PROJECTION", message = "projection lineage conflicts with Agent identity" }
+    end
+  elseif expected_lineage then
+    projection_opts.lineage = expected_lineage
+  end
+  projection_opts.agent_id = authoritative_id
   if projection_opts.session_id == nil then projection_opts.session_id = self.session_id end
   return self.context:project(projection_opts)
 end
@@ -1449,12 +1493,14 @@ local IMMUTABLE_FIELDS = { agent_id = true, lineage = true, role_binding = true 
 
 function WheelAgent.__index(target, key)
   if key == "agent_id" or key == "lineage" then
-    local identity = rawget(target, "_identity")
-    return identity and identity[key] or nil
+    local identity = AGENT_IDENTITY[target]
+    if not identity then return nil end
+    if key == "lineage" then return copy_lineage(identity.lineage) end
+    return identity.agent_id
   end
   if key == "role_binding" then
-    local authority = rawget(target, "_authority")
-    return authority and authority.role_binding or nil
+    local authority = AGENT_AUTHORITY[target]
+    return authority and binding_copy(authority.role_binding) or nil
   end
   return WheelAgent[key]
 end
