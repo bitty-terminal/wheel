@@ -70,6 +70,7 @@ local WheelTool = load_submodule("tool")
 local WheelUI = load_submodule("ui")
 
 local WheelHost = load_submodule("host")
+local WheelAudit = load_submodule("audit")
 local ok_lifecycle, WheelLifecycle = pcall(load_submodule, "lifecycle")
 if not ok_lifecycle then
   local lifecycle_error = WheelLifecycle
@@ -85,6 +86,7 @@ end
 
 local WheelTeam = {}
 WheelTeam.__index = WheelTeam
+local MAX_HANDOFF_RECORD_BYTES = 8192
 
 --- Create a new WheelTeam coordinator.
 --- @param opts table
@@ -108,6 +110,9 @@ function WheelTeam.new(opts)
   self.agent_states = {} -- map of agent_name -> { state = "idle"|"busy"|"waiting_review", active_task_id = string?, tasks_completed = number }
   self.handoffs = {} -- array of structured handoff records
   self.task_assignments = {} -- map of task_id -> agent_name
+  self.agent_tasks = {} -- map of agent_name -> set of active task ids
+  self.handoff_counter = 0
+  self.allow_multiple_tasks = opts.allow_multiple_tasks == true
 
   -- Shared context engine and event bus across peer colleagues
   self.context = opts.context or WheelContext.new({
@@ -149,7 +154,9 @@ function WheelTeam:register_agent(agent)
     tasks_completed = 0,
     handoffs_sent = 0,
     handoffs_received = 0,
+    active_task_ids = {},
   }
+  self.agent_tasks[agent.name] = {}
 
   -- Mount shared team context and subscribe colleague to context events
   agent.context = self.context
@@ -338,15 +345,26 @@ function WheelTeam:claim_task(agent_name, task_id)
   end
 
   local st = self.agent_states[agent_name]
-  if not st or st.state ~= "idle" then
-    return false, "agent '" .. agent_name .. "' is not idle (current state: " .. tostring(st and st.state) .. ")"
+  if not st then
+    return false, "agent not found: " .. tostring(agent_name)
   end
-
   -- Check if task is already assigned or active in team
   if self.task_assignments[task_id] then
     local assigned_to = self.task_assignments[task_id]
     if assigned_to ~= agent_name then
       return false, "task '" .. task_id .. "' is already claimed by agent '" .. assigned_to .. "'"
+    end
+  end
+
+  local owned = self.agent_tasks[agent_name] or {}
+  local owned_count = 0
+  for _ in pairs(owned) do owned_count = owned_count + 1 end
+  if owned_count > 0 then
+    if not self.allow_multiple_tasks then
+      return false, "concurrent task ownership is disabled for agent '" .. agent_name .. "'"
+    end
+    if not self:_has_task_session(agent_name, task_id) then
+      return false, "a distinct live runtime session and panel are required for task '" .. task_id .. "'"
     end
   end
 
@@ -357,7 +375,10 @@ function WheelTeam:claim_task(agent_name, task_id)
   end
 
   local status_lower = string.lower(task.status or "")
-  if status_lower ~= "ready" and status_lower ~= "pending" and status_lower ~= "running" then
+  local status_map = { ready="ready", pending="pending", running="in_progress", in_progress="in_progress",
+    succeeded="completed", completed="completed", failed="failed", cancelled="cancelled", blocked="blocked" }
+  task.lifecycle_status = status_map[status_lower] or "unknown"
+  if task.lifecycle_status ~= "ready" then
     return false, "task '" .. task_id .. "' is not claimable (status: " .. tostring(task.status) .. ")"
   end
 
@@ -365,13 +386,22 @@ function WheelTeam:claim_task(agent_name, task_id)
   if task.worker_id and task.worker_id ~= "" and task.worker_id ~= agent_name and status_lower == "running" then
     return false, "task '" .. task_id .. "' is already claimed by worker '" .. tostring(task.worker_id) .. "'"
   end
+  if status_lower == "running" and task.worker_id == agent_name then
+    return false, "task '" .. task_id .. "' is already in progress; recover it explicitly"
+  end
 
   -- Start task in kernel with agent attribution
   local started_task = self.kernel:start_task(task_id, agent_name)
+  if not started_task or started_task.status ~= "running" then
+    return false, "kernel refused task claim"
+  end
 
   -- Record team claim
+  self.agent_tasks[agent_name][task_id] = { generation = started_task.generation or task.generation or 0 }
+  st.active_task_ids = st.active_task_ids or {}
+  st.active_task_ids[task_id] = true
   st.state = "busy"
-  st.active_task_id = task_id
+  st.active_task_id = task_id -- compatibility: most recently claimed task
   self.task_assignments[task_id] = agent_name
 
   -- Record worker assignment in semantic slots
@@ -380,6 +410,33 @@ function WheelTeam:claim_task(agent_name, task_id)
   end
 
   return true, started_task or task
+end
+
+function WheelTeam:_has_task_session(agent_name, task_id)
+  if not self.lifecycle or type(self.lifecycle.list_sessions) ~= "function" then return false end
+  local agent = self.agents[agent_name]
+  if not agent then return false end
+  local sessions = self.lifecycle:list_sessions(agent.agent_id) or {}
+  local candidate
+  for _, session in ipairs(sessions) do
+    if session.agent_id == agent.agent_id and session.task_id == task_id
+      and (session.state == "active" or session.state == "created" or session.state == "paused") then
+      candidate = session
+      break
+    end
+  end
+  if not candidate then return false end
+  for task in pairs(self.agent_tasks[agent_name] or {}) do
+    if task ~= task_id then
+      for _, session in ipairs(sessions) do
+        if session.task_id == task and (session.state == "active" or session.state == "created" or session.state == "paused")
+          and session.panel_id == candidate.panel_id then
+          return false
+        end
+      end
+    end
+  end
+  return true
 end
 
 --- Release an agent's claim on a task upon completion or failure.
@@ -394,7 +451,7 @@ function WheelTeam:release_task(agent_name, task_id, outcome)
     return false, "agent not found: " .. tostring(agent_name)
   end
 
-  if st.active_task_id ~= task_id then
+  if not self.agent_tasks[agent_name] or not self.agent_tasks[agent_name][task_id] then
     return false, "agent '" .. agent_name .. "' does not hold active claim on task '" .. tostring(task_id) .. "'"
   end
 
@@ -402,22 +459,27 @@ function WheelTeam:release_task(agent_name, task_id, outcome)
   local status_lower = string.lower(status)
 
   local task = self.kernel:get_task(task_id)
-  local gen = (task and task.generation) or 1
+  local gen = self.agent_tasks[agent_name][task_id].generation
   local cur_status = string.lower((task and task.status) or "")
 
   if status_lower == "succeeded" then
     if cur_status ~= "succeeded" then
-      self.kernel:complete_task(task_id, gen, outcome.checkpoint_hash)
+      local completed = self.kernel:complete_task(task_id, gen, outcome.checkpoint_hash)
+      if not completed or completed.status ~= "succeeded" then return false, "task completion rejected (stale generation or invalid state)" end
     end
     st.tasks_completed = (st.tasks_completed or 0) + 1
   else
     if cur_status ~= "failed" then
-      self.kernel:fail_task(task_id, gen, outcome.error or "task failed")
+      local failed = self.kernel:fail_task(task_id, gen, outcome.error or "task failed")
+      if not failed or failed.status ~= "failed" then return false, "task failure rejected (stale generation or invalid state)" end
     end
   end
 
-  st.state = "idle"
-  st.active_task_id = nil
+  self.agent_tasks[agent_name][task_id] = nil
+  st.active_task_ids = st.active_task_ids or {}
+  st.active_task_ids[task_id] = nil
+  st.active_task_id = next(self.agent_tasks[agent_name])
+  st.state = st.active_task_id and "busy" or "idle"
   self.task_assignments[task_id] = nil
 
   return true, nil
@@ -435,7 +497,7 @@ function WheelTeam:handoff(from_agent, to_agent, task_id, opts)
   if not from_st then
     return false, "from_agent '" .. tostring(from_agent) .. "' not found"
   end
-  if from_st.active_task_id ~= task_id then
+  if not self.agent_tasks[from_agent] or not self.agent_tasks[from_agent][task_id] then
     return false, "from_agent '" .. from_agent .. "' does not hold task '" .. tostring(task_id) .. "'"
   end
 
@@ -444,52 +506,295 @@ function WheelTeam:handoff(from_agent, to_agent, task_id, opts)
   if not to_agent_inst or not to_st then
     return false, "to_agent '" .. tostring(to_agent) .. "' not found"
   end
-  if to_st.state ~= "idle" then
+  if self.task_assignments[task_id] ~= from_agent then return false, "task assignment changed before handoff" end
+  local task = self.kernel:get_task(task_id)
+  local source_claim = self.agent_tasks[from_agent][task_id]
+  local task_status = task and (task.status or ""):lower() or ""
+  if not task or (task_status ~= "running" and task_status ~= "succeeded")
+    or task.generation ~= source_claim.generation then
+    return false, "task generation is stale; handoff refused"
+  end
+  if self.agent_tasks[to_agent][task_id] then return false, "target agent already holds this task" end
+  if to_st.state ~= "idle" and not self.allow_multiple_tasks then
     return false, "to_agent '" .. tostring(to_agent) .. "' is not idle (state: " .. tostring(to_st.state) .. ")"
   end
 
-  local handoff_id = string.format("handoff-%d-%s", #self.handoffs + 1, task_id)
+  if opts.source_session_id or opts.target_session_id then
+    if not self.lifecycle then return false, "session references require a lifecycle registry" end
+    local function validate_session(session_id, agent, label)
+      if session_id == nil then return true end
+      if type(session_id) ~= "string" then return false, label .. " is invalid" end
+      local session = self.lifecycle:get_session(session_id)
+      if not session or session.agent_id ~= agent.agent_id or session.task_id ~= task_id
+        or (session.state ~= "created" and session.state ~= "active" and session.state ~= "paused") then
+        return false, label .. " does not identify a live session for the expected agent and task"
+      end
+      return true
+    end
+    local valid, validation_error = validate_session(opts.source_session_id, self.agents[from_agent], "source_session_id")
+    if not valid then return false, validation_error end
+    valid, validation_error = validate_session(opts.target_session_id, to_agent_inst, "target_session_id")
+    if not valid then return false, validation_error end
+  end
+
+  local function bounded_text(value, label, default)
+    if value == nil then value = default end
+    if type(value) ~= "string" or #value > 256 or value:find("[%z\1-\31\127]") then
+      return nil, label .. " must be a bounded string"
+    end
+    if value == "" and label ~= "rationale" then return nil, label .. " must not be empty" end
+    return WheelAudit.redact_bounded(value, 256)
+  end
+  local function bounded_list(value, label)
+    if value == nil then return {} end
+    if type(value) ~= "table" or getmetatable(value) ~= nil or #value > 16 then return nil, label .. " must contain at most 16 items" end
+    local count = 0
+    for key in pairs(value) do
+      if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return nil, label .. " must be a dense list" end
+      count = count + 1
+    end
+    if count ~= #value then return nil, label .. " must be a dense list" end
+    local out = {}
+    for _, item in ipairs(value) do
+      if type(item) ~= "string" or item == "" or #item > 256 or item:find("[%z\1-\31\127]") then return nil, label .. " contains an invalid item" end
+      out[#out + 1] = WheelAudit.redact_bounded(item, 256)
+    end
+    return out
+  end
+  local scope, err = bounded_list(opts.scope, "scope"); if not scope then return false, err end
+  local evidence; evidence, err = bounded_list(opts.evidence, "evidence"); if not evidence then return false, err end
+  local blockers; blockers, err = bounded_list(opts.blockers, "blockers"); if not blockers then return false, err end
+  local risks; risks, err = bounded_list(opts.risks, "risks"); if not risks then return false, err end
+  local next_steps; next_steps, err = bounded_list(opts.next_steps, "next_steps"); if not next_steps then return false, err end
+  local reason; reason, err = bounded_text(opts.reason, "reason", "handoff"); if not reason then return false, err end
+  local rationale; rationale, err = bounded_text(opts.rationale, "rationale", ""); if not rationale then return false, err end
+  local context_ref; context_ref, err = bounded_text(opts.context_ref, "context_ref"); if opts.context_ref ~= nil and not context_ref then return false, err end
+  local checkpoint_hash; checkpoint_hash, err = bounded_text(opts.checkpoint_hash, "checkpoint_hash"); if opts.checkpoint_hash ~= nil and not checkpoint_hash then return false, err end
+  local function bounded_reference(value, label)
+    if value == nil then return nil end
+    if type(value) ~= "string" or value == "" or #value > 128
+      or not value:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$") then
+      return nil, label .. " must be a bounded identifier"
+    end
+    return value
+  end
+  local source_session_id; source_session_id, err = bounded_reference(opts.source_session_id, "source_session_id")
+  if opts.source_session_id ~= nil and not source_session_id then return false, err end
+  local target_session_id; target_session_id, err = bounded_reference(opts.target_session_id, "target_session_id")
+  if opts.target_session_id ~= nil and not target_session_id then return false, err end
+  local previous_handoff = self.context and self.context:get_slot("tasks/" .. task_id .. "/handoff")
+  local handoff_revision = previous_handoff and previous_handoff.version or 0
+  local handoff_id = string.format("handoff-%s-%d-%d", task_id, task.generation, handoff_revision + 1)
   local record = {
     handoff_id = handoff_id,
     task_id = task_id,
     from_agent = from_agent,
     to_agent = to_agent,
-    reason = opts.reason or "handoff",
-    rationale = opts.rationale or "",
-    checkpoint_hash = opts.checkpoint_hash,
+    reason = reason,
+    rationale = rationale,
+    checkpoint_hash = checkpoint_hash,
+    source_session_id = source_session_id,
+    target_session_id = target_session_id,
+    context_ref = context_ref,
+    scope = scope, evidence = evidence, blockers = blockers, risks = risks, next_steps = next_steps,
+    generation = task.generation,
+    state = "offered",
     timestamp = WheelHost.time.now(),
   }
+  local persisted, persist_error = self:_persist_handoff(record)
+  if not persisted then return false, persist_error end
+  self.handoffs[#self.handoffs + 1] = record
+  if opts.defer_accept then return true, record end
+  local accepted, accepted_record = self:set_handoff_state(handoff_id, "accepted")
+  if not accepted then
+    table.remove(self.handoffs)
+    return false, accepted_record
+  end
+  if self.context.bus and type(self.context.bus.publish) == "function" then
+    self.context.bus:publish({ type="handoff_received", handoff=accepted_record, from_agent=from_agent, to_agent=to_agent, task_id=task_id })
+  end
+  return true, accepted_record
+end
 
-  table.insert(self.handoffs, record)
-
-  -- Transition states
-  from_st.state = "idle"
-  from_st.active_task_id = nil
-  from_st.handoffs_sent = (from_st.handoffs_sent or 0) + 1
-
-  to_st.state = "busy"
-  to_st.active_task_id = task_id
-  to_st.handoffs_received = (to_st.handoffs_received or 0) + 1
-
-  self.task_assignments[task_id] = to_agent
-
-  -- Record structured handoff in semantic slots and notify receiver
-  if self.context and type(self.context.put_slot) == "function" then
-    local handoff_payload = string.format("from: %s\nto: %s\ntask: %s\nreason: %s\nrationale: %s\ncheckpoint: %s",
-      from_agent, to_agent, task_id, record.reason, record.rationale, record.checkpoint_hash or "none")
-    self.context:put_slot("tasks/" .. task_id .. "/handoff", handoff_payload)
-    if self.context.bus and type(self.context.bus.publish) == "function" then
-      self.context.bus:publish({
-        type = "handoff_received",
-        handoff = record,
-        from_agent = from_agent,
-        to_agent = to_agent,
-        task_id = task_id,
-      })
+function WheelTeam:_persist_handoff(record)
+  if not self.context or type(self.context.put_slot) ~= "function" then
+    return false, "handoff requires a context persistence store"
+  end
+  local ok, encoded = pcall(self.kernel.json.encode, record)
+  if not ok or type(encoded) ~= "string" then return false, "handoff record could not be encoded" end
+  if #encoded > MAX_HANDOFF_RECORD_BYTES then return false, "handoff record exceeds the persistence limit" end
+  local slot_name = "tasks/" .. record.task_id .. "/handoff"
+  local existing = self.context:get_slot(slot_name)
+  local function rollback_slot(expected_version)
+    if existing and existing.found then
+      self.context:put_slot(slot_name, existing.content, expected_version)
+    else
+      self.context:remove_slot(slot_name, expected_version)
     end
   end
+  local result, err = self.context:put_slot(slot_name, encoded, existing and existing.version or 0)
+  if not result or not result.success then return false, err or { error="handoff_persist_failed" } end
+  local checkpoint, checkpoint_error = self.context:commit_checkpoint({
+    author = "wheel:team",
+    task_id = record.task_id,
+    message = "Handoff " .. record.handoff_id .. " " .. record.state,
+    rationale = { why = "Persist bounded handoff state transition", what = record.state },
+  })
+  if not checkpoint or not checkpoint.hash then
+    rollback_slot(result.version)
+    return false, checkpoint_error or "handoff checkpoint failed"
+  end
+  if record.checkpoint_hash == nil then
+    record.checkpoint_hash = checkpoint.hash
+    local checkpointed, checkpointed_error = self.context:put_slot(slot_name,
+      self.kernel.json.encode(record), result.version)
+    if not checkpointed or not checkpointed.success then
+      rollback_slot(result.version)
+      return false, checkpointed_error or { error="handoff_persist_failed" }
+    end
+    local final_checkpoint, final_error = self.context:commit_checkpoint({
+      author = "wheel:team", task_id = record.task_id,
+      message = "Handoff " .. record.handoff_id .. " checkpoint reference",
+      rationale = { why = "Bind handoff record to immutable ContextCommit", what = record.state },
+    })
+    if not final_checkpoint or not final_checkpoint.hash then
+      rollback_slot(checkpointed.version)
+      return false, final_error or "handoff checkpoint reference failed"
+    end
+  end
+  return true
+end
 
-  return true, record
+function WheelTeam:_find_handoff(handoff_id)
+  for _, record in ipairs(self.handoffs) do
+    if record.handoff_id == handoff_id then return record end
+  end
+  if not self.context or type(self.context.get_slot) ~= "function" then return nil end
+  for _, task in ipairs(self.kernel:list_tasks()) do
+    local slot = self.context:get_slot("tasks/" .. task.id .. "/handoff")
+    if slot and slot.found and type(slot.content) == "string" then
+      local ok, record = pcall(self.kernel.json.decode, slot.content)
+      if ok and type(record) == "table" and record.handoff_id == handoff_id and record.task_id == task.id then
+        local allowed = {
+          handoff_id=true, task_id=true, from_agent=true, to_agent=true, reason=true, rationale=true,
+          checkpoint_hash=true, source_session_id=true, target_session_id=true, context_ref=true,
+          scope=true, evidence=true, blockers=true, risks=true, next_steps=true, generation=true,
+          state=true, timestamp=true, updated_at=true,
+        }
+        local valid = true
+        for key in pairs(record) do if not allowed[key] then valid = false; break end end
+        local function bounded_string(value, optional)
+          return (optional and value == nil) or (type(value) == "string" and value ~= "" and #value <= 256
+            and not value:find("[%z\1-\31\127]"))
+        end
+        local function bounded_list(value)
+          if type(value) ~= "table" or getmetatable(value) ~= nil or #value > 16 then return false end
+          local count = 0
+          for key in pairs(value) do
+            if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return false end
+            count = count + 1
+          end
+          if count ~= #value then return false end
+          for _, item in ipairs(value) do if not bounded_string(item) then return false end end
+          return true
+        end
+        valid = valid and bounded_string(record.handoff_id) and bounded_string(record.task_id)
+          and bounded_string(record.from_agent) and bounded_string(record.to_agent)
+          and bounded_string(record.reason) and bounded_string(record.rationale, true)
+          and bounded_string(record.checkpoint_hash, true) and bounded_string(record.context_ref, true)
+          and bounded_string(record.source_session_id, true) and bounded_string(record.target_session_id, true)
+          and type(record.generation) == "number" and record.generation >= 1 and record.generation % 1 == 0
+          and (record.state == "offered" or record.state == "accepted" or record.state == "rejected" or record.state == "closed")
+          and type(record.timestamp) == "number"
+          and bounded_list(record.scope) and bounded_list(record.evidence) and bounded_list(record.blockers)
+          and bounded_list(record.risks) and bounded_list(record.next_steps)
+        for _, field in ipairs({ "scope", "evidence", "blockers", "risks", "next_steps" }) do
+          if #self.kernel.json.encode(record[field]) > 4096 then valid = false end
+        end
+        if valid then
+          self.handoffs[#self.handoffs + 1] = record
+          local owner
+          if record.state == "offered" then owner = record.from_agent
+          elseif record.state == "accepted" then owner = record.to_agent end
+          if owner and task.generation == record.generation and task.worker_id == owner
+            and (task.status or ""):lower() == "running" and self.agents[owner] then
+            self.task_assignments[record.task_id] = owner
+            self.agent_tasks[owner][record.task_id] = { generation = record.generation }
+            local state = self.agent_states[owner]
+            state.active_task_ids[record.task_id] = true
+            state.active_task_id, state.state = record.task_id, "busy"
+          end
+          return record
+        end
+      end
+    end
+  end
+  return nil
+end
+
+function WheelTeam:set_handoff_state(handoff_id, target_state)
+  local transitions = { offered = { accepted = true, rejected = true }, accepted = { closed = true } }
+  if target_state ~= "accepted" and target_state ~= "rejected" and target_state ~= "closed" then
+    return false, "invalid handoff state"
+  end
+  local record = self:_find_handoff(handoff_id)
+  if record then
+      if not (transitions[record.state] and transitions[record.state][target_state]) then
+        return false, "invalid handoff transition: " .. tostring(record.state) .. " -> " .. target_state
+      end
+      local task = self.kernel:get_task(record.task_id)
+      if not task or task.generation ~= record.generation
+        or (target_state == "accepted" and (task.status or ""):lower() ~= "running"
+          and (task.status or ""):lower() ~= "succeeded")
+        or (target_state ~= "accepted" and (task.status or ""):lower() ~= "running"
+          and (task.status or ""):lower() ~= "succeeded") then
+        return false, "handoff generation is stale"
+      end
+      local updated = {}; for key, value in pairs(record) do updated[key] = value end
+      updated.state, updated.updated_at = target_state, WheelHost.time.now()
+      if target_state == "accepted" then
+        if self.task_assignments[record.task_id] ~= record.from_agent then return false, "task assignment changed before acceptance" end
+        local source, target = self.agent_states[record.from_agent], self.agent_states[record.to_agent]
+        if not source or not target or self.agent_tasks[record.to_agent][record.task_id]
+          or (target.state ~= "idle" and not self.allow_multiple_tasks) then return false, "handoff target is no longer available" end
+        local reassigned = self.kernel:reassign_task(record.task_id, record.generation, record.to_agent)
+        if not reassigned or reassigned.status ~= "running" or reassigned.generation <= record.generation then
+          return false, "handoff task reassignment rejected (stale generation or invalid state)"
+        end
+        updated.generation = reassigned.generation
+      end
+      local persisted, persist_error = self:_persist_handoff(updated)
+      if not persisted then
+        if target_state == "accepted" then
+          local restored = self.kernel:reassign_task(record.task_id, updated.generation, record.from_agent)
+          if restored and restored.status == "running" then
+            record.generation = restored.generation
+            self.agent_tasks[record.from_agent][record.task_id].generation = restored.generation
+            self:_persist_handoff(record)
+          end
+        end
+        return false, persist_error
+      end
+      if target_state == "accepted" then
+        local source, target = self.agent_states[record.from_agent], self.agent_states[record.to_agent]
+        self.agent_tasks[record.from_agent][record.task_id] = nil
+        source.active_task_ids[record.task_id] = nil
+        source.active_task_id = next(self.agent_tasks[record.from_agent])
+        source.state = source.active_task_id and "busy" or "idle"
+        source.handoffs_sent = (source.handoffs_sent or 0) + 1
+        self.agent_tasks[record.to_agent][record.task_id] = { generation = updated.generation }
+        target.active_task_ids[record.task_id] = true
+        target.active_task_id, target.state = record.task_id, "busy"
+        target.handoffs_received = (target.handoffs_received or 0) + 1
+        self.task_assignments[record.task_id] = record.to_agent
+      elseif target_state == "rejected" then
+        self.task_assignments[record.task_id] = record.from_agent
+      end
+      for key in pairs(record) do record[key] = nil end
+      for key, value in pairs(updated) do record[key] = value end
+      return true, record
+  end
+  return false, "handoff not found"
 end
 
 --- Dispatch ready DAG tasks to available idle peer agents in wave order.

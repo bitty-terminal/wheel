@@ -49,6 +49,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   projections. No task hierarchy, durable handoff, Dashboard, provider-cache, or
   `bittyd` change is included.
 
+- Task hierarchy metadata independent of dependency edges and normalized task
+  lifecycle status; concurrent task ownership per agent with explicit distinct
+  runtime sessions/panels; bounded handoff routing, checkpoint, scope, evidence,
+  blocker, risk, next-step, and generation references. Handoff projections are
+  stored in the existing context slot store; CarryCtx remains the lifecycle
+  and recovery system of record.
+
 - Explicit AgentSession and Headless Panel lifecycle records (CTX-0045 /
   wheel#114): independent agent, session, panel, task, context branch/head,
   role/model, and optional worktree references; checkpoint, pause, detach,

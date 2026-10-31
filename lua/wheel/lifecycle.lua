@@ -864,7 +864,7 @@ function Lifecycle.new(opts)
   local self = setmetatable({}, Lifecycle)
   self.path = opts.path
   self.policy = { max_sessions_per_agent = opts.max_sessions_per_agent == nil and 1 or opts.max_sessions_per_agent,
-    allow_multiple_tasks = opts.allow_multiple_tasks ~= false }
+    allow_multiple_tasks = opts.allow_multiple_tasks == true }
   if self.policy.max_sessions_per_agent ~= nil and (not finite(self.policy.max_sessions_per_agent)
     or self.policy.max_sessions_per_agent < 1 or self.policy.max_sessions_per_agent % 1 ~= 0
     or self.policy.max_sessions_per_agent > MAX_SESSIONS) then error("invalid session policy") end
@@ -1061,7 +1061,7 @@ function Lifecycle:create_agent_session(opts)
     if state.policy.max_sessions_per_agent and live_count >= state.policy.max_sessions_per_agent then return false, { code="E_LIFECYCLE_POLICY", message="agent session policy limit reached" } end
     if not state.policy.allow_multiple_tasks then
       for _, item in pairs(state.sessions) do
-        if item.agent_id == agent_id and LIVE[item.state] then
+        if item.agent_id == agent_id and LIVE[item.state] and item.task_id ~= opts.task_id then
           return false, { code="E_LIFECYCLE_POLICY", message="agent cannot own multiple live session tasks" }
         end
       end

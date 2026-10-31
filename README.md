@@ -71,7 +71,17 @@ Checkpoint, pause, detach, attach, resume, stale/recover, end, and abandon are
 explicit transitions. A panel has at most one controller session; observer
 attachments are recorded separately and do not acquire execution authority.
 The registry policy defaults to one live session per AgentId and can explicitly
-allow more sessions/tasks. Lifecycle events contain bounded identifiers and
+allow more sessions/tasks. Team task concurrency is also disabled by default
+and must be enabled with `allow_multiple_tasks`; every concurrent task should
+use its own runtime session and panel. Kernel tasks expose `parent_task_id` separately from
+dependency edges and a normalized `lifecycle_status` beside kernel status. Team
+ownership is tracked per task, allowing one Agent identity to own multiple
+tasks; callers must provide distinct runtime AgentSessions/Panels for
+concurrent execution. Handoff records carry source/target agent and optional
+session references, bounded ContextRef, checkpoint, scope, evidence, blockers,
+risks, next steps, and task generation. The kernel fences stale generations.
+Handoffs remain harness-local and are not a durable cross-process store;
+CarryCtx remains the lifecycle and recovery reference. Lifecycle events contain bounded identifiers and
 state metadata only: prompt, transcript, context-slot, provider-response, and
 tool-output content are not lifecycle or `bittyd` records. The local
 `wheel-session` daemon remains a subordinate development/transport prototype;

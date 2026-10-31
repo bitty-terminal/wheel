@@ -273,6 +273,10 @@ WheelKernel.JSON = JSON
 -- ---------------------------------------------------------------------------
 
 local function create_mock_dispatcher()
+  local function lifecycle_status(status)
+    return ({ pending="pending", ready="ready", running="in_progress", succeeded="completed",
+      failed="failed", cancelled="cancelled", blocked="blocked" })[(status or ""):lower()] or "unknown"
+  end
   local state = {
     active_task = nil,
     head_checkpoint = nil,
@@ -343,6 +347,18 @@ local function create_mock_dispatcher()
         return json_codec.encode({ success = false, error = "task already exists" })
       end
       local deps = payload.dependencies or {}
+      if payload.parent_task_id ~= nil and (type(payload.parent_task_id) ~= "string"
+        or payload.parent_task_id == "" or #payload.parent_task_id > 128
+        or payload.parent_task_id:find("[%z\1-\31\127]")
+        or not payload.parent_task_id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$")) then
+        return json_codec.encode({ success = false, error = "parent_task_id is invalid" })
+      end
+      if payload.parent_task_id and not state.tasks[payload.parent_task_id] then
+        return json_codec.encode({ success = false, error = "parent task not found: " .. tostring(payload.parent_task_id) })
+      end
+      if payload.parent_task_id == id then
+        return json_codec.encode({ success = false, error = "task cannot be its own parent" })
+      end
       local status = (#deps == 0) and "ready" or "pending"
       local task = {
         id = id,
@@ -350,7 +366,9 @@ local function create_mock_dispatcher()
         description = payload.description or "",
         priority = payload.priority or 0,
         status = status,
+        lifecycle_status = lifecycle_status(status),
         dependencies = deps,
+        parent_task_id = payload.parent_task_id,
         generation = 0,
         assigned_agent = payload.assigned_agent or payload.worker_id,
         worker_id = payload.assigned_agent or payload.worker_id,
@@ -398,9 +416,30 @@ local function create_mock_dispatcher()
       end
       local worker = payload.assigned_agent or payload.worker_id or "worker"
       task.status = "running"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.generation = task.generation + 1
       task.assigned_agent = worker
       task.worker_id = worker
+      task.updated_at_ms = payload.now_ms or 0
+      return json_codec.encode({ success = true, data = task })
+
+    elseif command == "task.reassign" then
+      local task = state.tasks[payload.id]
+      if not task then return json_codec.encode({ success = false, error = "task not found" }) end
+      local task_status = (task.status or ""):lower()
+      if task_status ~= "running" and task_status ~= "succeeded" then
+        return json_codec.encode({ success = false, error = "task is not transferable" })
+      end
+      if payload.expected_generation ~= task.generation then
+        return json_codec.encode({ success = false, error = "stale generation" })
+      end
+      if type(payload.assigned_agent) ~= "string" or payload.assigned_agent == "" then
+        return json_codec.encode({ success = false, error = "assigned_agent is required" })
+      end
+      task.status = "running"
+      task.lifecycle_status = lifecycle_status(task.status)
+      task.generation = task.generation + 1
+      task.assigned_agent, task.worker_id = payload.assigned_agent, payload.assigned_agent
       task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
@@ -417,6 +456,7 @@ local function create_mock_dispatcher()
         return json_codec.encode({ success = false, error = "stale generation" })
       end
       task.status = "succeeded"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.checkpoint = payload.checkpoint
       task.updated_at_ms = payload.now_ms or 0
 
@@ -433,6 +473,7 @@ local function create_mock_dispatcher()
           end
           if all_succeeded then
             other.status = "ready"
+            other.lifecycle_status = lifecycle_status(other.status)
             other.updated_at_ms = payload.now_ms or 0
           end
         end
@@ -450,6 +491,7 @@ local function create_mock_dispatcher()
       end
       local err_msg = payload.failure_reason or payload.error or "unknown failure"
       task.status = "failed"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.failure_reason = err_msg
       task.error = err_msg
       task.updated_at_ms = payload.now_ms or 0
@@ -461,6 +503,7 @@ local function create_mock_dispatcher()
             local other_st = (other.status or ""):lower()
             if dep_id == failed_id and other_st ~= "succeeded" and other_st ~= "failed" then
               other.status = "blocked"
+              other.lifecycle_status = lifecycle_status(other.status)
               other.updated_at_ms = payload.now_ms or 0
               block_dependents(other.id)
             end
@@ -477,6 +520,7 @@ local function create_mock_dispatcher()
         return json_codec.encode({ success = false, error = "task not found" })
       end
       task.status = "cancelled"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
@@ -495,6 +539,7 @@ local function create_mock_dispatcher()
         end
       end
       task.status = all_succeeded and "ready" or "pending"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.failure_reason = nil
       task.error = nil
       task.updated_at_ms = payload.now_ms or 0
@@ -751,7 +796,7 @@ function WheelKernel:status()
 end
 
 --- Create a new task in the control plane DAG.
---- @param draft table { id: string, title: string, description: string, priority: number?, dependencies: string[]?, now_ms: number? }
+--- @param draft table { id: string, title: string, description: string, priority: number?, dependencies: string[]?, parent_task_id: string?, now_ms: number? }
 --- @return table
 function WheelKernel:create_task(draft)
   return self:call("task.create", draft)
@@ -791,6 +836,21 @@ function WheelKernel:start_task(id, worker_id, now_ms)
     id = id,
     worker_id = worker,
     assigned_agent = worker,
+    now_ms = now_ms or 0,
+  })
+end
+
+--- Reassign a running task while fencing stale owners by advancing generation.
+--- @param id string
+--- @param expected_generation number
+--- @param assigned_agent string
+--- @param now_ms number?
+--- @return table
+function WheelKernel:reassign_task(id, expected_generation, assigned_agent, now_ms)
+  return self:call("task.reassign", {
+    id = id,
+    expected_generation = expected_generation,
+    assigned_agent = assigned_agent,
     now_ms = now_ms or 0,
   })
 end

@@ -2425,7 +2425,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   -- the alternate root. The temporary tree contains only lua/wheel/<dep>.lua,
   -- so every rooted `wheel.<dep>` lookup is a real not-found result.
   local alternate_cases = {
-    { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host" } },
+    { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host", "audit" } },
     { parent = "context", deps = { "errors", "config", "host", "context_snapshot", "rationale" } },
     {
       parent = "tool",
@@ -3949,9 +3949,10 @@ end)
 
 run_test("WheelTeam: atomic task claim and collision prevention", function()
   local kernel = WheelKernel.new({ in_memory = true })
-  local team = WheelTeam.new({ kernel = kernel })
+  local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4, allow_multiple_tasks = true })
+  local team = WheelTeam.new({ kernel = kernel, lifecycle = lifecycle })
 
-  team:spawn_agent({ name = "dev-1", role = WheelAgent.Role.CODING })
+  local dev1 = team:spawn_agent({ name = "dev-1", role = WheelAgent.Role.CODING })
   team:spawn_agent({ name = "dev-2", role = WheelAgent.Role.CODING })
 
   kernel:create_task({ id = "TASK-CLAIM-01", title = "First task", priority = 10 })
@@ -3963,17 +3964,32 @@ run_test("WheelTeam: atomic task claim and collision prevention", function()
   local st_dev1 = team:get_agent_state("dev-1")
   assert(st_dev1.state == "busy")
   assert(st_dev1.active_task_id == "TASK-CLAIM-01")
+  dev1.lifecycle = team.lifecycle
+  assert(dev1:create_runtime_session({ task_id = "TASK-CLAIM-01" }))
 
   -- dev-2 attempts to claim the same task -> must fail closed
   local ok_c2, err_c2 = team:claim_task("dev-2", "TASK-CLAIM-01")
   assert(ok_c2 == false, "second claim on same task must fail")
   assert(string.find(tostring(err_c2), "already claimed") ~= nil, "error explains task is already claimed")
 
-  -- dev-1 attempts to claim another task while busy -> must fail
+  -- Concurrent claims require explicit team policy.
   kernel:create_task({ id = "TASK-CLAIM-02", title = "Second task", priority = 5 })
-  local ok_busy, err_busy = team:claim_task("dev-1", "TASK-CLAIM-02")
-  assert(ok_busy == false, "busy agent cannot claim another task")
-  assert(string.find(tostring(err_busy), "not idle") ~= nil, "error explains agent is busy")
+  local denied_multi = team:claim_task("dev-1", "TASK-CLAIM-02")
+  assert(not denied_multi, "concurrent task claims are disabled by default")
+  team.allow_multiple_tasks = true
+  local no_session = team:claim_task("dev-1", "TASK-CLAIM-02")
+  assert(not no_session, "multi-task policy requires a distinct task session")
+  assert(team.lifecycle:create_panel({ panel_id = "dev-1-task-2-panel", agent_id = dev1.agent_id }))
+  assert(team.lifecycle:ready_panel("dev-1-task-2-panel"))
+  local task_session = assert(team.lifecycle:create_agent_session({
+    agent_id = dev1.agent_id, task_id = "TASK-CLAIM-02", panel_id = "dev-1-task-2-panel",
+    session_id = "dev-1-task-2-session",
+  }))
+  assert(task_session.panel_id ~= dev1.panel_id or task_session.session_id ~= dev1.session_id)
+  local ok_busy = team:claim_task("dev-1", "TASK-CLAIM-02")
+  assert(ok_busy == true, "agent identity may own multiple tasks through separate sessions")
+  assert(team:get_agent_state("dev-1").active_task_ids["TASK-CLAIM-01"])
+  assert(team:get_agent_state("dev-1").active_task_ids["TASK-CLAIM-02"])
 end)
 
 run_test("WheelTeam: task completion and release", function()
@@ -4026,6 +4042,7 @@ run_test("WheelTeam: structured handoff from worker to reviewer", function()
   assert(ho_record.to_agent == "reviewer-alice")
   assert(ho_record.task_id == "TASK-HANDOFF-01")
   assert(ho_record.checkpoint_hash == "6a09e667bb67ae853c6ef372a54ff53a")
+  assert(ho_record.state == "accepted")
   assert(ho_record.timestamp ~= nil)
 
   -- Coder is now idle, Reviewer is now busy with the task
@@ -4036,10 +4053,145 @@ run_test("WheelTeam: structured handoff from worker to reviewer", function()
   assert(rev_st.state == "busy")
   assert(rev_st.active_task_id == "TASK-HANDOFF-01")
 
+  assert(#team.handoffs == 1, "recorded 1 handoff")
+  assert(team:set_handoff_state(ho_record.handoff_id, "closed"))
+  assert(not team:set_handoff_state(ho_record.handoff_id, "accepted"), "closed handoff is terminal")
   -- Reviewer audits and finishes
   team:release_task("reviewer-alice", "TASK-HANDOFF-01", { status = "succeeded" })
   assert(team:get_agent_state("reviewer-alice").state == "idle")
-  assert(#team.handoffs == 1, "recorded 1 handoff")
+end)
+
+run_test("WheelKernel: task hierarchy is separate from dependency edges", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  kernel:create_task({ id = "PARENT", title = "Parent" })
+  kernel:create_task({ id = "CHILD", title = "Child", parent_task_id = "PARENT" })
+  local child = kernel:get_task("CHILD")
+  assert(child.parent_task_id == "PARENT")
+  assert(#child.dependencies == 0)
+  local ok = pcall(function() kernel:create_task({ id = "ORPHAN", parent_task_id = "MISSING" }) end)
+  assert(not ok, "unknown parent is rejected")
+  assert(not pcall(function() kernel:create_task({ id = "BAD-PARENT", parent_task_id = "bad parent" }) end),
+    "parent identifiers are validated")
+end)
+
+run_test("WheelTeam: durable handoff metadata and generation fencing", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+  team:spawn_agent({ name = "handoff-source", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "handoff-target", role = WheelAgent.Role.REVIEWER })
+  kernel:create_task({ id = "HANDOFF-FENCE" })
+  team:claim_task("handoff-source", "HANDOFF-FENCE")
+  local generation = kernel:get_task("HANDOFF-FENCE").generation
+  local ok, handoff = team:handoff("handoff-source", "handoff-target", "HANDOFF-FENCE", {
+    context_ref = "ref:bounded",
+    checkpoint_hash = "checkpoint-a", scope = { "lua/wheel/team.lua" }, evidence = { "tests passed" },
+    blockers = { "none" }, risks = { "review" }, next_steps = { "inspect diff" },
+  })
+  assert(ok and handoff.generation == generation + 1 and handoff.context_ref == "ref:bounded")
+  assert(handoff.scope[1] == "lua/wheel/team.lua" and handoff.next_steps[1] == "inspect diff")
+  local stored = team.context:get_slot("tasks/HANDOFF-FENCE/handoff")
+  assert(stored.found and stored.content:find('"next_steps":["inspect diff"]', 1, true))
+  assert(not team:handoff("handoff-source", "handoff-target", "HANDOFF-FENCE"))
+  local task = kernel:get_task("HANDOFF-FENCE")
+  assert(not pcall(function() kernel:complete_task(task.id, generation) end), "stale generation cannot complete")
+  assert(task.generation == generation + 1, "accepted handoff advances generation")
+  assert(not team:release_task("handoff-source", task.id, { status = "succeeded" }), "former owner cannot release after handoff")
+  assert(team:release_task("handoff-target", task.id, { status = "succeeded" }))
+end)
+
+run_test("WheelTeam: handoffs validate sessions, persist before ownership, and redact metadata", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local context = WheelContext.new({ kernel = kernel })
+  local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4, allow_multiple_tasks = true })
+  local team = WheelTeam.new({ kernel = kernel, context = context, lifecycle = lifecycle, allow_multiple_tasks = true })
+  local source = team:spawn_agent({ name = "handoff-session-source", role = WheelAgent.Role.CODING })
+  local target = team:spawn_agent({ name = "handoff-session-target", role = WheelAgent.Role.REVIEWER })
+  kernel:create_task({ id = "HANDOFF-SESSION" })
+  team:claim_task(source.name, "HANDOFF-SESSION")
+  local source_session = assert(source:create_runtime_session({ task_id = "HANDOFF-SESSION" }))
+  local target_session = assert(target:create_runtime_session({ task_id = "HANDOFF-SESSION" }))
+  local rejected, reject_error = team:handoff(source.name, target.name, "HANDOFF-SESSION", {
+    source_session_id = target_session.session_id,
+  })
+  assert(not rejected and reject_error:find("source_session_id", 1, true))
+  local invalid_target, target_error = team:handoff(source.name, target.name, "HANDOFF-SESSION", {
+    source_session_id = source_session.session_id,
+    target_session_id = source_session.session_id,
+  })
+  assert(not invalid_target and target_error:find("target_session_id", 1, true))
+  local oversized, oversized_error = team:handoff(source.name, target.name, "HANDOFF-SESSION", {
+    scope = { string.rep("x", 257) },
+  })
+  assert(not oversized and oversized_error:find("scope", 1, true))
+  local sparse, sparse_error = team:handoff(source.name, target.name, "HANDOFF-SESSION", {
+    scope = { [1] = "valid", [3] = "sparse" },
+  })
+  assert(not sparse and sparse_error:find("dense", 1, true))
+  assert(team.task_assignments["HANDOFF-SESSION"] == source.name)
+  local ok, handoff = team:handoff(source.name, target.name, "HANDOFF-SESSION", {
+    source_session_id = source_session.session_id,
+    target_session_id = target_session.session_id,
+    rationale = "Authorization: Bearer synthetic-secret-value",
+  })
+  assert(ok and handoff.state == "accepted")
+  assert(not handoff.rationale:find("synthetic-secret-value", 1, true))
+
+  local reloaded_team = WheelTeam.new({ kernel = kernel, context = context, lifecycle = lifecycle, allow_multiple_tasks = true })
+  local restored = assert(reloaded_team:_find_handoff(handoff.handoff_id))
+  assert(restored.state == "accepted" and restored.generation == handoff.generation)
+  assert(reloaded_team:set_handoff_state(handoff.handoff_id, "closed"))
+  assert(not reloaded_team:set_handoff_state(handoff.handoff_id, "accepted"))
+end)
+
+run_test("WheelTeam: handoff persistence failure leaves ownership unchanged", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+  local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4, allow_multiple_tasks = true })
+  team.lifecycle = lifecycle
+  local source = team:spawn_agent({ name = "handoff-failure-source", role = WheelAgent.Role.CODING })
+  local target = team:spawn_agent({ name = "handoff-failure-target", role = WheelAgent.Role.REVIEWER })
+  kernel:create_task({ id = "HANDOFF-FAILURE" })
+  team:claim_task(source.name, "HANDOFF-FAILURE")
+  local source_session = assert(source:create_runtime_session({ task_id = "HANDOFF-FAILURE" }))
+  local target_session = assert(target:create_runtime_session({ task_id = "HANDOFF-FAILURE" }))
+  local original = team.context.put_slot
+  team.context.put_slot = function() return nil, { error = "injected" } end
+  local invalid, invalid_error = team:handoff(source.name, target.name, "HANDOFF-FAILURE", {
+    source_session_id = target_session.session_id,
+  })
+  assert(not invalid and invalid_error:find("source_session_id", 1, true))
+  local ok = team:handoff(source.name, target.name, "HANDOFF-FAILURE", {
+    source_session_id = source_session.session_id,
+    target_session_id = target_session.session_id,
+  })
+  team.context.put_slot = original
+  assert(not ok)
+  assert(team.task_assignments["HANDOFF-FAILURE"] == source.name)
+  assert(team:get_agent_state(source.name).active_task_ids["HANDOFF-FAILURE"])
+  assert(not team:get_agent_state(target.name).active_task_ids["HANDOFF-FAILURE"])
+end)
+
+run_test("WheelTeam: rejected handoff retains source claim and stale offers cannot be accepted", function()
+  local kernel = WheelKernel.new({ in_memory = true })
+  local team = WheelTeam.new({ kernel = kernel })
+  team:spawn_agent({ name = "handoff-reject-source", role = WheelAgent.Role.CODING })
+  team:spawn_agent({ name = "handoff-reject-target", role = WheelAgent.Role.REVIEWER })
+  kernel:create_task({ id = "HANDOFF-REJECT" })
+  team:claim_task("handoff-reject-source", "HANDOFF-REJECT")
+  local ok, offered = team:handoff("handoff-reject-source", "handoff-reject-target", "HANDOFF-REJECT", { defer_accept = true })
+  assert(ok and offered.state == "offered")
+  assert(type(offered.checkpoint_hash) == "string" and #offered.checkpoint_hash == 64)
+  assert(team.context:get_commit(offered.checkpoint_hash) ~= nil, "handoff checkpoint is immutable and committed")
+  local slot = assert(team.context:get_slot("tasks/HANDOFF-REJECT/handoff"))
+  local persisted = WheelKernel.json.decode(slot.content)
+  assert(persisted.checkpoint_hash == offered.checkpoint_hash)
+  assert(team:set_handoff_state(offered.handoff_id, "rejected"))
+  assert(team.task_assignments["HANDOFF-REJECT"] == "handoff-reject-source")
+  assert(team:get_agent_state("handoff-reject-source").active_task_ids["HANDOFF-REJECT"])
+  assert(not team:get_agent_state("handoff-reject-target").active_task_ids["HANDOFF-REJECT"])
+  local retry = assert(kernel:retry_task("HANDOFF-REJECT"))
+  assert(retry.status == "ready")
+  assert(not team:set_handoff_state(offered.handoff_id, "accepted"), "stale offer cannot be accepted")
 end)
 
 run_test("WheelTeam: wave dispatching across DAG dependencies", function()
@@ -5183,7 +5335,8 @@ run_test("WheelTeam: run_orchestration_loop full diamond DAG wave orchestration"
 
     local ho_slot = team.context:get_slot("tasks/" .. tid .. "/handoff")
     assert(ho_slot.found == true, "handoff slot for " .. tid .. " must exist")
-    assert(string.find(ho_slot.content, "to: reviewer-01", 1, true) ~= nil)
+    local handoff = WheelKernel.json.decode(ho_slot.content)
+    assert(handoff.to_agent == "reviewer-01")
 
     local rev_slot = team.context:get_slot("tasks/" .. tid .. "/review")
     assert(rev_slot.found == true, "review slot for " .. tid .. " must exist")
