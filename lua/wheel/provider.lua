@@ -253,6 +253,10 @@ function WheelProvider.normalize_usage(usage, provider)
   end
   if read_raw ~= nil and not valid_cache_count(read_raw) then malformed_cache_usage = true end
   if write_raw ~= nil and not valid_cache_count(write_raw) then malformed_cache_usage = true end
+  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
+    and valid_cache_count(read_raw) and read_raw > normalized.prompt_tokens then
+    malformed_cache_usage = true
+  end
   if malformed_cache_usage then
     normalized.provider_cache_status = "error"
   elseif type(read_raw) == "number" and read_raw > 0 then

@@ -7708,6 +7708,79 @@ run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", 
   assert(st.model_profile.thinking.enabled == true)
 end)
 
+run_test("WheelRunner: cache status aggregates observed turns without masking status", function()
+  local function run_statuses(policy, supported, statuses)
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    local registry = WheelTool.Registry.new()
+    registry:register_tool({
+      name = "noop",
+      intent = WheelTool.ActionIntent.INSPECT,
+      description = "Return a stable test observation",
+      execute = function()
+        return { success = true, exit_code = 0, stdout = "ok" }
+      end,
+    })
+    local agent = WheelAgent.new({
+      name = "cache-status-runner",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+      tool_registry = registry,
+      tools = { "noop" },
+    })
+    local responses = {}
+    for index, status in ipairs(statuses) do
+      local response = {
+        content = "turn " .. tostring(index),
+        tool_calls = {},
+        usage = {
+          prompt_tokens = 10,
+          completion_tokens = 2,
+          total_tokens = 12,
+          provider_cache_status = status,
+        },
+      }
+      if index < #statuses then
+        response.tool_calls = {
+          { id = "cache-status-" .. tostring(index), name = "noop", arguments = {} },
+        }
+      end
+      responses[index] = response
+    end
+    local provider = WheelProvider.MockProvider.new({
+      responses = responses,
+      prompt_cache_policy = policy,
+      prompt_cache_supported = supported,
+    })
+    agent:set_provider(provider)
+    local task = kernel:create_task({
+      id = "T-CACHE-STATUS-" .. policy .. "-" .. tostring(#statuses),
+      title = "Aggregate provider cache status",
+      priority = 1,
+    })
+    return WheelRunner.run_task(agent, task, { max_turns = #statuses })
+  end
+
+  local cache_off = run_statuses("off", true, { "verified_hit" })
+  assert(cache_off.success and cache_off.usage.provider_cache_status == "not_requested",
+    "cache-off-only runs must retain not_requested as their observed status")
+  local unsupported = run_statuses("prefer", false, { "verified_hit" })
+  assert(unsupported.success and unsupported.usage.provider_cache_status == "unsupported",
+    "unsupported prefer-only runs must retain unsupported as their observed status")
+
+  for _, statuses in ipairs({
+    { "verified_hit", "verified_miss" },
+    { "verified_miss", "verified_hit" },
+  }) do
+    local mixed = run_statuses("prefer", true, statuses)
+    assert(mixed.success and mixed.usage.provider_cache_status == "verified_hit",
+      "runner must preserve the strongest mixed status in either turn order")
+    assert(mixed.usage.prompt_tokens == 20 and mixed.usage.total_tokens == 24,
+      "cache status aggregation must remain independent of accumulated token totals")
+  end
+end)
+
 run_test("WheelTeam: run_orchestration_loop with autonomous provider runner and models command", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })

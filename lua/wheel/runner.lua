@@ -1034,7 +1034,7 @@ function WheelRunner.run_task(agent, task, opts)
     total_tokens = 0,
     cache_creation_tokens = 0,
     cache_read_tokens = 0,
-    provider_cache_status = "unknown",
+    provider_cache_status = nil,
     local_prefix_hash = nil,
     local_prefix_reuse_ratio = nil,
   }

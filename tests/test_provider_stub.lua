@@ -634,6 +634,15 @@ local function main()
   }, "openai")
   check(invalid_usage.provider_cache_status == "error",
     "malformed cache usage must not be reported as a miss or hit")
+  local impossible_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 45 },
+  }, "openai")
+  check(impossible_usage.provider_cache_status == "error",
+    "cached input greater than OpenAI prompt input must be an error")
+  check(impossible_usage.prompt_tokens == 40 and impossible_usage.cache_read_tokens == 45,
+    "impossible cache telemetry must retain independently valid provider counts")
+  check(impossible_usage.uncached_input_tokens == nil,
+    "impossible cached input must not produce a negative uncached count")
 
   local status_order = { "unsupported", "not_requested", "unknown", "verified_miss",
     "write_only", "verified_hit", "error" }
