@@ -57,6 +57,48 @@ packaging is not part of the 0.1.0 deliverable.
   widens without an independent security review plus mock/unit and real host
   fixture evidence (owner D7).
 
+### Runtime session and Headless Panel lifecycle
+
+Wheel keeps explicit harness-side lifecycle records in `wheel.lifecycle`. An
+`AgentSession` has its own `AgentId`, `SessionId`, `PanelId`, optional `TaskId`,
+context branch/head references, role binding, model profile, and optional
+worktree reference. Its states are `created`, `active`, `paused`, `stale`,
+`ended`, and `abandoned`. A Headless Panel has an independent `PanelId` and
+moves through `created`, `ready`, `attached`, `active`, `paused`, `detached`,
+and `closed`.
+
+Checkpoint, pause, detach, attach, resume, stale/recover, end, and abandon are
+explicit transitions. A panel has at most one controller session; observer
+attachments are recorded separately and do not acquire execution authority.
+The registry policy defaults to one live session per AgentId and can explicitly
+allow more sessions/tasks. Lifecycle events contain bounded identifiers and
+state metadata only: prompt, transcript, context-slot, provider-response, and
+tool-output content are not lifecycle or `bittyd` records. The local
+`wheel-session` daemon remains a subordinate development/transport prototype;
+final session hosting and attach/detach authority belong to `bittyd`.
+
+File-backed registries require an absolute path under an existing private,
+same-user directory. Symlinked path components, non-regular files, hard links,
+foreign ownership, and weak file permissions are refused. Writers use the
+existing ownership-checked session lock (including validated dead-owner
+reclamation), compare exact revisions, stage a private file, and atomically
+rename it. A stale writer must explicitly reload before retrying. Failed
+publication leaves the previous in-memory state unchanged. Publication closes
+and checks the staged file but does not fsync files or directories: this is
+process-restart persistence, not a power-loss durability guarantee. Invalid
+registries fail closed and are quarantined without replacing another path.
+
+The registry retains at most 2,048 recent events and 512 session records. On
+session admission at capacity, the oldest terminal session and its related
+events are pruned together; live sessions, checkpoints, and recovery references
+are retained. This bounded recent history is not a permanent audit archive.
+Reasons and recovery labels use approved codes, not arbitrary prose. Role/model
+metadata is typed, bounded, allowlisted, and sanitized again on load. Missing
+creation-time metadata uses `coding` and `unconfigured` reference defaults;
+missing persisted metadata is invalid. Controller detach always pauses active
+work, observers cannot promote through activation or transfer, and an explicit
+transfer moves an existing attachment without changing its authority mode.
+
 ### Scope
 
 Wheel is the agent harness for the Bitty terminal, scoped to software
@@ -686,6 +728,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                                                                                                                         |
 | `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                                                                                                                                 |
 | `lua/wheel/session.lua`                   | Local session control plane (client/shared): bounded strict JSON framing, session-name and private-path validation, metadata, serialization lock, and RPC.                                                                                                                                                                 |
+| `lua/wheel/lifecycle.lua`                 | Explicit AgentSession and Headless Panel records, state transitions, observer separation, stale recovery, policy bounds, lifecycle events, and optional file-backed registry persistence.                                                                                                                                  |
 | `lua/wheel/daemon.lua`                    | Detached session daemon: owns one WheelContext, serves the `wheel-session/1` methods over private FIFOs, and shuts down explicitly.                                                                                                                                                                                        |
 | `lua/wheel/session_cli.lua`               | Script entry point used by `scripts/wheel-session`; bootstraps the module path and prints structured results.                                                                                                                                                                                                              |
 | `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                                                                                                                               |
@@ -696,6 +739,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                                                                                                                             |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                                                                                                                         |
 | `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                                                                                                                                     |
+| `tests/test_lifecycle.lua`                | AgentSession and Headless Panel lifecycle tests, including observer/controller separation and cross-process registry reload/recovery.                                                                                                                                                                                      |
 | `tests/test_audit.lua`                    | Execution-audit suite (`just test-audit`): append/rotation, private modes, hash chain, redaction, 16 KiB bounds, high-risk fail-closed, non-high-risk warning, and denied no-spawn behavior.                                                                                                                               |
 | `tests/test_cancel.lua`                   | Real cancellation suite (`just test-cancel`): separate CLI process, prompt terminal result, no orphan/unrelated signal, repeated cancel, timeout/cancel race, forged/stale generation refusal, and audit.                                                                                                                  |
 | `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                                                                                                                                     |

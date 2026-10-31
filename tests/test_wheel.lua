@@ -14,6 +14,7 @@ local WheelHost = require("wheel.host")
 local WheelErrors = require("wheel.errors")
 local WheelSchema = require("wheel.schema")
 local WheelCommands = require("wheel.commands")
+local WheelLifecycle = require("wheel.lifecycle")
 
 -- Every filesystem fixture in this suite lives under one private per-run root.
 -- Concurrent worktrees therefore never share a directory, and each process
@@ -139,6 +140,121 @@ run_test("Wheel test harness: unsafe WHEEL_TEST_TMP bases are rejected", functio
     local ok = pcall(validate_test_base, candidate, "test base")
     assert(not ok, "unsafe base must be rejected: " .. tostring(candidate):gsub("\n", "\\n"))
   end
+end)
+
+run_test("WheelLifecycle: explicit AgentSession and Headless Panel lifecycle", function()
+  local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 2 })
+  local panel = assert(lifecycle:create_panel({ panel_id = "panel-lifecycle", agent_id = "agent-a" }))
+  assert(panel.state == WheelLifecycle.PanelState.CREATED)
+  panel = assert(lifecycle:ready_panel(panel.panel_id))
+  assert(panel.state == WheelLifecycle.PanelState.READY)
+
+  local session = assert(lifecycle:create_agent_session({
+    session_id = "session-lifecycle-1",
+    agent_id = "agent-a",
+    panel_id = panel.panel_id,
+    task_id = "task-a",
+    context_branch = "refs/heads/task-a",
+    context_head = "head-a",
+    role_binding = { role = "coding", binding_id = "role-binding-a" },
+    model_profile = { provider = "mock", model = "mock-model" },
+    worktree_id = "worktree-a",
+  }))
+  assert(session.state == WheelLifecycle.AgentSessionState.CREATED)
+  assert(session.agent_id == "agent-a" and session.task_id == "task-a")
+  assert(session.session_id ~= session.agent_id and session.panel_id ~= session.session_id)
+  assert(session.context_branch == "refs/heads/task-a" and session.context_head == "head-a")
+  assert(session.role_binding.binding_id == "role-binding-a")
+  assert(session.model_profile.model == "mock-model" and session.worktree_id == "worktree-a")
+
+  session = assert(lifecycle:activate_session(session.session_id))
+  assert(session.state == WheelLifecycle.AgentSessionState.ACTIVE)
+  assert(lifecycle:get_panel(panel.panel_id).state == WheelLifecycle.PanelState.ACTIVE)
+  assert(lifecycle:checkpoint_session(session.session_id, "checkpoint-a").checkpoint == "checkpoint-a")
+  session = assert(lifecycle:pause_session(session.session_id, "user_pause"))
+  assert(session.state == WheelLifecycle.AgentSessionState.PAUSED)
+  assert(lifecycle:get_panel(panel.panel_id).state == WheelLifecycle.PanelState.PAUSED)
+  session = assert(lifecycle:resume_session(session.session_id))
+  assert(session.state == WheelLifecycle.AgentSessionState.ACTIVE)
+  session = assert(lifecycle:detach_session(session.session_id, { pause = true }))
+  assert(session.state == WheelLifecycle.AgentSessionState.PAUSED)
+  assert(lifecycle:get_panel(panel.panel_id).state == WheelLifecycle.PanelState.DETACHED)
+  session = assert(lifecycle:attach_session(session.session_id, panel.panel_id))
+  assert(lifecycle:resume_session(session.session_id).state == WheelLifecycle.AgentSessionState.ACTIVE)
+
+  local observer = assert(lifecycle:create_agent_session({
+    session_id = "session-lifecycle-observer",
+    agent_id = "agent-b",
+    panel_id = panel.panel_id,
+    task_id = "task-b",
+  }))
+  observer = assert(lifecycle:attach_session(observer.session_id, panel.panel_id,
+    { mode = WheelLifecycle.AttachMode.OBSERVER }))
+  assert(#lifecycle:get_panel(panel.panel_id).observer_session_ids == 1)
+  local conflicting = lifecycle:create_agent_session({
+    session_id = "session-lifecycle-conflict",
+    agent_id = "agent-c",
+    panel_id = panel.panel_id,
+  })
+  assert(conflicting, "a second session may be created before the panel conflict is checked")
+  local conflict_ok, conflict_err = lifecycle:activate_session(conflicting.session_id)
+  assert(not conflict_ok and conflict_err.code == "E_LIFECYCLE_PANEL_BUSY")
+
+  session = assert(lifecycle:mark_stale(session.session_id, "stale"))
+  assert(session.state == WheelLifecycle.AgentSessionState.STALE)
+  session = assert(lifecycle:recover_session(session.session_id, { recovery = "checkpoint" }))
+  assert(session.state == WheelLifecycle.AgentSessionState.PAUSED)
+  assert(lifecycle:attach_session(session.session_id, panel.panel_id).session_id == session.session_id)
+  assert(lifecycle:resume_session(session.session_id).state == WheelLifecycle.AgentSessionState.ACTIVE)
+  session = assert(lifecycle:end_session(session.session_id, "complete"))
+  assert(session.state == WheelLifecycle.AgentSessionState.ENDED)
+  assert(#lifecycle:events() >= 12, "lifecycle events must be auditable")
+  for _, event in ipairs(lifecycle:events()) do
+    assert(event.prompt == nil and event.context == nil and event.content == nil,
+      "lifecycle events must not contain prompt/context content")
+  end
+end)
+
+run_test("WheelLifecycle: explicit policy permits multiple tasks only when configured", function()
+  local one = WheelLifecycle.new()
+  assert(one:create_panel({ panel_id = "policy-panel" }))
+  assert(one:ready_panel("policy-panel"))
+  assert(one:create_agent_session({ session_id = "policy-session-1", agent_id = "policy-agent", panel_id = "policy-panel", task_id = "task-1" }))
+  local second, second_err = one:create_agent_session({ session_id = "policy-session-2", agent_id = "policy-agent", panel_id = "policy-panel", task_id = "task-2" })
+  assert(not second and second_err.code == "E_LIFECYCLE_POLICY")
+
+  local many = WheelLifecycle.new({ max_sessions_per_agent = 3, allow_multiple_tasks = true })
+  assert(many:create_panel({ panel_id = "many-panel" }))
+  assert(many:ready_panel("many-panel"))
+  assert(many:create_agent_session({ session_id = "many-session-1", agent_id = "many-agent", panel_id = "many-panel", task_id = "task-1" }))
+  assert(many:create_agent_session({ session_id = "many-session-2", agent_id = "many-agent", panel_id = "many-panel", task_id = "task-2" }))
+  assert(#many:list_sessions("many-agent") == 2)
+end)
+
+run_test("WheelAgent: runtime lifecycle binds identity without copying context content", function()
+  local lifecycle = WheelLifecycle.new()
+  local agent = WheelAgent.new({
+    name = "runtime-agent",
+    agent_id = "runtime-agent-id",
+    role = WheelAgent.Role.CODING,
+    kernel = WheelKernel.new_mock(),
+    lifecycle = lifecycle,
+    panel_id = "runtime-panel",
+    worktree_id = "runtime-worktree",
+    model_profile = { provider = "mock", model = "runtime-model" },
+  })
+  local session, panel = assert(agent:create_runtime_session({ task_id = "runtime-task" }))
+  assert(session.agent_id == "runtime-agent-id")
+  assert(session.session_id ~= session.agent_id)
+  assert(session.panel_id == panel.panel_id and session.worktree_id == "runtime-worktree")
+  assert(agent:activate_runtime_session().state == WheelLifecycle.AgentSessionState.ACTIVE)
+  local rejected, reject_err = lifecycle:create_agent_session({
+    session_id = "metadata-content",
+    agent_id = "other-agent",
+    panel_id = panel.panel_id,
+    model_profile = { provider = "mock", prompt = "not metadata" },
+  })
+  assert(not rejected and reject_err.code == "E_LIFECYCLE_INVALID")
 end)
 
 -- ===========================================================================
