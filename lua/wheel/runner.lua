@@ -143,13 +143,15 @@ local function message_bytes(value, seen)
 end
 
 local function append_unique_bounded(target, value, limit)
-  if #target >= WheelRunner.MAX_EVIDENCE_ITEMS then return end
   local text = redact_bounded(value, limit)
   if type(text) ~= "string" or #text == 0 then return end
-  for _, existing in ipairs(target) do
-    if existing == text then return end
+  -- Retain the newest items: a long run must keep its current failures,
+  -- evidence, decisions, risks, and next actions rather than the first eight.
+  for index, existing in ipairs(target) do
+    if existing == text then table.remove(target, index); break end
   end
   target[#target + 1] = text
+  while #target > WheelRunner.MAX_EVIDENCE_ITEMS do table.remove(target, 1) end
 end
 
 local function extract_state(turn_record, state)
@@ -518,6 +520,18 @@ local function bound_provider_request(request)
     if bounded_system then bounded.messages[#bounded.messages + 1] = bounded_system end
   end
 
+  -- The original task instruction is pinned: tail selection and byte overflow
+  -- must never drop the task the run is executing.
+  local pinned_task = nil
+  for _, message in ipairs(source_messages) do
+    if message.role == "user" then pinned_task = message; break end
+  end
+  local pinned_bounded = nil
+  if pinned_task then
+    pinned_bounded = bounded_message(pinned_task, value_budget)
+    if pinned_bounded then bounded.messages[#bounded.messages + 1] = pinned_bounded end
+  end
+
   -- Select complete conversational groups from the tail. An assistant tool
   -- call and all matching observations are one indivisible group; orphan tool
   -- messages are never admitted to the bounded request.
@@ -525,7 +539,7 @@ local function bound_provider_request(request)
   local index = 1
   while index <= #source_messages do
     local message = source_messages[index]
-    if message == first_system then
+    if message == first_system or message == pinned_task then
       index = index + 1
     elseif message.role == "tool" then
       index = index + 1
@@ -581,7 +595,9 @@ local function bound_provider_request(request)
   while encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES do
     local removable = nil
     for index = 1, #bounded.messages do
-      if bounded.messages[index].role == "assistant" or bounded.messages[index].role == "user" then
+      local candidate_message = bounded.messages[index]
+      if candidate_message ~= pinned_bounded
+        and (candidate_message.role == "assistant" or candidate_message.role == "user") then
         removable = index
         break
       end
@@ -599,9 +615,10 @@ local function bound_provider_request(request)
     encoded = encoded_request(bounded)
   end
   if encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES then
-    bounded.messages = {
-      { role = "user", content = "[request content omitted: request byte bound]" },
-    }
+    bounded.messages = {}
+    if pinned_bounded then bounded.messages[1] = pinned_bounded end
+    bounded.messages[#bounded.messages + 1] =
+      { role = "user", content = "[request content omitted: request byte bound]" }
     bounded.tools = {}
     bounded.thinking = nil
     encoded = encoded_request(bounded)
@@ -609,7 +626,8 @@ local function bound_provider_request(request)
   if not encoded or #encoded > WheelRunner.MAX_REQUEST_BYTES then
     bounded = {
       model = "default-model",
-      messages = { { role = "user", content = "[request omitted: request byte bound]" } },
+      messages = pinned_bounded and { pinned_bounded }
+        or { { role = "user", content = "[request omitted: request byte bound]" } },
       tools = {},
       max_completion_tokens = request.max_completion_tokens,
     }
@@ -620,7 +638,33 @@ end
 WheelRunner.bound_provider_request = bound_provider_request
 
 local function copy_message(message)
-  return bounded_message(message)
+  local budget = make_budget(WheelRunner.MAX_REQUEST_VALUE_NODES,
+    WheelRunner.MAX_REQUEST_KEYS,
+    WheelRunner.MAX_REQUEST_MESSAGE_BYTES + WheelRunner.MAX_REQUEST_ARGUMENT_BYTES + 256)
+  local copied = bounded_message(message, budget)
+  if copied then return copied end
+  -- Never drop a retained message silently: keep role/content and the tool-call
+  -- boundary, truncating each field to its established bound.
+  local fallback = {
+    role = redact_bounded(message.role or "user", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+    content = redact_bounded(message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
+  }
+  if message.tool_call_id then
+    fallback.tool_call_id = redact_bounded(message.tool_call_id, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+  end
+  if type(message.tool_calls) == "table" then
+    fallback.tool_calls = {}
+    for index, call in ipairs(message.tool_calls) do
+      if index > WheelRunner.MAX_REQUEST_VALUE_NODES then break end
+      fallback.tool_calls[#fallback.tool_calls + 1] = {
+        id = redact_bounded(call.id or "call", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+        name = redact_bounded(call.name or "tool", WheelRunner.MAX_REQUEST_VALUE_BYTES),
+        arguments = type(call.arguments) == "table" and {}
+          or redact_bounded(call.arguments or "", WheelRunner.MAX_REQUEST_ARGUMENT_BYTES),
+      }
+    end
+  end
+  return fallback
 end
 
 --- Compact a conversation while retaining complete recent turns. Assistant tool

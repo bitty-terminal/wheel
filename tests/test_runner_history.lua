@@ -74,7 +74,7 @@ return function(run_test)
       messages[#messages + 1] = tool
     end
     local compacted = assert(WheelRunner.compact_history(messages, records, state, { task_id = "T-recovery" }))
-    assert(state.tool_calls[1] == "inspect:call-1", "tool call identity must be retained")
+    assert(state.tool_calls[#state.tool_calls] == "inspect:call-10", "the newest tool call identity must be retained")
     assert(state.failures[1]:find("failure evidence", 1, true), "failure evidence must be retained")
     local context_ref_content
     for _, item in ipairs(compacted) do
@@ -98,7 +98,7 @@ return function(run_test)
         response = {
           content = string.rep("evidence-" .. index, WheelRunner.MAX_EVIDENCE_BYTES),
           decisions = { string.rep("decision-" .. index, WheelRunner.MAX_STATE_FIELD_BYTES) },
-          risks = { string.rep("risk-" .. index, WheelRunner.MAX_STATE_FIELD_BYTES) },
+          risks = { string.rep("hazard-" .. index, WheelRunner.MAX_STATE_FIELD_BYTES) },
           next_actions = { string.rep("action-" .. index, WheelRunner.MAX_STATE_FIELD_BYTES) },
         },
         tools = {},
@@ -224,9 +224,12 @@ return function(run_test)
     assert(compacted ~= messages and context_ref.commit_hash, "successful persistence must compact and checkpoint")
     assert(slot.found and not slot.content:find("MODEL_CONTENT_SENTINEL", 1, true),
       "ContextRef slots must not contain raw model content")
-    assert(slot.content:find("decisions", 1, true), "bounded rationale decisions must be persisted")
-    assert(slot.content:find("risks", 1, true), "bounded rationale risks must be persisted")
-    assert(slot.content:find("next_actions", 1, true), "bounded rationale next actions must be persisted")
+    assert(slot.content:find("keep the bounded path", 1, true),
+      "bounded rationale decisions must be persisted")
+    assert(slot.content:find("model_content_api_key", 1, true),
+      "bounded rationale risks must be persisted")
+    assert(slot.content:find("run the regression", 1, true),
+      "bounded rationale next actions must be persisted")
     local checkpoint = context:get_commit(context_ref.commit_hash)
     local rationale = checkpoint and checkpoint.rationale or {}
     assert(not tostring(rationale):find("MODEL_CONTENT_SENTINEL", 1, true),
@@ -284,6 +287,75 @@ return function(run_test)
       assert(#(retained.content or "") <= WheelRunner.MAX_REQUEST_MESSAGE_BYTES,
         "retained message content must stay within its node bound")
     end
+  end)
+
+  run_test("WheelRunner history: retained state keeps the newest items", function()
+    local state = { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} }
+    for index = 1, WheelRunner.MAX_EVIDENCE_ITEMS + 4 do
+      WheelRunner.compact_history(
+        { message("user", "start") },
+        { {
+          messages = { message("assistant", "turn " .. index) },
+          response = { content = "evidence-" .. index },
+          rationale = {
+            decision = "decision-" .. index,
+            risk = "hazard-" .. index,
+            next_action = "next-action-" .. index,
+          },
+          tools = {},
+        } },
+        state,
+        { task_id = "T-newest", force = true }
+      )
+    end
+    local function contains(list, text)
+      for _, item in ipairs(list) do
+        if item == text or (type(item) == "string" and item:find(text, 1, true)) then return true end
+      end
+      return false
+    end
+    local function contains_exact(list, text)
+      for _, item in ipairs(list) do
+        if item == text then return true end
+      end
+      return false
+    end
+    local latest = WheelRunner.MAX_EVIDENCE_ITEMS + 4
+    assert(contains(state.decisions, "decision-" .. latest), "newest decision must survive the bound")
+    assert(contains(state.risks, "hazard-" .. latest), "newest hazard must survive the bound")
+    assert(contains(state.next_actions, "next-action-" .. latest), "newest action must survive the bound")
+    assert(not contains_exact(state.decisions, "decision-1"), "oldest decision must be dropped once full")
+  end)
+
+  run_test("WheelRunner history: the original task message survives truncation and compaction", function()
+    local task_prompt = "TASK-PINNED-MARKER " .. string.rep("description ", 340)
+    local messages = { message("user", task_prompt), message("system", "stable prefix") }
+    for index = 1, 20 do
+      messages[#messages + 1] = message("assistant", "answer-" .. index)
+    end
+    local compacted = WheelRunner.compact_history(messages, {
+      { messages = { message("assistant", "turn") }, response = { content = "evidence" }, tools = {} },
+    }, { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} },
+      { task_id = "T-pinned", force = true })
+    local kept_task = false
+    for _, item in ipairs(compacted) do
+      if item.role == "user" and item.content and item.content:find("TASK-PINNED-MARKER", 1, true) then
+        kept_task = true
+      end
+    end
+    assert(kept_task, "compaction must not drop a 4 KB task description")
+
+    local request = { model = "test-model", messages = { message("system", "stable prefix") }, tools = {} }
+    request.messages[#request.messages + 1] = message("user", task_prompt)
+    for index = 1, 30 do
+      request.messages[#request.messages + 1] = message("assistant", "answer-" .. index)
+    end
+    local bounded = WheelRunner.bound_provider_request(request)
+    local pinned = false
+    for _, item in ipairs(bounded.messages) do
+      if item.content and item.content:find("TASK-PINNED-MARKER", 1, true) then pinned = true end
+    end
+    assert(pinned, "the original task message must remain pinned in a bounded request")
   end)
 
   run_test("WheelRunner history: action records never re-persist raw tool output", function()
