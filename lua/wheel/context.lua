@@ -73,6 +73,7 @@ local WheelConfig = load_submodule("config")
 
 local WheelHost = load_submodule("host")
 local WheelSnapshot = load_submodule("context_snapshot")
+local Rationale = load_submodule("rationale")
 
 -- ---------------------------------------------------------------------------
 -- Constants & Limits
@@ -785,7 +786,7 @@ function WheelContext:commit_checkpoint(opts)
   opts = opts or {}
   local author = opts.author or "wheel:system"
   local task_id = opts.task_id
-  local rationale = opts.rationale
+  local rationale = Rationale.for_persistence(opts.rationale)
   local message = opts.message
   local timestamp_ms = opts.timestamp_ms or (WheelHost.time.now() * 1000)
 
@@ -804,7 +805,8 @@ function WheelContext:commit_checkpoint(opts)
 
   local rationale_summary = ""
   if type(rationale) == "table" then
-    rationale_summary = rationale.goal or rationale.approach or rationale.what or ""
+    rationale_summary = rationale.decision or rationale.why or rationale.goal
+      or rationale.approach or rationale.what or ""
   elseif type(rationale) == "string" then
     rationale_summary = rationale
   end

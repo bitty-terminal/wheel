@@ -51,10 +51,10 @@ WheelRunner.MAX_REQUEST_NODES = 512
 WheelRunner.MAX_REQUEST_KEYS = 512
 WheelRunner.MAX_REQUEST_DEPTH = 64
 WheelRunner.MAX_CONTEXT_REF_DEPTH = 64
+WheelRunner.MAX_CHECKPOINT_ID_BYTES = 128
 
 -- The runner's checkpoint rationale keeps the historical six-field contract;
 -- structured rationale records add decision/risk/next_action/evidence fields.
-local CHECKPOINT_RATIONALE_FIELDS = { "why", "what", "where_focus", "how", "expected", "observed" }
 local RATIONALE_TEXT_FIELDS = {
   "why", "what", "where_focus", "how", "expected", "observed",
   "decision", "uncertainty", "risk", "next_action",
@@ -121,11 +121,26 @@ local function safe_checkpoint_rationale(rationale)
   if type(normalized) ~= "table" then
     return normalized or {}
   end
-  local safe = {}
-  for _, field in ipairs(CHECKPOINT_RATIONALE_FIELDS) do
-    if normalized[field] ~= nil then safe[field] = normalized[field] end
+  -- Keep the structured marker so Rationale.for_persistence applies the
+  -- bounded canonical schema; the Kernel sink re-redacts every field.
+  if type(rationale) == "table" and rationale.schema ~= nil then
+    normalized.schema = rationale.schema
   end
-  return safe
+  if type(rationale) == "table"
+    and (rationale.source == "fallback" or rationale.source == "provider" or rationale.source == "legacy") then
+    normalized.source = rationale.source
+  end
+  -- Task/session linkage is durable context, not prompt content. Persistence
+  -- bounds and redacts these IDs in Rationale.for_persistence.
+  if type(rationale) == "table" and (rationale.schema ~= nil or rationale.source ~= nil) then
+    for _, field in ipairs({ "task_id", "session_id" }) do
+      local value = rationale[field]
+      if type(value) == "string" and #value > 0 and #value <= WheelRunner.MAX_CHECKPOINT_ID_BYTES then
+        normalized[field] = value
+      end
+    end
+  end
+  return normalized
 end
 
 local function message_bytes(value, seen)
@@ -1025,15 +1040,14 @@ function WheelRunner.run_task(agent, task, opts)
       total_usage.total_tokens = total_usage.total_tokens + (res.usage.total_tokens or 0)
     end
 
-    -- Construct Structured Rationale
-    local rationale = {
-      why = string.format("Autonomous execution turn %d for task %s", turn, task_id),
-      what = (res.content and #res.content > 0) and res.content:sub(1, 300) or ("Completed turn " .. turn),
-      where_focus = "task " .. task_id,
-      how = "autonomous LLM ReAct turn loop",
-      expected = "Task deliverables and verification",
-      observed = (res.thinking_content and #res.thinking_content > 0) and res.thinking_content:sub(1, 300) or "Model response processed",
-    }
+    -- Construct a bounded rationale.  Provider thinking is intentionally not
+    -- copied here: it remains transient on `res` and cannot enter a prompt,
+    -- checkpoint, or Context slot unless the provider returned a complete
+    -- structured rationale object.
+    local rationale = WheelProvider.parse_rationale(res, {
+      task_id = task_id,
+      session_id = opts.session_id or agent.session_id,
+    })
 
     -- Handle tool calls
     local tool_calls = res.tool_calls or {}
@@ -1145,6 +1159,15 @@ function WheelRunner.run_task(agent, task, opts)
         local put_ok, put_result = pcall(agent.context.put_slot, agent.context,
           "tasks/" .. task_id .. "/artifacts", safe_artifacts)
         if not put_ok or type(put_result) ~= "table" or put_result.success ~= true then
+          local failure = persistence_failure()
+          final_error = failure.message
+          final_error_code = failure.code
+          break
+        end
+        local encoded = WheelProvider.JSON.encode(WheelProvider.Rationale.for_persistence(rationale))
+        local rationale_ok, rationale_result = pcall(agent.context.put_slot, agent.context,
+          "tasks/" .. task_id .. "/rationale", encoded)
+        if not rationale_ok or type(rationale_result) ~= "table" or rationale_result.success ~= true then
           local failure = persistence_failure()
           final_error = failure.message
           final_error_code = failure.code

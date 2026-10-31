@@ -98,6 +98,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/tool.lua
     bun run luaparse --quiet --file lua/wheel/action.lua
     bun run luaparse --quiet --file lua/wheel/provider.lua
+    bun run luaparse --quiet --file lua/wheel/rationale.lua
     bun run luaparse --quiet --file lua/wheel/runner.lua
     bun run luaparse --quiet --file lua/wheel/session.lua
     bun run luaparse --quiet --file lua/wheel/daemon.lua
