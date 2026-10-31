@@ -48,6 +48,19 @@ WheelRunner.MAX_REQUEST_VALUE_BYTES = 2048
 WheelRunner.MAX_REQUEST_ARGUMENT_BYTES = 4096
 WheelRunner.MAX_REQUEST_VALUE_NODES = 256
 WheelRunner.MAX_REQUEST_NODES = 512
+WheelRunner.MAX_REQUEST_KEYS = 512
+WheelRunner.MAX_REQUEST_DEPTH = 64
+WheelRunner.MAX_CONTEXT_REF_DEPTH = 64
+
+-- The runner's checkpoint rationale keeps the historical six-field contract;
+-- structured rationale records add decision/risk/next_action/evidence fields.
+local CHECKPOINT_RATIONALE_FIELDS = { "why", "what", "where_focus", "how", "expected", "observed" }
+local RATIONALE_TEXT_FIELDS = {
+  "why", "what", "where_focus", "how", "expected", "observed",
+  "decision", "uncertainty", "risk", "next_action",
+}
+local RATIONALE_LIST_FIELDS = { "evidence", "rejected_alternatives" }
+local STATE_FIELDS = { "tool_calls", "failures", "decisions", "evidence", "risks", "next_actions" }
 
 local function bound_text(value, limit)
   local text = type(value) == "string" and value or tostring(value or "")
@@ -71,15 +84,46 @@ local function persistence_failure()
   }
 end
 
-local function safe_checkpoint_rationale(rationale)
+local function normalize_rationale(rationale)
   local safe = {}
   if type(rationale) ~= "table" then
-    return redact_bounded(rationale or "", WheelRunner.MAX_STATE_FIELD_BYTES)
+    if type(rationale) == "string" then
+      return redact_bounded(rationale, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    return nil
   end
-  for _, field in ipairs({ "why", "what", "where_focus", "how", "expected", "observed" }) do
-    if rationale[field] ~= nil then
+  for _, field in ipairs(RATIONALE_TEXT_FIELDS) do
+    if type(rationale[field]) == "string" then
       safe[field] = redact_bounded(rationale[field], WheelRunner.MAX_STATE_FIELD_BYTES)
     end
+  end
+  for _, field in ipairs(RATIONALE_LIST_FIELDS) do
+    local values = rationale[field]
+    if type(values) == "string" then values = { values } end
+    if type(values) == "table" then
+      local bounded = {}
+      for _, item in ipairs(values) do
+        if type(item) ~= "string" or #item == 0 then
+          -- A malformed structured record never contributes partial data.
+          return nil
+        end
+        bounded[#bounded + 1] = redact_bounded(item, WheelRunner.MAX_STATE_FIELD_BYTES)
+        if #bounded >= WheelRunner.MAX_EVIDENCE_ITEMS then break end
+      end
+      safe[field] = bounded
+    end
+  end
+  return safe
+end
+
+local function safe_checkpoint_rationale(rationale)
+  local normalized = normalize_rationale(rationale)
+  if type(normalized) ~= "table" then
+    return normalized or {}
+  end
+  local safe = {}
+  for _, field in ipairs(CHECKPOINT_RATIONALE_FIELDS) do
+    if normalized[field] ~= nil then safe[field] = normalized[field] end
   end
   return safe
 end
@@ -108,61 +152,36 @@ local function append_unique_bounded(target, value, limit)
   target[#target + 1] = text
 end
 
-local function append_labeled_state(text, state)
-  if type(text) ~= "string" then return end
-  local bounded = redact_bounded(text, WheelRunner.MAX_EVIDENCE_BYTES)
-  for line in bounded:gmatch("[^\n]+") do
-    local field, value = line:match("^%s*[Dd]ecision%s*:%s*(.-)%s*$")
-    if field then
-      append_unique_bounded(state.decisions, value, WheelRunner.MAX_STATE_FIELD_BYTES)
-    end
-    field, value = line:match("^%s*[Rr]isk%s*:%s*(.-)%s*$")
-    if field then
-      append_unique_bounded(state.risks, value, WheelRunner.MAX_STATE_FIELD_BYTES)
-    end
-    field, value = line:match("^%s*[Nn]ext[ %-][Aa]ction%s*:%s*(.-)%s*$")
-    if field then
-      append_unique_bounded(state.next_actions, value, WheelRunner.MAX_STATE_FIELD_BYTES)
-    end
-  end
-end
-
 local function extract_state(turn_record, state)
   local response = turn_record.response or {}
-  for _, field in ipairs({ "decisions", "risks", "next_actions" }) do
-    local values = response[field]
-    if type(values) == "table" then
-      for _, value in ipairs(values) do
-        append_unique_bounded(state[field], value, WheelRunner.MAX_STATE_FIELD_BYTES)
-      end
-    elseif values ~= nil then
-      append_unique_bounded(state[field], values, WheelRunner.MAX_STATE_FIELD_BYTES)
-    end
-  end
-  if response.content then
+  if type(response.content) == "string" and #response.content > 0 then
     append_unique_bounded(state.evidence, response.content, WheelRunner.MAX_EVIDENCE_BYTES)
-    append_labeled_state(response.content, state)
   end
-  if response.thinking_content then
-    append_labeled_state(response.thinking_content, state)
-  end
-  local rationale = response.rationale
-  if type(rationale) == "string" then
-    append_labeled_state(rationale, state)
-  elseif type(rationale) == "table" then
-    for _, field in ipairs({ "decision", "decisions", "risk", "risks", "next_action", "next_actions" }) do
-      local target = field:find("decision", 1, true) and state.decisions
-        or field:find("risk", 1, true) and state.risks
-        or state.next_actions
-      local values = rationale[field]
-      if type(values) == "table" then
-        for _, value in ipairs(values) do
-          append_unique_bounded(target, value, WheelRunner.MAX_STATE_FIELD_BYTES)
-        end
-      elseif values ~= nil then
-        append_unique_bounded(target, values, WheelRunner.MAX_STATE_FIELD_BYTES)
-      end
+  -- Structured state comes only from the bounded rationale contract. Provider
+  -- adapters do not guarantee arbitrary response fields, so nothing else is
+  -- mined for decisions, risks, or next actions.
+  local rationale = normalize_rationale(turn_record.rationale)
+  if type(rationale) == "table" then
+    if rationale.decision then
+      append_unique_bounded(state.decisions, rationale.decision, WheelRunner.MAX_STATE_FIELD_BYTES)
     end
+    if rationale.risk then
+      append_unique_bounded(state.risks, rationale.risk, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    if rationale.uncertainty then
+      append_unique_bounded(state.risks, rationale.uncertainty, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    if rationale.next_action then
+      append_unique_bounded(state.next_actions, rationale.next_action, WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    for _, item in ipairs(rationale.evidence or {}) do
+      append_unique_bounded(state.evidence, item, WheelRunner.MAX_EVIDENCE_BYTES)
+    end
+    if rationale.observed then
+      append_unique_bounded(state.evidence, rationale.observed, WheelRunner.MAX_EVIDENCE_BYTES)
+    end
+  elseif type(rationale) == "string" then
+    append_unique_bounded(state.evidence, rationale, WheelRunner.MAX_EVIDENCE_BYTES)
   end
   for _, tool in ipairs(turn_record.tools or {}) do
     if tool.call then
@@ -174,49 +193,69 @@ local function extract_state(turn_record, state)
     if outcome.success == false or (outcome.exit_code and outcome.exit_code ~= 0) then
       append_unique_bounded(state.failures,
         string.format("%s (exit=%s): %s", tostring(tool.call and tool.call.name or outcome.tool or "tool"),
-          tostring(outcome.exit_code or 1), redact_bounded(outcome.stderr or "tool failed", WheelRunner.MAX_STATE_FIELD_BYTES)),
+          tostring(outcome.exit_code or 1),
+          redact_bounded(outcome.stderr_preview or outcome.stderr or "tool failed",
+            WheelRunner.MAX_STATE_FIELD_BYTES)),
         WheelRunner.MAX_STATE_FIELD_BYTES)
     end
     local evidence = (outcome.blob_hash or outcome.spillover_hash)
       and ("ref=" .. tostring(outcome.blob_hash or outcome.spillover_hash))
-      or outcome.stdout or outcome.stderr
+      or outcome.stdout_preview or outcome.stderr_preview or outcome.stdout or outcome.stderr
     if evidence then append_unique_bounded(state.evidence, evidence, WheelRunner.MAX_EVIDENCE_BYTES) end
   end
 end
 
 local sorted_keys
 local canonical_value
+local make_budget
+
+-- Build a deterministic, bounded seed for the ContextRef identity. Each state
+-- item and retained message contributes a fixed-size digest, so wide or deep
+-- argument structures cannot force unbounded traversal or allocation and
+-- equal-size histories still receive distinct identities.
+local function seed_digest(value)
+  local text = type(value) == "string" and value or tostring(value or "")
+  local hash = WheelConfig and type(WheelConfig.compute_hash) == "function"
+    and WheelConfig.compute_hash(text) or nil
+  if type(hash) ~= "string" then
+    return string.format("len:%d:%d", #text, #text > 0 and text:byte(1) or 0)
+  end
+  return hash
+end
 
 local function canonical_state(state, retained)
   local parts = {}
-  for _, field in ipairs({ "tool_calls", "failures", "decisions", "evidence", "risks", "next_actions" }) do
+  for _, field in ipairs(STATE_FIELDS) do
     parts[#parts + 1] = field
-    for _, value in ipairs(state[field] or {}) do
-      local text = redact_bounded(value, WheelRunner.MAX_EVIDENCE_BYTES)
-      parts[#parts + 1] = string.format("%d:%s", #text, text)
+    local values = state[field] or {}
+    for index = 1, math.min(#values, WheelRunner.MAX_EVIDENCE_ITEMS) do
+      parts[#parts + 1] = seed_digest(values[index])
     end
     parts[#parts + 1] = ";"
   end
-  for index, record in ipairs(retained or {}) do
-    parts[#parts + 1] = "record:" .. tostring(index)
-    for _, message in ipairs(record.messages or {}) do
-      local role = redact_bounded(message.role or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
-      local content = redact_bounded(message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
-      parts[#parts + 1] = string.format("%d:%s:%d:%s", #role, role, #content, content)
-      for _, call in ipairs(message.tool_calls or {}) do
-        local name = redact_bounded(call.name or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
-        local id = redact_bounded(call.id or "", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+  for record_index, record in ipairs(retained or {}) do
+    parts[#parts + 1] = "r" .. tostring(record_index)
+    local messages = record.messages or {}
+    for message_index = 1, math.min(#messages, WheelRunner.MAX_REQUEST_MESSAGES) do
+      local message = messages[message_index]
+      parts[#parts + 1] = seed_digest(tostring(message.role) .. "\0" .. tostring(message.content))
+      local calls = message.tool_calls or {}
+      for call_index = 1, math.min(#calls, WheelRunner.MAX_REQUEST_VALUE_NODES) do
+        local call = calls[call_index]
         local args
         if type(call.arguments) == "table" then
-          args = canonical_value(call.arguments)
+          args = canonical_value(call.arguments,
+            make_budget(WheelRunner.MAX_REQUEST_VALUE_NODES, WheelRunner.MAX_REQUEST_KEYS,
+              WheelRunner.MAX_REQUEST_ARGUMENT_BYTES, WheelRunner.MAX_CONTEXT_REF_DEPTH))
         else
-          args = redact_bounded(call.arguments or "", WheelRunner.MAX_REQUEST_ARGUMENT_BYTES)
+          args = tostring(call.arguments or "")
         end
-        parts[#parts + 1] = string.format("call:%d:%s:%d:%s:%d:%s", #name, name, #id, id, #args, args)
+        parts[#parts + 1] = seed_digest(tostring(call.id) .. "\0" .. tostring(call.name) .. "\0"
+          .. tostring(args or ""))
       end
     end
   end
-  return table.concat(parts, "\0")
+  return table.concat(parts, "|")
 end
 
 local function serialize_state(state, context_ref)
@@ -249,57 +288,132 @@ local function serialize_state(state, context_ref)
   return table.concat(lines, "\n")
 end
 
-sorted_keys = function(value)
-  local keys = {}
-  for key in pairs(value) do keys[#keys + 1] = key end
-  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-  return keys
+local function encoded_size(value)
+  local codec = WheelProvider and WheelProvider.JSON
+  if not codec or type(codec.encode) ~= "function" then return nil end
+  local ok, encoded = pcall(codec.encode, value)
+  return ok and type(encoded) == "string" and #encoded or nil
 end
 
-canonical_value = function(value, depth)
+local function budget_bytes(budget, amount)
+  if amount > budget.bytes then return false end
+  budget.bytes = budget.bytes - amount
+  return true
+end
+
+local function budget_node(budget)
+  if budget.nodes <= 0 then return false end
+  budget.nodes = budget.nodes - 1
+  return true
+end
+
+local function budget_key(budget)
+  if budget.keys <= 0 then return false end
+  budget.keys = budget.keys - 1
+  return true
+end
+
+local function copy_budget(budget)
+  return { nodes = budget.nodes, keys = budget.keys, bytes = budget.bytes,
+    depth = budget.depth, seen = {} }
+end
+
+local function safe_string(value, limit, budget)
+  if not budget_node(budget) then return nil end
+  local text = redact_bounded(value, limit)
+  local size = encoded_size(text)
+  if not size or not budget_bytes(budget, size) then return nil end
+  return text
+end
+
+sorted_keys = function(value, limit)
+  local keys = {}
+  local overflow = false
+  for key in pairs(value) do
+    if limit and #keys >= limit then
+      overflow = true
+      break
+    end
+    keys[#keys + 1] = key
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  return keys, overflow
+end
+
+make_budget = function(nodes, keys, bytes, depth)
+  return { nodes = nodes, keys = keys, bytes = bytes,
+    depth = depth or WheelRunner.MAX_REQUEST_DEPTH, seen = {} }
+end
+
+canonical_value = function(value, budget, depth)
+  if not budget_node(budget) then return nil end
   depth = depth or 0
-  if depth >= WheelRunner.MAX_REQUEST_VALUE_NODES then return "[omitted:depth]" end
   local value_type = type(value)
   if value_type == "string" then
     local text = redact_bounded(value, WheelRunner.MAX_REQUEST_VALUE_BYTES)
-    return string.format("s%d:%s", #text, text)
-  end
-  if value_type ~= "table" then return value_type .. ":" .. tostring(value) end
-  local parts = { "{" }
-  for _, key in ipairs(sorted_keys(value)) do
-    parts[#parts + 1] = canonical_value(key, depth + 1)
-    parts[#parts + 1] = "="
-    parts[#parts + 1] = canonical_value(value[key], depth + 1)
-    parts[#parts + 1] = ";"
-  end
-  parts[#parts + 1] = "}"
-  return table.concat(parts)
-end
-
-local function bounded_value(value, byte_limit, node_budget, seen)
-  if type(value) == "string" then
-    return redact_bounded(value, byte_limit)
-  end
-  if type(value) ~= "table" then
-    if type(value) == "number" or type(value) == "boolean" then return value end
+    local encoded = string.format("s%d:%s", #text, text)
+    if budget_bytes(budget, #encoded) then return encoded end
     return nil
   end
-  seen = seen or {}
-  if seen[value] then return "[omitted:cycle]" end
-  seen[value] = true
+  if value_type ~= "table" then
+    local encoded = value_type .. ":" .. tostring(value)
+    if budget_bytes(budget, #encoded) then return encoded end
+    return nil
+  end
+  if depth >= budget.depth or budget.seen[value] then return nil end
+  budget.seen[value] = true
+  if not budget_bytes(budget, 2) then
+    budget.seen[value] = nil
+    return nil
+  end
+  local keys, overflow = sorted_keys(value, budget.keys)
+  if overflow then budget.seen[value] = nil; return nil end
+  budget.keys = budget.keys - #keys
+  local parts = { "{" }
+  for _, key in ipairs(keys) do
+    local key_text = canonical_value(key, budget, depth + 1)
+    local item_text = key_text and canonical_value(value[key], budget, depth + 1)
+    if not item_text then budget.seen[value] = nil; return nil end
+    local pair = key_text .. "=" .. item_text .. ";"
+    if not budget_bytes(budget, #pair) then budget.seen[value] = nil; return nil end
+    parts[#parts + 1] = pair
+  end
+  budget.seen[value] = nil
+  return table.concat(parts) .. "}"
+end
+
+local function bounded_value(value, byte_limit, budget, depth)
+  if not budget_node(budget) then return nil end
+  if type(value) == "string" then
+    local text = redact_bounded(value, byte_limit)
+    local size = encoded_size(text)
+    return size and budget_bytes(budget, size) and text or nil
+  end
+  if type(value) ~= "table" then
+    if type(value) == "number" or type(value) == "boolean" then
+      local size = encoded_size(value)
+      return size and budget_bytes(budget, size) and value or nil
+    end
+    return nil
+  end
+  if (depth or 0) >= budget.depth or budget.seen[value] then return nil end
+  budget.seen[value] = true
+  if not budget_bytes(budget, 2) then budget.seen[value] = nil; return nil end
+  local keys, overflow = sorted_keys(value, budget.keys)
+  if overflow then budget.seen[value] = nil; return nil end
+  budget.keys = budget.keys - #keys
   local result = {}
-  local nodes = 1
-  for _, key in ipairs(sorted_keys(value)) do
-    if nodes >= node_budget then break end
+  for _, key in ipairs(keys) do
     local bounded_key = type(key) == "string" and redact_bounded(key, WheelRunner.MAX_REQUEST_VALUE_BYTES)
       or tostring(key)
-    local bounded_item = bounded_value(value[key], byte_limit, node_budget - nodes, seen)
+    local key_size = encoded_size(bounded_key)
+    if not key_size or not budget_bytes(budget, key_size + 1) then break end
+    local bounded_item = bounded_value(value[key], byte_limit, budget, (depth or 0) + 1)
     if bounded_item ~= nil then
       result[bounded_key] = bounded_item
-      nodes = nodes + 1
     end
   end
-  seen[value] = nil
+  budget.seen[value] = nil
   return result
 end
 
@@ -310,74 +424,178 @@ local function encoded_request(request)
   return ok and type(encoded) == "string" and encoded or nil
 end
 
-local function bounded_message(message)
-  local bounded = {
-    role = redact_bounded(message.role or "user", WheelRunner.MAX_REQUEST_VALUE_BYTES),
-    content = redact_bounded(message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
-  }
-  if message.tool_call_id then
-    bounded.tool_call_id = redact_bounded(message.tool_call_id, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+local function bounded_message(message, budget)
+  budget = budget or make_budget(WheelRunner.MAX_REQUEST_VALUE_NODES,
+    WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_ARGUMENT_BYTES)
+  if not budget_node(budget) or not budget_bytes(budget, 2) then
+    return nil
   end
+  local bounded = {}
+  local function field(name, value, limit)
+    if not budget_key(budget) then return end
+    local key_size = encoded_size(name)
+    if not key_size or not budget_bytes(budget, key_size + 1) then return end
+    local safe = safe_string(value, limit, budget)
+    if safe ~= nil then bounded[name] = safe end
+  end
+  field("role", message.role or "user", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+  field("content", message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
+  if bounded.role == nil or bounded.content == nil then return nil end
+  if message.tool_call_id then field("tool_call_id", message.tool_call_id, WheelRunner.MAX_REQUEST_VALUE_BYTES) end
   if type(message.tool_calls) == "table" then
+    if not budget_key(budget) or not budget_node(budget) or not budget_bytes(budget, 2) then
+      return bounded
+    end
     bounded.tool_calls = {}
     for index, call in ipairs(message.tool_calls) do
       if index > WheelRunner.MAX_REQUEST_VALUE_NODES then break end
+      if not budget_node(budget) or not budget_bytes(budget, 2) then break end
+      local bounded_call = {}
+      local function call_field(name, value)
+        if not budget_key(budget) then return end
+        local key_size = encoded_size(name)
+        if not key_size or not budget_bytes(budget, key_size + 1) then return end
+        local safe = safe_string(value, WheelRunner.MAX_REQUEST_VALUE_BYTES, budget)
+        if safe ~= nil then bounded_call[name] = safe end
+      end
+      call_field("id", call.id or "call")
+      call_field("name", call.name or "tool")
+      if bounded_call.id == nil or bounded_call.name == nil then return nil end
       local arguments
       if type(call.arguments) == "table" then
-        arguments = bounded_value(call.arguments, WheelRunner.MAX_REQUEST_VALUE_BYTES,
-          WheelRunner.MAX_REQUEST_VALUE_NODES)
-        local argument_request = encoded_request(arguments)
-        if argument_request and #argument_request > WheelRunner.MAX_REQUEST_ARGUMENT_BYTES then
-          arguments = {}
-        end
+        arguments = bounded_value(call.arguments, WheelRunner.MAX_REQUEST_VALUE_BYTES, budget) or {}
       elseif type(call.arguments) == "string" then
         arguments = #call.arguments <= WheelRunner.MAX_REQUEST_ARGUMENT_BYTES
-          and redact_bounded(call.arguments, WheelRunner.MAX_REQUEST_ARGUMENT_BYTES) or {}
+          and safe_string(call.arguments, WheelRunner.MAX_REQUEST_ARGUMENT_BYTES, budget) or {}
       else
         arguments = {}
       end
-      bounded.tool_calls[#bounded.tool_calls + 1] = {
-        id = redact_bounded(call.id or "call", WheelRunner.MAX_REQUEST_VALUE_BYTES),
-        name = redact_bounded(call.name or "tool", WheelRunner.MAX_REQUEST_VALUE_BYTES),
-        arguments = arguments,
-      }
+      bounded_call.arguments = arguments
+      bounded.tool_calls[#bounded.tool_calls + 1] = bounded_call
     end
   end
   return bounded
 end
 
 local function bound_provider_request(request)
-  local bounded = {
-    model = redact_bounded(request.model or "default-model", WheelRunner.MAX_REQUEST_VALUE_BYTES),
-    messages = {},
-    tools = bounded_value(request.tools or {}, WheelRunner.MAX_REQUEST_VALUE_BYTES,
-      WheelRunner.MAX_REQUEST_NODES),
-    temperature = request.temperature,
-    thinking = bounded_value(request.thinking, WheelRunner.MAX_REQUEST_VALUE_BYTES,
-      WheelRunner.MAX_REQUEST_NODES),
-    max_completion_tokens = request.max_completion_tokens,
-  }
+  local value_budget = make_budget(WheelRunner.MAX_REQUEST_NODES,
+    WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_BYTES)
+  local bounded = { messages = {} }
+  local function top_level_key(name)
+    if not budget_key(value_budget) then return false end
+    local size = encoded_size(name)
+    return size ~= nil and budget_bytes(value_budget, size + 1)
+  end
+  local function bounded_scalar(name, value, limit)
+    if not top_level_key(name) then return nil end
+    return safe_string(value, limit, value_budget)
+  end
+  bounded.model = bounded_scalar("model", request.model or "default-model", WheelRunner.MAX_REQUEST_VALUE_BYTES)
+    or "default-model"
+  if not top_level_key("messages") or not budget_node(value_budget) or not budget_bytes(value_budget, 2) then
+    return { model = bounded.model, messages = {}, tools = {} }
+  end
+  if top_level_key("tools") then
+    bounded.tools = bounded_value(request.tools or {}, WheelRunner.MAX_REQUEST_VALUE_BYTES, value_budget) or {}
+  else
+    bounded.tools = {}
+  end
+  bounded.temperature = request.temperature
+  if request.thinking ~= nil and top_level_key("thinking") then
+    bounded.thinking = bounded_value(request.thinking, WheelRunner.MAX_REQUEST_VALUE_BYTES, value_budget)
+  end
+  if request.max_completion_tokens ~= nil and top_level_key("max_completion_tokens") then
+    bounded.max_completion_tokens = request.max_completion_tokens
+  end
 
   local source_messages = request.messages or {}
   local first_system = nil
   for _, message in ipairs(source_messages) do
     if message.role == "system" then first_system = message; break end
   end
-  if first_system then bounded.messages[#bounded.messages + 1] = bounded_message(first_system) end
-  local start = math.max(1, #source_messages - WheelRunner.MAX_REQUEST_MESSAGES + 2)
-  for index = start, #source_messages do
+  if first_system then
+    local bounded_system = bounded_message(first_system, value_budget)
+    if bounded_system then bounded.messages[#bounded.messages + 1] = bounded_system end
+  end
+
+  -- Select complete conversational groups from the tail. An assistant tool
+  -- call and all matching observations are one indivisible group; orphan tool
+  -- messages are never admitted to the bounded request.
+  local groups = {}
+  local index = 1
+  while index <= #source_messages do
     local message = source_messages[index]
-    if message ~= first_system then bounded.messages[#bounded.messages + 1] = bounded_message(message) end
+    if message == first_system then
+      index = index + 1
+    elseif message.role == "tool" then
+      index = index + 1
+    elseif message.role == "assistant" and type(message.tool_calls) == "table" and #message.tool_calls > 0 then
+      local expected, found = {}, {}
+      for _, call in ipairs(message.tool_calls) do expected[call.id] = true end
+      local group = { message }
+      local cursor = index + 1
+      while cursor <= #source_messages and source_messages[cursor].role == "tool"
+        and expected[source_messages[cursor].tool_call_id] do
+        group[#group + 1] = source_messages[cursor]
+        found[source_messages[cursor].tool_call_id] = true
+        cursor = cursor + 1
+      end
+      local complete = true
+      for id in pairs(expected) do if not found[id] then complete = false; break end end
+      if complete then groups[#groups + 1] = group end
+      index = cursor
+    else
+      groups[#groups + 1] = { message }
+      index = index + 1
+    end
+  end
+  local selected = {}
+  local count = 0
+  local available_messages = WheelRunner.MAX_REQUEST_MESSAGES - #bounded.messages
+  for group_index = #groups, 1, -1 do
+    local group = groups[group_index]
+    if count + #group > available_messages then break end
+    table.insert(selected, 1, group)
+    count = count + #group
+  end
+  for _, group in ipairs(selected) do
+    local trial_budget = copy_budget(value_budget)
+    local bounded_group = {}
+    for _, message in ipairs(group) do
+      local bounded_item = bounded_message(message, trial_budget)
+      if not bounded_item then
+        bounded_group = nil
+        break
+      end
+      bounded_group[#bounded_group + 1] = bounded_item
+    end
+    if bounded_group then
+      value_budget = trial_budget
+      for _, bounded_item in ipairs(bounded_group) do
+        bounded.messages[#bounded.messages + 1] = bounded_item
+      end
+    end
   end
 
   local encoded = encoded_request(bounded)
   while encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES do
     local removable = nil
     for index = 1, #bounded.messages do
-      if bounded.messages[index].role ~= "system" then removable = index; break end
+      if bounded.messages[index].role == "assistant" or bounded.messages[index].role == "user" then
+        removable = index
+        break
+      end
     end
     if not removable then break end
-    table.remove(bounded.messages, removable)
+    local candidate = table.remove(bounded.messages, removable)
+    if candidate.role == "assistant" and candidate.tool_calls then
+      local call_ids = {}
+      for _, call in ipairs(candidate.tool_calls) do call_ids[call.id] = true end
+      while bounded.messages[removable] and bounded.messages[removable].role == "tool"
+        and call_ids[bounded.messages[removable].tool_call_id] do
+        table.remove(bounded.messages, removable)
+      end
+    end
     encoded = encoded_request(bounded)
   end
   if encoded and #encoded > WheelRunner.MAX_REQUEST_BYTES then
@@ -775,7 +993,11 @@ function WheelRunner.run_task(agent, task, opts)
 
     -- Handle tool calls
     local tool_calls = res.tool_calls or {}
-    local turn_record = { response = res, tools = {}, messages = {} }
+    -- Prefer a provider-supplied structured rationale when an adapter
+    -- produced one; otherwise use the bounded local turn record. Extraction
+    -- only reads the documented rationale contract.
+    local turn_rationale = type(res.rationale) == "table" and res.rationale or rationale
+    local turn_record = { response = res, rationale = turn_rationale, tools = {}, messages = {} }
     if #tool_calls > 0 then
       -- Record assistant response message with tool calls
       local assistant_message = {
@@ -795,13 +1017,20 @@ function WheelRunner.run_task(agent, task, opts)
         local dispatch_ok, outcome = pcall(agent.execute_tool, agent, tc.name, tc.arguments)
         if not dispatch_ok or type(outcome) ~= "table" or type(outcome.format_observation) ~= "function" then
           local dispatch_error = dispatch_ok and "Tool returned an invalid outcome" or tostring(outcome)
+          local fallback_stderr = "Tool execution failed: " .. dispatch_error
+          local fallback_preview = redact_bounded(fallback_stderr, WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
           outcome = {
             tool = tc.name or "tool",
             success = false,
             exit_code = 1,
             duration_ms = 0,
             stdout = "",
-            stderr = "Tool execution failed: " .. dispatch_error,
+            stderr = fallback_stderr,
+            preview = fallback_preview,
+            stderr_preview = fallback_preview,
+            stdout_bytes = 0,
+            stderr_bytes = #fallback_stderr,
+            size_bytes = #fallback_stderr,
             format_observation = function(self)
               return string.format(
                 "[Tool: %s (exit=%d, %dms)]\nSTDERR: %s",
@@ -827,11 +1056,10 @@ function WheelRunner.run_task(agent, task, opts)
             duration_ms = outcome.duration_ms,
             tool = outcome.tool,
             intent = outcome.intent,
-            preview = outcome.preview,
-            stdout_preview = outcome.stdout_preview,
-            stderr_preview = outcome.stderr_preview,
-            raw_stdout = outcome.stdout or "",
-            raw_stderr = outcome.stderr or "",
+            preview = redact_bounded(outcome.preview or outcome.stdout_preview or outcome.stderr_preview or "",
+              WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
+            stdout_preview = redact_bounded(outcome.stdout_preview or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
+            stderr_preview = redact_bounded(outcome.stderr_preview or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES),
             size_bytes = outcome.size_bytes or ((outcome.stdout_bytes or 0) + (outcome.stderr_bytes or 0)),
             stdout_bytes = outcome.stdout_bytes,
             stderr_bytes = outcome.stderr_bytes,

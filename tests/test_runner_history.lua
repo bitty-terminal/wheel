@@ -202,10 +202,13 @@ return function(run_test)
     local messages = { message("user", "start") }
     local records = {
       {
-        messages = { message("assistant", "Decision: keep the bounded path") },
-        response = {
-          content = "Decision: keep the bounded path\nRisk: model_content_api_key=MODEL_CONTENT_SENTINEL\nNext-Action: run the regression",
-          thinking_content = "Risk: inspect provider limits",
+        messages = { message("assistant", "turn") },
+        response = { content = "sampled evidence" },
+        rationale = {
+          decision = "keep the bounded path",
+          risk = "model_content_api_key=MODEL_CONTENT_SENTINEL",
+          next_action = "run the regression",
+          evidence = { "observed bounded state" },
         },
         tools = {},
       },
@@ -281,5 +284,127 @@ return function(run_test)
       assert(#(retained.content or "") <= WheelRunner.MAX_REQUEST_MESSAGE_BYTES,
         "retained message content must stay within its node bound")
     end
+  end)
+
+  run_test("WheelRunner history: action records never re-persist raw tool output", function()
+    local WheelProvider = require("wheel.provider")
+    local WheelAction = require("wheel.action")
+    local sentinel = "RAW_SECRET_SENTINEL"
+    local raw = sentinel .. string.rep("x", WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
+    local blobs = {}
+    local recorded = {}
+    local provider = WheelProvider.MockProvider.new({ responses = {
+      { content = "", tool_calls = { { id = "call-1", name = "inspect", arguments = { path = "a" } } } },
+      { content = "done", tool_calls = {} },
+    } })
+    local agent = {
+      name = "raw-output-agent",
+      role = "coding",
+      model_profile = { model = "test-model" },
+      execute_tool = function(_, name)
+        return {
+          tool = name,
+          success = true,
+          exit_code = 0,
+          duration_ms = 1,
+          stdout = raw,
+          stdout_preview = "bounded preview",
+          stdout_bytes = #raw,
+          stderr = "",
+          stderr_bytes = 0,
+          format_observation = function() return "bounded observation" end,
+        }
+      end,
+      kernel = {
+        set_active_task = function() end,
+        commit_checkpoint = function() return { hash = "checkpoint" } end,
+        record_action = function(_, payload) recorded[#recorded + 1] = payload end,
+      },
+    }
+    local result = WheelRunner.run_task(agent, {
+      id = "T-raw-output", title = "raw output", description = "bounded action", priority = 1,
+    }, { provider = provider, max_turns = 2, commit_checkpoints = false })
+    assert(result.success == true, "the scripted runner turn must complete: " .. tostring(result.error))
+    assert(#recorded == 1, "the tool turn must record exactly one action")
+    local payload = recorded[1]
+    assert(payload.stdout == nil and payload.raw_stdout == nil,
+      "raw stdout must not be handed to the action record")
+    assert(payload.stderr == nil and payload.raw_stderr == nil,
+      "raw stderr must not be handed to the action record")
+    local normalized = WheelAction.normalize(payload, function(hash, content)
+      blobs[#blobs + 1] = content
+    end)
+    assert(normalized.blob_hash == nil or #blobs == 0,
+      "the preview-only runner path must not spill a full payload")
+    for _, content in ipairs(blobs) do
+      assert(not content:find(sentinel, 1, true), "raw tool output must never reach an action blob")
+    end
+  end)
+
+  run_test("WheelRunner history: request truncation never splits tool call groups", function()
+    local request = { model = "test-model", messages = {}, tools = {} }
+    request.messages[#request.messages + 1] = message("system", "stable prefix")
+    for index = 1, 20 do
+      request.messages[#request.messages + 1] = message("user", "prompt-" .. index)
+      request.messages[#request.messages + 1] = message("assistant", "answer-" .. index)
+      request.messages[#request.messages + 1] = {
+        role = "assistant",
+        content = "",
+        tool_calls = { { id = "call-" .. index, name = "inspect", arguments = {} } },
+      }
+      request.messages[#request.messages + 1] = {
+        role = "tool", tool_call_id = "call-" .. index, content = "observation-" .. index,
+      }
+    end
+    -- A partial group (two calls, one observation) must never be admitted.
+    request.messages[#request.messages + 1] = {
+      role = "assistant",
+      content = "",
+      tool_calls = {
+        { id = "partial-a", name = "inspect", arguments = {} },
+        { id = "partial-b", name = "inspect", arguments = {} },
+      },
+    }
+    request.messages[#request.messages + 1] = {
+      role = "tool", tool_call_id = "partial-b", content = "only-one-result",
+    }
+    local bounded = WheelRunner.bound_provider_request(request)
+    local open_calls = {}
+    for _, item in ipairs(bounded.messages) do
+      if item.role == "assistant" and item.tool_calls then
+        for _, call in ipairs(item.tool_calls) do open_calls[call.id] = (open_calls[call.id] or 0) + 1 end
+      elseif item.role == "tool" then
+        assert(open_calls[item.tool_call_id] and open_calls[item.tool_call_id] > 0,
+          "a tool observation must never appear without its assistant tool call")
+        open_calls[item.tool_call_id] = open_calls[item.tool_call_id] - 1
+      end
+    end
+    for id, count in pairs(open_calls) do
+      assert(count == 0, "assistant tool call " .. tostring(id) .. " must keep all observations")
+    end
+    for _, item in ipairs(bounded.messages) do
+      assert(not (item.role == "tool" and item.content == "only-one-result"),
+        "a partial tool-call group must be dropped whole")
+    end
+  end)
+
+  run_test("WheelRunner history: ContextRef seeds bound hostile wide and deep arguments", function()
+    local function compact(seed)
+      local deep = { value = seed }
+      for _ = 1, 80 do deep = { nested = deep } end
+      local wide = {}
+      for index = 1, 600 do wide["key-" .. index] = string.rep(seed, 4) end
+      local messages = { message("user", "start") }
+      local call = { id = "call-deep", name = "inspect", arguments = { deep = deep, wide = wide } }
+      local assistant = { role = "assistant", content = "call", tool_calls = { call } }
+      local records = { { messages = { assistant }, rationale = { decision = seed }, tools = {} } }
+      local state = { tool_calls = {}, failures = {}, decisions = {}, evidence = {}, risks = {}, next_actions = {} }
+      return WheelRunner.compact_history(messages, records, state, { task_id = "T-hostile-seed", force = true })
+    end
+    local compacted, first = compact("seed-A")
+    local _, second = compact("seed-B")
+    assert(first and first.id and #first.id > 0, "hostile arguments must still produce a ContextRef")
+    assert(compacted and compacted[#compacted].content ~= nil, "compaction must complete with a ContextRef message")
+    assert(first.id ~= second.id, "bounded seeds must keep distinct identities for distinct histories")
   end)
 end
