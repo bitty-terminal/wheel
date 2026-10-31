@@ -135,9 +135,11 @@ function WheelTeam:register_agent(agent)
   if self.agents[agent.name] then
     error("Agent with name '" .. agent.name .. "' is already registered in this team")
   end
+  local agent_identity = agent:status().agent_id
   for _, existing in pairs(self.agents) do
-    if existing.agent_id and agent.agent_id and existing.agent_id == agent.agent_id then
-      error("Agent identity '" .. agent.agent_id .. "' is already registered in this team")
+    local existing_identity = existing:status().agent_id
+    if existing_identity and agent_identity and existing_identity == agent_identity then
+      error("Agent identity '" .. agent_identity .. "' is already registered in this team")
     end
   end
   self.agents[agent.name] = agent
@@ -282,13 +284,14 @@ function WheelTeam:list_agents()
   local list = {}
   for name, agent in pairs(self.agents) do
     local st = self.agent_states[name] or {}
+    local agent_status = agent:status()
     table.insert(list, {
       name = name,
-      agent_id = agent.agent_id,
-      role = agent.role_binding and agent.role_binding.role or agent.role,
-      role_binding = WheelAgent.binding_reference(agent.role_binding),
-      policy_generation = agent.policy_generation,
-      lineage = agent.lineage_projection and agent:lineage_projection() or nil,
+      agent_id = agent_status.agent_id,
+      role = agent_status.role,
+      role_binding = agent_status.role_binding and WheelAgent.binding_reference(agent_status.role_binding),
+      policy_generation = agent_status.policy_generation,
+      lineage = agent_status.lineage,
       state = st.state or "idle",
       active_task_id = st.active_task_id,
       panel_id = agent.panel_id,
@@ -309,7 +312,7 @@ function WheelTeam:find_idle_agent(role)
   for name, agent in pairs(self.agents) do
     local st = self.agent_states[name]
     if st and st.state == "idle" then
-      local current = agent.role_binding and agent.role_binding.role or agent.role
+      local current = agent:current_role()
       if not role or current == role then
         return agent
       end
@@ -521,7 +524,7 @@ function WheelTeam:dispatch_wave(role_mapping)
           table.insert(dispatched, {
             task_id = task.id,
             agent_name = idle_agent.name,
-            role = idle_agent.role,
+            role = idle_agent:current_role(),
           })
         end
       end
@@ -542,6 +545,7 @@ function WheelTeam:status()
   for name, agent in pairs(self.agents) do
     total = total + 1
     local st = self.agent_states[name] or {}
+    local agent_status = agent:status()
     if st.state == "busy" then
       busy = busy + 1
     else
@@ -549,11 +553,11 @@ function WheelTeam:status()
     end
     table.insert(agent_summaries, {
       name = name,
-      agent_id = agent.agent_id,
-      role = agent.role_binding and agent.role_binding.role or agent.role,
-      role_binding = WheelAgent.binding_reference(agent.role_binding),
-      policy_generation = agent.policy_generation,
-      lineage = agent.lineage_projection and agent:lineage_projection() or nil,
+      agent_id = agent_status.agent_id,
+      role = agent_status.role,
+      role_binding = agent_status.role_binding and WheelAgent.binding_reference(agent_status.role_binding),
+      policy_generation = agent_status.policy_generation,
+      lineage = agent_status.lineage,
       state = st.state or "idle",
       active_task_id = st.active_task_id,
       panel_id = agent.panel_id,

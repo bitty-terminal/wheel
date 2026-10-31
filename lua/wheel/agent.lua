@@ -571,7 +571,7 @@ function WheelAgent:create_runtime_session(opts)
   if not panel then
     panel, panel_err = self.lifecycle:create_panel({
       panel_id = opts.panel_id or self.panel_id,
-      agent_id = self.agent_id,
+      agent_id = authoritative_identity(self).agent_id,
       headless = self.headless,
       kind = opts.panel_kind or "headless",
     })
@@ -585,12 +585,12 @@ function WheelAgent:create_runtime_session(opts)
   end
   local session, session_err = self.lifecycle:create_agent_session({
     session_id = opts.session_id,
-    agent_id = self.agent_id,
+    agent_id = authoritative_identity(self).agent_id,
     panel_id = panel.panel_id,
     task_id = opts.task_id or self.active_task_id,
     context_branch = opts.context_branch or self:current_branch(),
     context_head = opts.context_head,
-    role_binding = opts.role_binding or WheelAgent.binding_reference(self.role_binding),
+    role_binding = WheelAgent.binding_reference(authoritative_binding(self)),
     model_profile = opts.model_profile or self.model_profile,
     worktree_id = opts.worktree_id or self.worktree_id,
   })
@@ -1033,9 +1033,10 @@ end
 --- @param plan_items table[] Array of { id = string, title = string, description = string, priority = number?, dependencies = string[]? }
 --- @return table[] List of created task records
 function WheelAgent:decompose_plan(plan_items)
-  local role = self.role_binding.role
+  local binding = authoritative_binding(self)
+  local role = binding and binding.role or nil
   if role ~= ROLE_COMMANDER then
-    error("Only Commander role may decompose project plans (current role: " .. role .. ")")
+    error("Only Commander role may decompose project plans (current role: " .. tostring(role) .. ")")
   end
   local created = {}
   for _, item in ipairs(plan_items) do
@@ -1050,9 +1051,10 @@ end
 --- @param review_fn fun(agent: table, task: table, history: table[])?: boolean, string
 --- @return table { approved: boolean, reason: string?, checkpoint: string? }
 function WheelAgent:review_task(task_id, review_fn)
-  local role = self.role_binding.role
+  local binding = authoritative_binding(self)
+  local role = binding and binding.role or nil
   if role ~= ROLE_REVIEWER then
-    error("Only Reviewer role may review tasks (current role: " .. role .. ")")
+    error("Only Reviewer role may review tasks (current role: " .. tostring(role) .. ")")
   end
   local task = self.kernel:get_task(task_id)
   if not task then
@@ -1305,12 +1307,13 @@ end
 -- projections. It contains references only.
 -- @return table
 function WheelAgent:lineage_projection()
-  local lineage = self.lineage
+  local identity = authoritative_identity(self)
+  local lineage = identity and identity.lineage
   return {
-    agent_id = self.agent_id,
+    agent_id = identity and identity.agent_id or nil,
     name = self.name,
     policy_generation = self.policy_generation,
-    role_binding = self.role_binding and WheelAgent.binding_reference(self.role_binding) or nil,
+    role_binding = WheelAgent.binding_reference(authoritative_binding(self)),
     forked_from_agent = lineage and lineage.forked_from_agent or nil,
     forked_from_session = lineage and lineage.forked_from_session or nil,
     base_context_commit = lineage and lineage.base_context_commit or nil,
@@ -1325,7 +1328,7 @@ end
 function WheelAgent:context_reference()
   local refs = self.context_refs or {}
   return {
-    agent_id = self.agent_id,
+    agent_id = authoritative_identity(self).agent_id,
     base_context_commit = refs.base_context_commit,
     session_id = refs.session_id or self.session_id,
     branch = refs.branch or self:current_branch(),
@@ -1392,7 +1395,9 @@ end
 -- @return table|nil child agent, table|nil typed error
 function WheelAgent.fork_agent(parent, opts)
   opts = opts or {}
-  if type(parent) ~= "table" or parent.role_binding == nil then
+  local parent_binding = type(parent) == "table" and authoritative_binding(parent) or nil
+  local parent_identity = type(parent) == "table" and authoritative_identity(parent) or nil
+  if not parent_binding or not parent_identity then
     return nil, { code = "E_FORK_INVALID", message = "fork requires a parent Agent" }
   end
   local name = bounded_string(opts.name, MAX_IDENTITY_BYTES)
@@ -1403,7 +1408,7 @@ function WheelAgent.fork_agent(parent, opts)
   if not bounded_string(agent_id, MAX_IDENTITY_BYTES) then
     return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded child agent_id" }
   end
-  if name == parent.name or agent_id == parent.agent_id then
+  if name == parent.name or agent_id == parent_identity.agent_id then
     return nil, {
       code = "E_FORK_IDENTITY",
       message = "fork requires an independent Agent identity",
@@ -1428,12 +1433,12 @@ function WheelAgent.fork_agent(parent, opts)
     return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded reason" }
   end
   local initial, binding_err = WheelAgent.normalize_role_binding(
-    opts.role_binding or { role = opts.role or parent.role_binding.role,
+    opts.role_binding or { role = opts.role or parent_binding.role,
       capabilities = opts.capabilities }, agent_id)
   if not initial then
     return nil, { code = "E_FORK_INVALID", message = tostring(binding_err) }
   end
-  local added = capability_diff(initial.capabilities, parent.role_binding.capabilities)
+  local added = capability_diff(initial.capabilities, parent_binding.capabilities)
   if #added > 0 and opts.approve_widening ~= true then
     return nil, {
       code = "E_FORK_AUTHORITY",
@@ -1443,7 +1448,7 @@ function WheelAgent.fork_agent(parent, opts)
   end
   local forked_from_session = opts.forked_from_session or parent.session_id
   local lineage, lineage_err = WheelAgent.validate_lineage({
-    forked_from_agent = parent.agent_id,
+    forked_from_agent = parent_identity.agent_id,
     forked_from_session = forked_from_session,
     base_context_commit = commit.hash,
     reason = reason,
@@ -1483,12 +1488,14 @@ end
 -- separate fields so no caller has to parse a role word out of prompt text.
 -- @return table
 function WheelAgent:status()
+  local identity = authoritative_identity(self)
+  local binding = authoritative_binding(self)
   return {
     name = self.name,
-    agent_id = self.agent_id,
-    role = self.role_binding.role,
-    role_binding = binding_copy(self.role_binding),
-    policy_generation = self.policy_generation,
+    agent_id = identity and identity.agent_id or nil,
+    role = binding and binding.role or nil,
+    role_binding = binding_copy(binding),
+    policy_generation = binding and binding.policy_generation or nil,
     lineage = self:lineage_projection(),
     context_refs = self:context_reference(),
     panel_id = self.panel_id,

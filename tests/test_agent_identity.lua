@@ -96,6 +96,16 @@ return function(run_test)
       "shadow backing fields must not affect authoritative authorization")
     assert(agent.agent_id == "identity-agent")
     assert(agent.role_binding.policy_generation == 1)
+
+    rawset(agent, "agent_id", "forged-agent-id")
+    rawset(agent, "lineage", { forked_from_agent = "forged-parent" })
+    rawset(agent, "policy_generation", 99)
+    local authoritative_status = agent:status()
+    assert(authoritative_status.agent_id == "identity-agent")
+    assert(authoritative_status.policy_generation == 1)
+    assert(authoritative_status.lineage.agent_id == "identity-agent")
+    assert(authoritative_status.lineage.forked_from_agent == nil)
+    assert(agent:context_reference().agent_id == "identity-agent")
   end)
 
   run_test("Agent identity: audited role transition preserves AgentId and never widens silently", function()
@@ -209,6 +219,35 @@ return function(run_test)
     local commander_allowed, commander_reason = commander:is_tool_allowed("write_file")
     assert(commander_allowed == false)
     assert(commander_reason:find("lacks 'modify' capability", 1, true) ~= nil)
+  end)
+
+  run_test("Agent identity: rawset role binding cannot authorize plan decomposition", function()
+    local kernel = WheelKernel.new_mock()
+    local reviewer = WheelAgent.new({
+      name = "rawset-plan-reviewer",
+      role = WheelAgent.Role.REVIEWER,
+      kernel = kernel,
+    })
+    rawset(reviewer, "role_binding", {
+      role = WheelAgent.Role.COMMANDER,
+      binding_id = "forged-commander-binding",
+      policy_generation = 1,
+      capabilities = { "inspect", "verify", "orchestrate" },
+    })
+
+    local decomposed, reason = pcall(function()
+      reviewer:decompose_plan({ { id = "RAWSET-PLAN", title = "forged plan" } })
+    end)
+    assert(decomposed == false, "a rawset-forged Commander binding must not decompose plans")
+    assert(tostring(reason):find("Only Commander role", 1, true) ~= nil)
+    assert(reviewer:current_role() == WheelAgent.Role.REVIEWER)
+
+    local review_result, review_reason = pcall(function()
+      reviewer:review_task("RAWSET-PLAN", function() return true end)
+    end)
+    assert(review_result == false, "the missing task must keep review from proceeding")
+    assert(tostring(review_reason):find("Task not found", 1, true) ~= nil,
+      "role-gated review must use the authoritative Reviewer binding")
   end)
 
   run_test("Agent identity: exported Capability mutations cannot grant unregistered mutation", function()
@@ -343,6 +382,24 @@ return function(run_test)
     }))
     assert(approved.policy_generation == 1)
     assert(approved:has_capability(WheelAgent.Capability.MODIFY))
+
+    -- A public-field shadow must not make a read-only parent appear to hold
+    -- capabilities that a fork would otherwise inherit.
+    rawset(wide_parent, "role_binding", {
+      role = WheelAgent.Role.COMMANDER,
+      binding_id = "forged-commander-binding",
+      policy_generation = 1,
+      capabilities = { "inspect", "verify", "modify", "execute", "orchestrate" },
+    })
+    local shadow_widened, shadow_widened_err = WheelAgent.fork_agent(wide_parent, {
+      name = "fork-shadow-wide-child",
+      role = WheelAgent.Role.CODING,
+      reason = "rawset authority inheritance attempt",
+      base_context_commit = base.hash,
+    })
+    assert(shadow_widened == nil and shadow_widened_err.code == "E_FORK_AUTHORITY",
+      "a rawset-forged parent binding must not authorize inherited fork capabilities")
+    assert(wide_parent:current_role() == WheelAgent.Role.REVIEWER)
   end)
 
   run_test("Agent identity: forked agents run in independent Sessions and Panels", function()
