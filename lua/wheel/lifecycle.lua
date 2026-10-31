@@ -58,6 +58,7 @@ local EVENT_TYPES = {
   ["panel.detached"] = true, ["panel.closed"] = true, ["agent_session.created"] = true,
   ["agent_session.active"] = true, ["agent_session.paused"] = true, ["agent_session.stale"] = true,
   ["agent_session.recovered"] = true, ["agent_session.checkpointed"] = true,
+  ["agent_session.role_transition"] = true,
   ["agent_session.ended"] = true, ["agent_session.abandoned"] = true,
 }
 
@@ -76,7 +77,7 @@ local REASON_CODES = {
   explicit = true, stale = true, session_ended = true, session_abandoned = true,
   panel_detached = true, transfer = true, recovery = true, manual = true,
   complete = true, user_pause = true, owner_lost = true, checkpoint = true,
-  redacted = true,
+  redacted = true, role_transition = true, role_widening = true,
 }
 
 local function fail(code, message) return nil, { code = code, message = message } end
@@ -159,7 +160,7 @@ end
 -- Metadata has an allowlist, not merely a denylist. This prevents sensitive
 -- data being moved under a new spelling or nested alternate key.
 local METADATA_KEYS = {
-  role = true, binding_id = true, provider = true, model = true, temperature = true,
+  role = true, binding_id = true, policy_generation = true, provider = true, model = true, temperature = true,
   thinking = true, context_budget = true, retry = true, max_completion_tokens = true,
   enabled = true, gear = true, budget_tokens = true, max_tokens = true,
   max_retries = true, backoff_ms = true,
@@ -225,7 +226,7 @@ local function normalize_session_metadata(record)
   local role, role_err = metadata(record.role_binding, 0, budget)
   local model, model_err = metadata(record.model_profile, 0, budget)
   if not role or not model then return false, role_err or model_err end
-  if not exact_keys(role, { role=true, binding_id=true }) or not exact_keys(model, {
+  if not exact_keys(role, { role=true, binding_id=true, policy_generation=true }) or not exact_keys(model, {
     provider=true, model=true, temperature=true, thinking=true, context_budget=true,
     retry=true, max_completion_tokens=true,
   }) then return false, "role/model metadata has unknown fields" end
@@ -233,6 +234,9 @@ local function normalize_session_metadata(record)
     if type(model[key]) ~= "string" then return false, "model reference is invalid" end
   end
   if role.binding_id ~= nil and not id(role.binding_id, "binding_id", true) then return false, "binding reference invalid" end
+  if role.policy_generation ~= nil and (not finite(role.policy_generation)
+    or role.policy_generation < 1 or role.policy_generation % 1 ~= 0
+    or role.policy_generation > MAX_SAFE_INTEGER) then return false, "policy generation invalid" end
   if model.temperature ~= nil and (not finite(model.temperature) or model.temperature < 0 or model.temperature > 2) then return false, "temperature invalid" end
   local groups = {
     thinking = { enabled="boolean", gear="string", budget_tokens="number" },
@@ -342,6 +346,7 @@ end
 local function event_allowed(key)
   return key == "reason" or key == "recovery" or key == "checkpoint"
     or key == "mode" or key == "observer_session_id" or key == "controller_session_id" or key == "transfer"
+    or key == "policy_generation"
 end
 local function event_extra(extra, loaded)
   local result = {}
@@ -351,6 +356,10 @@ local function event_extra(extra, loaded)
       local clean, err = reason(value, key, loaded); if not clean then return nil, err end; result[key] = clean
     elseif key == "checkpoint" or key == "observer_session_id" or key == "controller_session_id" then
       local clean, err = id(value, key, true); if not clean then return nil, err end; result[key] = clean
+    elseif key == "policy_generation" then
+      if type(value) ~= "number" or not finite(value) or value < 1 or value % 1 ~= 0
+        or value > MAX_SAFE_INTEGER then return nil, "event policy generation is invalid" end
+      result[key] = value
     elseif key == "mode" then
       if value ~= Lifecycle.AttachMode.CONTROLLER and value ~= Lifecycle.AttachMode.OBSERVER then
         return nil, "event mode is invalid"
@@ -395,6 +404,7 @@ local function valid_event_transition(event)
     ["agent_session.stale"] = { ["active:stale"] = true, ["paused:stale"] = true },
     ["agent_session.recovered"] = { ["stale:paused"] = true },
     ["agent_session.checkpointed"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
+    ["agent_session.role_transition"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
     ["agent_session.ended"] = { ["created:ended"] = true, ["active:ended"] = true, ["paused:ended"] = true, ["stale:ended"] = true },
     ["agent_session.abandoned"] = { ["created:abandoned"] = true, ["active:abandoned"] = true, ["paused:abandoned"] = true, ["stale:abandoned"] = true },
   }
@@ -499,7 +509,7 @@ local function registry_shape(value)
     if result then return result end
     local record = value.sessions[session_id]
     if not record then return nil end
-    result = { panel_id = nil, state = nil, mode = nil, created = false }
+    result = { panel_id = nil, state = nil, mode = nil, created = false, policy_generation = nil }
     replay_sessions[session_id] = result
     return result
   end
@@ -564,10 +574,10 @@ local function registry_shape(value)
       event_id=true, type=true, timestamp_ms=true, session_id=true, panel_id=true,
       agent_id=true, task_id=true, from_state=true, to_state=true, reason=true,
       recovery=true, checkpoint=true, mode=true, observer_session_id=true, transfer=true,
-      controller_session_id=true,
+      controller_session_id=true, policy_generation=true,
     }) then return false, "event contains unknown fields" end
     local extras = {}
-    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "controller_session_id", "transfer" }) do
+    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "controller_session_id", "transfer", "policy_generation" }) do
       if event[key] ~= nil then extras[key] = event[key] end
     end
     local clean, err = event_extra(extras, true); if not clean then return false, err end
@@ -577,6 +587,17 @@ local function registry_shape(value)
     if event.type == "panel.observer_attached"
       and (event.mode ~= "observer" or not event.observer_session_id) then return false, "observer event identity invalid" end
     if event.type == "agent_session.checkpointed" and not event.checkpoint then return false, "checkpoint event value missing" end
+    if event.type == "agent_session.role_transition"
+      and (not event.checkpoint or not event.policy_generation) then
+      return false, "role transition event value missing"
+    end
+    if event.type == "agent_session.role_transition"
+      and event.reason ~= "role_transition" and event.reason ~= "role_widening" then
+      return false, "role transition event reason is invalid"
+    end
+    if event.type ~= "agent_session.role_transition" and event.policy_generation ~= nil then
+      return false, "policy generation belongs only to a role transition"
+    end
     if event.type == "agent_session.recovered" and not event.recovery then return false, "recovery event value missing" end
     if event.session_id ~= nil and not value.sessions[event.session_id] then return false, "event references unknown session" end
     if event.panel_id ~= nil and not value.panels[event.panel_id] then return false, "event references unknown panel" end
@@ -624,6 +645,13 @@ local function registry_shape(value)
           panel.controller, session.mode = event.session_id, Lifecycle.AttachMode.CONTROLLER
         elseif event.type == "agent_session.active" and session.mode ~= Lifecycle.AttachMode.CONTROLLER then
           return false, "active session is not a controller"
+        end
+        if event.type == "agent_session.role_transition" then
+          local previous = session.policy_generation or 0
+          if event.policy_generation <= previous then
+            return false, "role transition policy generation is not monotonic"
+          end
+          session.policy_generation = event.policy_generation
         end
         session.state = event.to_state
       end
@@ -712,6 +740,17 @@ local function registry_shape(value)
       local owner = value.sessions[event.session_id]
       if event.agent_id and event.agent_id ~= owner.agent_id then return false, "event/session agent mismatch" end
       if event.task_id ~= owner.task_id then return false, "event/session task mismatch" end
+    end
+  end
+  if complete_history then
+    for session_id, replayed in pairs(replay_sessions) do
+      if replayed.policy_generation then
+        local record = value.sessions[session_id]
+        local generation = record and record.role_binding and record.role_binding.policy_generation
+        if generation ~= replayed.policy_generation then
+          return false, "role transition generation does not match the session"
+        end
+      end
     end
   end
   -- Relationship and uniqueness invariants are checked after all IDs exist.
@@ -1076,6 +1115,42 @@ function Lifecycle:checkpoint_session(session_id, checkpoint)
     record.checkpoint, record.updated_at_ms = clean, now_ms(); new_event(state, "agent_session.checkpointed", record, record.state, record.state, { checkpoint=clean }, function(prefix) return self:_next_id(state, prefix) end); return copy(record)
   end)
 end
+function Lifecycle:record_role_transition(session_id, opts)
+  opts = opts or {}
+  return self:_change(function(state)
+    local record, err = self:_session_in(state, session_id); if not record then return false, err end
+    if TERMINAL[record.state] then return false, { code="E_LIFECYCLE_STATE", message="terminal session cannot change its role binding" } end
+    local binding, binding_err = metadata(opts.role_binding, 0, { keys = 0, bytes = 0 })
+    if not binding then return false, { code="E_LIFECYCLE_INVALID", message=binding_err } end
+    if not exact_keys(binding, { role=true, binding_id=true, policy_generation=true })
+      or not binding.role or not binding.binding_id or not binding.policy_generation then
+      return false, { code="E_LIFECYCLE_INVALID", message="role transition binding is incomplete" }
+    end
+    local previous = record.role_binding or {}
+    local expected = (previous.policy_generation or 1) + 1
+    if binding.policy_generation ~= expected then
+      return false, { code="E_LIFECYCLE_AUTHORITY", message="policy generation must advance by exactly one" }
+    end
+    if binding.binding_id == previous.binding_id then
+      return false, { code="E_LIFECYCLE_AUTHORITY", message="role transition must issue a new binding" }
+    end
+    local checkpoint, checkpoint_err = id(opts.checkpoint, "checkpoint", true)
+    if not checkpoint then return false, { code="E_LIFECYCLE_INVALID", message=checkpoint_err } end
+    local transition_reason, reason_err = reason(opts.reason or "role_transition", "reason")
+    if not transition_reason then return false, { code="E_LIFECYCLE_INVALID", message=reason_err } end
+    if transition_reason ~= "role_transition" and transition_reason ~= "role_widening" then
+      return false, { code="E_LIFECYCLE_INVALID", message="role transition requires a role reason code" }
+    end
+    local from = record.state
+    record.role_binding, record.checkpoint, record.updated_at_ms = binding, checkpoint, now_ms()
+    local event, event_err = new_event(state, "agent_session.role_transition", record, from, from, {
+      reason = transition_reason, checkpoint = checkpoint,
+      policy_generation = binding.policy_generation,
+    }, function(prefix) return self:_next_id(state, prefix) end)
+    if not event then return false, { code="E_LIFECYCLE_INVALID", message=event_err } end
+    return copy(record)
+  end)
+end
 function Lifecycle:resume_session(session_id)
   local record = self.sessions[session_id]; if not record or record.state ~= S.PAUSED then return fail("E_LIFECYCLE_STATE", "only paused sessions can resume") end
   return self:activate_session(session_id)
@@ -1217,6 +1292,7 @@ Lifecycle.resume = Lifecycle.resume_session
 Lifecycle.detach = Lifecycle.detach_session
 Lifecycle.attach = Lifecycle.attach_session
 Lifecycle.checkpoint = Lifecycle.checkpoint_session
+Lifecycle.role_transition = Lifecycle.record_role_transition
 Lifecycle.stale = Lifecycle.mark_stale
 Lifecycle.recover = Lifecycle.recover_session
 

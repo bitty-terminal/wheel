@@ -4,7 +4,6 @@
 -- Roles vary by configuration inside that domain, bounded by budgets and permissions.
 
 local WheelAgent = {}
-WheelAgent.__index = WheelAgent
 
 local ok_tool, WheelTool = pcall(require, "wheel.tool")
 if not ok_tool then
@@ -72,6 +71,218 @@ local READ_ONLY_TOOLS = {
 }
 
 WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
+
+--- Capability vocabulary. Authorization is decided from the granted capability
+-- set on the current RoleBinding, never from a role word in prompt or identity
+-- text. `WheelAgent.ROLE_CAPABILITIES` is the only role-to-capability matrix.
+WheelAgent.Capability = {
+  INSPECT = "inspect",
+  VERIFY = "verify",
+  ORCHESTRATE = "orchestrate",
+  MODIFY = "modify",
+  EXECUTE = "execute",
+}
+
+local CAPABILITY_ORDER = {
+  WheelAgent.Capability.INSPECT,
+  WheelAgent.Capability.VERIFY,
+  WheelAgent.Capability.ORCHESTRATE,
+  WheelAgent.Capability.MODIFY,
+  WheelAgent.Capability.EXECUTE,
+}
+local CAPABILITY_VALUES = {}
+for _, capability in ipairs(CAPABILITY_ORDER) do CAPABILITY_VALUES[capability] = true end
+
+--- Canonical role capability matrix. Read-only roles never hold Modify or
+-- Execute, and Commander orchestrates without direct code modification.
+local ROLE_CAPABILITIES = {
+  [WheelAgent.Role.COMMANDER] = {
+    inspect = true, verify = true, orchestrate = true,
+  },
+  [WheelAgent.Role.CODING] = {
+    inspect = true, verify = true, modify = true, execute = true,
+  },
+  [WheelAgent.Role.DEBUG] = {
+    inspect = true, verify = true, modify = true, execute = true,
+  },
+  [WheelAgent.Role.RESEARCH] = {
+    inspect = true, verify = true,
+  },
+  [WheelAgent.Role.REVIEWER] = {
+    inspect = true, verify = true,
+  },
+}
+WheelAgent.ROLE_CAPABILITIES = ROLE_CAPABILITIES
+
+local ROLE_VALUES = {}
+for _, role in pairs(WheelAgent.Role) do ROLE_VALUES[role] = true end
+
+local MAX_IDENTITY_BYTES = 128
+local MAX_REASON_BYTES = 256
+local MAX_BINDING_ID_BYTES = 128
+local BINDING_ID_AGENT_BYTES = 48
+local POLICY_GENERATION_START = 1
+local MAX_POLICY_GENERATION = 9007199254740991
+local IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/%-]*$"
+local COMMIT_HASH_PATTERN = "^[0-9a-f]+$"
+local COMMIT_HASH_BYTES = 64
+
+--- Return a defensive ordered copy of a capability set for a role.
+-- @param role string Role from WheelAgent.Role
+-- @return table|nil capabilities
+function WheelAgent.role_capabilities(role)
+  local matrix = ROLE_CAPABILITIES[role]
+  if not matrix then return nil end
+  local result = {}
+  for _, capability in ipairs(CAPABILITY_ORDER) do
+    if matrix[capability] then result[#result + 1] = capability end
+  end
+  return result
+end
+
+local function bounded_string(value, limit)
+  if type(value) ~= "string" or value == "" or #value > limit then return nil end
+  if value:find("[%z\1-\31\127]") then return nil end
+  return value
+end
+
+local function capability_map(list)
+  local result = {}
+  for _, capability in ipairs(list or {}) do result[capability] = true end
+  return result
+end
+
+local function capability_diff(left, right)
+  local other = capability_map(right)
+  local result = {}
+  for _, capability in ipairs(left or {}) do
+    if not other[capability] then result[#result + 1] = capability end
+  end
+  return result
+end
+
+local function normalize_capabilities(role, requested)
+  local matrix = ROLE_CAPABILITIES[role]
+  local canonical = WheelAgent.role_capabilities(role)
+  if not matrix or not canonical then return nil, "unknown role: " .. tostring(role) end
+  if requested == nil then return canonical end
+  if type(requested) ~= "table" then return nil, "capabilities must be an array" end
+  local seen = {}
+  for key in pairs(requested) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      return nil, "capabilities must be a dense array"
+    end
+  end
+  local count = 0
+  for index = 1, #requested do
+    local capability = requested[index]
+    if not CAPABILITY_VALUES[capability] then
+      return nil, "unknown capability: " .. tostring(capability)
+    end
+    if seen[capability] then return nil, "duplicate capability: " .. capability end
+    if not matrix[capability] then
+      return nil, "role '" .. role .. "' may not hold capability '" .. capability .. "'"
+    end
+    seen[capability] = true
+    count = count + 1
+  end
+  if count ~= #requested then return nil, "capabilities must be a dense array" end
+  if count == 0 then return nil, "capabilities must not be empty" end
+  local ordered = {}
+  for _, capability in ipairs(CAPABILITY_ORDER) do
+    if seen[capability] then ordered[#ordered + 1] = capability end
+  end
+  return ordered
+end
+
+local function default_binding_id(agent_id, generation)
+  local component = tostring(agent_id or "agent"):gsub("[^A-Za-z0-9._%-]", "-")
+  component = component:sub(1, BINDING_ID_AGENT_BYTES)
+  if component == "" or component:sub(1, 1):match("^[A-Za-z0-9]$") == nil then
+    component = "agent-" .. component
+  end
+  return string.format("role-binding:%s:%d", component, generation)
+end
+
+--- Validate and normalize a RoleBinding. A binding carries the granted
+-- capability state and a monotonic policy generation. Explicit capabilities may
+-- only narrow the canonical role matrix.
+-- @param binding table|nil { role, binding_id?, policy_generation?, capabilities? }
+-- @param agent_id string|nil Stable Agent identity the binding is issued to
+-- @return table|nil normalized binding, string? error
+function WheelAgent.normalize_role_binding(binding, agent_id)
+  if type(binding) ~= "table" then return nil, "role binding must be a table" end
+  local role = binding.role
+  if type(role) ~= "string" or not ROLE_VALUES[role] then
+    return nil, "invalid role: " .. tostring(role)
+  end
+  local generation = binding.policy_generation
+  if generation == nil then generation = POLICY_GENERATION_START end
+  if type(generation) ~= "number" or generation ~= generation or generation % 1 ~= 0
+    or generation < POLICY_GENERATION_START or generation > MAX_POLICY_GENERATION then
+    return nil, "policy_generation must be a positive integer"
+  end
+  local capabilities, capability_err = normalize_capabilities(role, binding.capabilities)
+  if not capabilities then return nil, capability_err end
+  local binding_id = binding.binding_id
+  if binding_id == nil then
+    binding_id = default_binding_id(agent_id, generation)
+  else
+    if not bounded_string(binding_id, MAX_BINDING_ID_BYTES) or not binding_id:match(IDENTIFIER_PATTERN) then
+      return nil, "binding_id must be a bounded identifier"
+    end
+  end
+  return {
+    role = role,
+    binding_id = binding_id,
+    policy_generation = generation,
+    capabilities = capabilities,
+  }
+end
+
+local function copy_lineage(lineage)
+  if type(lineage) ~= "table" then return nil end
+  return {
+    forked_from_agent = lineage.forked_from_agent,
+    forked_from_session = lineage.forked_from_session,
+    base_context_commit = lineage.base_context_commit,
+    reason = lineage.reason,
+  }
+end
+
+--- Validate immutable fork lineage. Lineage records references only; it never
+-- carries transcripts, prompts, or copied context content.
+-- @param lineage table
+-- @return table|nil normalized lineage, string? error
+function WheelAgent.validate_lineage(lineage)
+  if type(lineage) ~= "table" then return nil, "lineage must be a table" end
+  local allowed = {
+    forked_from_agent = true, forked_from_session = true,
+    base_context_commit = true, reason = true,
+  }
+  for key in pairs(lineage) do
+    if not allowed[key] then return nil, "lineage contains an unknown field" end
+  end
+  local parent = bounded_string(lineage.forked_from_agent, MAX_IDENTITY_BYTES)
+  if not parent then return nil, "lineage forked_from_agent is invalid" end
+  local session = lineage.forked_from_session
+  if session ~= nil and not bounded_string(session, MAX_IDENTITY_BYTES) then
+    return nil, "lineage forked_from_session is invalid"
+  end
+  local base = lineage.base_context_commit
+  if not bounded_string(base, COMMIT_HASH_BYTES) or #base ~= COMMIT_HASH_BYTES
+    or not base:match(COMMIT_HASH_PATTERN) then
+    return nil, "lineage base_context_commit must be an immutable commit hash"
+  end
+  local reason = bounded_string(lineage.reason, MAX_REASON_BYTES)
+  if not reason then return nil, "lineage reason is invalid" end
+  return copy_lineage({
+    forked_from_agent = parent,
+    forked_from_session = session,
+    base_context_commit = base,
+    reason = reason,
+  })
+end
 
 --- Default heterogeneous model profiles per role.
 local DEFAULT_MODEL_PROFILES = {
@@ -189,32 +400,55 @@ function WheelAgent.new(opts)
   if not opts.name or opts.name == "" then
     error("Agent requires a non-empty 'name'")
   end
-  local role = opts.role or WheelAgent.Role.CODING
-  local valid_role = false
-  for _, r in pairs(WheelAgent.Role) do
-    if r == role then
-      valid_role = true
-      break
-    end
+  local agent_id = opts.agent_id or opts.name
+  if not bounded_string(agent_id, MAX_IDENTITY_BYTES) then
+    error("Agent requires a bounded, control-free 'agent_id'")
   end
-  if not valid_role then
+  local role = opts.role
+  if role ~= nil and (type(role) ~= "string" or not ROLE_VALUES[role]) then
     error("Invalid agent role: " .. tostring(role))
+  end
+  local binding_input = opts.role_binding
+  if binding_input == nil and role ~= nil then
+    binding_input = {
+      role = role,
+      binding_id = opts.binding_id,
+      capabilities = opts.capabilities,
+    }
+  end
+  if binding_input == nil then binding_input = { role = WheelAgent.Role.CODING } end
+  local role_binding, binding_err = WheelAgent.normalize_role_binding(binding_input, agent_id)
+  if not role_binding then
+    error("Invalid role binding for agent '" .. opts.name .. "': " .. tostring(binding_err))
+  end
+  if role ~= nil and role ~= role_binding.role then
+    error("Agent 'role' conflicts with its role_binding role")
+  end
+  local lineage
+  if opts.lineage ~= nil then
+    local lineage_err
+    lineage, lineage_err = WheelAgent.validate_lineage(opts.lineage)
+    if not lineage then
+      error("Invalid lineage for agent '" .. opts.name .. "': " .. tostring(lineage_err))
+    end
   end
   if not opts.kernel then
     error("Agent requires a 'kernel' (WheelKernel instance)")
   end
 
   local self = setmetatable({}, WheelAgent)
+  rawset(self, "_identity", { agent_id = agent_id, lineage = lineage })
+  rawset(self, "_authority", { role_binding = role_binding })
   self.name = opts.name
-  self.agent_id = opts.agent_id or self.name
-  self.role = role
+  self.role = role_binding.role
+  self.policy_generation = role_binding.policy_generation
   self.kernel = opts.kernel
 
   -- Role config resolution from opts.config if present
-  local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role]) or {}
+  local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role_binding.role]) or {}
 
   -- Model profile resolution (heterogeneous model profile support)
-  local default_profile = WheelAgent.get_default_model_profile(role)
+  local default_profile = WheelAgent.get_default_model_profile(role_binding.role)
   local user_profile = opts.model_profile or (role_cfg and role_cfg.model_profile)
   if user_profile then
     local ok_val, val_err = WheelAgent.validate_model_profile(user_profile)
@@ -282,6 +516,11 @@ function WheelAgent.new(opts)
     self.provider = WheelProvider.create(self.model_profile)
   end
 
+  -- Structured references only. A forked agent points at immutable commits and
+  -- identifiers; it never receives a copied transcript or slot snapshot.
+  self.context_refs = opts.context_refs
+  self.last_role_checkpoint = opts.last_role_checkpoint
+
   return self
 end
 
@@ -319,7 +558,7 @@ function WheelAgent:create_runtime_session(opts)
     task_id = opts.task_id or self.active_task_id,
     context_branch = opts.context_branch or self:current_branch(),
     context_head = opts.context_head,
-    role_binding = opts.role_binding or { role = self.role },
+    role_binding = opts.role_binding or WheelAgent.binding_reference(self.role_binding),
     model_profile = opts.model_profile or self.model_profile,
     worktree_id = opts.worktree_id or self.worktree_id,
   })
@@ -411,10 +650,19 @@ function WheelAgent:put_slot(name, content, expected_version)
   return nil, { error = "no_context", message = "No context engine available" }
 end
 
---- Check if a tool can be invoked under this agent's role authority.
---- @param tool_name string
---- @return boolean, string?
+--- Check if a tool can be invoked under this agent's current RoleBinding.
+-- Authorization is derived from the granted capability set on the binding, not
+-- from `name`, prompt identity text, or a role word alone.
+-- @param tool_name string
+-- @return boolean, string?
 function WheelAgent:is_tool_allowed(tool_name)
+  local binding = self.role_binding
+  if type(binding) ~= "table" then
+    return false, "agent '" .. tostring(self.name) .. "' has no role binding"
+  end
+  local granted = capability_map(binding.capabilities)
+  local role = binding.role
+
   -- 1. Check if tool is in agent's declared tools
   local declared = false
   for _, t in ipairs(self.tools) do
@@ -427,25 +675,55 @@ function WheelAgent:is_tool_allowed(tool_name)
     return false, "tool '" .. tool_name .. "' is not in declared tools for " .. self.name
   end
 
-  -- 2. If tool is in registry, enforce intent-based role authority gating
+  -- 2. Map the tool intent to the capability it needs.
+  local required
+  local intent
+  local mutating = false
   if self.tool_registry and type(self.tool_registry.get_tool) == "function" and WheelTool then
     local tool_def = self.tool_registry:get_tool(tool_name)
     if tool_def then
-      local ok_auth, auth_err = WheelTool.check_role_authority(self.role, tool_def)
-      if not ok_auth then
-        return false, auth_err
+      intent = tool_def.intent or WheelTool.ActionIntent.INSPECT
+      if intent == WheelTool.ActionIntent.INSPECT or intent == WheelTool.ActionIntent.VERIFY then
+        required = intent
+      elseif intent == WheelTool.ActionIntent.MODIFY or intent == WheelTool.ActionIntent.EXECUTE then
+        required = intent
+        mutating = true
+      elseif intent == WheelTool.ActionIntent.CUSTOM then
+        required = tool_def.read_only and WheelAgent.Capability.INSPECT or WheelAgent.Capability.MODIFY
+        mutating = not tool_def.read_only
+      else
+        return false, "tool '" .. tool_name .. "' has an unknown intent"
+      end
+      if not granted[required] then
+        local role_matrix = ROLE_CAPABILITIES[role] or {}
+        if mutating and not role_matrix.modify and not role_matrix.execute
+          and not role_matrix.orchestrate then
+          return false, string.format(
+            "role_authority_violation: role '%s' has read-only authority; cannot execute tool '%s' with intent '%s'",
+            role, tool_name, tostring(intent))
+        end
+        return false, string.format(
+          "role_authority_violation: role '%s' lacks '%s' capability for tool '%s'",
+          role, required, tool_name)
       end
       return true, nil
     end
   end
 
-  -- 3. Fallback role-based read-only gating: Research and Reviewer cannot call mutating tools
-  if self.role == WheelAgent.Role.RESEARCH or self.role == WheelAgent.Role.REVIEWER then
-    if not READ_ONLY_TOOLS[tool_name] then
-      return false, "role '" .. self.role .. "' has read-only authority; denied: " .. tool_name
-    end
+  -- 3. Unregistered tools still obey the same capability state.
+  if granted[WheelAgent.Capability.MODIFY] or granted[WheelAgent.Capability.EXECUTE] then
+    return true, nil
   end
-
+  if not READ_ONLY_TOOLS[tool_name] then
+    local role_matrix = ROLE_CAPABILITIES[role] or {}
+    if not role_matrix.modify and not role_matrix.execute and not role_matrix.orchestrate then
+      return false, "role '" .. role .. "' has read-only authority; denied: " .. tool_name
+    end
+    return false, "role '" .. role .. "' lacks 'modify' capability; denied: " .. tool_name
+  end
+  if not granted[WheelAgent.Capability.INSPECT] then
+    return false, "role '" .. role .. "' lacks 'inspect' capability; denied: " .. tool_name
+  end
   return true, nil
 end
 
@@ -723,8 +1001,9 @@ end
 --- @param plan_items table[] Array of { id = string, title = string, description = string, priority = number?, dependencies = string[]? }
 --- @return table[] List of created task records
 function WheelAgent:decompose_plan(plan_items)
-  if self.role ~= WheelAgent.Role.COMMANDER then
-    error("Only Commander role may decompose project plans (current role: " .. self.role .. ")")
+  local role = self.role_binding.role
+  if role ~= WheelAgent.Role.COMMANDER then
+    error("Only Commander role may decompose project plans (current role: " .. role .. ")")
   end
   local created = {}
   for _, item in ipairs(plan_items) do
@@ -739,8 +1018,9 @@ end
 --- @param review_fn fun(agent: table, task: table, history: table[])?: boolean, string
 --- @return table { approved: boolean, reason: string?, checkpoint: string? }
 function WheelAgent:review_task(task_id, review_fn)
-  if self.role ~= WheelAgent.Role.REVIEWER then
-    error("Only Reviewer role may review tasks (current role: " .. self.role .. ")")
+  local role = self.role_binding.role
+  if role ~= WheelAgent.Role.REVIEWER then
+    error("Only Reviewer role may review tasks (current role: " .. role .. ")")
   end
   local task = self.kernel:get_task(task_id)
   if not task then
@@ -827,12 +1107,324 @@ function WheelAgent:current_branch()
   return "(detached)"
 end
 
---- Get current agent status summary including headless panel container telemetry and model profile.
---- @return table
+--- Project a RoleBinding into the bounded reference shape used by lifecycle
+-- records. Capability state is runtime authority and is not persisted as prompt
+-- or tool content.
+-- @param binding table
+-- @return table|nil
+function WheelAgent.binding_reference(binding)
+  if type(binding) ~= "table" then return nil end
+  return {
+    role = binding.role,
+    binding_id = binding.binding_id,
+    policy_generation = binding.policy_generation,
+  }
+end
+
+local function binding_copy(binding)
+  if type(binding) ~= "table" then return nil end
+  local capabilities = {}
+  for index, capability in ipairs(binding.capabilities or {}) do capabilities[index] = capability end
+  return {
+    role = binding.role,
+    binding_id = binding.binding_id,
+    policy_generation = binding.policy_generation,
+    capabilities = capabilities,
+  }
+end
+
+local function capabilities_equal(left, right)
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
+end
+
+--- Current authoritative role, read from the RoleBinding.
+-- @return string|nil
+function WheelAgent:current_role()
+  return self.role_binding and self.role_binding.role or nil
+end
+
+--- Check whether the current RoleBinding grants a capability.
+-- @param capability string WheelAgent.Capability value
+-- @return boolean
+function WheelAgent:has_capability(capability)
+  return capability_map(self.role_binding and self.role_binding.capabilities)[capability] == true
+end
+
+--- Get a defensive copy of the granted capability set.
+-- @return table
+function WheelAgent:capabilities()
+  local result = {}
+  for index, capability in ipairs(self.role_binding and self.role_binding.capabilities or {}) do
+    result[index] = capability
+  end
+  return result
+end
+
+--- Audited role transition that preserves the stable Agent identity.
+-- The transition issues a new RoleBinding with the next policy generation and
+-- commits an immutable Context checkpoint boundary. A transition that would add
+-- a capability fails closed unless the caller explicitly approves the widening;
+-- there is no silent path from a wider-capability role to a narrower one.
+-- @param target string|table Role name or a partial RoleBinding { role, capabilities }
+-- @param opts table { reason = string, approve_widening = boolean?, model_profile = table? }
+-- @return table|nil new binding projection, table|nil typed error
+function WheelAgent:transition_role(target, opts)
+  opts = opts or {}
+  local requested = type(target) == "table" and target or { role = target }
+  local reason = bounded_string(opts.reason, MAX_REASON_BYTES)
+  if not reason then
+    return nil, { code = "E_ROLE_INVALID", message = "role transition requires a bounded reason" }
+  end
+  local current = self.role_binding
+  if type(current) ~= "table" then
+    return nil, { code = "E_ROLE_INVALID", message = "agent has no role binding" }
+  end
+  local generation = (current.policy_generation or POLICY_GENERATION_START) + 1
+  local normalized, binding_err = WheelAgent.normalize_role_binding({
+    role = requested.role,
+    capabilities = requested.capabilities or opts.capabilities,
+    binding_id = requested.binding_id,
+    policy_generation = generation,
+  }, self.agent_id)
+  if not normalized then
+    return nil, { code = "E_ROLE_INVALID", message = tostring(binding_err) }
+  end
+  if normalized.role == current.role
+    and capabilities_equal(normalized.capabilities, current.capabilities) then
+    return nil, { code = "E_ROLE_NOOP", message = "role binding is already in the requested state" }
+  end
+  local added = capability_diff(normalized.capabilities, current.capabilities)
+  if #added > 0 and opts.approve_widening ~= true then
+    return nil, {
+      code = "E_ROLE_AUTHORITY",
+      message = string.format(
+        "role transition '%s' -> '%s' would widen authority (%s); explicit approval required",
+        current.role, normalized.role, table.concat(added, ",")),
+    }
+  end
+  if not self.context or type(self.context.commit_checkpoint) ~= "function" then
+    return nil, {
+      code = "E_ROLE_CHECKPOINT",
+      message = "role transition requires an immutable Context checkpoint boundary",
+    }
+  end
+  local task_id = self.kernel and self.kernel.active_task_id or nil
+  local checkpoint = self.context:commit_checkpoint({
+    author = self.agent_id,
+    task_id = task_id,
+    message = string.format("Role transition %s -> %s (policy generation %d)",
+      current.role, normalized.role, generation),
+    rationale = {
+      why = "Role transition requested: " .. reason,
+      what = string.format("Reissued RoleBinding %s at policy generation %d",
+        tostring(normalized.binding_id), generation),
+      where_focus = "agent " .. self.agent_id,
+      how = #added > 0
+        and ("explicit widening approval granted for: " .. table.concat(added, ","))
+        or "narrowed or re-scoped capabilities without widening authority",
+      expected = "authority follows the new RoleBinding capability state only",
+      observed = "previous generation " .. tostring(current.policy_generation or POLICY_GENERATION_START),
+    },
+  })
+  if not checkpoint or not checkpoint.hash then
+    return nil, { code = "E_ROLE_CHECKPOINT", message = "role transition checkpoint was not committed" }
+  end
+  -- The checkpoint is immutable and may remain if a later record fails; the
+  -- in-memory binding is not applied until the lifecycle record succeeds, so a
+  -- failure never widens authority.
+  if self.lifecycle and self.session_id then
+    local recorded, record_err = self.lifecycle:record_role_transition(self.session_id, {
+      role_binding = WheelAgent.binding_reference(normalized),
+      checkpoint = checkpoint.hash,
+      reason = #added > 0 and "role_widening" or "role_transition",
+    })
+    if not recorded then
+      return nil, record_err or {
+        code = "E_ROLE_CHECKPOINT",
+        message = "role transition could not be recorded in the lifecycle registry",
+      }
+    end
+  end
+  rawset(self, "_authority", { role_binding = normalized })
+  self.role = normalized.role
+  self.policy_generation = normalized.policy_generation
+  self.last_role_checkpoint = checkpoint.hash
+  local projection = binding_copy(normalized)
+  projection.checkpoint = checkpoint.hash
+  projection.widened = #added > 0
+  projection.added_capabilities = added
+  return projection
+end
+
+--- Structured lineage projection shared by status, checkpoint, and context
+-- projections. It contains references only.
+-- @return table
+function WheelAgent:lineage_projection()
+  local lineage = self.lineage
+  return {
+    agent_id = self.agent_id,
+    name = self.name,
+    policy_generation = self.policy_generation,
+    role_binding = self.role_binding and WheelAgent.binding_reference(self.role_binding) or nil,
+    forked_from_agent = lineage and lineage.forked_from_agent or nil,
+    forked_from_session = lineage and lineage.forked_from_session or nil,
+    base_context_commit = lineage and lineage.base_context_commit or nil,
+    reason = lineage and lineage.reason or nil,
+    role_checkpoint = self.last_role_checkpoint,
+  }
+end
+
+--- Structured Context references for this agent. A forked agent receives these
+-- references instead of a copied transcript or slot snapshot.
+-- @return table
+function WheelAgent:context_reference()
+  local refs = self.context_refs or {}
+  return {
+    agent_id = self.agent_id,
+    base_context_commit = refs.base_context_commit,
+    session_id = refs.session_id or self.session_id,
+    branch = refs.branch or self:current_branch(),
+    head = self.context and type(self.context.head_commit_hash) == "function"
+      and self.context:head_commit_hash() or nil,
+  }
+end
+
+--- Build a role-aware Context projection with this agent's identity, RoleBinding,
+-- and lineage attached as provenance. Lineage is therefore visible in every
+-- checkpoint projection without entering prompt or transcript content.
+-- @param opts table WheelContext:project options
+-- @return table|nil projection, table|nil typed error
+function WheelAgent:context_projection(opts)
+  opts = opts or {}
+  if not self.context or type(self.context.project) ~= "function" then
+    return nil, { code = "E_NO_CONTEXT", message = "agent has no context engine configured" }
+  end
+  local projection_opts = {}
+  for key, value in pairs(opts) do projection_opts[key] = value end
+  projection_opts.agent_id = projection_opts.agent_id or self.agent_id
+  projection_opts.role_binding = projection_opts.role_binding
+    or WheelAgent.binding_reference(self.role_binding)
+  if projection_opts.lineage == nil and self.lineage then
+    projection_opts.lineage = copy_lineage(self.lineage)
+  end
+  if projection_opts.session_id == nil then projection_opts.session_id = self.session_id end
+  return self.context:project(projection_opts)
+end
+
+--- Fork an independent Agent identity from an immutable ContextCommit.
+-- The child shares the context engine by reference, records lineage identifiers,
+-- and starts with its own RoleBinding. No transcript, prompt, or slot content is
+-- copied, and a fork may not silently widen authority beyond its parent.
+-- @param parent table WheelAgent instance
+-- @param opts table { name, agent_id?, role?, role_binding?, reason,
+--   base_context_commit?, forked_from_session?, approve_widening?, tools?,
+--   budget?, workspace?, lifecycle?, panel_id?, headless? }
+-- @return table|nil child agent, table|nil typed error
+function WheelAgent.fork_agent(parent, opts)
+  opts = opts or {}
+  if type(parent) ~= "table" or parent.role_binding == nil then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a parent Agent" }
+  end
+  local name = bounded_string(opts.name, MAX_IDENTITY_BYTES)
+  if not name then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded child name" }
+  end
+  local agent_id = opts.agent_id or name
+  if not bounded_string(agent_id, MAX_IDENTITY_BYTES) then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded child agent_id" }
+  end
+  if name == parent.name or agent_id == parent.agent_id then
+    return nil, {
+      code = "E_FORK_IDENTITY",
+      message = "fork requires an independent Agent identity",
+    }
+  end
+  if not parent.context or type(parent.context.get_commit) ~= "function" then
+    return nil, {
+      code = "E_FORK_CONTEXT",
+      message = "fork requires a parent context engine with immutable commits",
+    }
+  end
+  local base = opts.base_context_commit or parent.context:head_commit_hash()
+  local commit = type(base) == "string" and parent.context:get_commit(base) or nil
+  if not commit or type(commit.hash) ~= "string" or #commit.hash ~= COMMIT_HASH_BYTES then
+    return nil, {
+      code = "E_FORK_CONTEXT",
+      message = "fork requires an immutable ContextCommit as base_context_commit",
+    }
+  end
+  local reason = bounded_string(opts.reason, MAX_REASON_BYTES)
+  if not reason then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded reason" }
+  end
+  local initial, binding_err = WheelAgent.normalize_role_binding(
+    opts.role_binding or { role = opts.role or parent.role_binding.role,
+      capabilities = opts.capabilities }, agent_id)
+  if not initial then
+    return nil, { code = "E_FORK_INVALID", message = tostring(binding_err) }
+  end
+  local added = capability_diff(initial.capabilities, parent.role_binding.capabilities)
+  if #added > 0 and opts.approve_widening ~= true then
+    return nil, {
+      code = "E_FORK_AUTHORITY",
+      message = "fork would widen authority (" .. table.concat(added, ",")
+        .. "); explicit approval required",
+    }
+  end
+  local forked_from_session = opts.forked_from_session or parent.session_id
+  local lineage, lineage_err = WheelAgent.validate_lineage({
+    forked_from_agent = parent.agent_id,
+    forked_from_session = forked_from_session,
+    base_context_commit = commit.hash,
+    reason = reason,
+  })
+  if not lineage then
+    return nil, { code = "E_FORK_INVALID", message = tostring(lineage_err) }
+  end
+  local context_refs = {
+    base_context_commit = commit.hash,
+    session_id = forked_from_session,
+    branch = opts.base_context_branch or parent:current_branch(),
+  }
+  local child = WheelAgent.new({
+    name = name,
+    agent_id = agent_id,
+    kernel = opts.kernel or parent.kernel,
+    config = opts.config or parent.config,
+    role_binding = initial,
+    tools = opts.tools or deep_copy(parent.tools),
+    budget = opts.budget or deep_copy(parent.budget),
+    workspace = opts.workspace or deep_copy(parent.workspace),
+    context = parent.context,
+    tool_registry = opts.tool_registry or parent.tool_registry,
+    provider = opts.provider,
+    lifecycle = opts.lifecycle or parent.lifecycle,
+    headless = opts.headless,
+    panel_id = opts.panel_id,
+    lineage = lineage,
+    context_refs = context_refs,
+  })
+  if opts.approve_widening == true then child.approved_widening = true end
+  return child
+end
+
+--- Get current agent status summary including headless panel container telemetry
+-- and model profile. Identity, RoleBinding, policy generation, and lineage are
+-- separate fields so no caller has to parse a role word out of prompt text.
+-- @return table
 function WheelAgent:status()
   return {
     name = self.name,
-    role = self.role,
+    agent_id = self.agent_id,
+    role = self.role_binding.role,
+    role_binding = binding_copy(self.role_binding),
+    policy_generation = self.policy_generation,
+    lineage = self:lineage_projection(),
+    context_refs = self:context_reference(),
     panel_id = self.panel_id,
     headless = self.headless,
     model_profile = self.model_profile,
@@ -848,6 +1440,30 @@ function WheelAgent:status()
     context_branch = self:current_branch(),
     context_head = self.context and type(self.context.head_commit_hash) == "function" and self.context:head_commit_hash() or nil,
   }
+end
+
+-- Stable Agent identity, fork lineage, and the current RoleBinding are immutable
+-- after construction. RoleBinding changes flow only through transition_role,
+-- which issues a new binding and policy generation instead of rewriting history.
+local IMMUTABLE_FIELDS = { agent_id = true, lineage = true, role_binding = true }
+
+function WheelAgent.__index(target, key)
+  if key == "agent_id" or key == "lineage" then
+    local identity = rawget(target, "_identity")
+    return identity and identity[key] or nil
+  end
+  if key == "role_binding" then
+    local authority = rawget(target, "_authority")
+    return authority and authority.role_binding or nil
+  end
+  return WheelAgent[key]
+end
+
+function WheelAgent.__newindex(target, key, value)
+  if IMMUTABLE_FIELDS[key] then
+    error("agent identity field '" .. tostring(key) .. "' is immutable", 2)
+  end
+  rawset(target, key, value)
 end
 
 return WheelAgent

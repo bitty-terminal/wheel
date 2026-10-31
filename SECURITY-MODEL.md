@@ -549,6 +549,17 @@ security principals. The following matrix is mandatory and fail-closed:
 - A subagent cannot exceed the authority of the agent that dispatched it. A
   reviewer is dispatched with read-only authority and cannot approve work it
   implemented.
+- Runtime authorization is derived from the Agent's current `RoleBinding`
+  capability state, not from a role word in prompt, system-instruction, or
+  identity text. An explicit capability list may narrow the role matrix; it may
+  not widen it.
+- A role change preserves the stable Agent identity but must issue a new
+  monotonic policy generation and an immutable Context checkpoint boundary. A
+  change that would add a capability fails closed unless explicitly approved,
+  and each transition is an audited, bounded lifecycle event.
+- A forked Agent may not exceed its parent's capability state without explicit
+  approval; fork lineage carries references to immutable Context commits, never
+  transcripts or copied context content.
 - A role gate denial is a typed failure, recorded in audit, and never presented
   as a capability denial for a surface that does not exist.
 - Project configuration may narrow a role's tool set. It may not widen a role
@@ -1102,8 +1113,9 @@ that the policy relies on, and they remain unverified until the gates pass:
 
 - a lexical path resolver and canonicalization routine used by file and cwd
   arguments (containment only; see gaps);
-- role gates for the read-only roles and Commander Modify, plus a partial
-  custom-tool check;
+- role gates driven by RoleBinding capability state in the Agent runtime, with
+  role-intent checks retained for direct tool dispatch, plus policy-generation
+  and checkpoint auditing for role transitions;
 - a dangerous-command scanner covering a subset of the policy categories;
 - a project-configuration trust gate with a bounded 32 KiB reader, regular-file
   and symlink refusal, host canonical-root resolution, native SHA-256 over the
@@ -1186,9 +1198,11 @@ Known gaps relative to this policy (not claims of compliance):
   setuid/setgid, credential-store exfiltration, remote-pipe, audit/trust
   tampering, ownership-outside-root, or detach screening. Rejections are
   free-form errors, not the typed failure boundary.
-- The role matrix is only partially enforced: `Research`/`Reviewer` are
-  read-only and `Commander` is denied Modify, but there is no `Primary` role,
-  and Commander Custom-mutating and the full matrix are not enforced.
+- The role matrix is enforced from RoleBinding capability state for `Research`,
+  `Reviewer`, `Commander`, `Coding`, and `Debug`; there is no `Primary` role
+  yet, and direct `WheelTool.check_role_authority` callers still receive the
+  older role-and-intent wording. Lifecycle records audit policy generations and
+  checkpoint references but do not persist the capability list itself.
 - The process primitive enforces a finite timeout (default 120 s, maximum
   10 min), a 256 KiB capture cap per stream, `/dev/null` stdin unless bytes are
   supplied, a `setsid`-recorded process group held by a retained leader through

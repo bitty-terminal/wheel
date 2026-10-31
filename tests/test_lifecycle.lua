@@ -261,11 +261,106 @@ local ok, err = pcall(function()
       { model_profile = { arbitrary = "private" } },
       { role_binding = setmetatable({}, {}) },
       { role_binding = { role = 0 / 0 } },
+      { role_binding = { role = "coding", policy_generation = 0 } },
+      { role_binding = { role = "coding", policy_generation = 1.5 } },
+      { role_binding = { role = "coding", policy_generation = "2" } },
       { agent_id = string.rep("a", 33) },
     }) do
       data.session_id, data.agent_id, data.panel_id = "bad", data.agent_id or "bad", "p2"
       assert(not life:create_agent_session(data))
     end
+  end)
+
+  run_test("Lifecycle: role transitions advance one policy generation with a checkpoint boundary", function()
+    local life = fixture()
+    assert(life:activate_session("s1"))
+    local checkpoint = string.rep("ab", 32)
+    local updated = assert(life:record_role_transition("s1", {
+      role_binding = { role = "reviewer", binding_id = "role-binding:s1:2", policy_generation = 2 },
+      checkpoint = checkpoint,
+      reason = "role_transition",
+    }))
+    assert(updated.agent_id == "s1")
+    assert(updated.state == Lifecycle.AgentSessionState.ACTIVE)
+    assert(updated.role_binding.role == "reviewer")
+    assert(updated.role_binding.policy_generation == 2)
+    assert(updated.checkpoint == checkpoint)
+    assert(life:get_panel("p1").attached_session_id == "s1")
+    local transition_event = life:events()[#life:events()]
+    assert(transition_event.type == "agent_session.role_transition")
+    assert(transition_event.from_state == "active" and transition_event.to_state == "active")
+    assert(transition_event.policy_generation == 2 and transition_event.checkpoint == checkpoint)
+    assert(transition_event.agent_id == "s1")
+
+    local function transition(binding, value)
+      return life:record_role_transition("s1", {
+        role_binding = binding,
+        checkpoint = value or string.rep("cd", 32),
+        reason = "role_transition",
+      })
+    end
+    local stale, stale_err = transition({
+      role = "coding", binding_id = "role-binding:s1:3", policy_generation = 2,
+    })
+    assert(stale == nil and stale_err.code == "E_LIFECYCLE_AUTHORITY")
+    local skipped, skipped_err = transition({
+      role = "coding", binding_id = "role-binding:s1:4", policy_generation = 4,
+    })
+    assert(skipped == nil and skipped_err.code == "E_LIFECYCLE_AUTHORITY")
+    local reused, reused_err = transition({
+      role = "coding", binding_id = "role-binding:s1:2", policy_generation = 3,
+    })
+    assert(reused == nil and reused_err.code == "E_LIFECYCLE_AUTHORITY")
+    local missing_checkpoint, checkpoint_err = life:record_role_transition("s1", {
+      role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
+      reason = "role_transition",
+    })
+    assert(missing_checkpoint == nil and checkpoint_err.code == "E_LIFECYCLE_INVALID")
+    local wrong_reason, reason_err = life:record_role_transition("s1", {
+      role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
+      checkpoint = string.rep("ef", 32),
+      reason = "manual",
+    })
+    assert(wrong_reason == nil and reason_err.code == "E_LIFECYCLE_INVALID")
+
+    assert(life:get_session("s1").role_binding.policy_generation == 2)
+    assert(life:end_session("s1"))
+    local terminal, terminal_err = transition({
+      role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3,
+    })
+    assert(terminal == nil and terminal_err.code == "E_LIFECYCLE_STATE")
+    assert(life:get_session("s1").role_binding.policy_generation == 2)
+  end)
+
+  run_test("Lifecycle: persisted policy generations reject a forged history", function()
+    local path = root .. "/role-transition.json"
+    local life = Lifecycle.new({ path = path })
+    assert(life:create_panel({ panel_id = "role-panel" }))
+    assert(life:ready_panel("role-panel"))
+    assert(life:create_agent_session({
+      session_id = "role-session", agent_id = "role-agent", panel_id = "role-panel",
+      role_binding = { role = "coding", binding_id = "role-binding:role-agent:1", policy_generation = 1 },
+    }))
+    local checkpoint = string.rep("12", 32)
+    assert(life:record_role_transition("role-session", {
+      role_binding = { role = "debug", binding_id = "role-binding:role-agent:2", policy_generation = 2 },
+      checkpoint = checkpoint,
+      reason = "role_transition",
+    }))
+
+    local reloaded = assert(Lifecycle.new({ path = path }))
+    local record = assert(reloaded:get_session("role-session"))
+    assert(record.role_binding.role == "debug")
+    assert(record.role_binding.policy_generation == 2)
+    assert(record.checkpoint == checkpoint)
+
+    local raw = assert(WheelHost.fs.read_file(path))
+    local forged = Session.json_decode(raw)
+    forged.sessions["role-session"].role_binding.policy_generation = 5
+    assert(WheelHost.fs.remove_file(path))
+    assert(WheelHost.fs.create_private_file(path, Session.json_encode(forged)))
+    assert(not pcall(Lifecycle.new, { path = path }))
+    assert(not WheelHost.fs.stat(path).exists)
   end)
 
   run_test("Lifecycle: registry symlink never overwrites its target", function()

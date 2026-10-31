@@ -135,6 +135,11 @@ function WheelTeam:register_agent(agent)
   if self.agents[agent.name] then
     error("Agent with name '" .. agent.name .. "' is already registered in this team")
   end
+  for _, existing in pairs(self.agents) do
+    if existing.agent_id and agent.agent_id and existing.agent_id == agent.agent_id then
+      error("Agent identity '" .. agent.agent_id .. "' is already registered in this team")
+    end
+  end
   self.agents[agent.name] = agent
   self.agent_states[agent.name] = {
     state = "idle",
@@ -188,6 +193,67 @@ function WheelTeam:create_runtime_session(agent_name, opts)
   return agent:create_runtime_session(opts)
 end
 
+--- Fork an independent Agent identity from an immutable ContextCommit and
+-- register it with the team. The child gets its own AgentSession and Headless
+-- Panel; lineage and the base Context commit are carried as references only.
+--- @param agent_name string Parent Agent name
+-- @param opts table WheelAgent.fork_agent options plus { runtime?, activate?, task_id? }
+-- @return table|nil child agent, table|nil typed error
+function WheelTeam:fork_agent(agent_name, opts)
+  local parent = self.agents[agent_name]
+  if not parent then
+    return nil, { code = "E_TEAM_AGENT_NOT_FOUND", message = "agent not found: " .. tostring(agent_name) }
+  end
+  opts = opts or {}
+  local fork_opts = {}
+  for key, value in pairs(opts) do fork_opts[key] = value end
+  fork_opts.lifecycle = fork_opts.lifecycle or self.lifecycle
+  local child, fork_err = WheelAgent.fork_agent(parent, fork_opts)
+  if not child then return nil, fork_err end
+  self:register_agent(child)
+  if self.lifecycle and opts.runtime ~= false then
+    local session, session_err = child:create_runtime_session({
+      task_id = opts.task_id,
+      session_id = opts.session_id,
+      panel_id = opts.panel_id,
+      context_branch = opts.context_branch,
+      context_head = opts.context_head or child.context_refs.base_context_commit,
+    })
+    if not session then
+      self.agents[child.name] = nil
+      self.agent_states[child.name] = nil
+      return nil, session_err
+    end
+    if opts.activate ~= false then
+      local activated, activate_err = child:activate_runtime_session()
+      if not activated then
+        if child.session_id then
+          pcall(self.lifecycle.end_session, self.lifecycle, child.session_id, "explicit")
+        end
+        self.agents[child.name] = nil
+        self.agent_states[child.name] = nil
+        return nil, activate_err
+      end
+    end
+  end
+  return child
+end
+
+--- Audited role transition for a registered agent. The stable AgentId is
+-- preserved; a new RoleBinding policy generation and Context checkpoint
+-- boundary are created, and a widening transition requires explicit approval.
+--- @param agent_name string
+-- @param role string|table Target role or partial RoleBinding
+-- @param opts table { reason, approve_widening? }
+-- @return table|nil binding projection, table|nil typed error
+function WheelTeam:transition_role(agent_name, role, opts)
+  local agent = self.agents[agent_name]
+  if not agent then
+    return nil, { code = "E_TEAM_AGENT_NOT_FOUND", message = "agent not found: " .. tostring(agent_name) }
+  end
+  return agent:transition_role(role, opts)
+end
+
 function WheelTeam:runtime_sessions(agent_id)
   return self.lifecycle:list_sessions(agent_id)
 end
@@ -218,7 +284,11 @@ function WheelTeam:list_agents()
     local st = self.agent_states[name] or {}
     table.insert(list, {
       name = name,
-      role = agent.role,
+      agent_id = agent.agent_id,
+      role = agent.role_binding and agent.role_binding.role or agent.role,
+      role_binding = WheelAgent.binding_reference(agent.role_binding),
+      policy_generation = agent.policy_generation,
+      lineage = agent.lineage_projection and agent:lineage_projection() or nil,
       state = st.state or "idle",
       active_task_id = st.active_task_id,
       panel_id = agent.panel_id,
@@ -239,7 +309,8 @@ function WheelTeam:find_idle_agent(role)
   for name, agent in pairs(self.agents) do
     local st = self.agent_states[name]
     if st and st.state == "idle" then
-      if not role or agent.role == role then
+      local current = agent.role_binding and agent.role_binding.role or agent.role
+      if not role or current == role then
         return agent
       end
     end
@@ -478,7 +549,11 @@ function WheelTeam:status()
     end
     table.insert(agent_summaries, {
       name = name,
-      role = agent.role,
+      agent_id = agent.agent_id,
+      role = agent.role_binding and agent.role_binding.role or agent.role,
+      role_binding = WheelAgent.binding_reference(agent.role_binding),
+      policy_generation = agent.policy_generation,
+      lineage = agent.lineage_projection and agent:lineage_projection() or nil,
       state = st.state or "idle",
       active_task_id = st.active_task_id,
       panel_id = agent.panel_id,

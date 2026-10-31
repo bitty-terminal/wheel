@@ -133,6 +133,10 @@
 - Read secret environment values only from the named allowlist through the
   provider boundary; never log, persist, display, or pass them to child
   processes. Redaction applies before every persistence sink.
+- Agent authority comes from the current RoleBinding capability state, never
+  from prompt or identity text. A role transition preserves the AgentId, issues
+  a new policy generation, and commits a Context checkpoint boundary; a
+  transition or fork that widens capability requires explicit approval.
 - High-risk operations (shell strings, secret reads, trust approval, new
   network destinations) fail closed when audit cannot record them.
 - The experimental local session daemon (`scripts/wheel-session`) is

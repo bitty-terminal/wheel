@@ -16,6 +16,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Agent identity, RoleBinding, policy generations, and fork lineage (CTX-0046 /
+  wheel#115): a stable, immutable `AgentId` is separate from the role it holds;
+  each Agent carries a `RoleBinding` with a monotonic `policy_generation` and a
+  capability set derived from the role matrix, and runtime authorization reads
+  that capability state instead of prompt or identity text. `transition_role`
+  preserves the Agent, commits an immutable Context checkpoint boundary, records
+  an audited `agent_session.role_transition` lifecycle event, and fails closed
+  when a change would add a capability without explicit approval.
+  `WheelAgent.fork_agent` creates an independent Agent from an immutable
+  `ContextCommit` with `forked_from_agent`, `forked_from_session`,
+  `base_context_commit`, reason, and an initial `RoleBinding`; the child shares
+  Context by reference only (never copied transcripts), can run in its own
+  Session and Headless Panel, and lineage is visible in status and Context
+  projections. No task hierarchy, durable handoff, Dashboard, provider-cache, or
+  `bittyd` change is included.
+
 - Explicit AgentSession and Headless Panel lifecycle records (CTX-0045 /
   wheel#114): independent agent, session, panel, task, context branch/head,
   role/model, and optional worktree references; checkpoint, pause, detach,
