@@ -183,7 +183,22 @@ class StubHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": STUB_CONTENT},
+                    "message": {
+                        "role": "assistant",
+                        "content": STUB_CONTENT,
+                        "reasoning_content": json.dumps(
+                            {
+                                "schema": "wheel-rationale/1",
+                                "decision": "Use the deterministic stub response",
+                                "evidence": ["loopback request accepted"],
+                                "uncertainty": "none",
+                                "risk": "stub-only response",
+                                "rejected_alternatives": ["external provider"],
+                                "next_action": "return the bounded result",
+                            },
+                            separators=(",", ":"),
+                        ),
+                    },
                     "finish_reason": "stop",
                 }
             ],

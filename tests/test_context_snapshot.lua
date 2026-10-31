@@ -97,7 +97,7 @@ local function build_fixture()
       task_id = "CTX-1",
       message = "root checkpoint",
       timestamp_ms = 1700000000000,
-      rationale = { goal = "root", confidence = 0.9 },
+      rationale = { goal = "root" },
     })
     assert(ctx:create_branch("experiment"))
     assert(ctx:checkout("experiment"))

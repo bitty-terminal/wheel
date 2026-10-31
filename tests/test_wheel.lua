@@ -2310,7 +2310,7 @@ run_test("Wheel Init: missing required module is rooted and attributed", functio
   -- so every rooted `wheel.<dep>` lookup is a real not-found result.
   local alternate_cases = {
     { parent = "team", deps = { "errors", "agent", "context", "tool", "ui", "host" } },
-    { parent = "context", deps = { "errors", "config", "host", "context_snapshot" } },
+    { parent = "context", deps = { "errors", "config", "host", "context_snapshot", "rationale" } },
     {
       parent = "tool",
       deps = { "errors", "host" },
@@ -5462,6 +5462,382 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.usage.output_tokens == 20)
 end)
 
+run_test("WheelProvider: rationale is bounded, structured, and never replays thinking", function()
+  local long = string.rep("x", WheelProvider.Rationale.MAX_FIELD_BYTES + 80)
+  local response = {
+    content = "visible answer",
+    thinking_content = "private reasoning that must remain transient",
+    rationale = {
+      schema = WheelProvider.Rationale.SCHEMA,
+      decision = "Use the visible answer",
+      evidence = { "bounded evidence", "second" },
+      uncertainty = "limited",
+      risk = "bounded",
+      rejected_alternatives = { "replay private thinking" },
+      next_action = "Continue verification",
+    },
+  }
+  local rationale = WheelProvider.parse_rationale(response, {
+    task_id = "R-BOUND",
+    session_id = "S-BOUND",
+  })
+  assert(rationale.schema == WheelProvider.Rationale.SCHEMA)
+  assert(rationale.decision == "Use the visible answer")
+  assert(rationale.evidence[1] == "bounded evidence")
+  assert(rationale.task_id == "R-BOUND" and rationale.session_id == "S-BOUND")
+  assert(rationale.decision:find("private", 1, true) == nil)
+  assert(rationale.thinking_content == nil, "rationale must not retain thinking content")
+
+  local fallback = WheelProvider.parse_rationale({
+    content = "answer",
+    thinking_content = "not-json private reasoning",
+  }, { task_id = "R-FALLBACK" })
+  assert(fallback.source == "fallback")
+  assert(fallback.task_id == "R-FALLBACK")
+  assert(fallback.uncertainty == "Provider rationale unavailable")
+  assert(fallback.next_action == "Continue task execution")
+
+  local valid_thinking = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"Use bounded output"}',
+  })
+  assert(valid_thinking.source == "provider", "versioned rationale object must be accepted")
+  assert(valid_thinking.decision == "Use bounded output")
+  local escaped_thinking_key = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","\\u0064ecision":"Use decoded key"}',
+  })
+  assert(escaped_thinking_key.source == "provider", "escaped allowlisted key must be interpreted after decoding")
+  assert(escaped_thinking_key.decision == "Use decoded key")
+
+  local unicode_thinking = {
+    { json = '{"schema":"wheel-rationale/1","decision":"caf\\u00e9"}',
+      expected = "caf\195\169", label = "BMP escape" },
+    { json = '{"schema":"wheel-rationale/1","decision":"\\ud83d\\ude00"}',
+      expected = "\240\159\152\128", label = "surrogate-pair escape" },
+  }
+  for _, case in ipairs(unicode_thinking) do
+    local parsed = WheelProvider.parse_rationale({ thinking_content = case.json })
+    assert(parsed.source == "provider", case.label .. " rationale must be accepted")
+    assert(parsed.decision == case.expected, case.label .. " must decode to UTF-8")
+    local persisted = WheelProvider.Rationale.for_persistence(parsed)
+    assert(persisted.decision == case.expected, case.label .. " must survive rationale persistence")
+
+    local kernel = WheelKernel.new_mock()
+    local checkpoint = kernel:commit_checkpoint(parsed)
+    assert(kernel:get_checkpoint(checkpoint.hash).rationale.decision == case.expected,
+      case.label .. " must survive Kernel checkpoint persistence")
+
+    local context = WheelContext.new()
+    local context_checkpoint = context:commit_checkpoint({ rationale = parsed })
+    assert(context_checkpoint.rationale.decision == case.expected,
+      case.label .. " must survive Context checkpoint persistence")
+  end
+
+  local rejected_thinking_json = {
+    ["empty object"] = "{}",
+    ["array"] = "[]",
+    ["unversioned object"] = '{"decision":"unversioned"}',
+    ["schema-only object"] = '{"schema":"wheel-rationale/1"}',
+    ["wrong schema"] = '{"schema":"wheel-rationale/2","decision":"wrong"}',
+    ["escaped duplicate schema"] = '{"schema":"wheel-rationale/2","\\u0073chema":"wheel-rationale/1","decision":"bad"}',
+    ["escaped duplicate decision"] = '{"schema":"wheel-rationale/1","decision":"good","\\u0064ecision":"bad"}',
+    ["string"] = '"not an object"',
+    ["number"] = "42",
+    ["boolean"] = "true",
+  }
+  for label, thinking_content in pairs(rejected_thinking_json) do
+    local rejected = WheelProvider.parse_rationale({ thinking_content = thinking_content })
+    assert(rejected.source == "fallback", label .. " provider thinking must use fallback")
+  end
+
+  local malformed = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":{}}',
+  })
+  assert(malformed.source == "fallback", "malformed structured thinking must use fallback")
+
+  local trailing = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID"} TRAILING_PRIVATE',
+  })
+  assert(trailing.source == "fallback", "trailing private text must use fallback")
+  local null_risk = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID","risk":null}',
+  })
+  assert(null_risk.source == "fallback", "null scalar must use fallback")
+  local null_evidence = WheelProvider.parse_rationale({
+    thinking_content = '{"schema":"wheel-rationale/1","decision":"RETAINED_INVALID","evidence":[null]}',
+  })
+  assert(null_evidence.source == "fallback", "null list item must use fallback")
+
+  local linked_fallback_inputs = {
+    {
+      label = "malformed prose",
+      task_id = "TASK-LINK-PROSE",
+      session_id = "SESSION-LINK-PROSE",
+      response = { thinking_content = "private reasoning in prose" },
+    },
+    {
+      label = "malformed structured rationale",
+      task_id = "TASK-LINK-STRUCTURED",
+      session_id = "SESSION-LINK-STRUCTURED",
+      response = { rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        decision = "RETAINED_INVALID",
+        extra = "unknown field",
+      } },
+    },
+    {
+      label = "explicit fallback",
+      task_id = "TASK-LINK-FALLBACK",
+      session_id = "SESSION-LINK-FALLBACK",
+      rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        source = "fallback",
+        task_id = "TASK-LINK-FALLBACK",
+        session_id = "SESSION-LINK-FALLBACK",
+      },
+    },
+    {
+      label = "malformed tagged persistence input",
+      task_id = "TASK-LINK-MALFORMED",
+      session_id = "SESSION-LINK-MALFORMED",
+      rationale = {
+        schema = WheelProvider.Rationale.SCHEMA,
+        source = "provider",
+        decision = "RETAINED_INVALID",
+        task_id = "TASK-LINK-MALFORMED",
+        session_id = "SESSION-LINK-MALFORMED",
+        extra = "unknown field",
+      },
+    },
+  }
+  for _, case in ipairs(linked_fallback_inputs) do
+    local rationale = case.rationale or WheelProvider.parse_rationale(case.response, {
+      task_id = case.task_id,
+      session_id = case.session_id,
+    })
+    if case.rationale then
+      rationale.task_id = case.task_id
+      rationale.session_id = case.session_id
+    end
+    local task_id = rationale.task_id
+    local session_id = rationale.session_id
+    local direct = WheelProvider.Rationale.for_persistence(rationale)
+    assert(direct.source == "fallback", case.label .. " must persist as fallback")
+    assert(direct.task_id == task_id and direct.session_id == session_id,
+      case.label .. " IDs must survive direct rationale persistence")
+
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(rationale)
+    local kernel_record = kernel:get_checkpoint(kernel_cp.hash)
+    assert(kernel_record.rationale.task_id == task_id and kernel_record.rationale.session_id == session_id,
+      case.label .. " IDs must survive Kernel checkpoint persistence")
+
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = rationale })
+    assert(context_cp.rationale.task_id == task_id and context_cp.rationale.session_id == session_id,
+      case.label .. " IDs must survive Context checkpoint persistence")
+  end
+
+  local oversized_id = string.rep("T", WheelProvider.Rationale.MAX_TASK_ID_BYTES + 1)
+  local oversized_session = string.rep("S", WheelProvider.Rationale.MAX_SESSION_ID_BYTES + 1)
+  local rejected_ids = WheelProvider.Rationale.for_persistence({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  assert(rejected_ids.task_id == nil and rejected_ids.session_id == nil,
+    "oversized fallback IDs must be omitted rather than truncated or persisted")
+  local invalid_ids = WheelProvider.Rationale.for_persistence({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = {},
+    session_id = 42,
+  })
+  assert(invalid_ids.task_id == nil and invalid_ids.session_id == nil,
+    "non-string fallback IDs must be omitted")
+  local oversized_parsed = WheelProvider.parse_rationale({ thinking_content = "private prose" }, {
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  assert(oversized_parsed.task_id == oversized_id:sub(1, WheelProvider.Rationale.MAX_TASK_ID_BYTES)
+      and oversized_parsed.session_id == oversized_session:sub(1, WheelProvider.Rationale.MAX_SESSION_ID_BYTES),
+    "parser IDs must retain the established bounded truncation behavior")
+  local oversized_kernel = WheelKernel.new_mock()
+  local oversized_kernel_cp = oversized_kernel:commit_checkpoint({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  })
+  local oversized_kernel_record = oversized_kernel:get_checkpoint(oversized_kernel_cp.hash)
+  assert(oversized_kernel_record.rationale.task_id == nil
+      and oversized_kernel_record.rationale.session_id == nil,
+    "Kernel checkpoint must omit oversized rationale IDs")
+  local oversized_context = WheelContext.new()
+  local oversized_context_cp = oversized_context:commit_checkpoint({ rationale = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "fallback",
+    task_id = oversized_id,
+    session_id = oversized_session,
+  } })
+  assert(oversized_context_cp.rationale.task_id == nil
+      and oversized_context_cp.rationale.session_id == nil,
+    "Context checkpoint must omit oversized rationale IDs")
+
+  for _, private_text in ipairs({ "TRAILING_PRIVATE", "RETAINED_INVALID" }) do
+    assert(trailing.decision:find(private_text, 1, true) == nil,
+      "rejected thinking text must not enter static fallback")
+  end
+
+  local oversized_scalar = WheelProvider.parse_rationale({
+    rationale = { decision = string.rep("s", WheelProvider.Rationale.MAX_FIELD_BYTES + 1) },
+  })
+  assert(oversized_scalar.source == "fallback", "oversized scalar must use fallback")
+  assert(oversized_scalar.decision == "Provider response processed")
+
+  local oversized_item = WheelProvider.parse_rationale({
+    rationale = { evidence = { string.rep("i", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES + 1) } },
+  })
+  assert(oversized_item.source == "fallback", "oversized list item must use fallback")
+
+  local token = "Bearer sk-rationale-persistence-token-0001"
+  local persisted = WheelProvider.Rationale.for_persistence(WheelProvider.Rationale.with_legacy_labels({
+    schema = WheelProvider.Rationale.SCHEMA,
+    source = "provider",
+    decision = token,
+    evidence = { token },
+    uncertainty = "none",
+    risk = token,
+    rejected_alternatives = { token },
+    next_action = token,
+    task_id = "RATIONALE-TOKEN",
+  }))
+  local persisted_json = WheelProvider.JSON.encode(persisted)
+  assert(persisted_json:find(token, 1, true) == nil, "redacted rationale must not retain token-shaped input")
+  assert(persisted_json:find("[redacted", 1, true) ~= nil, "redacted rationale must contain a marker")
+  assert(persisted.why == persisted.decision and persisted.what == persisted.next_action,
+    "persisted rationale must retain legacy labels")
+
+  local legacy = WheelProvider.Rationale.for_persistence({
+    why = "Legacy decision",
+    what = "Legacy next action",
+    where_focus = "task LEGACY-1",
+    how = "deterministic adapter",
+    expected = "bounded record",
+    observed = "legacy consumer",
+  })
+  assert(legacy.decision == "Legacy decision")
+  assert(legacy.next_action == "Legacy next action")
+  assert(legacy.why == legacy.decision and legacy.what == legacy.next_action,
+    "allowlisted legacy rationale fields must map to the canonical schema")
+
+  local huge_map = {}
+  for index = 1, WheelProvider.Rationale.MAX_LEGACY_FIELDS + 1 do
+    huge_map["field_" .. tostring(index)] = "value"
+  end
+  local huge_map_result = WheelProvider.Rationale.for_persistence(huge_map)
+  assert(huge_map_result.source == "fallback", "legacy key-count overflow must use fallback")
+
+  local token_key = {}
+  token_key["Bearer sk-legacy-key-leak-0001"] = "value"
+  local token_key_result = WheelProvider.Rationale.for_persistence(token_key)
+  local token_key_json = WheelProvider.JSON.encode(token_key_result)
+  assert(token_key_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+    "legacy keys must never reach persistence")
+  assert(token_key_result.source == "fallback", "unknown token-shaped key must use fallback")
+
+  local nested_result = WheelProvider.Rationale.for_persistence({
+    why = { nested = string.rep("n", 1024) },
+  })
+  assert(nested_result.source == "fallback", "nested legacy values must use fallback")
+  assert(#WheelProvider.JSON.encode(nested_result) <= WheelProvider.Rationale.MAX_LEGACY_AGGREGATE_BYTES,
+    "legacy fallback must remain within the aggregate bound")
+
+  local tagged_extra = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = "RETAINED_INVALID",
+    extra = "unknown",
+  }
+  local tagged_token_key = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = "RETAINED_INVALID",
+    ["Bearer sk-review-key-0001"] = "unknown",
+  }
+  local tagged_huge = { schema = WheelProvider.Rationale.SCHEMA, decision = "RETAINED_INVALID" }
+  for index = 1, 5000 do tagged_huge["extra_" .. tostring(index)] = "unknown" end
+  local tagged_nested = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = { nested = "RETAINED_INVALID" },
+  }
+  local tagged_aggregate_overflow = {
+    schema = WheelProvider.Rationale.SCHEMA,
+    decision = string.rep("d", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    uncertainty = string.rep("u", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    risk = string.rep("r", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    next_action = string.rep("n", WheelProvider.Rationale.MAX_FIELD_BYTES),
+    evidence = {
+      string.rep("e", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES),
+      string.rep("f", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES),
+    },
+    rejected_alternatives = { string.rep("a", WheelProvider.Rationale.MAX_LIST_ITEM_BYTES) },
+  }
+  for _, invalid_tagged in ipairs({
+    tagged_extra, tagged_token_key, tagged_huge, tagged_nested, tagged_aggregate_overflow,
+  }) do
+    local direct = WheelProvider.Rationale.for_persistence(invalid_tagged)
+    assert(direct.source == "fallback", "invalid tagged map must use fallback")
+    assert(direct.decision ~= "RETAINED_INVALID")
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(invalid_tagged)
+    local kernel_record = kernel:get_checkpoint(kernel_cp.hash)
+    assert(kernel_record.rationale.source == "fallback")
+    assert(kernel_record.rationale.decision ~= "RETAINED_INVALID")
+
+    local bridge_kernel = WheelKernel.new_mock()
+    local bridge_cp = bridge_kernel:call("checkpoint.commit", { rationale = invalid_tagged })
+    assert(bridge_cp.rationale.source == "fallback")
+    assert(bridge_cp.rationale.decision ~= "RETAINED_INVALID")
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = invalid_tagged })
+    assert(context_cp.rationale.source == "fallback")
+    assert(context_cp.rationale.decision ~= "RETAINED_INVALID")
+
+    local slot_rationale = WheelProvider.Rationale.for_persistence(invalid_tagged)
+    context:put_slot("tasks/tagged/rationale", WheelProvider.JSON.encode(slot_rationale))
+    local slot = context:get_slot("tasks/tagged/rationale")
+    assert(slot.found and slot.content:find("RETAINED_INVALID", 1, true) == nil,
+      "Context rationale slot must contain only the sanitized fallback")
+  end
+
+  local huge_sink_map = {}
+  for index = 1, 5000 do
+    huge_sink_map["legacy_" .. tostring(index)] = string.rep("v", WheelProvider.Rationale.MAX_FIELD_BYTES)
+  end
+  huge_sink_map["Bearer sk-legacy-key-leak-0001"] = "value"
+  local huge_nested_value = {
+    why = { nested = string.rep("n", WheelProvider.Rationale.MAX_LEGACY_AGGREGATE_BYTES * 4) },
+  }
+
+  local invalid_legacy_inputs = { token_key, huge_sink_map, huge_nested_value }
+  for _, invalid_input in ipairs(invalid_legacy_inputs) do
+    local kernel = WheelKernel.new_mock()
+    local kernel_cp = kernel:commit_checkpoint(invalid_input)
+    local kernel_json = WheelProvider.JSON.encode(kernel:get_checkpoint(kernel_cp.hash))
+    assert(kernel_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+      "kernel checkpoint sink must discard token-shaped legacy keys")
+    assert(kernel:get_checkpoint(kernel_cp.hash).rationale.source == "fallback",
+      "kernel checkpoint sink must reject unbounded or non-canonical legacy rationale")
+
+    local context = WheelContext.new()
+    local context_cp = context:commit_checkpoint({ rationale = invalid_input })
+    local context_json = WheelProvider.JSON.encode(context_cp)
+    assert(context_json:find("sk-legacy-key-leak-0001", 1, true) == nil,
+      "Context checkpoint sink must discard token-shaped legacy keys")
+    assert(context_cp.rationale.source == "fallback",
+      "Context checkpoint sink must reject unbounded or non-canonical legacy rationale")
+  end
+end)
+
 run_test("WheelProvider: opt-in caller attribution is absent by default and strictly validated", function()
   local OpenAIAdapter = WheelProvider.OpenAIAdapter
   local REFERER_MAX = WheelProvider.ATTRIBUTION_REFERER_MAX
@@ -5970,6 +6346,18 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
       {
         content = "Verified test_core() implementation successfully. All tests passing.",
         thinking_content = "Verification confirmed. Preparing final delivery.",
+        rationale = {
+          schema = WheelProvider.Rationale.SCHEMA,
+          decision = "Deliver the verified implementation",
+          evidence = {
+            "inspect_file completed",
+            "Bearer sk-rationale-test-token-0001",
+          },
+          uncertainty = "No remaining uncertainty",
+          risk = "Bearer sk-rationale-test-token-0001",
+          rejected_alternatives = { "Do not replay private thinking" },
+          next_action = "Request independent verification",
+        },
         tool_calls = {},
         finish_reason = "stop",
         usage = { prompt_tokens = 150, completion_tokens = 25, thinking_tokens = 10, total_tokens = 185 },
@@ -6015,6 +6403,44 @@ run_test("WheelRunner: autonomous ReAct turn loop with tool calling and checkpoi
   local art_slot = context:get_slot("tasks/" .. task.id .. "/artifacts")
   assert(art_slot.found == true, "artifacts slot must be created in context")
   assert(string.find(art_slot.content, "Verified test_core()", 1, true) ~= nil)
+  local rationale_slot = context:get_slot("tasks/" .. task.id .. "/rationale")
+  assert(rationale_slot.found == true, "bounded rationale slot must be created in context")
+  assert(string.find(rationale_slot.content, "Deliver the verified implementation", 1, true) ~= nil)
+  assert(string.find(rationale_slot.content, "Verification confirmed. Preparing final delivery.", 1, true) == nil,
+    "private thinking must not reach the Context persistence sink")
+  assert(string.find(rationale_slot.content, "sk-rationale-test-token-0001", 1, true) == nil,
+    "token-shaped rationale input must not reach the Context persistence sink")
+  for _, message in ipairs(mock.call_history[2].messages or {}) do
+    assert(string.find(message.content or "", "Verification confirmed. Preparing final delivery.", 1, true) == nil,
+      "private thinking must not be replayed into a later prompt")
+  end
+  local checkpoint = kernel:get_checkpoint(runner_res.checkpoints[#runner_res.checkpoints])
+  assert(checkpoint.rationale.task_id == task.id, "checkpoint rationale must link to the active task")
+  assert(checkpoint.rationale.decision == "Deliver the verified implementation")
+  assert(string.find(checkpoint.rationale.evidence[2] or "", "sk-rationale-test-token-0001", 1, true) == nil,
+    "token-shaped rationale input must not reach the checkpoint sink")
+  assert(checkpoint.rationale.why == checkpoint.rationale.decision)
+  assert(checkpoint.rationale.what == checkpoint.rationale.next_action)
+end)
+
+run_test("WheelContext: rationale checkpoints retain legacy message compatibility", function()
+  local context = WheelContext.new()
+  local commit = context:commit_checkpoint({
+    task_id = "TASK-COMPAT",
+    rationale = {
+      schema = WheelProvider.Rationale.SCHEMA,
+      decision = "Choose bounded persistence",
+      evidence = { "checkpoint consumer" },
+      uncertainty = "none",
+      risk = "bounded",
+      rejected_alternatives = {},
+      next_action = "Continue verification",
+    },
+  })
+  assert(commit.rationale.why == "Choose bounded persistence")
+  assert(commit.rationale.what == "Continue verification")
+  assert(commit.message == "Choose bounded persistence",
+    "context checkpoint message must derive from the compatibility label")
 end)
 
 run_test("WheelRunner: action records retain non-spilled output byte counts", function()
