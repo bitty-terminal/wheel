@@ -269,11 +269,20 @@ wheel#110 upgrades these into deterministic structured projections and semantic
 delta references. Issue #111 bounds the autonomous conversation history and
 replaces old messages with ContextRefs.
 
-The provider-level cache key currently identifies Wheel's local Zone 1 hash.
-Any local prefix-share ratio is a design/local-reuse signal, not a provider
-cache hit rate; neither proves a provider cache hit. Provider hit evidence
-requires response telemetry. Issue #118 owns provider capability negotiation
-and measured cache telemetry.
+Provider cache negotiation is implemented behind `off`, `prefer` (the
+default), and `required` policies. When supported and requested, the provider
+cache key is derived from the exact bounded system-prefix bytes serialized in
+the request and a domain containing the provider, model, endpoint, policy,
+tool-schema, and capability versions. A caller-declared prefix that does not
+match the serialized bytes, or exceeds the named bound, does not receive cache
+controls; `required` fails closed. Unsupported providers remain usable in
+`prefer` mode and fail closed in `required` mode.
+
+Local prefix hashes and prefix-share ratios remain design/local-reuse signals,
+not provider cache-hit evidence. Provider cache status and read/write token
+counts are reported only from explicit provider response usage, and are kept
+separate from local prefix telemetry. Wheel does not persist provider KV cache
+contents, and `bittyd` owns neither prompt content nor provider cache state.
 
 ## 8. Output and reasoning density
 
