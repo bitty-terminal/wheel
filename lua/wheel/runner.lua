@@ -51,10 +51,10 @@ WheelRunner.MAX_REQUEST_NODES = 512
 WheelRunner.MAX_REQUEST_KEYS = 512
 WheelRunner.MAX_REQUEST_DEPTH = 64
 WheelRunner.MAX_CONTEXT_REF_DEPTH = 64
+WheelRunner.MAX_CHECKPOINT_ID_BYTES = 128
 
 -- The runner's checkpoint rationale keeps the historical six-field contract;
 -- structured rationale records add decision/risk/next_action/evidence fields.
-local CHECKPOINT_RATIONALE_FIELDS = { "why", "what", "where_focus", "how", "expected", "observed" }
 local RATIONALE_TEXT_FIELDS = {
   "why", "what", "where_focus", "how", "expected", "observed",
   "decision", "uncertainty", "risk", "next_action",
@@ -121,11 +121,26 @@ local function safe_checkpoint_rationale(rationale)
   if type(normalized) ~= "table" then
     return normalized or {}
   end
-  local safe = {}
-  for _, field in ipairs(CHECKPOINT_RATIONALE_FIELDS) do
-    if normalized[field] ~= nil then safe[field] = normalized[field] end
+  -- Keep the structured marker so Rationale.for_persistence applies the
+  -- bounded canonical schema; the Kernel sink re-redacts every field.
+  if type(rationale) == "table" and rationale.schema ~= nil then
+    normalized.schema = rationale.schema
   end
-  return safe
+  if type(rationale) == "table"
+    and (rationale.source == "fallback" or rationale.source == "provider" or rationale.source == "legacy") then
+    normalized.source = rationale.source
+  end
+  -- Task/session linkage is durable context, not prompt content. Persistence
+  -- bounds and redacts these IDs in Rationale.for_persistence.
+  if type(rationale) == "table" and (rationale.schema ~= nil or rationale.source ~= nil) then
+    for _, field in ipairs({ "task_id", "session_id" }) do
+      local value = rationale[field]
+      if type(value) == "string" and #value > 0 and #value <= WheelRunner.MAX_CHECKPOINT_ID_BYTES then
+        normalized[field] = value
+      end
+    end
+  end
+  return normalized
 end
 
 local function message_bytes(value, seen)
