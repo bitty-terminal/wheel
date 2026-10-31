@@ -974,6 +974,12 @@ secret environment reads.
   resources and shape policy within the allowed fields.
 - Model providers receive prompts and code by design. Secret values are not
   included, but repository content sent to a provider leaves the machine.
+- Prompt Cache remains provider-owned. Wheel may send an adapter-specific cache
+  key for an explicitly supported capability, but never persists provider KV
+  cache contents; `bittyd` owns neither Prompt content nor Prompt Cache. Local
+  prefix hashes and ratios are theoretical stability telemetry, not evidence
+  of a provider cache hit. Cache keys are domain-bound to provider, model,
+  endpoint, policy/tool-schema versions, and capability version.
 - Third-party tools and dependencies run with user authority.
 - The audit log and trust store are same-user files, not a tamper-proof record.
 - No release artifact, signature, or update channel exists yet; none may be

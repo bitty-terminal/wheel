@@ -864,8 +864,10 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
   pipeline (Tier 1 scratchpad pruning, Tier 2 bounded rationale/slot previews,
   Tier 3 tail truncation). Any local prefix-share ratio is a design/local-reuse
   signal only, not a provider cache hit rate; provider hit evidence requires
-  response telemetry. Provider-level cache hits are not yet implemented or
-  verified; see [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
+  explicit response telemetry. Provider cache negotiation uses a bounded,
+  domain-bound key and reports cache usage separately from local prefix reuse;
+  unsupported providers continue without cache controls. See
+  [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
 
 ### Context Graph Projections (CTX-0037)
 

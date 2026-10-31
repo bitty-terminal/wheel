@@ -6,6 +6,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Provider Cache
+
+- Provider prompt-cache negotiation for `off`, `prefer` (default), and
+  `required` policies. OpenAI adapters use an opaque, domain-bound
+  `prompt_cache_key`; Anthropic adapters mark the stable system prefix with a
+  provider-native ephemeral `cache_control` breakpoint. Unsupported providers
+  remain usable in `prefer` mode and fail closed in `required` mode. Normalized
+  cache read/write token counts and status are derived only from explicit
+  provider usage; local prefix hashes never imply a provider hit. No KV cache is
+  persisted and `bittyd` receives no cache or prompt content.
+
 ### Fixed
 
 - Close CTX-0046 PX-0451 findings: keep binding projection and normalization

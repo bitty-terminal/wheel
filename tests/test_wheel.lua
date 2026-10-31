@@ -5585,7 +5585,7 @@ run_test("WheelContext: prefix-cache-friendly Three-Zone prompt compilation and 
 
   local res2, err2 = ctx:compile_prompt(prompt_opts_shuffled)
   assert(res2 ~= nil and res2.success == true)
-  -- The prefix_cache_key MUST be byte-identical, achieving 100% prefix cache reuse!
+  -- Local prefix identity is deterministic; it does not imply provider cache reuse.
   assert(res2.prefix_cache_key == res1.prefix_cache_key, "Zone 1 prefix_cache_key must be byte-stable across orderings and turns")
   assert(res2.zone1_prefix == res1.zone1_prefix, "Zone 1 prefix string must match exactly")
 end)
@@ -6511,7 +6511,7 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
     assert(req.headers["anthropic-version"] == "2023-06-01")
 
     local events = {
-      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":40}}}\n\n",
+      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":40,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":12}}}\n\n",
       "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
       "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Claude thinking process\"}}\n\n",
       "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
@@ -6547,6 +6547,11 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.thinking_content == "Claude thinking process")
   assert(ant_res.finish_reason == "end_turn")
   assert(ant_res.usage.output_tokens == 20)
+  assert(ant_res.usage.prompt_tokens == 40 and ant_res.usage.cache_read_tokens == 12
+    and ant_res.usage.cache_creation_tokens == 4,
+    "Anthropic stream must merge input/cache and output usage events")
+  assert(ant_res.usage.provider_cache_status == "verified_hit",
+    "explicit stream cache-read tokens must be a verified hit")
 end)
 
 run_test("WheelProvider: rationale is bounded, structured, and never replays thinking", function()
