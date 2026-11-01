@@ -15,31 +15,75 @@ local STATUS = {
 }
 
 local ID_FIELDS = {
-  "provider",
-  "model",
   "endpoint",
   "cache_domain_version",
-  "prompt_cache_policy",
   "cache_policy_version",
   "tool_schema_version",
   "capability_version",
   "evidence_source",
 }
 
-local function bounded_identifier(value, field)
+local PROVIDERS = {
+  anthropic = true,
+  deepseek = true,
+  mock = true,
+  openai = true,
+  stdio = true,
+}
+PROVIDERS["local"] = true
+
+local EVIDENCE_SOURCES = {
+  provider_response = true,
+  provider_usage = true,
+}
+
+local function secret_shaped(value)
+  local lower = value:lower()
+  return lower:find("bearer%s+[%w%._%-]+") ~= nil
+    or lower:find("sk%-[%w_%-]+") ~= nil
+    or lower:find("gh[pousr]_[%w]+") ~= nil
+    or lower:find("akia[%w]+") ~= nil
+    or lower:find("ya29%.[%w_%-]+") ~= nil
+    or lower:find("x%-api%-key%s*[:=]") ~= nil
+    or lower:find("authorization%s*[:=]") ~= nil
+    or lower:find("api[_%-]?key%s*[:=]") ~= nil
+    or lower:find("token%s*[:=]") ~= nil
+    or lower:find("secret%s*[:=]") ~= nil
+    or lower:find("password%s*[:=]") ~= nil
+    or lower:find("xox[baprs]%-[%w%-]+") ~= nil
+    or lower:find("-----begin[%w%s%-]+private key-----") ~= nil
+    or value:match("^[0-9a-fA-F]+$") ~= nil and #value >= 32
+    or value:match("^[A-Za-z0-9_%-]+$") ~= nil and #value >= 48
+    or value:match("^[%w_-]+%.[%w_-]+%.[%w_-]+$") ~= nil
+end
+
+local function bounded_identifier(value)
   if type(value) ~= "string" or value == "" then return nil end
-  if value:lower():find("sk%-") or value:lower():find("bearer%s")
-    or value:lower():find("api[_%-]?key") or value:find("\n", 1, true)
+  if secret_shaped(value) or value:find("\n", 1, true)
     or value:find("\r", 1, true) then
     return nil
   end
-  if field == "endpoint" then
-    local scheme, authority = value:match("^(https?)://([^/?#]+)")
-    if not scheme or authority:find("@", 1, true) then return nil end
-    value = scheme .. "://" .. authority
-  end
   if #value > WheelCacheTelemetry.MAX_ID_BYTES then return nil end
   return value
+end
+
+local function version_identifier(value)
+  if type(value) ~= "string" or #value > 32 then return nil end
+  if value:match("^v?%d+$") or value:match("^v?%d+%.%d+$")
+    or value:match("^v?%d+%.%d+%.%d+$") then
+    return value
+  end
+  return nil
+end
+
+local function endpoint_origin(value)
+  if type(value) ~= "string" or #value > WheelCacheTelemetry.MAX_ID_BYTES then return nil end
+  local scheme, authority = value:match("^(https?)://([^/?#]+)")
+  if not scheme or authority:find("@", 1, true) or secret_shaped(authority) then return nil end
+  if not authority:match("^[%w%.%-]+$") and not authority:match("^[%w%.%-]+:%d+$") then
+    return nil
+  end
+  return scheme .. "://" .. authority
 end
 
 local function non_negative_number(value)
@@ -53,9 +97,22 @@ local function project_sample(source)
   sample.provider_cache_status = STATUS[status] and status or "unknown"
 
   for _, field in ipairs(ID_FIELDS) do
-    local value = bounded_identifier(source[field], field)
+    local value
+    if field == "endpoint" then
+      value = endpoint_origin(source[field])
+    elseif field == "evidence_source" then
+      local source_name = source[field]
+      value = type(source_name) == "string" and EVIDENCE_SOURCES[source_name] and source_name or nil
+    else
+      value = version_identifier(source[field])
+    end
     if value then sample[field] = value end
   end
+  if type(source.provider) == "string" and PROVIDERS[source.provider] then
+    sample.provider = source.provider
+  end
+  local model = bounded_identifier(source.model)
+  if model and model:match("^[%w][%w._:/%-]*$") then sample.model = model end
   if source.prompt_cache_policy == "off" or source.prompt_cache_policy == "prefer"
     or source.prompt_cache_policy == "required" then
     sample.prompt_cache_policy = source.prompt_cache_policy
@@ -76,7 +133,9 @@ local function project_sample(source)
     sample.provider_cache_read_ratio = sample.provider_cache_read_tokens / denominator
   end
 
-  local local_prefix_hash = bounded_identifier(source.local_prefix_hash, "local_prefix_hash")
+  local local_prefix_hash = type(source.local_prefix_hash) == "string"
+    and source.local_prefix_hash:match("^[0-9a-f]+$")
+    and #source.local_prefix_hash == 64 and source.local_prefix_hash or nil
   local local_prefix_reuse_ratio = non_negative_number(source.local_prefix_reuse_ratio)
   if local_prefix_hash then sample.local_prefix_hash = local_prefix_hash end
   if local_prefix_reuse_ratio and local_prefix_reuse_ratio <= 1 then

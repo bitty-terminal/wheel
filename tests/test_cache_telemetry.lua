@@ -71,6 +71,10 @@ local local_only = project({
 check(local_only.samples[1].provider_cache_status == "unknown"
   and local_only.provider_cache_hit_rate == nil, "local hash cannot imply provider hit")
 check(local_only.samples[1].local_prefix_reuse_ratio == 1, "local metric stays separately available")
+local valid_prefix_hash = string.rep("a", 64)
+local hashed = project({ { local_prefix_hash = valid_prefix_hash } })
+check(hashed.samples[1].local_prefix_hash == valid_prefix_hash,
+  "Wheel SHA-256 digest is retained")
 
 local bounded = project({ { provider_cache_status = "verified_miss" } }, 10000)
 check(bounded.window == Telemetry.MAX_WINDOW, "window has a hard maximum")
@@ -80,6 +84,11 @@ local redacted = project({ {
   prompt_cache_policy = "prefer",
   provider = "openai",
   model = "model-safe",
+  cache_domain_version = "1.2",
+  cache_policy_version = "v2",
+  tool_schema_version = "3",
+  capability_version = "1.0.4",
+  evidence_source = "provider_usage",
   endpoint = "https://user:secret@example.test/v1?token=secret",
   cache_domain = "raw-provider-cache-id-secret",
   local_prefix_hash = "sk-secret-value",
@@ -89,11 +98,39 @@ local redacted = project({ {
 } })
 local safe = redacted.samples[1]
 check(safe.provider == "openai" and safe.model == "model-safe", "authoritative safe identities survive")
+check(safe.cache_domain_version == "1.2" and safe.cache_policy_version == "v2"
+  and safe.tool_schema_version == "3" and safe.capability_version == "1.0.4"
+  and safe.evidence_source == "provider_usage", "known bounded metadata survives")
 check(safe.prompt_cache_policy == "prefer", "known policy is projected")
 check(safe.endpoint == nil and safe.cache_domain == nil and safe.local_prefix_hash == nil,
   "credential-bearing endpoint and raw identifiers are omitted")
 check(safe.prompt == nil and safe.authorization == nil and safe.api_key == nil,
   "prompt and secret fields are not projected")
+local rejected_metadata = {
+  { provider = "my-private-gateway-secret" },
+  { provider = "openai api_key=abc" },
+  { model = "Bearer abc.def" },
+  { model = "ghp_abcdefghijklmnopqrstuvwxyz0123456789" },
+  { model = "akia1234567890EXAMPLE" },
+  { model = "xoxb-123456-secret" },
+  { model = "token=private-value" },
+  { model = "authorization:private-value" },
+  { model = "x-api-key=private-value" },
+  { model = string.rep("a", 48) },
+  { model = "ya29." .. string.rep("a", 32) },
+  { model = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature" },
+}
+for _, fields in ipairs(rejected_metadata) do
+  local rejected = project({ fields }).samples[1]
+  check(rejected.provider == nil and rejected.model == nil,
+    "unrecognized or secret-shaped identity metadata is omitted")
+end
+local malformed_hashes = { "local-hash", string.rep("a", 63), string.rep("a", 65),
+  string.rep("A", 64), string.rep("g", 64), "sha256:" .. string.rep("a", 64) }
+for _, hash in ipairs(malformed_hashes) do
+  local rejected = project({ { local_prefix_hash = hash } }).samples[1]
+  check(rejected.local_prefix_hash == nil, "non-digest local prefix values are omitted")
+end
 local safe_endpoint = project({ {
   provider_cache_status = "unknown",
   endpoint = "https://provider.example/v1/chat?token=secret#fragment",
