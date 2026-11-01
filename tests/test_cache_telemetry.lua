@@ -65,6 +65,32 @@ check(inconsistent_denominator.provider_cache_read_ratio == nil
   and inconsistent_denominator.samples[1].provider_cache_read_ratio == nil,
   "read counts above denominator remain unknown")
 
+local fractional_provider_counts = project({
+  { provider_cache_status = "verified_hit", cache_read_tokens = 4.5,
+    provider_cache_read_denominator = 10 },
+  { provider_cache_status = "verified_hit", cache_read_tokens = 4,
+    provider_cache_read_denominator = 10.5 },
+  { provider_cache_status = "write_only", cache_creation_tokens = 2.5 },
+  { provider_cache_status = "write_only", cache_write_tokens = 3.5 },
+})
+local fractional_read, fractional_denominator, fractional_native_write, fractional_fallback_write =
+  unpack(fractional_provider_counts.samples)
+check(fractional_read.provider_cache_read_tokens == nil
+  and fractional_read.provider_cache_read_ratio == nil,
+  "fractional provider read counts do not project")
+check(fractional_denominator.provider_cache_read_tokens == 4
+  and fractional_denominator.provider_cache_read_ratio == nil,
+  "fractional read denominator does not produce a ratio")
+check(fractional_native_write.provider_cache_write_tokens == nil,
+  "fractional native provider write counts do not project")
+check(fractional_fallback_write.provider_cache_write_tokens == nil,
+  "fractional provider write fallback does not project")
+check(fractional_provider_counts.provider_cache_read_ratio == nil,
+  "fractional provider counts do not produce an aggregate ratio")
+local fractional_local_ratio = project({ { local_prefix_reuse_ratio = 0.75 } }).samples[1]
+check(fractional_local_ratio.local_prefix_reuse_ratio == 0.75,
+  "local prefix reuse ratio retains fractional precision")
+
 local local_only = project({
   { local_prefix_hash = "local-hash", local_prefix_reuse_ratio = 1 },
 })

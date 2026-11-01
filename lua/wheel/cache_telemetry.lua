@@ -91,6 +91,11 @@ local function non_negative_number(value)
   return type(value) == "number" and value >= 0 and value < math.huge and value or nil
 end
 
+local function non_negative_integer(value)
+  value = non_negative_number(value)
+  return value and value % 1 == 0 and value or nil
+end
+
 local function project_sample(source)
   local sample = {}
   local status = type(source.provider_cache_status) == "string"
@@ -122,13 +127,13 @@ local function project_sample(source)
     sample.prompt_cache_supported = source.prompt_cache_supported
   end
 
-  sample.provider_cache_read_tokens = non_negative_number(source.cache_read_tokens)
-  sample.provider_cache_write_tokens = non_negative_number(source.cache_creation_tokens)
+  sample.provider_cache_read_tokens = non_negative_integer(source.cache_read_tokens)
+  sample.provider_cache_write_tokens = non_negative_integer(source.cache_creation_tokens)
   if sample.provider_cache_write_tokens == nil then
-    sample.provider_cache_write_tokens = non_negative_number(source.cache_write_tokens)
+    sample.provider_cache_write_tokens = non_negative_integer(source.cache_write_tokens)
   end
 
-  local denominator = non_negative_number(source.provider_cache_read_denominator)
+  local denominator = non_negative_integer(source.provider_cache_read_denominator)
   if sample.provider_cache_read_tokens ~= nil and denominator and denominator > 0
     and sample.provider_cache_read_tokens <= denominator then
     sample.provider_cache_read_ratio = sample.provider_cache_read_tokens / denominator
