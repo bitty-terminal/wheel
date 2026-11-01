@@ -153,4 +153,7 @@ esac
 
 status=0
 "$interpreter" "$REPO_ROOT/tests/test_wheel.lua" || status=$?
+if [ "$status" -eq 0 ]; then
+  "$interpreter" "$REPO_ROOT/tests/test_cache_telemetry.lua" || status=$?
+fi
 exit "$status"
