@@ -237,7 +237,33 @@ print(
     "PASS live HTTP client reports an unset selected-provider key without cross-provider fallback"
 )
 
-# 6. An unsupported selector fails before reading stdin or contacting a host.
+# 6. The key-presence probe uses only a fixed marker and never reads the live
+# request or contacts a provider when the selected key is absent.
+fake_stdout = _FakeStdout()
+stderr = io.StringIO()
+with (
+    mock.patch.object(client, "fetch") as fetch_mock,
+    mock.patch.dict(
+        os.environ,
+        {
+            client.PROVIDER_SELECTOR_ENV: OPENAI_CACHE.name,
+            OPENAI_CACHE.api_key_env: "",
+        },
+    ),
+    mock.patch.object(sys, "argv", ["live_http_client.py", "--check-key"]),
+    mock.patch.object(sys, "stdin", _FakeStdin(b"must remain unread")),
+    mock.patch.object(sys, "stdout", fake_stdout),
+    mock.patch.object(sys, "stderr", stderr),
+):
+    exit_code = client.main()
+
+fetch_mock.assert_not_called()
+assert exit_code == 0
+assert fake_stdout.buffer.data == b"KEY_ABSENT OPENAI_API_KEY\n"
+assert stderr.getvalue() == ""
+print("PASS key-presence probe skips without reading request data or contacting a host")
+
+# 7. An unsupported selector fails before reading stdin or contacting a host.
 fake_stdout = _FakeStdout()
 stderr = io.StringIO()
 with (
@@ -266,7 +292,7 @@ assert FAKE_KEY not in message
 assert fake_stdout.buffer.data == b""
 print("PASS live HTTP client fails closed on an unsupported selector")
 
-# 7. The Lua selector fails closed with exit 2 before reading a key.
+# 8. The Lua selector fails closed with exit 2 before invoking the helper.
 lua = next(
     (candidate for candidate in ("lua5.1", "luajit", "lua") if shutil.which(candidate)),
     None,

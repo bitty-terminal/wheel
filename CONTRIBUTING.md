@@ -54,10 +54,11 @@ or linters by name):
    without it.
 5. Run the opt-in live provider test only when needed: `just test-live` first
    runs a key-free loopback redirect-policy test, then requires
-   `OPENROUTER_API_KEY` in the inherited environment for the live portion. It
-   is never part of `just check` or CI, and skips the live portion cleanly when
-   the key is absent. See the README's offline/live test section for the
-   env-only key handling contract.
+   the selected provider's key in the helper environment for the live portion
+   (`OPENROUTER_API_KEY`, `COMMANDCODE_API_KEY`, or `OPENAI_API_KEY`). It is
+   never part of `just check` or CI, and skips the live portion cleanly when
+   the selected key is absent. See the README's offline/live test section for
+   the selector and env-only key handling contract.
 6. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
    stop at review; independent review is required for acceptance.
 

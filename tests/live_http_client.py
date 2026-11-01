@@ -222,6 +222,11 @@ def main() -> int:
         return _fail(str(error))
 
     api_key = os.environ.get(provider.api_key_env, "")
+    if len(sys.argv) == 2 and sys.argv[1] == "--check-key":
+        marker = "KEY_PRESENT" if api_key else f"KEY_ABSENT {provider.api_key_env}"
+        sys.stdout.buffer.write(f"{marker}\n".encode("ascii"))
+        sys.stdout.buffer.flush()
+        return 0
     if not api_key:
         return _fail(f"{provider.api_key_env} is not set in the helper environment")
 

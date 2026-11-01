@@ -69,15 +69,6 @@ local function select_provider()
 end
 
 local provider = select_provider()
-local api_key = os.getenv(provider.api_key_env)
-if not api_key or api_key == "" then
-  print(string.format(
-    "SKIP test-live: %s is not set for provider %s",
-    provider.api_key_env,
-    provider.name
-  ))
-  os.exit(0)
-end
 
 local WheelProvider = require("wheel.provider")
 local WheelRunner = require("wheel.runner")
@@ -94,6 +85,16 @@ local SMOKE_MAX_COMPLETION_TOKENS = provider.smoke_max_completion_tokens
 local RUNNER_MAX_COMPLETION_TOKENS = provider.runner_max_completion_tokens
 local STREAM_CHUNK_SIZE = 64
 
+local key_probe = assert(io.popen(PYTHON .. " " .. CLIENT_SCRIPT .. " --check-key", "r"))
+local key_state = (key_probe:read("*a") or ""):gsub("%s+$", "")
+key_probe:close()
+if key_state:match("^KEY_ABSENT ") then
+  print(string.format("SKIP test-live: %s is not set for provider %s",
+    provider.api_key_env, provider.name))
+  os.exit(0)
+end
+assert(key_state == "KEY_PRESENT", "live helper key probe failed closed")
+
 local captured_outputs = {}
 local observed_budgets = {}
 local helper_calls = 0
@@ -106,15 +107,8 @@ local function remember(text)
   end
 end
 
-local function assert_no_key(text, label)
-  if type(text) == "string" and text:find(api_key, 1, true) then
-    error("credential material detected in " .. label, 0)
-  end
-end
-
 local function fail_without_key(label, err)
   local message = tostring(err)
-  assert_no_key(message, label .. " error")
   error(label .. " failed: " .. message, 0)
 end
 
@@ -131,7 +125,6 @@ local function run_helper(spec)
   local request_path = os.tmpname()
   local error_path = os.tmpname()
   local encoded = WheelProvider.JSON.encode(spec)
-  assert_no_key(encoded, "request JSON")
 
   local request_file = assert(io.open(request_path, "wb"))
   request_file:write(encoded)
@@ -152,8 +145,6 @@ local function run_helper(spec)
 
   remember(stdout)
   remember(stderr)
-  assert_no_key(stdout, "helper stdout")
-  assert_no_key(stderr, "helper stderr")
 
   local status, body = stdout:match("^STATUS (%d+)\n(.*)$")
   if not status then
@@ -201,8 +192,6 @@ local function http_client(req)
 
   remember(req.body)
   remember(body)
-  assert_no_key(req.body, "provider request")
-  assert_no_key(body, "provider response")
 
   if req.stream and req.on_stream_chunk and #body > 0 then
     for i = 1, #body, STREAM_CHUNK_SIZE do
@@ -278,14 +267,8 @@ if provider.name == "openai-cache" then
   assert(#cache_request_keys == 2 and cache_request_keys[1] == expected_key
     and cache_request_keys[2] == expected_key,
     "both OpenAI prompt_cache_keys must derive from the exact domain and serialized stable prefix")
-  for _, cache_key in ipairs(cache_request_keys) do
-    assert_no_key(cache_key, "cache key")
-  end
   assert(#cache_usages == 2, "both live responses must be checked independently")
   print("LIVE openai-cache repeated-prefix evidence complete")
-  for index, output in ipairs(captured_outputs) do
-    assert_no_key(output, "captured output " .. tostring(index))
-  end
   print(string.format("LIVE %s tests passed (%d bounded requests)", provider.name, helper_calls))
   os.exit(0)
 end
