@@ -38,6 +38,7 @@ local EVIDENCE_SOURCES = {
   provider_usage = true,
 }
 
+-- Reject credential-like strings and opaque high-entropy identifiers before projection.
 local function secret_shaped(value)
   local lower = value:lower()
   return lower:find("bearer%s+[%w%._%-]+") ~= nil
@@ -58,6 +59,7 @@ local function secret_shaped(value)
     or value:match("^[%w_-]+%.[%w_-]+%.[%w_-]+$") ~= nil
 end
 
+-- Keep only bounded, single-line identifiers that do not resemble secrets.
 local function bounded_identifier(value)
   if type(value) ~= "string" or value == "" then return nil end
   if secret_shaped(value) or value:find("\n", 1, true)
@@ -68,6 +70,7 @@ local function bounded_identifier(value)
   return value
 end
 
+-- Accept only numeric versions so arbitrary metadata is not projected.
 local function version_identifier(value)
   if type(value) ~= "string" or #value > 32 then return nil end
   if value:match("^v?%d+$") or value:match("^v?%d+%.%d+$")
@@ -77,6 +80,7 @@ local function version_identifier(value)
   return nil
 end
 
+-- Reduce an endpoint to its credential-free HTTP(S) origin; omit other URLs.
 local function endpoint_origin(value)
   if type(value) ~= "string" or #value > WheelCacheTelemetry.MAX_ID_BYTES then return nil end
   local scheme, authority = value:match("^(https?)://([^/?#]+)")
@@ -87,15 +91,19 @@ local function endpoint_origin(value)
   return scheme .. "://" .. authority
 end
 
+-- Return finite, non-negative numbers; nil represents invalid or absent input.
 local function non_negative_number(value)
   return type(value) == "number" and value >= 0 and value < math.huge and value or nil
 end
 
+-- Provider token counts and their denominator must be whole finite counts.
 local function non_negative_integer(value)
   value = non_negative_number(value)
   return value and value % 1 == 0 and value or nil
 end
 
+-- Copy allowlisted usage metadata, validating counts and deriving ratios only
+-- when the record supplies a consistent positive denominator.
 local function project_sample(source)
   local sample = {}
   local status = type(source.provider_cache_status) == "string"
@@ -146,6 +154,7 @@ local function project_sample(source)
   return sample, denominator
 end
 
+-- Default invalid windows and clamp valid ones to the supported range.
 local function bounded_window(value)
   if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
     value = WheelCacheTelemetry.DEFAULT_WINDOW
@@ -157,7 +166,13 @@ local function bounded_window(value)
   return value
 end
 
---- Project the newest bounded window of normalized usage records.
+--- Project normalized usage records into sanitized samples and aggregate metrics.
+-- @param records array of usage records; non-table values are treated as empty.
+-- @param opts optional table with `window`, defaulting to DEFAULT_WINDOW and
+--   clamped to [1, MAX_WINDOW].
+-- @return projection with newest samples in input order, status counts, verified
+--   hit rate, and provider read ratio; unavailable or unsupported ratios are nil.
+--   Local prefix reuse remains a separate per-sample metric and hashes are omitted.
 function WheelCacheTelemetry.project(records, opts)
   records = type(records) == "table" and records or {}
   opts = type(opts) == "table" and opts or {}
@@ -200,6 +215,8 @@ function WheelCacheTelemetry.project(records, opts)
     end
   end
 
+  -- Scale each eligible record by the largest denominator to avoid summing
+  -- potentially huge token counts directly while preserving the weighted ratio.
   local scaled_reads, scaled_denominators = 0, 0
   if max_denominator > 0 then
     for _, entry in ipairs(samples) do
