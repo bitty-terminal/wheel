@@ -8,6 +8,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Close CTX-0046 PX-0451 findings: keep binding projection and normalization
+  private, issue the exact fork binding checked for widening, restore canonical
+  Commander Execute while retaining narrowed grants, refuse terminal-parent
+  fork widening before child creation, reject skipped replay generations, and
+  preserve validated AgentId and policy generation in P3 delta provenance.
+  Add Lua 5.1/LuaJIT regressions for export replacement, approval/audit failure,
+  ended and abandoned parents, forged replay, and changed workspace deltas.
+
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
   exact revision conflicts, exception-safe lock cleanup, bounded recent history,

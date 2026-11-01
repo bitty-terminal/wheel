@@ -545,7 +545,8 @@ security principals. The following matrix is mandatory and fail-closed:
 - `Research` and `Reviewer` are strictly read-only. They cannot execute shell
   strings, argv, network tools, or mutating custom tools.
 - `Commander` plans and orchestrates; direct code modification is delegated to
-  a worker.
+  a worker. Its canonical RoleBinding includes Execute for declared tools;
+  explicit narrowed bindings may omit that capability.
 - A subagent cannot exceed the authority of the agent that dispatched it. A
   reviewer is dispatched with read-only authority and cannot approve work it
   implemented.
@@ -562,9 +563,17 @@ security principals. The following matrix is mandatory and fail-closed:
   creation rejects caller resolvers and fabricated or borrowed references;
   transition and widening APIs validate bindings against the protected Agent
   issuer. Persisted metadata cannot restore an in-process authority reference.
+- Binding normalization, issuance, and reference projection are private
+  operations. Replaceable public compatibility helpers never receive canonical
+  bindings or decide issued authority. A fork checks and issues the same
+  normalized binding, and an ended or abandoned parent cannot authorize fork
+  widening. Replay requires successive recorded policy generations to advance
+  by exactly one, including within retained partial history.
 - Public Agents are opaque Lua 5.1/LuaJIT handles: `rawset` fails rather than
   shadowing identity, lineage, RoleBinding, or session fields. Identity reads,
   status, authorization, routing, and provenance use the same private state.
+  P3 semantic delta provenance carries the validated AgentId and policy
+  generation consistently with its root Context projection.
 - A forked Agent may not exceed its parent's capability state without explicit
   approval; fork lineage carries references to immutable Context commits, never
   transcripts or copied context content.

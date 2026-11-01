@@ -662,6 +662,12 @@ local function registry_shape(value)
     elseif event.type:match("^agent_session%.") then
       local session = replay_session(event.session_id)
       if not session then return false, "session event references unknown session" end
+      if event.type == "agent_session.role_transition" then
+        if session.policy_generation and event.policy_generation ~= session.policy_generation + 1 then
+          return false, "role transition policy generation must advance by exactly one"
+        end
+        session.policy_generation = event.policy_generation
+      end
       if not session.created then
         if complete_history then return false, "session event has no historical creation" end
         session.incomplete = true
@@ -682,13 +688,6 @@ local function registry_shape(value)
           panel.controller, session.mode = event.session_id, Lifecycle.AttachMode.CONTROLLER
         elseif event.type == "agent_session.active" and session.mode ~= Lifecycle.AttachMode.CONTROLLER then
           return false, "active session is not a controller"
-        end
-        if event.type == "agent_session.role_transition" then
-          local previous = session.policy_generation or 0
-          if event.policy_generation <= previous then
-            return false, "role transition policy generation is not monotonic"
-          end
-          session.policy_generation = event.policy_generation
         end
         session.state = event.to_state
       end
@@ -1246,6 +1245,9 @@ function Lifecycle:record_authority_widening(parent_session_id, child_session_id
   return self:_change(function(state)
     local parent, parent_err = self:_session_in(state, parent_session_id); if not parent then return false, parent_err end
     local child, child_err = self:_session_in(state, child_session_id); if not child then return false, child_err end
+    if TERMINAL[parent.state] then
+      return false, { code="E_LIFECYCLE_STATE", message="terminal parent session cannot authorize widening" }
+    end
     local parent_authority, parent_authority_err = resolve_session_authority(
       self, parent_session_id, opts.parent_authority_reference, parent.role_binding)
     local child_authority, child_authority_err = resolve_session_authority(

@@ -141,6 +141,12 @@
   issuer bridge, never caller resolvers or restored metadata. Agent instances
   are opaque Lua 5.1/LuaJIT handles; use their field/method API or `status()`,
   never table introspection or `rawset`.
+- Canonical binding normalization, issuance, and reference projection stay
+  private; replaceable public helpers cannot receive canonical bindings or
+  determine authority. Fork issuance reuses the checked binding, terminal
+  parent sessions cannot authorize widening, and replay requires successive
+  generations to advance by exactly one. Context delta provenance carries the
+  validated AgentId and policy generation.
 - High-risk operations (shell strings, secret reads, trust approval, new
   network destinations) fail closed when audit cannot record them.
 - The experimental local session daemon (`scripts/wheel-session`) is

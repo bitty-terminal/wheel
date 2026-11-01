@@ -2434,6 +2434,8 @@ function WheelContext:project(opts)
     current_records = current_records,
     task_id = opts.task_id,
     session_id = opts.session_id,
+    agent_id = identity and identity.agent_id,
+    role_binding = identity and copy_projection_value(identity.role_binding),
     relevant_scopes = copy_projection_value(scopes),
     confidence = opts.confidence,
     _projection_nodes_limit = work_nodes,

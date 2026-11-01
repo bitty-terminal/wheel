@@ -34,6 +34,14 @@ local function is_hex_hash(value)
   return type(value) == "string" and #value == 64 and value:match("^[0-9a-f]+$") ~= nil
 end
 
+local function with_replaced_export(name, replacement, check)
+  local original = WheelAgent[name]
+  WheelAgent[name] = replacement
+  local ok, err = pcall(check)
+  WheelAgent[name] = original
+  assert(ok, err)
+end
+
 return function(run_test)
   run_test("Agent identity: RoleBinding is separate from Agent identity and roles bound capabilities", function()
     local agent = WheelAgent.new({
@@ -229,6 +237,74 @@ return function(run_test)
     assert(commander_reason:find("lacks 'modify' capability", 1, true) ~= nil)
   end)
 
+  run_test("Agent identity: canonical Commander permits declared Execute while narrowed bindings deny it", function()
+    local kernel = WheelKernel.new_mock()
+    local commander = WheelAgent.new({ name = "execute-commander", role = "commander",
+      tools = { "read_file", "write_file", "run_command" }, kernel = kernel })
+    assert(commander:has_capability("execute"))
+    assert(commander:is_tool_allowed("run_command"), "Commander Execute is required by the security matrix")
+    assert(not commander:is_tool_allowed("write_file"))
+    local narrowed = WheelAgent.new({ name = "narrowed-execute-commander", role = "commander",
+      capabilities = { "inspect", "orchestrate" }, tools = { "read_file", "run_command" }, kernel = kernel })
+    assert(not narrowed:has_capability("execute") and not narrowed:is_tool_allowed("run_command"))
+  end)
+
+  run_test("Agent identity: terminal parent cannot authorize fork widening", function()
+    for _, terminal in ipairs({ "ended", "abandoned" }) do
+      local kernel = WheelKernel.new_mock()
+      local context = fixed_context(kernel)
+      checkpoint(context, "terminal parent baseline")
+      local life = WheelLifecycle.new()
+      local reviewer = WheelAgent.new({ name = "terminal-parent-" .. terminal, role = "reviewer",
+        kernel = kernel, context = context, lifecycle = life })
+      local parent_session = assert(reviewer:create_runtime_session())
+      if terminal == "ended" then
+        assert(life:end_session(parent_session.session_id, "explicit"))
+      else
+        assert(life:abandon_session(parent_session.session_id, "explicit"))
+      end
+      local events, sessions, panels = #life:events(), #life:list_sessions(), #life:list_panels()
+      local child, err = WheelAgent.fork_agent(reviewer, {
+        name = "terminal-child-" .. terminal, role = "coding", reason = "terminal widening",
+        approve_widening = true,
+      })
+      assert(child == nil and err.code == "E_FORK_AUTHORITY")
+      assert(life:get_session(parent_session.session_id).state == terminal)
+      assert(#life:events() == events and #life:list_sessions() == sessions and #life:list_panels() == panels,
+        "denied widening must not issue child authority or lifecycle events")
+      assert(reviewer:current_role() == "reviewer" and not reviewer:has_capability("modify"))
+    end
+  end)
+
+  run_test("Agent identity: lifecycle widening rejects terminal parent before recording an event", function()
+    for _, terminal in ipairs({ "ended", "abandoned" }) do
+      local kernel = WheelKernel.new_mock()
+      local context = fixed_context(kernel)
+      local base = checkpoint(context, "canonical terminal parent audit")
+      local life = WheelLifecycle.new()
+      local parent = WheelAgent.new({ name = "audit-parent-" .. terminal, role = "reviewer",
+        kernel = kernel, context = context, lifecycle = life })
+      assert(parent:create_runtime_session())
+      local child = assert(WheelAgent.fork_agent(parent, { name = "audit-child-" .. terminal,
+        role = "coding", reason = "approved live parent", approve_widening = true }))
+      if terminal == "ended" then
+        assert(life:end_session(parent.session_id, "explicit"))
+      else
+        assert(life:abandon_session(parent.session_id, "explicit"))
+      end
+      local events = #life:events()
+      local event, err = life:record_authority_widening(parent.session_id, child.session_id, {
+        parent_authority_reference = parent:authority_reference(),
+        child_authority_reference = child:authority_reference(),
+        checkpoint = base.hash, capability_delta = "modify,execute",
+      })
+      assert(event == nil and err.code == "E_LIFECYCLE_STATE")
+      assert(#life:events() == events and child.policy_generation == 1)
+      assert(child:current_role() == "coding" and child:has_capability("modify"))
+      assert(not parent:has_capability("modify"))
+    end
+  end)
+
   run_test("Agent identity: rawset role binding cannot authorize plan decomposition", function()
     local kernel = WheelKernel.new_mock()
     local reviewer = WheelAgent.new({
@@ -347,6 +423,296 @@ return function(run_test)
     assert(allowed == false, "replacing role_capabilities must not grant mutation")
     assert(reason:find("read-only authority", 1, true) ~= nil,
       "unregistered mutation must remain denied after role_capabilities replacement")
+  end)
+
+  run_test("Agent identity: binding reference export cannot capture private authority through projections", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    local base = checkpoint(context, "export projection baseline")
+    local reviewer = WheelAgent.new({ name = "reference-reviewer", role = "reviewer",
+      kernel = kernel, context = context })
+    local original = WheelAgent.binding_reference
+    local captured = {}
+    with_replaced_export("binding_reference", function(binding)
+      captured[#captured + 1] = binding
+      return original(binding)
+    end, function()
+      assert(reviewer:status().role_binding.role == "reviewer")
+      assert(reviewer:lineage_projection().role_binding.role == "reviewer")
+      local projection = assert(reviewer:context_projection({
+        base_commit = base.hash, current_commit = base.hash,
+        role = WheelContext.Role.REVIEWER, task_id = "TASK-EXPORT-PROJECTION",
+      }))
+      assert(projection.identity.role_binding.role == "reviewer")
+      local forged, err = reviewer:context_projection({
+        base_commit = base.hash, current_commit = base.hash,
+        role_binding = { role = "coding", binding_id = "forged-export-binding", policy_generation = 1 },
+      })
+      assert(forged == nil and err.code == "E_IDENTITY_PROJECTION")
+    end)
+    for _, binding in ipairs(captured) do
+      binding.capabilities = { "inspect", "verify", "modify", "execute" }
+    end
+    assert(not reviewer:has_capability("modify"))
+    assert(reviewer:is_tool_allowed("write_file") == false)
+    assert(reviewer.agent_id == "reference-reviewer" and reviewer.policy_generation == 1)
+    assert(context:head_commit_hash() == base.hash)
+    assert(#captured == 0, "internal projections must never pass private bindings to a public export")
+  end)
+
+  run_test("Agent identity: binding reference replacement cannot change session or pending transition authority", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    checkpoint(context, "export session baseline")
+    local lifecycle = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "reference-session-reviewer", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    local original = WheelAgent.binding_reference
+    local captured = {}
+    with_replaced_export("binding_reference", function(binding)
+      captured[#captured + 1] = binding
+      return original(binding)
+    end, function()
+      local session = assert(reviewer:create_runtime_session())
+      assert(session.role_binding.role == "reviewer")
+      local denied, denial = reviewer:transition_role("coding", { reason = "unapproved export widening" })
+      assert(denied == nil and denial.code == "E_ROLE_AUTHORITY")
+      local narrowed = assert(reviewer:transition_role({ role = "coding", capabilities = { "inspect" } }, {
+        reason = "inspect only assignment",
+      }))
+      assert(not narrowed.widened and #narrowed.capabilities == 1)
+      assert(not reviewer:has_capability("modify"))
+      local child = assert(WheelAgent.fork_agent(reviewer, { name = "reference-narrow-child",
+        capabilities = { "inspect" }, reason = "preserve narrowed inheritance" }))
+      assert(#child:capabilities() == 1 and child:is_tool_allowed("write_file") == false)
+      assert(child.lineage.forked_from_agent == reviewer.agent_id)
+    end)
+    for _, binding in ipairs(captured) do binding.capabilities = { "inspect", "modify", "execute" } end
+    assert(not reviewer:has_capability("modify") and reviewer:is_tool_allowed("write_file") == false)
+    assert(reviewer.policy_generation == 2)
+    local session = lifecycle:get_session(reviewer.session_id)
+    assert(session.role_binding.role == "coding" and session.role_binding.policy_generation == 2)
+    local event = lifecycle:events()[#lifecycle:events()]
+    assert(event.type == "agent_session.role_transition" and event.reason == "role_transition")
+    assert(event.checkpoint == reviewer.last_role_checkpoint)
+    assert(#captured == 0, "session and transition issuance must not expose canonical bindings")
+  end)
+
+  run_test("Agent identity: normalizer export cannot grant Reviewer or narrowed constructor authority", function()
+    local kernel = WheelKernel.new_mock()
+    local original = WheelAgent.normalize_role_binding
+    local calls = 0
+    with_replaced_export("normalize_role_binding", function(binding, agent_id)
+      calls = calls + 1
+      local forged = assert(original(binding, agent_id))
+      forged.capabilities = { "inspect", "verify", "modify", "execute" }
+      return forged
+    end, function()
+      local reviewer = WheelAgent.new({ name = "normalizer-reviewer", role = "reviewer", kernel = kernel })
+      assert(not reviewer:has_capability("modify") and reviewer:is_tool_allowed("write_file") == false)
+      local narrowed = WheelAgent.new({ name = "normalizer-narrowed", role = "coding",
+        capabilities = { "inspect" }, kernel = kernel })
+      assert(#narrowed:capabilities() == 1)
+      assert(narrowed:is_tool_allowed("write_file") == false)
+      assert(not pcall(WheelAgent.new, { name = "normalizer-invalid", role = "reviewer",
+        capabilities = { "modify" }, kernel = kernel }))
+      reject_rawset(reviewer, "role_binding", { role = "coding", capabilities = { "modify" } })
+      assert(reviewer:status().role_binding.role == "reviewer")
+      assert(calls == 0, "constructor authority must use the private normalizer")
+    end)
+  end)
+
+  run_test("Agent identity: normalizer replacement preserves transition narrowing and widening audit", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    checkpoint(context, "normalizer transition baseline")
+    local lifecycle = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "normalizer-transition", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    local session = assert(reviewer:create_runtime_session())
+    local original = WheelAgent.normalize_role_binding
+    local calls = 0
+    with_replaced_export("normalize_role_binding", function(binding, agent_id)
+      calls = calls + 1
+      local forged = assert(original(binding, agent_id))
+      forged.capabilities = { "inspect", "verify", "modify", "execute" }
+      return forged
+    end, function()
+      local denied, err = reviewer:transition_role("coding", { reason = "unapproved normalization" })
+      assert(denied == nil and err.code == "E_ROLE_AUTHORITY")
+      local narrowed = assert(reviewer:transition_role({ role = "coding", capabilities = { "inspect" } }, {
+        reason = "narrowed normalization",
+      }))
+      assert(not narrowed.widened and #narrowed.capabilities == 1)
+      assert(reviewer:is_tool_allowed("write_file") == false)
+      local widened = assert(reviewer:transition_role("coding", {
+        reason = "explicit normalization approval", approve_widening = true,
+      }))
+      assert(widened.widened and widened.policy_generation == 3)
+      assert(reviewer:has_capability("modify"))
+      local event = lifecycle:events()[#lifecycle:events()]
+      assert(event.type == "agent_session.role_transition" and event.reason == "role_widening")
+      assert(event.checkpoint == widened.checkpoint and event.policy_generation == 3)
+      assert(lifecycle:get_session(session.session_id).role_binding.policy_generation == 3)
+      assert(calls == 0, "transition authority must use the private normalizer")
+    end)
+  end)
+
+  run_test("Agent identity: normalizer replacement cannot widen between fork validation and issuance", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    local base = checkpoint(context, "normalizer fork baseline")
+    local lifecycle = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "normalizer-fork-parent", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    assert(reviewer:create_runtime_session())
+    local narrowed = WheelAgent.new({ name = "normalizer-fork-narrowed", role = "coding",
+      capabilities = { "inspect" }, kernel = kernel, context = context })
+    local original = WheelAgent.normalize_role_binding
+    local calls = 0
+    local before = #lifecycle:events()
+    with_replaced_export("normalize_role_binding", function(binding, agent_id)
+      calls = calls + 1
+      return original(calls % 2 == 0 and { role = "coding" } or binding, agent_id)
+    end, function()
+      local child = assert(WheelAgent.fork_agent(reviewer, { name = "normalizer-fork-child",
+        reason = "inherited read only binding", base_context_commit = base.hash }))
+      assert(child:current_role() == "reviewer" and child:is_tool_allowed("write_file") == false)
+      assert(child.session_id == nil and #lifecycle:events() == before)
+      assert(child.lineage.forked_from_agent == reviewer.agent_id)
+      local denied, err = WheelAgent.fork_agent(reviewer, { name = "normalizer-wide-child",
+        role = "coding", reason = "unapproved fork" })
+      assert(denied == nil and err.code == "E_FORK_AUTHORITY")
+      local inherited, inherit_err = WheelAgent.fork_agent(narrowed, {
+        name = "normalizer-narrow-wide-child", reason = "role defaults exceed narrowed parent",
+      })
+      assert(inherited == nil and inherit_err.code == "E_FORK_AUTHORITY")
+      local narrow_child = assert(WheelAgent.fork_agent(narrowed, { name = "normalizer-narrow-child",
+        capabilities = { "inspect" }, reason = "explicit narrowed inheritance" }))
+      assert(#narrow_child:capabilities() == 1 and narrow_child:is_tool_allowed("write_file") == false)
+      assert(#lifecycle:events() == before)
+      local approved = assert(WheelAgent.fork_agent(reviewer, { name = "normalizer-approved-child",
+        role = "coding", reason = "approved fork", approve_widening = true }))
+      assert(approved:has_capability("modify") and approved.session_id ~= nil)
+      local event = lifecycle:events()[#lifecycle:events()]
+      assert(event.type == "agent_session.authority_widened")
+      assert(event.parent_session_id == reviewer.session_id and event.child_session_id == approved.session_id)
+      assert(event.capability_delta == "modify,execute")
+      assert(calls == 0, "fork checks and issued bindings must use the same private normalizer")
+    end)
+  end)
+
+  run_test("Agent identity: fork checks and issues a single snapshot of binding input", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    checkpoint(context, "single binding evaluation")
+    local life = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "single-evaluation-parent", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = life })
+    assert(reviewer:create_runtime_session())
+    local reads, events = 0, #life:events()
+    local requested = setmetatable({}, { __index = function(_, key)
+      if key == "role" then
+        reads = reads + 1
+        return reads == 1 and "reviewer" or "coding"
+      end
+    end })
+    local child = assert(WheelAgent.fork_agent(reviewer, { name = "single-evaluation-child",
+      role_binding = requested, reason = "one immutable binding snapshot" }))
+    assert(reads == 1, "fork binding input must be normalized only once")
+    assert(child:current_role() == "reviewer" and not child:has_capability("modify"))
+    assert(child.policy_generation == 1 and child.session_id == nil and #life:events() == events)
+    local forged = { role = "coding", capabilities = { "inspect", "verify", "modify", "execute" } }
+    local direct = WheelAgent.new({ name = "public-constructor-extra-argument", role = "reviewer",
+      kernel = kernel }, forged)
+    assert(direct:current_role() == "reviewer" and not direct:has_capability("modify"))
+  end)
+
+  run_test("Agent identity: fork issuance and widening cannot dispatch through compatibility exports", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    local base = checkpoint(context, "fork helper export baseline")
+    local lifecycle = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "helper-export-parent", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    assert(reviewer:create_runtime_session())
+    for index, name in ipairs({ "new", "validate_lineage", "commit_fork_widening" }) do
+      local calls = 0
+      with_replaced_export(name, function()
+        calls = calls + 1
+        return true
+      end, function()
+        local child = assert(WheelAgent.fork_agent(reviewer, { name = "helper-export-child-" .. index,
+          role = "coding", reason = "explicit audited helper test", approve_widening = true }))
+        assert(child:has_capability("modify") and child.session_id ~= nil)
+        assert(child.lineage.forked_from_agent == reviewer.agent_id)
+        assert(child.lineage.base_context_commit == base.hash)
+        local event = lifecycle:events()[#lifecycle:events()]
+        assert(event.type == "agent_session.authority_widened" and event.child_session_id == child.session_id)
+        assert(calls == 0, "internal fork issuance must not call replaceable " .. name)
+      end)
+    end
+  end)
+
+  run_test("Agent identity: replaced binding helpers cannot bypass failed transition or fork audit", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    checkpoint(context, "failed export audit baseline")
+    local lifecycle = WheelLifecycle.new()
+    local reviewer = WheelAgent.new({ name = "failed-export-reviewer", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    local session = assert(reviewer:create_runtime_session())
+    local reference = reviewer:authority_reference()
+    local binding_id = reviewer.role_binding.binding_id
+    local event_count = #lifecycle:events()
+    local calls = 0
+    local function hostile()
+      calls = calls + 1
+      error("binding compatibility export must not be consulted")
+    end
+    with_replaced_export("binding_reference", hostile, function()
+      with_replaced_export("normalize_role_binding", hostile, function()
+        lifecycle.record_role_transition = function()
+          return nil, { code = "E_ROLE_AUDIT", message = "fixture audit unavailable" }
+        end
+        local changed, err = reviewer:transition_role("coding", {
+          reason = "approved but unrecorded transition", approve_widening = true,
+        })
+        lifecycle.record_role_transition = nil
+        assert(changed == nil and err.code == "E_ROLE_AUDIT")
+        assert(reviewer:is_tool_allowed("write_file") == false and reviewer.policy_generation == 1)
+        assert(reviewer.role_binding.binding_id == binding_id and reviewer.last_role_checkpoint == nil)
+        assert(reviewer:authority_reference() == reference and reviewer.session_id == session.session_id)
+        assert(#lifecycle:events() == event_count)
+        assert(lifecycle:get_session(session.session_id).role_binding.policy_generation == 1)
+        local forged, forged_err = lifecycle:record_role_transition(session.session_id, {
+          role_binding = { role = "coding", binding_id = "forged-pending-binding", policy_generation = 2 },
+          checkpoint = context:head_commit_hash(), reason = "role_widening", authority_reference = reference,
+        })
+        assert(forged == nil and forged_err.code == "E_LIFECYCLE_AUTHORITY")
+        lifecycle.record_authority_widening = function()
+          return nil, { code = "E_FORK_AUDIT", message = "fixture widening audit unavailable" }
+        end
+        local child, child_err = WheelAgent.fork_agent(reviewer, { name = "failed-export-child",
+          role = "coding", reason = "approved but unrecorded fork", approve_widening = true })
+        lifecycle.record_authority_widening = nil
+        assert(child == nil and child_err.code == "E_FORK_AUDIT")
+        assert(not reviewer:has_capability("modify") and reviewer.policy_generation == 1)
+        local found_child = false
+        for _, child_session in ipairs(lifecycle:list_sessions()) do
+          if child_session.agent_id == "failed-export-child" then
+            found_child = true
+            assert(child_session.state == WheelLifecycle.AgentSessionState.ENDED)
+          end
+        end
+        assert(found_child, "failed fork audit must end the child runtime session")
+        for _, event in ipairs(lifecycle:events()) do
+          assert(event.type ~= "agent_session.authority_widened")
+        end
+        reject_rawset(reviewer, "session_id", "forged-export-session")
+        assert(calls == 0)
+      end)
+    end)
   end)
 
   run_test("Agent identity: fork from an immutable ContextCommit keeps references only", function()
@@ -596,6 +962,23 @@ return function(run_test)
     assert(projection.identity.lineage.base_context_commit == base.hash)
     assert(projection.provenance.agent_id == child.agent_id)
     assert(projection.provenance.policy_generation == 1)
+
+    assert(context:put_slot("workspace/project", "Wheel provenance update").success)
+    local updated = checkpoint(context, "projection update", 1700000001000)
+    local changed = assert(child:context_projection({
+      base_commit = base.hash, current_commit = updated.hash, role = WheelContext.Role.REVIEWER,
+      task_id = "TASK-PROJECTION",
+    }))
+    local saw_delta = false
+    for _, record in ipairs(changed.layers.P3.records) do
+      if record.ref == "slot:workspace/project" then saw_delta = true end
+      assert(record.provenance.agent_id == changed.provenance.agent_id)
+      assert(record.provenance.policy_generation == changed.provenance.policy_generation)
+      assert(record.provenance.source_session == changed.provenance.source_session)
+      assert(record.provenance.source_commit == changed.provenance.source_commit)
+    end
+    assert(saw_delta and changed.provenance.agent_id == child.agent_id)
+    assert(changed.provenance.policy_generation == child.policy_generation)
 
     local forged_identity, identity_err = child:context_projection({
       base_commit = base.hash,

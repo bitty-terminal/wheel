@@ -114,6 +114,12 @@ RoleBinding reads come from private storage, and `rawset` rejects the handle
 without changing public identity or routing. Table introspection of an Agent
 is unsupported; use `status()` for a defensive table projection.
 
+RoleBinding normalization, issuance, and reference projection use private
+helpers. Replacing the exported compatibility helpers cannot receive private
+bindings or grant authority; a fork issues exactly the binding checked for its
+capability delta. The canonical Commander binding permits declared Execute
+tools and denies direct Modify; explicit narrowed bindings retain their limits.
+
 `agent:transition_role(role, { reason = ..., approve_widening = ... })` keeps the
 `AgentId`, issues the next policy generation, and commits an immutable Context
 checkpoint boundary. A transition that would add a capability fails closed with
@@ -128,7 +134,8 @@ protected Agent issuer and records a bounded
 and rejects caller-supplied, stale, skipped, reused, or forged generations on
 reload. Approved fork widening also requires independent parent and child
 runtime sessions and emits an `agent_session.authority_widened` event before
-the child is returned.
+the child is returned. An ended or abandoned parent session cannot authorize
+fork widening; refusal occurs before child runtime creation.
 
 `WheelAgent.fork_agent(parent, opts)` and `WheelTeam:fork_agent(...)` create an
 independent Agent identity from an immutable `ContextCommit`. The child records
@@ -137,7 +144,9 @@ and its initial `RoleBinding`; it shares the Context engine by reference and
 receives no copied transcript or slot snapshot. A fork that would exceed its
 parent's capability state is refused without explicit approval. Forked Agents
 can run in their own `AgentSession` and Headless Panel, and status, team status,
-and Context projections expose the identity and lineage references.
+and Context projections expose the identity and lineage references. P3 semantic
+delta records retain the same validated AgentId and policy generation as the
+root projection.
 
 ### Scope
 

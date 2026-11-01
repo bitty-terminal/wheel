@@ -77,6 +77,11 @@ Lifecycle authority references must be issued by the Agent's private registry;
 caller resolvers, forged tokens, or restored metadata cannot authorize role
 transitions or widening. Public Agent handles reject `rawset`, keeping direct
 identity and lineage reads consistent with status, authorization, and routing.
+Private binding helpers keep replaceable compatibility exports outside the
+authority path. Fork issuance uses the checked binding, terminal parent
+sessions cannot authorize widening, and lifecycle replay rejects skipped
+successive policy generations. Context delta provenance retains the validated
+Agent identity and policy generation.
 
 ### Superseded plugin-sandbox scope (historical)
 

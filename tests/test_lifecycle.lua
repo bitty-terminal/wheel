@@ -474,6 +474,34 @@ local ok, err = pcall(function()
     assert(not WheelHost.fs.stat(path).exists)
   end)
 
+  run_test("Lifecycle: replay rejects skipped successive policy generations", function()
+    local path = root .. "/skipped-policy-generation.json"
+    local life = Lifecycle.new({ path = path })
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local agent = WheelAgent.new({ name = "successive-policy-agent", role = "coding",
+      kernel = kernel, context = context, lifecycle = life })
+    local session = assert(agent:create_runtime_session())
+    assert(agent:transition_role("debug", { reason = "first successive generation" }))
+    assert(agent:transition_role("coding", { reason = "second successive generation" }))
+    assert(Lifecycle.new({ path = path }):get_session(session.session_id).role_binding.policy_generation == 3)
+    local forged = Session.json_decode(assert(WheelHost.fs.read_file(path)))
+    for _, event in ipairs(forged.events) do
+      if event.type == "agent_session.role_transition" and event.policy_generation == 3 then
+        event.policy_generation = 4
+      end
+    end
+    forged.sessions[session.session_id].role_binding.policy_generation = 4
+    assert(WheelHost.fs.remove_file(path))
+    for _, retained in ipairs({ false, true }) do
+      if retained then table.remove(forged.events, 1) end
+      assert(WheelHost.fs.create_private_file(path, Session.json_encode(forged)))
+      assert(not pcall(Lifecycle.new, { path = path }), "forged 2 -> 4 transition must fail full and retained replay")
+      assert(not WheelHost.fs.stat(path).exists)
+    end
+  end)
+
   run_test("Lifecycle: registry symlink never overwrites its target", function()
     local target, link = root .. "/sentinel", root .. "/link.json"
     assert(WheelHost.fs.create_private_file(target, "preserve-this"))
