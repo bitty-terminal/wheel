@@ -73,6 +73,11 @@ capability without an audited policy generation and checkpoint, a fork that
 exceeds its parent's authority, or any authority wider than the approved
 ceiling.
 
+Lifecycle authority references must be issued by the Agent's private registry;
+caller resolvers, forged tokens, or restored metadata cannot authorize role
+transitions or widening. Public Agent handles reject `rawset`, keeping direct
+identity and lineage reads consistent with status, authorization, and routing.
+
 ### Superseded plugin-sandbox scope (historical)
 
 The following text described the pre-decision plugin position. It is superseded

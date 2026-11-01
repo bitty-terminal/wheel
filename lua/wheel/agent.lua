@@ -7,7 +7,10 @@ local WheelAgent = {}
 local AGENT_IDENTITY = setmetatable({}, { __mode = "k" })
 local AGENT_AUTHORITY = setmetatable({}, { __mode = "k" })
 local AGENT_RUNTIME = setmetatable({}, { __mode = "k" })
+local AGENT_FIELDS = setmetatable({}, { __mode = "k" })
+local AUTHORITY_AGENTS = setmetatable({}, { __mode = "kv" })
 local PENDING_FORK_WIDENING = setmetatable({}, { __mode = "k" })
+local agent_index, agent_newindex
 
 local function authoritative_identity(agent)
   return AGENT_IDENTITY[agent]
@@ -517,9 +520,18 @@ function WheelAgent.new(opts)
     error("Agent requires a 'kernel' (WheelKernel instance)")
   end
 
-  local self = setmetatable({}, WheelAgent)
+  -- Lua 5.1/LuaJIT userdata preserves field syntax without a raw table surface.
+  -- A table proxy cannot protect identity because rawset bypasses __newindex.
+  if type(newproxy) ~= "function" then error("Agent requires Lua 5.1/LuaJIT opaque handles") end
+  local self = newproxy(true)
+  local handle_meta = getmetatable(self)
+  handle_meta.__index = agent_index
+  handle_meta.__newindex = agent_newindex
+  handle_meta.__metatable = "WheelAgent"
+  AGENT_FIELDS[self] = {}
   AGENT_IDENTITY[self] = { agent_id = agent_id, lineage = lineage }
   AGENT_AUTHORITY[self] = { role_binding = role_binding, token = {} }
+  AUTHORITY_AGENTS[authoritative_binding_token(self)] = self
   self.name = opts.name
   self.role = role_binding.role
   self.kernel = opts.kernel
@@ -640,6 +652,8 @@ function WheelAgent:create_runtime_session(opts)
     panel, panel_err = lifecycle:ready_panel(panel.panel_id)
     if not panel then return nil, panel_err end
   end
+  local runtime = AGENT_RUNTIME[self]
+  runtime.pending_session_panel = panel.panel_id
   local session, session_err = lifecycle:create_agent_session({
     session_id = opts.session_id,
     agent_id = authoritative_identity(self).agent_id,
@@ -649,36 +663,13 @@ function WheelAgent:create_runtime_session(opts)
     context_head = opts.context_head,
     role_binding = WheelAgent.binding_reference(authoritative_binding(self)),
     authority_reference = authoritative_binding_token(self),
-    authority_resolver = function(candidate)
-      local runtime = AGENT_RUNTIME[self]
-      local identity = authoritative_identity(self)
-      local current_binding = authoritative_binding(self)
-      local pending_binding = runtime and runtime.pending_role_binding
-      if not identity or type(current_binding) ~= "table"
-        or (pending_binding and type(pending_binding) ~= "table")
-        or type(candidate) ~= "table"
-        or (not pending_binding and candidate.role ~= current_binding.role)
-        or (not pending_binding and candidate.binding_id ~= current_binding.binding_id)
-        or (not pending_binding and candidate.policy_generation ~= current_binding.policy_generation)
-        or (pending_binding and candidate.role ~= pending_binding.role)
-        or (pending_binding and candidate.binding_id ~= pending_binding.binding_id)
-        or (pending_binding and candidate.policy_generation ~= pending_binding.policy_generation) then
-        return nil
-      end
-      local binding = pending_binding or current_binding
-      return {
-        agent_id = identity.agent_id,
-        role_binding = WheelAgent.binding_reference(binding),
-        capabilities = deep_copy(binding.capabilities),
-      }
-    end,
     model_profile = opts.model_profile or self.model_profile,
     worktree_id = opts.worktree_id or self.worktree_id,
   })
+  runtime.pending_session_panel = nil
   if not session then
     return nil, session_err
   end
-  local runtime = AGENT_RUNTIME[self]
   runtime.session_id = session.session_id
   runtime.panel_id = panel.panel_id
   return session, panel
@@ -1516,8 +1507,8 @@ end
 -- @return table|nil child agent, table|nil typed error
 function WheelAgent.fork_agent(parent, opts)
   opts = opts or {}
-  local parent_binding = type(parent) == "table" and authoritative_binding(parent) or nil
-  local parent_identity = type(parent) == "table" and authoritative_identity(parent) or nil
+  local parent_binding = authoritative_binding(parent)
+  local parent_identity = authoritative_identity(parent)
   if not parent_binding or not parent_identity then
     return nil, { code = "E_FORK_INVALID", message = "fork requires a parent Agent" }
   end
@@ -1705,7 +1696,7 @@ local IMMUTABLE_FIELDS = {
   last_role_checkpoint = true,
 }
 
-function WheelAgent.__index(target, key)
+agent_index = function(target, key)
   if key == "agent_id" or key == "lineage" then
     local identity = AGENT_IDENTITY[target]
     if not identity then return nil end
@@ -1724,14 +1715,55 @@ function WheelAgent.__index(target, key)
     return deep_copy(authoritative_context_refs(target))
   end
   if key == "lifecycle" then return authoritative_lifecycle(target) end
+  local fields = AGENT_FIELDS[target]
+  if fields and fields[key] ~= nil then return fields[key] end
   return WheelAgent[key]
 end
 
-function WheelAgent.__newindex(target, key, value)
+agent_newindex = function(target, key, value)
   if IMMUTABLE_FIELDS[key] then
     error("agent identity field '" .. tostring(key) .. "' is immutable", 2)
   end
-  rawset(target, key, value)
+  local fields = AGENT_FIELDS[target]
+  if not fields then error("invalid Agent handle", 2) end
+  fields[key] = value
+end
+WheelAgent.__index = agent_index
+WheelAgent.__newindex = agent_newindex
+
+-- The protected module metatable is a read-only issuer bridge. Lifecycle reads
+-- this bridge rather than any replaceable module export or caller callback.
+-- References resolve only through the private registry populated by new().
+local function resolve_authority(reference, lifecycle, session_id, candidate, creation)
+  local agent = AUTHORITY_AGENTS[reference]
+  local runtime = agent and AGENT_RUNTIME[agent]
+  local identity = agent and authoritative_identity(agent)
+  local current = agent and authoritative_binding(agent)
+  if not runtime or not identity or not current or runtime.lifecycle ~= lifecycle
+    or type(candidate) ~= "table" then return nil end
+  if creation then
+    if runtime.pending_session_panel ~= creation.panel_id
+      or identity.agent_id ~= creation.agent_id then return nil end
+  elseif runtime.session_id ~= session_id then
+    return nil
+  end
+  local binding = (not creation and runtime.pending_role_binding) or current
+  if candidate.role ~= binding.role or candidate.binding_id ~= binding.binding_id
+    or candidate.policy_generation ~= binding.policy_generation then return nil end
+  return {
+    agent_id = identity.agent_id,
+    role_binding = { role = binding.role, binding_id = binding.binding_id,
+      policy_generation = binding.policy_generation },
+    capabilities = deep_copy(binding.capabilities),
+  }
+end
+if type(newproxy) == "function" then
+  local issuer = newproxy(true)
+  local issuer_meta = getmetatable(issuer)
+  issuer_meta.__index = function(_, key) if key == "resolve" then return resolve_authority end end
+  issuer_meta.__newindex = function() error("Agent issuer is immutable", 2) end
+  issuer_meta.__metatable = "WheelAgent issuer"
+  setmetatable(WheelAgent, { __metatable = issuer })
 end
 
 return WheelAgent

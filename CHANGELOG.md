@@ -16,6 +16,15 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Close CTX-0046 PX-0417 authority and identity defects: lifecycle session
+  creation rejects caller resolvers and forged references, while transitions
+  and fork widening validate private Agent-issued references against a protected
+  issuer. Persisted metadata cannot recreate authority. Public Agents use opaque
+  Lua 5.1/LuaJIT handles that reject `rawset`, preserving canonical direct
+  identity, lineage, authorization, and session routing. Adversarial regressions
+  cover fabricated and borrowed tokens, the Reviewer-to-Coding resolver exploit,
+  restored metadata, issuer tampering, and public identity shadow attempts.
+
 - Agent identity, RoleBinding, policy generations, and fork lineage (CTX-0046 /
   wheel#115): a stable, immutable `AgentId` is separate from the role it holds;
   each Agent carries a `RoleBinding` with a monotonic `policy_generation` and a

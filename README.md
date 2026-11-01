@@ -108,13 +108,22 @@ lineage record. Runtime authorization reads the binding's capability state;
 prompt or identity text never grants authority, and an explicit capability list
 may narrow a role's matrix but never widen it.
 
+Agents are opaque Lua 5.1/LuaJIT userdata handles with the existing field and
+method API. Mutable runtime fields remain available; identity, lineage, and
+RoleBinding reads come from private storage, and `rawset` rejects the handle
+without changing public identity or routing. Table introspection of an Agent
+is unsupported; use `status()` for a defensive table projection.
+
 `agent:transition_role(role, { reason = ..., approve_widening = ... })` keeps the
 `AgentId`, issues the next policy generation, and commits an immutable Context
 checkpoint boundary. A transition that would add a capability fails closed with
 `E_ROLE_AUTHORITY` unless the caller explicitly approves the widening; the
-approval and the previous generation are recorded in the checkpoint. When the
-Agent has a runtime session, it must be bound to the Agent's canonical
-identity and capability state. The lifecycle registry records a bounded
+approval and the previous generation are recorded in the checkpoint. The Agent
+must have a runtime session bound to its privately issued authority reference.
+Caller-provided resolvers and fabricated or borrowed references are rejected;
+metadata-only and reloaded sessions cannot authorize role changes or widening.
+The lifecycle registry resolves identity and pending bindings through the
+protected Agent issuer and records a bounded
 `agent_session.role_transition` event with the new generation and checkpoint,
 and rejects caller-supplied, stale, skipped, reused, or forged generations on
 reload. Approved fork widening also requires independent parent and child

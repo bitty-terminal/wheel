@@ -137,6 +137,10 @@
   from prompt or identity text. A role transition preserves the AgentId, issues
   a new policy generation, and commits a Context checkpoint boundary; a
   transition or fork that widens capability requires explicit approval.
+- Lifecycle authority uses private Agent-issued references and a protected
+  issuer bridge, never caller resolvers or restored metadata. Agent instances
+  are opaque Lua 5.1/LuaJIT handles; use their field/method API or `status()`,
+  never table introspection or `rawset`.
 - High-risk operations (shell strings, secret reads, trust approval, new
   network destinations) fail closed when audit cannot record them.
 - The experimental local session daemon (`scripts/wheel-session`) is

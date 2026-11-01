@@ -354,6 +354,88 @@ local ok, err = pcall(function()
     assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
   end)
 
+  run_test("Lifecycle: callers cannot mint canonical Agent authority", function()
+    local life = Lifecycle.new({ max_sessions_per_agent = 3 })
+    assert(life:create_panel({ panel_id = "forged-panel" }))
+    local token = {}
+    local calls = 0
+    local function forged_resolver(candidate)
+      calls = calls + 1
+      return { agent_id = "forged-agent", role_binding = candidate,
+        capabilities = { "inspect", "verify", "modify", "execute" } }
+    end
+    local initial = { role = "reviewer", binding_id = "forged-binding:1", policy_generation = 1 }
+    local created, create_err = life:create_agent_session({
+      session_id = "forged-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial, authority_reference = token, authority_resolver = forged_resolver,
+    })
+    assert(created == nil and create_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(calls == 0 and life:get_session("forged-session") == nil)
+    local token_only, token_err = life:create_agent_session({
+      session_id = "forged-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial, authority_reference = token,
+    })
+    assert(token_only == nil and token_err.code == "E_LIFECYCLE_AUTHORITY")
+    local plain = assert(life:create_agent_session({
+      session_id = "plain-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial,
+    }))
+    -- Public-looking backing fields and a caller resolver cannot turn metadata
+    -- sessions into canonical Agent sessions, including the reviewer's exploit.
+    life._authority_tokens = { [plain.session_id] = token }
+    life._authority_resolvers = { [plain.session_id] = forged_resolver }
+    life._authorize_session = function() return true end
+    life._resolve_session_authority = function(_, _, _, candidate) return forged_resolver(candidate) end
+    local changed, err = life:record_role_transition(plain.session_id, {
+      role_binding = { role = "coding", binding_id = "forged-binding:2", policy_generation = 2 },
+      checkpoint = string.rep("ab", 32), reason = "role_widening", authority_reference = token,
+    })
+    assert(changed == nil and err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(calls == 0 and life:authority_reference(plain.session_id) == nil)
+    assert(life:get_session(plain.session_id).role_binding.role == "reviewer")
+    assert(life:get_session(plain.session_id).role_binding.policy_generation == 1)
+    assert(#life:events() == 2)
+
+    local second = assert(life:create_agent_session({
+      session_id = "plain-child", agent_id = "plain-child", panel_id = "forged-panel",
+      role_binding = { role = "coding", binding_id = "plain-child:1", policy_generation = 1 },
+    }))
+    life._authority_tokens[second.session_id] = token
+    life._authority_resolvers[second.session_id] = forged_resolver
+    local widened, widen_err = life:record_authority_widening(plain.session_id, second.session_id, {
+      parent_authority_reference = token, child_authority_reference = token,
+      checkpoint = string.rep("ab", 32), capability_delta = "modify,execute",
+    })
+    assert(widened == nil and widen_err.code == "E_LIFECYCLE_AUTHORITY" and calls == 0)
+
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local reviewer = WheelAgent.new({ name = "issuer-reviewer", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = life })
+    local session = assert(reviewer:create_runtime_session({ session_id = "issuer-session" }))
+    local reference = reviewer:authority_reference()
+    assert(reference == life:authority_reference(session.session_id))
+    local candidate = { role = "coding", binding_id = "role-binding:issuer-reviewer:2", policy_generation = 2 }
+    local forged_transition, forged_err = life:record_role_transition(session.session_id, {
+      role_binding = candidate, checkpoint = string.rep("cd", 32),
+      reason = "role_widening", authority_reference = reference,
+    })
+    assert(forged_transition == nil and forged_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(not reviewer:has_capability("modify") and reviewer.agent_id == session.agent_id)
+    local borrowed, borrow_err = life:create_agent_session({
+      session_id = "borrowed-session", agent_id = reviewer.agent_id, panel_id = session.panel_id,
+      role_binding = reviewer.role_binding, authority_reference = reference,
+    })
+    assert(borrowed == nil and borrow_err.code == "E_LIFECYCLE_AUTHORITY")
+    local issuer = getmetatable(WheelAgent)
+    assert(not pcall(function() issuer.resolve = forged_resolver end))
+    assert(not pcall(rawset, issuer, "resolve", forged_resolver))
+    assert(not pcall(setmetatable, WheelAgent, { __metatable = { resolve = forged_resolver } }))
+    assert(reviewer:transition_role("coding", { reason = "approved escalation", approve_widening = true }))
+    assert(reviewer:has_capability("modify"))
+  end)
+
   run_test("Lifecycle: persisted policy generations reject a forged history", function()
     local path = root .. "/role-transition.json"
     local life = Lifecycle.new({ path = path })
@@ -375,6 +457,13 @@ local ok, err = pcall(function()
     assert(record.role_binding.role == "debug")
     assert(record.role_binding.policy_generation == 2)
     assert(type(record.checkpoint) == "string")
+    local resumed, resume_err = reloaded:record_role_transition("role-session", {
+      role_binding = { role = "coding", binding_id = "reloaded:3", policy_generation = 3 },
+      reason = "role_widening", checkpoint = record.checkpoint,
+      authority_reference = agent:authority_reference(),
+    })
+    assert(resumed == nil and resume_err.code == "E_LIFECYCLE_AUTHORITY",
+      "persisted metadata must not restore in-process Agent authority")
 
     local raw = assert(WheelHost.fs.read_file(path))
     local forged = Session.json_decode(raw)

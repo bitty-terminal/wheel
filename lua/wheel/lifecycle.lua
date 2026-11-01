@@ -32,6 +32,19 @@ local Session = load_submodule("session")
 
 local Lifecycle = {}
 Lifecycle.__index = Lifecycle
+local SESSION_AUTHORITIES = setmetatable({}, { __mode = "k" })
+local resolve_agent_authority
+
+local function canonical_agent_authority(reference, lifecycle, session_id, candidate, creation)
+  if not resolve_agent_authority then
+    -- Lazy loading avoids the Agent -> Lifecycle import cycle. The protected,
+    -- opaque issuer bridge cannot be replaced by assigning module fields.
+    local issuer = getmetatable(load_submodule("agent"))
+    if type(issuer) ~= "userdata" or type(issuer.resolve) ~= "function" then return nil end
+    resolve_agent_authority = issuer.resolve
+  end
+  return resolve_agent_authority(reference, lifecycle, session_id, candidate, creation)
+end
 
 Lifecycle.AgentSessionState = {
   CREATED = "created", ACTIVE = "active", PAUSED = "paused", STALE = "stale",
@@ -858,8 +871,7 @@ function Lifecycle.new(opts)
     or self.policy.max_sessions_per_agent > MAX_SESSIONS) then error("invalid session policy") end
   self.revision, self.next_counter = 0, 0
   self.sessions, self.panels, self.events_log = {}, {}, {}
-  self._authority_tokens = {}
-  self._authority_resolvers = {}
+  SESSION_AUTHORITIES[self] = {}
   if self.path then
     local ok, err = self:load()
     if not ok then error(err, 0) end
@@ -992,7 +1004,8 @@ function Lifecycle:load()
   local state = from_payload(decoded)
   self.revision, self.policy, self.next_counter = state.revision, state.policy, state.next_counter
   self.sessions, self.panels, self.events_log = state.sessions, state.panels, state.events
-  for session_id in pairs(self.sessions) do self._authority_tokens[session_id] = {} end
+  -- Persisted metadata is never an in-process Agent capability.
+  SESSION_AUTHORITIES[self] = {}
   return true
 end
 function Lifecycle:save() return self:_commit(self:_state()) end
@@ -1034,9 +1047,12 @@ end
 function Lifecycle:create_agent_session(opts)
   opts = opts or {}
   local authority_reference = opts.authority_reference
-  local authority_resolver = opts.authority_resolver
-  if authority_resolver ~= nil and type(authority_resolver) ~= "function" then
-    return nil, { code="E_LIFECYCLE_AUTHORITY", message="authority resolver must be canonical" }
+  if opts.authority_resolver ~= nil then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="caller authority resolvers are forbidden" }
+  end
+  if authority_reference ~= nil and not canonical_agent_authority(
+    authority_reference, self, nil, opts.role_binding, opts) then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="session requires an Agent-issued authority reference" }
   end
   local created, create_err = self:_change(function(state)
     local agent_id, err = identity_id(opts.agent_id, "agent_id", true); if not agent_id then return false, { code="E_LIFECYCLE_INVALID", message=err } end
@@ -1079,29 +1095,25 @@ function Lifecycle:create_agent_session(opts)
     state.sessions[session_id] = record; local event, event_err = new_event(state, "agent_session.created", record, nil, S.CREATED, nil, function(prefix) return self:_next_id(state, prefix) end); if not event then return false, { code="E_LIFECYCLE_INVALID", message=event_err } end
     return copy(record)
   end)
-  if created and authority_resolver then
-    self._authority_tokens[created.session_id] = authority_reference or {}
-    self._authority_resolvers[created.session_id] = authority_resolver
+  if created and authority_reference then
+    SESSION_AUTHORITIES[self][created.session_id] = authority_reference
   end
   return created, create_err
 end
 function Lifecycle:authority_reference(session_id)
   if not self.sessions[session_id] then return nil end
-  return self._authority_tokens[session_id]
+  return SESSION_AUTHORITIES[self][session_id]
 end
 function Lifecycle:_authorize_session(session_id, reference)
-  local expected = self._authority_tokens[session_id]
+  local expected = SESSION_AUTHORITIES[self][session_id]
   return expected ~= nil and reference ~= nil and expected == reference
 end
-function Lifecycle:_resolve_session_authority(session_id, reference, candidate)
-  if not self:_authorize_session(session_id, reference) then
+local function resolve_session_authority(self, session_id, reference, candidate)
+  local expected = SESSION_AUTHORITIES[self][session_id]
+  if expected == nil or reference == nil or expected ~= reference then
     return nil, { code="E_LIFECYCLE_AUTHORITY", message="session authority is not canonical" }
   end
-  local resolver = self._authority_resolvers[session_id]
-  if type(resolver) ~= "function" then
-    return nil, { code="E_LIFECYCLE_AUTHORITY", message="session is not bound to a canonical Agent" }
-  end
-  local called, resolved = pcall(resolver, candidate)
+  local called, resolved = pcall(canonical_agent_authority, reference, self, session_id, candidate)
   if not called or type(resolved) ~= "table"
     or type(resolved.agent_id) ~= "string"
     or type(resolved.role_binding) ~= "table"
@@ -1117,6 +1129,9 @@ function Lifecycle:_resolve_session_authority(session_id, reference, candidate)
     return nil, { code="E_LIFECYCLE_AUTHORITY", message="canonical Agent capabilities are empty" }
   end
   return resolved
+end
+function Lifecycle:_resolve_session_authority(session_id, reference, candidate)
+  return resolve_session_authority(self, session_id, reference, candidate)
 end
 function Lifecycle:_session_in(state, session_id)
   local record = state.sessions[session_id]; if not record then return nil, { code="E_LIFECYCLE_NOT_FOUND", message="agent session not found" } end; return record
@@ -1211,8 +1226,8 @@ function Lifecycle:record_role_transition(session_id, opts)
     if transition_reason ~= "role_transition" and transition_reason ~= "role_widening" then
       return false, { code="E_LIFECYCLE_INVALID", message="role transition requires a role reason code" }
     end
-    local canonical, authority_err = self:_resolve_session_authority(
-      session_id, opts.authority_reference, binding)
+    local canonical, authority_err = resolve_session_authority(
+      self, session_id, opts.authority_reference, binding)
     if not canonical or canonical.agent_id ~= record.agent_id then
       return false, authority_err or { code="E_LIFECYCLE_AUTHORITY", message="role transition identity is not canonical" }
     end
@@ -1231,10 +1246,10 @@ function Lifecycle:record_authority_widening(parent_session_id, child_session_id
   return self:_change(function(state)
     local parent, parent_err = self:_session_in(state, parent_session_id); if not parent then return false, parent_err end
     local child, child_err = self:_session_in(state, child_session_id); if not child then return false, child_err end
-    local parent_authority, parent_authority_err = self:_resolve_session_authority(
-      parent_session_id, opts.parent_authority_reference, parent.role_binding)
-    local child_authority, child_authority_err = self:_resolve_session_authority(
-      child_session_id, opts.child_authority_reference, child.role_binding)
+    local parent_authority, parent_authority_err = resolve_session_authority(
+      self, parent_session_id, opts.parent_authority_reference, parent.role_binding)
+    local child_authority, child_authority_err = resolve_session_authority(
+      self, child_session_id, opts.child_authority_reference, child.role_binding)
     if not parent_authority or not child_authority
       or parent_authority.agent_id ~= parent.agent_id
       or child_authority.agent_id ~= child.agent_id then

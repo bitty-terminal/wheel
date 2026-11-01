@@ -557,6 +557,14 @@ security principals. The following matrix is mandatory and fail-closed:
   monotonic policy generation and an immutable Context checkpoint boundary. A
   change that would add a capability fails closed unless explicitly approved,
   and each transition is an audited, bounded lifecycle event.
+- Canonical lifecycle authority is an Agent-issued opaque reference bound to
+  that Agent, lifecycle instance, and session in private storage. Session
+  creation rejects caller resolvers and fabricated or borrowed references;
+  transition and widening APIs validate bindings against the protected Agent
+  issuer. Persisted metadata cannot restore an in-process authority reference.
+- Public Agents are opaque Lua 5.1/LuaJIT handles: `rawset` fails rather than
+  shadowing identity, lineage, RoleBinding, or session fields. Identity reads,
+  status, authorization, routing, and provenance use the same private state.
 - A forked Agent may not exceed its parent's capability state without explicit
   approval; fork lineage carries references to immutable Context commits, never
   transcripts or copied context content.

@@ -12,6 +12,10 @@ local WheelKernel = require("wheel.kernel")
 local WheelLifecycle = require("wheel.lifecycle")
 local WheelTeam = require("wheel.team")
 
+local function reject_rawset(agent, key, value)
+  assert(not pcall(rawset, agent, key, value), "opaque Agent must reject rawset: " .. key)
+end
+
 local function fixed_context(kernel)
   local context = WheelContext.new({ kernel = kernel })
   assert(context:put_slot("workspace/project", "Wheel"))
@@ -85,11 +89,11 @@ return function(run_test)
       "mutating a returned RoleBinding must not change policy generation")
     assert(WheelAgent.ROLE_CAPABILITIES == nil,
       "the mutable authorization matrix must not be exported")
-    assert(rawget(agent, "_authority") == nil and rawget(agent, "_identity") == nil,
-      "authoritative identity and policy state must not be stored on the public Agent table")
-    rawset(agent, "_authority", { role_binding = { role = WheelAgent.Role.CODING,
+    assert(type(agent) == "userdata" and agent._authority == nil and agent._identity == nil,
+      "authoritative identity and policy state must not be stored on the public Agent handle")
+    reject_rawset(agent, "_authority", { role_binding = { role = WheelAgent.Role.CODING,
       capabilities = { "inspect", "verify", "modify", "execute" }, policy_generation = 99 } })
-    rawset(agent, "_identity", { agent_id = "forged", lineage = nil })
+    reject_rawset(agent, "_identity", { agent_id = "forged", lineage = nil })
     assert(agent:current_role() == WheelAgent.Role.CODING)
     assert(agent.agent_id == "identity-agent")
     assert(not agent:has_capability(WheelAgent.Capability.ORCHESTRATE),
@@ -97,9 +101,11 @@ return function(run_test)
     assert(agent.agent_id == "identity-agent")
     assert(agent.role_binding.policy_generation == 1)
 
-    rawset(agent, "agent_id", "forged-agent-id")
-    rawset(agent, "lineage", { forked_from_agent = "forged-parent" })
-    rawset(agent, "policy_generation", 99)
+    reject_rawset(agent, "agent_id", "forged-agent-id")
+    reject_rawset(agent, "lineage", { forked_from_agent = "forged-parent" })
+    reject_rawset(agent, "policy_generation", 99)
+    assert(agent.agent_id == "identity-agent")
+    assert(agent.lineage == nil and agent.policy_generation == 1)
     local authoritative_status = agent:status()
     assert(authoritative_status.agent_id == "identity-agent")
     assert(authoritative_status.policy_generation == 1)
@@ -230,7 +236,7 @@ return function(run_test)
       role = WheelAgent.Role.REVIEWER,
       kernel = kernel,
     })
-    rawset(reviewer, "role_binding", {
+    reject_rawset(reviewer, "role_binding", {
       role = WheelAgent.Role.COMMANDER,
       binding_id = "forged-commander-binding",
       policy_generation = 1,
@@ -262,10 +268,13 @@ return function(run_test)
       kernel = kernel, context = context, lifecycle = lifecycle })
     assert(first:create_runtime_session({ session_id = "runtime-first-session" }))
     assert(second:create_runtime_session({ session_id = "runtime-second-session" }))
-    rawset(first, "session_id", "runtime-second-session")
-    rawset(first, "policy_generation", 99)
-    rawset(first, "last_role_checkpoint", "forged-checkpoint")
-    rawset(first, "context_refs", { session_id = "runtime-second-session", branch = "forged" })
+    reject_rawset(first, "session_id", "runtime-second-session")
+    reject_rawset(first, "policy_generation", 99)
+    reject_rawset(first, "last_role_checkpoint", "forged-checkpoint")
+    reject_rawset(first, "context_refs", { session_id = "runtime-second-session", branch = "forged" })
+    reject_rawset(first, "agent_id", second.agent_id)
+    assert(first.agent_id == "runtime-first" and first:status().agent_id == first.agent_id)
+    assert(first:lineage_projection().agent_id == first.agent_id)
     assert(first:runtime_session_id() == "runtime-first-session")
     assert(first:context_reference().session_id == "runtime-first-session")
     assert(first:lineage_projection().policy_generation == 1)
@@ -373,6 +382,13 @@ return function(run_test)
     assert(child.lineage.forked_from_session == "fork-parent-session")
     assert(child.lineage.base_context_commit == base.hash)
     assert(child.lineage.reason == "parallel independent verification")
+    reject_rawset(child, "agent_id", parent.agent_id)
+    reject_rawset(child, "lineage", { forked_from_agent = "forged-parent" })
+    local exposed_lineage = child.lineage
+    exposed_lineage.forked_from_agent = "forged-parent"
+    assert(child.agent_id ~= parent.agent_id and child:status().agent_id == child.agent_id)
+    assert(child.lineage.forked_from_agent == parent.agent_id)
+    assert(child:status().lineage.forked_from_agent == child.lineage.forked_from_agent)
     assert(child.context == parent.context, "fork shares the context engine by reference")
     assert(child.context_refs.base_context_commit == base.hash)
     assert(child.context_refs.slots == nil and child.context_refs.transcript == nil)
@@ -455,7 +471,7 @@ return function(run_test)
 
     -- A public-field shadow must not make a read-only parent appear to hold
     -- capabilities that a fork would otherwise inherit.
-    rawset(wide_parent, "role_binding", {
+    reject_rawset(wide_parent, "role_binding", {
       role = WheelAgent.Role.COMMANDER,
       binding_id = "forged-commander-binding",
       policy_generation = 1,
