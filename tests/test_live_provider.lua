@@ -95,17 +95,10 @@ if key_state:match("^KEY_ABSENT ") then
 end
 assert(key_state == "KEY_PRESENT", "live helper key probe failed closed")
 
-local captured_outputs = {}
 local observed_budgets = {}
 local helper_calls = 0
 local cache_request_keys = {}
 local cache_usages = {}
-
-local function remember(text)
-  if type(text) == "string" and #text > 0 then
-    table.insert(captured_outputs, text)
-  end
-end
 
 local function fail_without_key(label, err)
   local message = tostring(err)
@@ -143,13 +136,13 @@ local function run_helper(spec)
   os.remove(request_path)
   os.remove(error_path)
 
-  remember(stdout)
-  remember(stderr)
-
   local status, body = stdout:match("^STATUS (%d+)\n(.*)$")
   if not status then
-    return nil, "test HTTP helper produced no status: " .. stderr:sub(1, 256)
+    -- The Python helper filters response bytes and diagnostics against its
+    -- credential. Lua reports only a fixed failure, never helper output.
+    return nil, "test HTTP helper produced no status"
   end
+  assert(stderr == "", "successful test HTTP helper must have no diagnostics")
   return tonumber(status), body
 end
 
@@ -175,9 +168,9 @@ local function http_client(req)
   local headers = {}
   for name, value in pairs(req.headers or {}) do
     local lower = string.lower(name)
-    if lower ~= "authorization" and lower ~= "x-api-key" then
-      headers[name] = value
-    end
+    assert(lower ~= "authorization" and lower ~= "x-api-key",
+      "live adapter request must not contain credential headers")
+    headers[name] = value
   end
 
   local status, body = run_helper({
@@ -189,9 +182,6 @@ local function http_client(req)
   if not status then
     return nil, body
   end
-
-  remember(req.body)
-  remember(body)
 
   if req.stream and req.on_stream_chunk and #body > 0 then
     for i = 1, #body, STREAM_CHUNK_SIZE do
@@ -402,7 +392,6 @@ do
   if not report.success then
     fail_without_key("runner", report.error)
   end
-  remember(report.artifacts)
   assert(report.iterations >= 2, "runner must complete a tool turn and a final turn")
   assert(#tools_called >= 1 and tools_called[1] == "get_time", "runner must dispatch the stub tool")
   assert(type(report.artifacts) == "string" and #report.artifacts > 0, "runner must produce deliverables")
@@ -419,10 +408,6 @@ for _, budget in ipairs(observed_budgets) do
     "live request budget must stay within the named bound")
 end
 assert(helper_calls == #observed_budgets, "every helper call must be a bounded provider request")
-
-for index, output in ipairs(captured_outputs) do
-  assert_no_key(output, "captured output " .. tostring(index))
-end
 
 print(string.format(
   "LIVE %s tests passed (%d bounded requests)",

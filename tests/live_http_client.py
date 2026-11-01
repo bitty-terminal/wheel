@@ -43,6 +43,7 @@ REQUEST_TIMEOUT_SECONDS = 90
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 STATUS_PREFIX = "STATUS"
+OUTPUT_REFUSAL = "test client refused credential-bearing output"
 HTTPS_PORT = 443
 # Command Code's edge rejects the default Python-urllib signature with a
 # Cloudflare 1010 error. Use one fixed, non-secret signature for every request
@@ -124,8 +125,12 @@ def select_provider(value: str | None = None) -> ProviderConfig:
     return config
 
 
-def _fail(message: str) -> int:
-    """Write a bounded, key-free diagnostic to stderr."""
+def _fail(message: str, api_key: str = "") -> int:
+    """Check the entire diagnostic before writing a bounded, static refusal."""
+    if api_key and api_key.encode("utf-8") in message.encode("utf-8"):
+        message = OUTPUT_REFUSAL
+        if api_key in message:
+            return 1
     sys.stderr.write(message[:512] + "\n")
     return 1
 
@@ -224,6 +229,8 @@ def main() -> int:
     api_key = os.environ.get(provider.api_key_env, "")
     if len(sys.argv) == 2 and sys.argv[1] == "--check-key":
         marker = "KEY_PRESENT" if api_key else f"KEY_ABSENT {provider.api_key_env}"
+        if api_key and api_key in marker:
+            return _fail(OUTPUT_REFUSAL, api_key)
         sys.stdout.buffer.write(f"{marker}\n".encode("ascii"))
         sys.stdout.buffer.flush()
         return 0
@@ -233,27 +240,34 @@ def main() -> int:
     try:
         raw_spec = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     except OSError:
-        return _fail("failed to read the request specification from stdin")
+        return _fail("failed to read the request specification from stdin", api_key)
     if len(raw_spec) > MAX_REQUEST_BYTES:
-        return _fail("request specification exceeds the test client bound")
+        return _fail("request specification exceeds the test client bound", api_key)
 
     try:
         spec = json.loads(raw_spec.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
-        return _fail("request specification is not valid JSON")
+        return _fail("request specification is not valid JSON", api_key)
 
     try:
         status, payload = fetch(spec, api_key, allowed_host=provider.allowed_host)
     except InvalidRequest as error:
-        return _fail(str(error))
+        return _fail(str(error), api_key)
     except RedirectRefused:
-        return _fail("test client refused an HTTP redirect")
-    except TransportFailure:
-        return _fail("test HTTP request failed before a response was available")
+        return _fail("test client refused an HTTP redirect", api_key)
+    except Exception:
+        # Transport/library exception text may include credentials. Never let
+        # it reach a traceback or an unfiltered diagnostic.
+        return _fail(
+            "test HTTP request failed before a response was available", api_key
+        )
+
+    output = f"{STATUS_PREFIX} {status}\n".encode("ascii") + payload
+    if api_key.encode("utf-8") in output:
+        return _fail(OUTPUT_REFUSAL, api_key)
 
     stdout = sys.stdout.buffer
-    stdout.write(f"{STATUS_PREFIX} {status}\n".encode("ascii"))
-    stdout.write(payload)
+    stdout.write(output)
     stdout.flush()
     return 0
 

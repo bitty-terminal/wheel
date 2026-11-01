@@ -53,12 +53,14 @@ or linters by name):
    activation, or command dispatch; it requires `lua5.1` and fails closed
    without it.
 5. Run the opt-in live provider test only when needed: `just test-live` first
-   runs a key-free loopback redirect-policy test, then requires
-   the selected provider's key in the helper environment for the live portion
-   (`OPENROUTER_API_KEY`, `COMMANDCODE_API_KEY`, or `OPENAI_API_KEY`). It is
-   never part of `just check` or CI, and skips the live portion cleanly when
-   the selected key is absent. See the README's offline/live test section for
-   the selector and env-only key handling contract.
+   runs the key-free offline gates. `WHEEL_LIVE_PROVIDER` selects the live
+   provider, case-insensitively: `openrouter` (the default) uses only
+   `OPENROUTER_API_KEY`, `commandcode` uses only `COMMANDCODE_API_KEY`, and
+   `openai-cache` uses only `OPENAI_API_KEY`. Keep the selected key exclusively
+   in the Python helper's environment. The live portion is never part of
+   `just check` or CI and skips cleanly when its selected key is absent; keys
+   for other providers do not satisfy that requirement. See the README's
+   offline/live test section for scenario coverage and credential isolation.
 6. Record scoped work in CarryCtx (task, session, progress, checkpoint) and
    stop at review; independent review is required for acceptance.
 

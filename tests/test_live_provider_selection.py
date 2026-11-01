@@ -201,6 +201,67 @@ for _provider in client.PROVIDERS.values():
     assert stderr.getvalue() == ""
 print("PASS live HTTP client uses the selected provider key and host")
 
+# Provider bodies and transport diagnostics are untrusted, including errors.
+# Only this Python process sees the synthetic credential in these regressions.
+for _provider in client.PROVIDERS.values():
+    for _status in (200, 401):
+        fake_stdout = _FakeStdout()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    client.PROVIDER_SELECTOR_ENV: _provider.name,
+                    _provider.api_key_env: FAKE_KEY,
+                },
+            ),
+            mock.patch.object(sys, "argv", ["live_http_client.py"]),
+            mock.patch.object(sys, "stdin", _FakeStdin(b"{}")),
+            mock.patch.object(sys, "stdout", fake_stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                client,
+                "fetch",
+                return_value=(_status, b"\xffecho: " + FAKE_KEY.encode()),
+            ),
+        ):
+            exit_code = client.main()
+        assert exit_code == 1
+        assert fake_stdout.buffer.data == b""
+        assert stderr.getvalue() == "test client refused credential-bearing output\n"
+        assert FAKE_KEY not in stderr.getvalue()
+
+    for _error in (
+        client.InvalidRequest("echo: " + FAKE_KEY),
+        client.InvalidRequest("x" * 600 + FAKE_KEY),
+        ValueError("echo: " + FAKE_KEY),
+    ):
+        fake_stdout = _FakeStdout()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    client.PROVIDER_SELECTOR_ENV: _provider.name,
+                    _provider.api_key_env: FAKE_KEY,
+                },
+            ),
+            mock.patch.object(sys, "argv", ["live_http_client.py"]),
+            mock.patch.object(sys, "stdin", _FakeStdin(b"{}")),
+            mock.patch.object(sys, "stdout", fake_stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(client, "fetch", side_effect=_error),
+        ):
+            exit_code = client.main()
+        assert exit_code == 1
+        assert fake_stdout.buffer.data == b""
+        assert stderr.getvalue() in (
+            "test client refused credential-bearing output\n",
+            "test HTTP request failed before a response was available\n",
+        )
+        assert FAKE_KEY not in stderr.getvalue()
+print("PASS helper rejects credential echoes before stdout or stderr emission")
+
 # 5. An unset selected-provider key produces a clear, key-free failure even
 #    when the other provider's key is present.
 for _provider in client.PROVIDERS.values():
@@ -336,5 +397,25 @@ else:
     assert "SKIP test-live: OPENAI_API_KEY is not set" in result.stdout
     assert result.stderr == ""
     print("PASS live OpenAI cache test skips cleanly without its key")
+
+    for legacy_provider in (OPENROUTER, COMMANDCODE):
+        for mode in ("success", "failure"):
+            args = [lua, "tests/test_live_provider_offline.lua", legacy_provider.name]
+            if mode == "failure":
+                args.append(mode)
+            result = subprocess.run(
+                args,
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stderr == ""
+            assert "PASS offline legacy live scenarios" in result.stdout
+    print(
+        "PASS both legacy selectors complete synthetic adapter/runner scenarios and static failures"
+    )
 
 print("PASS live provider selection")

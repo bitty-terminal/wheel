@@ -822,15 +822,16 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                                                                                                                             |
 | `tests/test_agent_identity.lua`           | Agent identity, RoleBinding policy generations, audited role transitions without silent widening, fork lineage from immutable Context commits, independent Sessions/Panels, and capability-based authorization denial.                                                                                                     |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code, or official OpenAI cache evidence): complete, tool call, stream, runner, and repeated-prefix measured cache telemetry.                                                                                            |
+| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects and credential-bearing output, and never accepts the key via argv, files, or JSON.                                                                                                       |
+| `tests/test_live_provider_selection.py`   | Key-free offline selector and helper tests: selection, per-provider key/host binding, HTTPS-only requests, credential-echo rejection, static diagnostics, and synthetic legacy scenarios.                                                                                                                                  |
+| `tests/test_live_provider_offline.lua`    | Key-free legacy-selector regression using the real adapter and in-memory helper/runner doubles; covers scenario success tails, credential-free request headers, forbidden Lua credential reads, and static helper failures.                                                                                                |
 | `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                                                                                                                                     |
 | `tests/test_lifecycle.lua`                | AgentSession and Headless Panel lifecycle tests, including observer/controller separation and cross-process registry reload/recovery.                                                                                                                                                                                      |
 | `tests/test_audit.lua`                    | Execution-audit suite (`just test-audit`): append/rotation, private modes, hash chain, redaction, 16 KiB bounds, high-risk fail-closed, non-high-risk warning, and denied no-spawn behavior.                                                                                                                               |
 | `tests/test_cancel.lua`                   | Real cancellation suite (`just test-cancel`): separate CLI process, prompt terminal result, no orphan/unrelated signal, repeated cancel, timeout/cancel race, forged/stale generation refusal, and audit.                                                                                                                  |
-| `tests/live_http_client.py`               | Test-only stdlib HTTP transport for `just test-live`; reads the selected provider key, binds HTTPS to its host, rejects redirects, and never accepts the key via argv, files, or JSON.                                                                                                                                     |
 | `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                                                                                                                               |
 | `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                                                                                                                                 |
 | `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                                                                                                                                  |
-| `tests/test_live_provider_selection.py`   | Key-free offline selector test: default/case-insensitive selection, per-provider key and host binding, HTTPS-only requests, and fail-closed diagnostics.                                                                                                                                                                   |
 | `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                                                                                                                      |
 | `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                                                                                                                             |
 | `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                                                                                                                      |
@@ -1289,11 +1290,15 @@ WHEEL_LIVE_PROVIDER=openai-cache just test-live  # OpenAI cache evidence
   live portion skips successfully without contacting the provider.
 - `just test-live` is not part of `just check` or CI. Its key-free offline
   gates (`test-live-offline`: redirect policy, provider selection, host
-  binding) run first and are also part of `check`; the live portion then skips
+  binding, helper credential-echo rejection, and synthetic legacy scenarios)
+  run first and are also part of `check`; the live portion then skips
   with exit 0 and a clear message when the selected provider's key is absent.
-- The live portion calls the selected provider's model and covers a
-  non-streaming completion, a tool call with parsed arguments, an SSE stream,
-  and one runner ReAct turn with a stub tool.
+- The OpenRouter and Command Code live paths attempt a non-streaming
+  completion, a tool call with parsed arguments, an SSE stream, and one runner
+  ReAct turn with a stub tool. The `openai-cache` path is limited to the two
+  same-prefix completions described earlier. Offline legacy-selector tests
+  exercise the real adapter and success/failure tails with in-memory helper
+  and runner doubles; they do not establish live runner evidence.
 - Command Code serves a reasoning model, so content-bearing checks use a
   1024-token completion budget (at least 512 is required; a 64-token budget can
   be consumed entirely by reasoning and return empty content with
@@ -1305,8 +1310,12 @@ WHEEL_LIVE_PROVIDER=openai-cache just test-live  # OpenAI cache evidence
   test-only) reads the selected provider's key variable from its inherited
   environment and adds the authorization header after receiving a key-free
   request JSON over stdin. The key is never passed in argv, written to a
-  request file, logged, or placed in a captured artifact, and the live test
-  asserts it never appears in its captured output.
+  request file, logged, or placed in a captured artifact. Before emitting any
+  response bytes or diagnostics, the Python helper checks for its selected
+  credential and rejects a match with a static failure diagnostic. Synthetic
+  response-echo and diagnostic regressions cover this boundary. Lua never
+  reads the credential; it asserts the adapter sends no Authorization or
+  x-api-key header and reports helper failures using static text.
 - The client is HTTPS-only and accepts only the selected provider host on the
   default HTTPS port. It refuses every HTTP redirect without a second hop, so
   the authorization header cannot be forwarded to another host or downgraded to

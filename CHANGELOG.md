@@ -44,6 +44,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The transaction covers the owned in-process Context/kernel projection;
   CarryCtx remains the lifecycle and cross-process recovery system of record.
 
+- CTX-0048 review repairs: reject selected credentials in live-helper response
+  bytes and diagnostics before output, keep legacy live assertions key-free,
+  preserve configured stdio prompt-cache policies, and report contradictory
+  native/alias cache counters as errors using consistent normalization.
+  Offline regressions cover credential echoes, legacy selectors, direct and
+  factory stdio construction, and cache telemetry conflicts.
+
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
   exact revision conflicts, exception-safe lock cleanup, bounded recent history,

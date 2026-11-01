@@ -644,6 +644,61 @@ local function main()
   check(impossible_usage.uncached_input_tokens == nil,
     "impossible cached input must not produce a negative uncached count")
 
+  for _, conflict in ipairs({
+    { details = { cached_tokens = 16 }, alias = "cache_read_tokens", value = 0, read = 16 },
+    { details = { cached_tokens = 0 }, alias = "cache_read_tokens", value = 16, read = 0 },
+    { details = { cached_tokens = 16 }, alias = "cache_read_tokens", value = "bad", read = 16 },
+    { details = { cached_tokens = "bad" }, alias = "cache_read_tokens", value = 16 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_write_tokens", value = 0, write = 3 },
+    { details = { cache_write_tokens = 0 }, alias = "cache_creation_tokens", value = 3, write = 0 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_creation_tokens", value = -1, write = 3 },
+  }) do
+    local raw = { prompt_tokens = 40, prompt_tokens_details = conflict.details }
+    raw[conflict.alias] = conflict.value
+    local usage = WheelProvider.normalize_usage(raw, "openai")
+    check(usage.provider_cache_status == "error", "conflicting native/alias cache telemetry must be an error")
+    check(usage.cache_read_tokens == conflict.read and usage.cache_creation_tokens == conflict.write,
+      "native cache counts must take precedence over aliases, including zero and malformed counts")
+  end
+  for _, raw in ipairs({
+    { cache_read_tokens = 16, cache_write_tokens = 3 },
+    { cache_read_tokens = 16, cache_creation_tokens = 3 },
+    { prompt_tokens_details = { cached_tokens = 16, cache_write_tokens = 3 },
+      cache_read_tokens = 16, cache_write_tokens = 3, cache_creation_tokens = 3 },
+  }) do
+    raw.prompt_tokens = 40
+    local usage = WheelProvider.normalize_usage(raw, "openai")
+    check(usage.cache_read_tokens == 16 and usage.cache_creation_tokens == 3
+      and usage.uncached_input_tokens == 24 and usage.provider_cache_status == "verified_hit",
+      "matching native counts and supported top-level fallbacks must share normalization and status")
+  end
+  local alias_conflict = WheelProvider.normalize_usage({
+    prompt_tokens = 40, cache_write_tokens = 3, cache_creation_tokens = 0,
+  }, "openai")
+  check(alias_conflict.provider_cache_status == "error" and alias_conflict.cache_creation_tokens == 3,
+    "conflicting top-level fallbacks must preserve precedence and report an error")
+  local fallback_miss = WheelProvider.normalize_usage({
+    prompt_tokens = 40, cache_read_tokens = 0, cache_creation_tokens = 0,
+  }, "openai")
+  check(fallback_miss.provider_cache_status == "verified_miss"
+    and fallback_miss.uncached_input_tokens == 40,
+    "explicit zero fallback counts must yield a consistent verified miss")
+  local fallback_write = WheelProvider.normalize_usage({ cache_creation_tokens = 3 }, "openai")
+  check(fallback_write.provider_cache_status == "write_only" and fallback_write.cache_creation_tokens == 3,
+    "creation alias alone must support write-only evidence")
+  local invalid_fallback = WheelProvider.normalize_usage({ cache_read_tokens = "bad" }, "openai")
+  check(invalid_fallback.provider_cache_status == "error" and invalid_fallback.cache_read_tokens == nil,
+    "malformed fallback counts must fail without inventing normalized values")
+  local alias_impossible = WheelProvider.normalize_usage({ prompt_tokens = 40, cache_read_tokens = 45 }, "openai")
+  check(alias_impossible.provider_cache_status == "error" and alias_impossible.uncached_input_tokens == nil,
+    "impossible fallback cached reads must be rejected consistently")
+  local anthropic_conflict = WheelProvider.normalize_usage({ input_tokens = 20, output_tokens = 2,
+    completion_tokens = 9, cache_read_input_tokens = 12, cache_read_tokens = 0,
+    cache_creation_input_tokens = 3, cache_creation_tokens = 0 }, "anthropic")
+  check(anthropic_conflict.completion_tokens == 2 and anthropic_conflict.cache_read_tokens == 12
+    and anthropic_conflict.cache_creation_tokens == 3 and anthropic_conflict.provider_cache_status == "error",
+    "Anthropic native fields must retain precedence and contradictory cache aliases must be errors")
+
   local status_order = { "unsupported", "not_requested", "unknown", "verified_miss",
     "write_only", "verified_hit", "error" }
   for _, stronger in ipairs(status_order) do

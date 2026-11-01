@@ -7892,6 +7892,40 @@ run_test("WheelProvider.SSEParser: buffer limits and StdioAdapter prompt stdin p
   assert(string.find(captured_prompt, "hello stdio", 1, true) ~= nil, "runner must receive prompt")
 end)
 
+run_test("WheelProvider.StdioAdapter: direct and factory cache policy survives until validation", function()
+  for _, construction in ipairs({ "direct", "stdio", "local", "ollama" }) do
+    for _, policy in ipairs({ "off", "prefer", "required" }) do
+      local calls = 0
+      local opts = {
+        command = { "synthetic-model" },
+        prompt_cache_policy = policy,
+        runner = function()
+          calls = calls + 1
+          return "synthetic completion"
+        end,
+      }
+      local adapter
+      if construction == "direct" then
+        adapter = WheelProvider.StdioAdapter.new(opts)
+      else
+        adapter = assert(WheelProvider.create({ provider = construction }, opts))
+      end
+      assert(adapter.prompt_cache_policy == policy, "configured stdio policy must be preserved")
+      for _, method in ipairs({ "complete", "stream" }) do
+        local result, err = adapter[method](adapter, { messages = {} })
+        if policy == "required" then
+          assert(result == nil and err:find("unsupported", 1, true),
+            "unsupported stdio required policy must fail closed")
+          assert(calls == 0, "required policy must fail before runner execution")
+        else
+          assert(result and err == nil, "off and prefer must preserve stdio fallback")
+        end
+      end
+      assert(calls == (policy == "required" and 0 or 2))
+    end
+  end
+end)
+
 run_test("WheelProvider: OpenAI & Anthropic wire format, status check, and error stream rejection", function()
   -- 1. OpenAI format: assistant tool_calls converted to OpenAI wire schema
   local oai = WheelProvider.OpenAIAdapter.new({

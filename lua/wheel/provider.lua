@@ -197,8 +197,28 @@ end
 function WheelProvider.normalize_usage(usage, provider)
   if type(usage) ~= "table" then return nil end
   local normalized = {}
-  local read_raw, write_raw
+  local read_count, read_present, write_count
   local malformed_cache_usage = false
+  local function valid_cache_count(value)
+    return type(value) == "number" and value >= 0 and value % 1 == 0
+  end
+  local function select_cache_count(...)
+    local selected, count
+    for index = 1, select("#", ...) do
+      local value = select(index, ...)
+      if value ~= nil then
+        local valid = valid_cache_count(value)
+        if not valid then malformed_cache_usage = true end
+        if selected == nil then
+          selected = value
+          if valid then count = value end
+        elseif value ~= selected then
+          malformed_cache_usage = true
+        end
+      end
+    end
+    return count, selected ~= nil
+  end
   local function copy(target, source)
     local value = usage[source]
     if type(value) == "number" and value >= 0 and value % 1 == 0 then
@@ -213,63 +233,45 @@ function WheelProvider.normalize_usage(usage, provider)
     copy("completion_tokens", "output_tokens")
     copy("input_tokens", "input_tokens")
     copy("output_tokens", "output_tokens")
-    read_raw = usage.cache_read_input_tokens
-    write_raw = usage.cache_creation_input_tokens
+    read_count, read_present = select_cache_count(usage.cache_read_input_tokens, usage.cache_read_tokens)
+    write_count = select_cache_count(usage.cache_creation_input_tokens,
+      usage.cache_write_tokens, usage.cache_creation_tokens)
   else
     -- OpenAI prompt_tokens includes cached tokens when the provider reports
     -- them. The uncached field removes cache reads; cache writes are not reads.
     copy("prompt_tokens", "prompt_tokens")
     local details = type(usage.prompt_tokens_details) == "table" and usage.prompt_tokens_details or {}
-    read_raw = details.cached_tokens
-    write_raw = details.cache_write_tokens or usage.cache_write_tokens
+    if usage.prompt_tokens_details ~= nil and type(usage.prompt_tokens_details) ~= "table" then
+      malformed_cache_usage = true
+    end
+    read_count, read_present = select_cache_count(details.cached_tokens, usage.cache_read_tokens)
+    write_count = select_cache_count(details.cache_write_tokens,
+      usage.cache_write_tokens, usage.cache_creation_tokens)
   end
-  copy("completion_tokens", "completion_tokens")
+  if provider ~= "anthropic" or usage.output_tokens == nil then
+    copy("completion_tokens", "completion_tokens")
+  end
   copy("total_tokens", "total_tokens")
-  if provider == "anthropic" then
-    copy("cache_creation_tokens", "cache_creation_input_tokens")
-    copy("cache_read_tokens", "cache_read_input_tokens")
-  else
-    local details = type(usage.prompt_tokens_details) == "table" and usage.prompt_tokens_details or {}
-    local cached = details.cached_tokens
-    if type(cached) == "number" and cached >= 0 and cached % 1 == 0 then
-      normalized.cache_read_tokens = cached
-    end
-    copy("cache_creation_tokens", "cache_write_tokens")
-    if normalized.cache_creation_tokens == nil then
-      local cache_write = details.cache_write_tokens
-      if type(cache_write) == "number" and cache_write >= 0 and cache_write % 1 == 0 then
-        normalized.cache_creation_tokens = cache_write
-      end
-    end
-    if normalized.cache_creation_tokens == nil then copy("cache_creation_tokens", "cache_creation_tokens") end
-    copy("cache_read_tokens", "cache_read_tokens")
-  end
+  normalized.cache_read_tokens = read_count
+  normalized.cache_creation_tokens = write_count
   if provider ~= "anthropic" and normalized.prompt_tokens ~= nil then
     local cached = normalized.cache_read_tokens or 0
-    local cached_raw = type(usage.prompt_tokens_details) == "table"
-      and usage.prompt_tokens_details.cached_tokens or nil
-    if (cached_raw == nil or (type(cached_raw) == "number" and cached_raw >= 0
-        and cached_raw % 1 == 0))
+    if (not read_present or read_count ~= nil)
       and cached <= normalized.prompt_tokens then
       normalized.uncached_input_tokens = normalized.prompt_tokens - cached
     end
   end
-  local function valid_cache_count(value)
-    return type(value) == "number" and value >= 0 and value % 1 == 0
-  end
-  if read_raw ~= nil and not valid_cache_count(read_raw) then malformed_cache_usage = true end
-  if write_raw ~= nil and not valid_cache_count(write_raw) then malformed_cache_usage = true end
   if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
-    and valid_cache_count(read_raw) and read_raw > normalized.prompt_tokens then
+    and read_count ~= nil and read_count > normalized.prompt_tokens then
     malformed_cache_usage = true
   end
   if malformed_cache_usage then
     normalized.provider_cache_status = "error"
-  elseif type(read_raw) == "number" and read_raw > 0 then
+  elseif read_count ~= nil and read_count > 0 then
     normalized.provider_cache_status = "verified_hit"
-  elseif type(write_raw) == "number" and write_raw > 0 then
+  elseif write_count ~= nil and write_count > 0 then
     normalized.provider_cache_status = "write_only"
-  elseif type(read_raw) == "number" and type(write_raw) == "number" then
+  elseif read_count ~= nil and write_count ~= nil then
     normalized.provider_cache_status = "verified_miss"
   else
     normalized.provider_cache_status = "unknown"
@@ -2021,6 +2023,7 @@ function StdioAdapter.new(opts)
   self.command = opts.command or "ollama run qwen2.5-coder"
   self.timeout_ms = opts.timeout_ms
   self.runner = opts.runner
+  self.prompt_cache_policy = opts.prompt_cache_policy
   return self
 end
 
@@ -2214,6 +2217,7 @@ function WheelProvider.create(profile, opts)
       command = cmd,
       timeout_ms = opts.timeout_ms,
       runner = opts.runner,
+      prompt_cache_policy = opts.prompt_cache_policy,
     })
   else
     return nil, "Unknown or unsupported provider type: " .. tostring(p_type)
