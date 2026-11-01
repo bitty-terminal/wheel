@@ -244,6 +244,10 @@ if provider.name == "openai-cache" then
         "reported live prompt usage must exceed the documented cache minimum")
     end
     local status = usage.provider_cache_status or "unknown"
+    print(string.format(
+      "LIVE openai-cache attempt %d: provider_cache_status=%s prompt_tokens=%s cache_read_tokens=%s cache_creation_tokens=%s",
+      attempt, tostring(status), tostring(usage.prompt_tokens), tostring(usage.cache_read_tokens),
+      tostring(usage.cache_creation_tokens)))
     assert(status == "verified_hit" or status == "verified_miss" or status == "write_only"
       or status == "unknown" or status == "unsupported" or status == "error",
       "OpenAI cache status must reflect provider usage without inventing a hit")

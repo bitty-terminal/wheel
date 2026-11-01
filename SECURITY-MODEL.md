@@ -985,8 +985,8 @@ secret environment reads.
   use `uncached_input_tokens` for comparable uncached-input totals and never
   add OpenAI cached-read tokens to `prompt_tokens`. Aggregated cache status is
   independent of token totals and preserves the strongest evidence in this
-  order: `error` > `verified_hit` > `write_only` > `verified_miss` > `unknown`
-  > `not_requested` > `unsupported`.
+  order: `error` > `verified_hit` > `write_only` > `verified_miss` > `unknown` >
+  `not_requested` > `unsupported`.
 - Third-party tools and dependencies run with user authority.
 - The audit log and trust store are same-user files, not a tamper-proof record.
 - No release artifact, signature, or update channel exists yet; none may be

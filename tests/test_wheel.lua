@@ -6513,6 +6513,10 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(oai_res.usage.total_tokens == 25)
   assert(oai_res.usage.provider_cache_status == "verified_hit",
     "a later streaming miss must not overwrite an earlier cache hit")
+  assert(oai_res.usage.cache_read_tokens == 4,
+    "cache counters must come from the snapshot whose stronger status is retained")
+  assert(oai_res.usage.uncached_input_tokens == 6,
+    "uncached input must match the snapshot whose stronger status is retained")
   cache_usage_order = "miss_first"
   local oai_reverse, oai_reverse_err = oai_adapter:stream({
     messages = { { role = "user", content = "Test query" } },
@@ -6520,6 +6524,10 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   })
   assert(oai_reverse_err == nil and oai_reverse.usage.provider_cache_status == "verified_hit",
     "streaming cache hit must remain dominant when it arrives after a miss")
+  assert(oai_reverse.usage.cache_read_tokens == 4,
+    "reversed cache snapshots must retain counters matching the stronger hit status")
+  assert(oai_reverse.usage.uncached_input_tokens == 6,
+    "reversed snapshots must keep uncached input aligned with the retained hit")
 
   -- 2. Test AnthropicAdapter with mocked HTTP client emitting Anthropic SSE events
   --- Emit Anthropic input/cache and output usage in their native event shapes.

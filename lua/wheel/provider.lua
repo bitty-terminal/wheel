@@ -295,11 +295,23 @@ end
 --- Merge stream usage snapshots while retaining the strongest cache status.
 local function merge_usage(current, incoming)
   current = current or {}
-  for field, value in pairs(incoming or {}) do
+  incoming = incoming or {}
+  local retained_status = WheelProvider.aggregate_cache_status(
+    current.provider_cache_status, incoming.provider_cache_status)
+  local retain_incoming_cache = retained_status == incoming.provider_cache_status
+    and incoming.provider_cache_status ~= nil
+  local cache_fields = {
+    cache_read_tokens = true,
+    cache_creation_tokens = true,
+    uncached_input_tokens = true,
+  }
+  if retain_incoming_cache then
+    for field in pairs(cache_fields) do current[field] = nil end
+  end
+  for field, value in pairs(incoming) do
     if field == "provider_cache_status" then
-      current.provider_cache_status = WheelProvider.aggregate_cache_status(
-        current.provider_cache_status, value)
-    else
+      current.provider_cache_status = retained_status
+    elseif not cache_fields[field] or retain_incoming_cache or current.provider_cache_status == nil then
       current[field] = value
     end
   end
