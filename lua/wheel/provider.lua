@@ -176,6 +176,9 @@ function WheelProvider.validate_prompt_cache_request(request, adapter)
   return policy
 end
 
+--- Build the cache-key domain from provider identity, request policy, and schema.
+-- The returned digest intentionally excludes prompt content; callers combine
+-- it with the exact serialized stable prefix before producing a provider key.
 function WheelProvider.cache_domain(request, provider, model, endpoint, policy)
   request = request or {}
   local schema = request.tools and json.encode(request.tools) or "[]"
@@ -188,6 +191,9 @@ function WheelProvider.cache_domain(request, provider, model, endpoint, policy)
   return prompt_cache_digest(material)
 end
 
+--- Normalize only explicit provider usage fields into cross-provider telemetry.
+-- Missing cache counters stay unknown, malformed counters produce `error`, and
+-- OpenAI uncached input excludes only explicitly reported cached reads.
 function WheelProvider.normalize_usage(usage, provider)
   if type(usage) ~= "table" then return nil end
   local normalized = {}
@@ -317,6 +323,9 @@ function WheelProvider.cache_usage_status(usage, request, adapter)
   return usage and usage.provider_cache_status or "unknown"
 end
 
+--- Attach provider-native cache metadata when the serialized stable prefix matches.
+-- In `prefer` mode any unsupported or unverifiable setup leaves the payload
+-- unchanged; `required` mode returns an error instead.
 local function apply_prompt_cache(payload, request, adapter, provider, endpoint)
   local policy, policy_err = WheelProvider.resolve_prompt_cache_policy(request, adapter.prompt_cache_policy)
   if not policy then return nil, policy_err end

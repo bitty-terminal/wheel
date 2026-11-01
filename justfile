@@ -305,7 +305,7 @@ test-provider-stub:
     "$interpreter" tests/test_provider_stub.lua
 
 # Opt-in live provider test. Manual only; never part of `just check` or CI.
-# WHEEL_LIVE_PROVIDER selects openrouter (default) or commandcode,
+# WHEEL_LIVE_PROVIDER selects openrouter (default), commandcode, or openai-cache,
 # case-insensitively. The key-free offline gates run first; the live portion
 # skips with exit 0 after them when the selected provider's key is unset. The
 # test-only Python client reads the key from its own environment; the Lua

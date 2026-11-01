@@ -9,7 +9,8 @@ specification as JSON on stdin and reads the provider response from stdout:
     STATUS <http-status>\n<raw-response-body>
 
 The API key is read only from this process's inherited environment variable for
-the selected provider (``OPENROUTER_API_KEY`` or ``COMMANDCODE_API_KEY``). It
+the selected provider (``OPENROUTER_API_KEY``, ``COMMANDCODE_API_KEY``, or
+``OPENAI_API_KEY``). It
 is never accepted through argv, a file, or the request JSON, and it is never
 written to stdout or stderr. Any caller-supplied Authorization or x-api-key
 header is discarded so the key cannot travel through the Lua adapter or a
@@ -68,6 +69,11 @@ PROVIDERS: dict[str, ProviderConfig] = {
         name="commandcode",
         api_key_env="COMMANDCODE_API_KEY",
         allowed_host="api.commandcode.ai",
+    ),
+    "openai-cache": ProviderConfig(
+        name="openai-cache",
+        api_key_env="OPENAI_API_KEY",
+        allowed_host="api.openai.com",
     ),
 }
 

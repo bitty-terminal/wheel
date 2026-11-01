@@ -2,8 +2,8 @@
 -- Opt-in live provider test for Wheel's OpenAIAdapter and runner.
 --
 -- Manual only: run with `just test-live`. The recipe is deliberately absent
--- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default)
--- or `commandcode`, case-insensitively. The test skips with exit 0 when the
+-- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default),
+-- `commandcode`, or `openai-cache`, case-insensitively. The test skips with exit 0 when the
 -- selected provider's key environment variable is absent, and fails closed on
 -- an unknown selector. The key is read from the inherited environment by the
 -- test-only Python transport (tests/live_http_client.py); it is never passed
@@ -34,6 +34,14 @@ local PROVIDERS = {
     smoke_max_completion_tokens = 1024,
     runner_max_completion_tokens = 1024,
   },
+  ["openai-cache"] = {
+    name = "openai-cache",
+    api_key_env = "OPENAI_API_KEY",
+    base_url = "https://api.openai.com/v1",
+    model = "gpt-4o-mini",
+    smoke_max_completion_tokens = 64,
+    runner_max_completion_tokens = 64,
+  },
 }
 
 local function trim(value)
@@ -52,7 +60,7 @@ local function select_provider()
   local config = PROVIDERS[name]
   if not config then
     io.stderr:write(string.format(
-      "test-live: unsupported %s value; expected openrouter or commandcode\n",
+      "test-live: unsupported %s value; expected openrouter, commandcode, or openai-cache\n",
       PROVIDER_SELECTOR_ENV
     ))
     os.exit(2)
@@ -89,6 +97,8 @@ local STREAM_CHUNK_SIZE = 64
 local captured_outputs = {}
 local observed_budgets = {}
 local helper_calls = 0
+local cache_request_keys = {}
+local cache_usages = {}
 
 local function remember(text)
   if type(text) == "string" and #text > 0 then
@@ -166,6 +176,10 @@ local function http_client(req)
     return nil, "live request is missing a bounded completion max_tokens"
   end
   table.insert(observed_budgets, budget)
+  if provider.name == "openai-cache" then
+    assert(decoded.prompt_cache_key ~= nil, "OpenAI cache request must include prompt_cache_key")
+    table.insert(cache_request_keys, decoded.prompt_cache_key)
+  end
 
   local headers = {}
   for name, value in pairs(req.headers or {}) do
@@ -204,10 +218,77 @@ local adapter = WheelProvider.OpenAIAdapter.new({
   model = MODEL,
   temperature = 0.0,
   http_client = http_client,
+  prompt_cache_supported = provider.name == "openai-cache",
+  prompt_cache_policy = provider.name == "openai-cache" and "prefer" or nil,
 })
 
 -- The adapter never holds the key; only the out-of-process test helper does.
 assert(adapter:describe().has_api_key == false, "live adapter must not store an API key")
+
+if provider.name == "openai-cache" then
+  -- This evidence path is intentionally limited to two same-prefix requests;
+  -- it does not invoke the unrelated tool, stream, or runner live scenarios.
+  local stable_prefix = "You are a concise assistant. Follow the user's request precisely."
+  local request = {
+    stable_context_prefix = stable_prefix,
+    messages = {
+      { role = "system", content = stable_prefix },
+      { role = "user", content = "Reply with OK." },
+    },
+    max_completion_tokens = SMOKE_MAX_COMPLETION_TOKENS,
+  }
+  local expected_domain = WheelProvider.cache_domain(
+    request, "openai", MODEL, BASE_URL .. "/chat/completions", "prefer")
+  local config = require("wheel.config")
+  local expected_key = config.compute_hash(table.concat({ expected_domain, stable_prefix }, "\0"))
+
+  for attempt = 1, 2 do
+    local response = expect_response("OpenAI cache completion " .. tostring(attempt),
+      adapter:complete(request))
+    assert(type(response.content) == "string" and #response.content > 0,
+      "OpenAI cache completion must return content")
+    assert(response.usage == nil or type(response.usage) == "table",
+      "OpenAI cache completion usage must be normalized or absent")
+    local usage = response.usage or {}
+    local status = usage.provider_cache_status or "unknown"
+    assert(status == "verified_hit" or status == "verified_miss" or status == "write_only"
+      or status == "unknown" or status == "unsupported" or status == "error",
+      "OpenAI cache status must reflect provider usage without inventing a hit")
+    if usage.cache_read_tokens ~= nil then
+      assert(type(usage.cache_read_tokens) == "number" and usage.cache_read_tokens >= 0,
+        "normalized cache reads must come from a valid provider usage count")
+    end
+    if usage.cache_creation_tokens ~= nil then
+      assert(type(usage.cache_creation_tokens) == "number" and usage.cache_creation_tokens >= 0,
+        "normalized cache creation must come from a valid provider usage count")
+    end
+    if usage.prompt_tokens ~= nil and usage.cache_read_tokens ~= nil
+      and usage.cache_read_tokens <= usage.prompt_tokens then
+      assert(usage.uncached_input_tokens == usage.prompt_tokens - usage.cache_read_tokens,
+        "uncached input must subtract only explicitly reported cached reads")
+    end
+    if status == "verified_hit" then
+      assert(type(usage.cache_read_tokens) == "number" and usage.cache_read_tokens > 0,
+        "a cache hit requires positive cached tokens in provider usage")
+    end
+    table.insert(cache_usages, usage)
+  end
+  assert(helper_calls == 2 and #observed_budgets == 2,
+    "OpenAI cache evidence must use exactly two bounded requests")
+  assert(#cache_request_keys == 2 and cache_request_keys[1] == expected_key
+    and cache_request_keys[2] == expected_key,
+    "both OpenAI prompt_cache_keys must derive from the exact domain and serialized stable prefix")
+  for _, cache_key in ipairs(cache_request_keys) do
+    assert_no_key(cache_key, "cache key")
+  end
+  assert(#cache_usages == 2, "both live responses must be checked independently")
+  print("LIVE openai-cache repeated-prefix evidence complete")
+  for index, output in ipairs(captured_outputs) do
+    assert_no_key(output, "captured output " .. tostring(index))
+  end
+  print(string.format("LIVE %s tests passed (%d bounded requests)", provider.name, helper_calls))
+  os.exit(0)
+end
 
 -- 1. Non-streaming completion with a bounded completion budget.
 do

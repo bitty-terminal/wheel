@@ -1271,15 +1271,22 @@ is a separate, manual, opt-in target with an explicit provider selector:
 ```sh
 just test-live                                  # OpenRouter (default)
 WHEEL_LIVE_PROVIDER=commandcode just test-live  # Command Code
+WHEEL_LIVE_PROVIDER=openai-cache just test-live  # OpenAI cache evidence
 ```
 
-- `WHEEL_LIVE_PROVIDER` is `openrouter` (default) or `commandcode` and is
+- `WHEEL_LIVE_PROVIDER` is `openrouter` (default), `commandcode`, or
+  `openai-cache` and is
   matched case-insensitively; an unknown value fails closed with a non-zero
   exit. The default stays OpenRouter.
 - OpenRouter uses `OPENROUTER_API_KEY`, `https://openrouter.ai/api/v1`, and
   model `deepseek/deepseek-v4.1-flash`. Command Code uses
   `COMMANDCODE_API_KEY`, `https://api.commandcode.ai/provider/v1`, and the same
   model.
+- `openai-cache` uses only `OPENAI_API_KEY` and `https://api.openai.com/v1`.
+  It issues two bounded completions with the same stable prefix and reports
+  cache telemetry only from explicit response usage; absent, unsupported, or
+  malformed usage is not treated as a cache hit. Without `OPENAI_API_KEY`, the
+  live portion skips successfully without contacting the provider.
 - `just test-live` is not part of `just check` or CI. Its key-free offline
   gates (`test-live-offline`: redirect policy, provider selection, host
   binding) run first and are also part of `check`; the live portion then skips
