@@ -393,7 +393,7 @@ local ok, err = pcall(function()
 
   run_test("Lifecycle: callers cannot mint canonical Agent authority", function()
     local life = Lifecycle.new({ max_sessions_per_agent = 3 })
-    assert(life:create_panel({ panel_id = "forged-panel" }))
+    assert(life:create_panel({ panel_id = "forged-panel", agent_id = "forged-agent" }))
     local token = {}
     local calls = 0
     local function forged_resolver(candidate)
@@ -434,7 +434,7 @@ local ok, err = pcall(function()
     assert(#life:events() == 2)
 
     local second = assert(life:create_agent_session({
-      session_id = "plain-child", agent_id = "plain-child", panel_id = "forged-panel",
+      session_id = "plain-child", agent_id = "forged-agent", panel_id = "forged-panel",
       role_binding = { role = "coding", binding_id = "plain-child:1", policy_generation = 1 },
     }))
     life._authority_tokens[second.session_id] = token
