@@ -134,11 +134,7 @@ local function project_sample(source)
     sample.provider_cache_read_ratio = sample.provider_cache_read_tokens / denominator
   end
 
-  local local_prefix_hash = type(source.local_prefix_hash) == "string"
-    and source.local_prefix_hash:match("^[0-9a-f]+$")
-    and #source.local_prefix_hash == 64 and source.local_prefix_hash or nil
   local local_prefix_reuse_ratio = non_negative_number(source.local_prefix_reuse_ratio)
-  if local_prefix_hash then sample.local_prefix_hash = local_prefix_hash end
   if local_prefix_reuse_ratio and local_prefix_reuse_ratio <= 1 then
     sample.local_prefix_reuse_ratio = local_prefix_reuse_ratio
   end

@@ -70,11 +70,11 @@ local local_only = project({
 })
 check(local_only.samples[1].provider_cache_status == "unknown"
   and local_only.provider_cache_hit_rate == nil, "local hash cannot imply provider hit")
+check(local_only.samples[1].local_prefix_hash == nil, "arbitrary local prefix hash is omitted")
 check(local_only.samples[1].local_prefix_reuse_ratio == 1, "local metric stays separately available")
 local valid_prefix_hash = string.rep("a", 64)
-local hashed = project({ { local_prefix_hash = valid_prefix_hash } })
-check(hashed.samples[1].local_prefix_hash == valid_prefix_hash,
-  "Wheel SHA-256 digest is retained")
+local valid_hash_sample = project({ { local_prefix_hash = valid_prefix_hash } }).samples[1]
+check(valid_hash_sample.local_prefix_hash == nil, "valid local prefix digest is omitted")
 
 local bounded = project({ { provider_cache_status = "verified_miss" } }, 10000)
 check(bounded.window == Telemetry.MAX_WINDOW, "window has a hard maximum")
@@ -144,8 +144,10 @@ local malformed_hashes = { "local-hash", string.rep("a", 63), string.rep("a", 65
   string.rep("A", 64), string.rep("g", 64), "sha256:" .. string.rep("a", 64) }
 for _, hash in ipairs(malformed_hashes) do
   local rejected = project({ { local_prefix_hash = hash } }).samples[1]
-  check(rejected.local_prefix_hash == nil, "non-digest local prefix values are omitted")
+  check(rejected.local_prefix_hash == nil, "malformed local prefix values are omitted")
 end
+local secret_hash_sample = project({ { local_prefix_hash = "sk-secret-value" } }).samples[1]
+check(secret_hash_sample.local_prefix_hash == nil, "secret-shaped local prefix hash is omitted")
 local safe_endpoint = project({ {
   provider_cache_status = "unknown",
   endpoint = "https://provider.example/v1/chat?token=secret#fragment",
