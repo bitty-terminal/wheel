@@ -664,13 +664,20 @@ local function main()
     and openai_read_miss.cache_read_tokens == 0 and openai_read_miss.cache_creation_tokens == nil,
     "explicit OpenAI zero cached tokens must prove a miss without a write counter")
   local absent_usage = WheelProvider.normalize_usage({ prompt_tokens = 40 }, "openai")
-  check(absent_usage.provider_cache_status == "unknown",
-    "usage without cache fields must remain unknown")
+  check(absent_usage.provider_cache_status == "unknown" and absent_usage.uncached_input_tokens == nil,
+    "usage without cache fields must remain unknown without fabricating uncached input")
+  local explicit_zero_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 },
+  }, "openai")
+  check(explicit_zero_usage.uncached_input_tokens == 40,
+    "an explicit zero cached-read count must establish the full uncached input count")
   local invalid_usage = WheelProvider.normalize_usage({
     prompt_tokens = 40, prompt_tokens_details = { cached_tokens = "bad" },
   }, "openai")
   check(invalid_usage.provider_cache_status == "error",
     "malformed cache usage must not be reported as a miss or hit")
+  check(invalid_usage.uncached_input_tokens == nil,
+    "malformed cached-read telemetry must not produce an uncached input count")
   local impossible_usage = WheelProvider.normalize_usage({
     prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 45 },
   }, "openai")
@@ -680,6 +687,11 @@ local function main()
     "impossible cache telemetry must retain independently valid provider counts")
   check(impossible_usage.uncached_input_tokens == nil,
     "impossible cached input must not produce a negative uncached count")
+  local conflicting_reads = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 }, cache_read_tokens = 0,
+  }, "openai")
+  check(conflicting_reads.provider_cache_status == "error" and conflicting_reads.uncached_input_tokens == nil,
+    "conflicting cached-read counters must not produce an uncached input count")
 
   for _, conflict in ipairs({
     { details = { cached_tokens = 16 }, alias = "cache_read_tokens", value = 0, read = 16 },

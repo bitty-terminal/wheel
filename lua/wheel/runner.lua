@@ -1133,13 +1133,19 @@ function WheelRunner.run_task(agent, task, opts)
     -- Accumulate usage telemetry
     if res.usage then
       total_usage.prompt_tokens = total_usage.prompt_tokens + (res.usage.prompt_tokens or 0)
-      total_usage.uncached_input_tokens = total_usage.uncached_input_tokens
-        + (res.usage.uncached_input_tokens or res.usage.prompt_tokens or 0)
+      if total_usage.uncached_input_tokens ~= nil and res.usage.uncached_input_tokens ~= nil then
+        total_usage.uncached_input_tokens = total_usage.uncached_input_tokens
+          + res.usage.uncached_input_tokens
+      else
+        total_usage.uncached_input_tokens = nil
+      end
       total_usage.completion_tokens = total_usage.completion_tokens + (res.usage.completion_tokens or 0)
       total_usage.thinking_tokens = total_usage.thinking_tokens + (res.usage.thinking_tokens or 0)
       total_usage.total_tokens = total_usage.total_tokens + (res.usage.total_tokens or 0)
       total_usage.cache_creation_tokens = total_usage.cache_creation_tokens + (res.usage.cache_creation_tokens or 0)
       total_usage.cache_read_tokens = total_usage.cache_read_tokens + (res.usage.cache_read_tokens or 0)
+    else
+      total_usage.uncached_input_tokens = nil
     end
     local cache_status = WheelProvider.cache_usage_status(res.usage, req, provider)
     total_usage.provider_cache_status = WheelProvider.aggregate_cache_status(

@@ -7804,6 +7804,48 @@ run_test("WheelRunner: cache status aggregates observed turns without masking st
   end
 end)
 
+run_test("WheelRunner: uncached input totals require explicit valid OpenAI read telemetry", function()
+  local function run_usage(raw_usage)
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    local agent = WheelAgent.new({
+      name = "uncached-usage-runner",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+    })
+    local provider = WheelProvider.MockProvider.new({ responses = {
+      { content = "done", tool_calls = {}, usage = WheelProvider.normalize_usage(raw_usage, "openai") },
+    } })
+    agent:set_provider(provider)
+    local task = kernel:create_task({
+      id = "T-UNCACHED-USAGE-" .. tostring(raw_usage.prompt_tokens),
+      title = "Preserve unknown uncached usage",
+      priority = 1,
+    })
+    return WheelRunner.run_task(agent, task, { max_turns = 1 })
+  end
+
+  local absent = run_usage({ prompt_tokens = 40 })
+  assert(absent.success and absent.usage.prompt_tokens == 40 and absent.usage.uncached_input_tokens == nil,
+    "missing cached-read telemetry must remain unknown in runner totals")
+  local explicit_zero = run_usage({ prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 } })
+  assert(explicit_zero.success and explicit_zero.usage.uncached_input_tokens == 40,
+    "explicit zero cached reads must contribute the full prompt to uncached totals")
+  local positive_read = run_usage({ prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 } })
+  assert(positive_read.success and positive_read.usage.uncached_input_tokens == 24,
+    "valid positive cached reads must contribute only the measured uncached remainder")
+  for _, raw_usage in ipairs({
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = "bad" } },
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 }, cache_read_tokens = 0 },
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 45 } },
+  }) do
+    local invalid = run_usage(raw_usage)
+    assert(invalid.success and invalid.usage.uncached_input_tokens == nil,
+      "malformed, conflicting, and out-of-range telemetry must not enter runner uncached totals")
+  end
+end)
+
 run_test("WheelTeam: run_orchestration_loop with autonomous provider runner and models command", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })

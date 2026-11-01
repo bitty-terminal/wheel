@@ -262,12 +262,10 @@ function WheelProvider.normalize_usage(usage, provider)
   copy("total_tokens", "total_tokens")
   normalized.cache_read_tokens = read_count
   normalized.cache_creation_tokens = write_count
-  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil then
-    local cached = normalized.cache_read_tokens or 0
-    if (not read_present or read_count ~= nil)
-      and cached <= normalized.prompt_tokens then
-      normalized.uncached_input_tokens = normalized.prompt_tokens - cached
-    end
+  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
+    and read_present and read_count ~= nil and not malformed_cache_usage
+    and read_count <= normalized.prompt_tokens then
+    normalized.uncached_input_tokens = normalized.prompt_tokens - read_count
   end
   if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
     and read_count ~= nil and read_count > normalized.prompt_tokens then
