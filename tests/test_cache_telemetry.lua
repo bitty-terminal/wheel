@@ -1,6 +1,7 @@
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local Telemetry = require("wheel.cache_telemetry")
+local WheelContext = require("wheel.context")
 
 local checks = 0
 local function check(value, message)
@@ -11,6 +12,46 @@ end
 local function project(records, window)
   return Telemetry.project(records, { window = window })
 end
+
+local context = WheelContext.new()
+local stable_prompt = {
+  system_instruction = "You are a coding assistant.",
+  project_rules = { "Keep changes focused", "Use deterministic tests" },
+  tool_schemas = { "read_file", "write_file" },
+}
+local first_compile = assert(context:compile_prompt({
+  system_instruction = stable_prompt.system_instruction,
+  project_rules = stable_prompt.project_rules,
+  tool_schemas = stable_prompt.tool_schemas,
+  turn_prompt = "Inspect the current implementation.",
+}))
+local second_compile = assert(context:compile_prompt({
+  system_instruction = stable_prompt.system_instruction,
+  project_rules = stable_prompt.project_rules,
+  tool_schemas = stable_prompt.tool_schemas,
+  turn_prompt = "Now write a detailed regression test for the tail change.",
+}))
+check(first_compile.prefix_cache_key == second_compile.prefix_cache_key,
+  "dynamic tail changes preserve the compiler stable-prefix key")
+check(first_compile.cache_share_ratio ~= second_compile.cache_share_ratio,
+  "dynamic tail changes update the compiler local reuse ratio")
+
+local compiler_projection = project({
+  { local_prefix_hash = first_compile.prefix_cache_key,
+    local_prefix_reuse_ratio = first_compile.cache_share_ratio },
+  { local_prefix_hash = second_compile.prefix_cache_key,
+    local_prefix_reuse_ratio = second_compile.cache_share_ratio },
+})
+local first_compiled_sample, second_compiled_sample = unpack(compiler_projection.samples)
+check(first_compiled_sample.local_prefix_reuse_ratio == first_compile.cache_share_ratio
+  and second_compiled_sample.local_prefix_reuse_ratio == second_compile.cache_share_ratio,
+  "projection preserves each compiler local reuse ratio separately")
+check(first_compiled_sample.local_prefix_hash == nil and second_compiled_sample.local_prefix_hash == nil,
+  "projection omits both compiler prefix hashes")
+check(first_compiled_sample.provider_cache_status == "unknown"
+  and second_compiled_sample.provider_cache_status == "unknown"
+  and compiler_projection.provider_cache_hit_rate == nil,
+  "local compiler digests do not imply provider cache evidence")
 
 local empty = project({}, 3)
 check(empty.sample_count == 0 and empty.provider_cache_hit_rate == nil, "zero samples have no rate")
