@@ -78,6 +78,19 @@ check(hashed.samples[1].local_prefix_hash == valid_prefix_hash,
 
 local bounded = project({ { provider_cache_status = "verified_miss" } }, 10000)
 check(bounded.window == Telemetry.MAX_WINDOW, "window has a hard maximum")
+local nan_window = project({}, 0 / 0)
+check(nan_window.window == Telemetry.DEFAULT_WINDOW, "NaN window uses the default")
+local infinite_window = project({}, math.huge)
+check(infinite_window.window == Telemetry.DEFAULT_WINDOW, "infinite window uses the default")
+
+local max_finite = 1.7976931348623157e308
+local large_counts = project({
+  { cache_read_tokens = max_finite, provider_cache_read_denominator = max_finite },
+  { cache_read_tokens = max_finite, provider_cache_read_denominator = max_finite },
+})
+check(large_counts.provider_cache_read_ratio ~= nil
+  and large_counts.provider_cache_read_ratio >= 0 and large_counts.provider_cache_read_ratio <= 1,
+  "large finite counters produce a finite bounded aggregate ratio")
 
 local redacted = project({ {
   provider_cache_status = "verified_hit",
@@ -98,6 +111,8 @@ local redacted = project({ {
 } })
 local safe = redacted.samples[1]
 check(safe.provider == "openai" and safe.model == "model-safe", "authoritative safe identities survive")
+local legacy_ollama = project({ { provider = "ollama" } }).samples[1]
+check(legacy_ollama.provider == "ollama", "legacy ollama provider identity is allowlisted")
 check(safe.cache_domain_version == "1.2" and safe.cache_policy_version == "v2"
   and safe.tool_schema_version == "3" and safe.capability_version == "1.0.4"
   and safe.evidence_source == "provider_usage", "known bounded metadata survives")

@@ -27,6 +27,7 @@ local PROVIDERS = {
   anthropic = true,
   deepseek = true,
   mock = true,
+  ollama = true,
   openai = true,
   stdio = true,
 }
@@ -145,7 +146,11 @@ local function project_sample(source)
 end
 
 local function bounded_window(value)
-  value = type(value) == "number" and math.floor(value) or WheelCacheTelemetry.DEFAULT_WINDOW
+  if type(value) ~= "number" or value ~= value or value == math.huge or value == -math.huge then
+    value = WheelCacheTelemetry.DEFAULT_WINDOW
+  else
+    value = math.floor(value)
+  end
   if value < 1 then return 1 end
   if value > WheelCacheTelemetry.MAX_WINDOW then return WheelCacheTelemetry.MAX_WINDOW end
   return value
@@ -179,7 +184,7 @@ function WheelCacheTelemetry.project(records, opts)
 
   local status_counts = {}
   for status in pairs(STATUS) do status_counts[status] = 0 end
-  local hits, misses, reads, denominators = 0, 0, 0, 0
+  local hits, misses, max_denominator = 0, 0, 0
   local projected_samples = {}
   for index, entry in ipairs(samples) do
     local sample = entry.sample
@@ -190,8 +195,19 @@ function WheelCacheTelemetry.project(records, opts)
     if status == "verified_miss" then misses = misses + 1 end
     if sample.provider_cache_read_tokens ~= nil and entry.denominator and entry.denominator > 0
       and sample.provider_cache_read_tokens <= entry.denominator then
-      reads = reads + sample.provider_cache_read_tokens
-      denominators = denominators + entry.denominator
+      max_denominator = math.max(max_denominator, entry.denominator)
+    end
+  end
+
+  local scaled_reads, scaled_denominators = 0, 0
+  if max_denominator > 0 then
+    for _, entry in ipairs(samples) do
+      local read_tokens = entry.sample.provider_cache_read_tokens
+      local denominator = entry.denominator
+      if read_tokens ~= nil and denominator and denominator > 0 and read_tokens <= denominator then
+        scaled_reads = scaled_reads + read_tokens / max_denominator
+        scaled_denominators = scaled_denominators + denominator / max_denominator
+      end
     end
   end
 
@@ -203,7 +219,8 @@ function WheelCacheTelemetry.project(records, opts)
     provider_cache_hit_rate = hits + misses > 0 and hits / (hits + misses) or nil,
     provider_cache_hit_samples = hits,
     provider_cache_miss_samples = misses,
-    provider_cache_read_ratio = denominators > 0 and reads / denominators or nil,
+    provider_cache_read_ratio = scaled_denominators > 0
+      and math.min(1, scaled_reads / scaled_denominators) or nil,
   }
   return projection
 end
