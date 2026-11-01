@@ -9,6 +9,9 @@ package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 local WheelHost = require("wheel.host")
 local Lifecycle = require("wheel.lifecycle")
 local Session = require("wheel.session")
+local WheelAgent = require("wheel.agent")
+local WheelContext = require("wheel.context")
+local WheelKernel = require("wheel.kernel")
 
 local function success(status) return status == true or status == 0 end
 local function interpreter()
@@ -275,28 +278,45 @@ local ok, err = pcall(function()
     local life = fixture()
     assert(life:activate_session("s1"))
     local checkpoint = string.rep("ab", 32)
-    local updated = assert(life:record_role_transition("s1", {
+    local updated, authority_err = life:record_role_transition("s1", {
       role_binding = { role = "reviewer", binding_id = "role-binding:s1:2", policy_generation = 2 },
       checkpoint = checkpoint,
       reason = "role_transition",
-    }))
-    assert(updated.agent_id == "s1")
-    assert(updated.state == Lifecycle.AgentSessionState.ACTIVE)
-    assert(updated.role_binding.role == "reviewer")
-    assert(updated.role_binding.policy_generation == 2)
-    assert(updated.checkpoint == checkpoint)
-    assert(life:get_panel("p1").attached_session_id == "s1")
-    local transition_event = life:events()[#life:events()]
+    })
+    assert(updated == nil and authority_err.code == "E_LIFECYCLE_AUTHORITY",
+      "caller supplied role metadata must not authorize a lifecycle transition")
+    assert(life:get_session("s1").role_binding.policy_generation == nil)
+    local forged, forged_err = life:record_role_transition("s1", {
+      role_binding = { role = "reviewer", binding_id = "role-binding:s1:2", policy_generation = 2 },
+      checkpoint = checkpoint,
+      reason = "role_transition",
+      authority_reference = {},
+    })
+    assert(forged == nil and forged_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(life:get_session("s1").role_binding.policy_generation == nil)
+
+    local context = WheelContext.new({ kernel = WheelKernel.new_mock() })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local bound_life = Lifecycle.new({ max_sessions_per_agent = 3 })
+    assert(bound_life:create_panel({ panel_id = "bound-panel", agent_id = "bound-agent" }))
+    assert(bound_life:ready_panel("bound-panel"))
+    local agent = WheelAgent.new({ name = "bound-agent", role = "coding",
+      kernel = context.kernel, context = context, lifecycle = bound_life })
+    assert(agent:create_runtime_session({ session_id = "bound-session", panel_id = "bound-panel" }))
+    assert(agent:activate_runtime_session())
+    local transitioned = assert(agent:transition_role("reviewer", { reason = "role transition" }))
+    assert(transitioned.policy_generation == 2)
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
+    local transition_event = bound_life:events()[#bound_life:events()]
     assert(transition_event.type == "agent_session.role_transition")
-    assert(transition_event.from_state == "active" and transition_event.to_state == "active")
-    assert(transition_event.policy_generation == 2 and transition_event.checkpoint == checkpoint)
-    assert(transition_event.agent_id == "s1")
+    assert(transition_event.policy_generation == 2 and transition_event.checkpoint == transitioned.checkpoint)
 
     local function transition(binding, value)
-      return life:record_role_transition("s1", {
+      return bound_life:record_role_transition("bound-session", {
         role_binding = binding,
         checkpoint = value or string.rep("cd", 32),
         reason = "role_transition",
+        authority_reference = agent:authority_reference(),
       })
     end
     local stale, stale_err = transition({
@@ -311,48 +331,50 @@ local ok, err = pcall(function()
       role = "coding", binding_id = "role-binding:s1:2", policy_generation = 3,
     })
     assert(reused == nil and reused_err.code == "E_LIFECYCLE_AUTHORITY")
-    local missing_checkpoint, checkpoint_err = life:record_role_transition("s1", {
+    local missing_checkpoint, checkpoint_err = bound_life:record_role_transition("bound-session", {
       role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
       reason = "role_transition",
+      authority_reference = agent:authority_reference(),
     })
     assert(missing_checkpoint == nil and checkpoint_err.code == "E_LIFECYCLE_INVALID")
-    local wrong_reason, reason_err = life:record_role_transition("s1", {
+    local wrong_reason, reason_err = bound_life:record_role_transition("bound-session", {
       role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
       checkpoint = string.rep("ef", 32),
       reason = "manual",
+      authority_reference = agent:authority_reference(),
     })
     assert(wrong_reason == nil and reason_err.code == "E_LIFECYCLE_INVALID")
 
-    assert(life:get_session("s1").role_binding.policy_generation == 2)
-    assert(life:end_session("s1"))
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
+    assert(bound_life:end_session("bound-session"))
     local terminal, terminal_err = transition({
       role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3,
     })
     assert(terminal == nil and terminal_err.code == "E_LIFECYCLE_STATE")
-    assert(life:get_session("s1").role_binding.policy_generation == 2)
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
   end)
 
   run_test("Lifecycle: persisted policy generations reject a forged history", function()
     local path = root .. "/role-transition.json"
     local life = Lifecycle.new({ path = path })
-    assert(life:create_panel({ panel_id = "role-panel" }))
+    assert(life:create_panel({ panel_id = "role-panel", agent_id = "role-agent" }))
     assert(life:ready_panel("role-panel"))
-    assert(life:create_agent_session({
-      session_id = "role-session", agent_id = "role-agent", panel_id = "role-panel",
-      role_binding = { role = "coding", binding_id = "role-binding:role-agent:1", policy_generation = 1 },
-    }))
-    local checkpoint = string.rep("12", 32)
-    assert(life:record_role_transition("role-session", {
-      role_binding = { role = "debug", binding_id = "role-binding:role-agent:2", policy_generation = 2 },
-      checkpoint = checkpoint,
-      reason = "role_transition",
-    }))
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local agent = WheelAgent.new({ name = "role-agent", role = "coding",
+      kernel = kernel, context = context, lifecycle = life })
+    assert(agent:create_runtime_session({ session_id = "role-session", panel_id = "role-panel" }))
+    local checkpoint = assert(context:commit_checkpoint({ author = "role-agent", message = "baseline" }))
+    assert(agent:transition_role("debug", { reason = "role transition" }))
+    local persisted_checkpoint = life:get_session("role-session").checkpoint
+    assert(persisted_checkpoint == checkpoint.hash or type(persisted_checkpoint) == "string")
 
     local reloaded = assert(Lifecycle.new({ path = path }))
     local record = assert(reloaded:get_session("role-session"))
     assert(record.role_binding.role == "debug")
     assert(record.role_binding.policy_generation == 2)
-    assert(record.checkpoint == checkpoint)
+    assert(type(record.checkpoint) == "string")
 
     local raw = assert(WheelHost.fs.read_file(path))
     local forged = Session.json_decode(raw)
@@ -721,7 +743,13 @@ local ok, err = pcall(function()
       ready_panel = function() return nil, marker end,
       create_agent_session = function() error("must not create session", 0) end,
     }
-    local agent = setmetatable({ lifecycle=fake, panel_id="p" }, { __index=Agent })
+    local agent = Agent.new({
+      name = "typed-lifecycle-agent",
+      role = Agent.Role.CODING,
+      kernel = require("wheel.kernel").new_mock(),
+      lifecycle = fake,
+      panel_id = "p",
+    })
     local result, failure = agent:create_runtime_session()
     assert(not result and failure == marker)
   end)

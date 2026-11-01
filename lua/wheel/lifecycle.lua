@@ -59,6 +59,7 @@ local EVENT_TYPES = {
   ["agent_session.active"] = true, ["agent_session.paused"] = true, ["agent_session.stale"] = true,
   ["agent_session.recovered"] = true, ["agent_session.checkpointed"] = true,
   ["agent_session.role_transition"] = true,
+  ["agent_session.authority_widened"] = true,
   ["agent_session.ended"] = true, ["agent_session.abandoned"] = true,
 }
 
@@ -346,7 +347,8 @@ end
 local function event_allowed(key)
   return key == "reason" or key == "recovery" or key == "checkpoint"
     or key == "mode" or key == "observer_session_id" or key == "controller_session_id" or key == "transfer"
-    or key == "policy_generation"
+    or key == "policy_generation" or key == "parent_session_id" or key == "parent_agent_id"
+    or key == "child_session_id" or key == "child_agent_id" or key == "capability_delta"
 end
 local function event_extra(extra, loaded)
   local result = {}
@@ -360,6 +362,13 @@ local function event_extra(extra, loaded)
       if type(value) ~= "number" or not finite(value) or value < 1 or value % 1 ~= 0
         or value > MAX_SAFE_INTEGER then return nil, "event policy generation is invalid" end
       result[key] = value
+    elseif key == "parent_session_id" or key == "parent_agent_id"
+      or key == "child_session_id" or key == "child_agent_id" then
+      local clean, err = id(value, key, true); if not clean then return nil, err end; result[key] = clean
+    elseif key == "capability_delta" then
+      local clean, err = text(value, key, true, MAX_STRING_BYTES)
+      if not clean or not clean:match("^[A-Za-z0-9_,%-]+$") then return nil, err or "capability delta is invalid" end
+      result[key] = clean
     elseif key == "mode" then
       if value ~= Lifecycle.AttachMode.CONTROLLER and value ~= Lifecycle.AttachMode.OBSERVER then
         return nil, "event mode is invalid"
@@ -404,7 +413,8 @@ local function valid_event_transition(event)
     ["agent_session.stale"] = { ["active:stale"] = true, ["paused:stale"] = true },
     ["agent_session.recovered"] = { ["stale:paused"] = true },
     ["agent_session.checkpointed"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
-    ["agent_session.role_transition"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
+  ["agent_session.role_transition"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
+    ["agent_session.authority_widened"] = { ["created:created"] = true, ["active:active"] = true, ["paused:paused"] = true, ["stale:stale"] = true },
     ["agent_session.ended"] = { ["created:ended"] = true, ["active:ended"] = true, ["paused:ended"] = true, ["stale:ended"] = true },
     ["agent_session.abandoned"] = { ["created:abandoned"] = true, ["active:abandoned"] = true, ["paused:abandoned"] = true, ["stale:abandoned"] = true },
   }
@@ -574,10 +584,11 @@ local function registry_shape(value)
       event_id=true, type=true, timestamp_ms=true, session_id=true, panel_id=true,
       agent_id=true, task_id=true, from_state=true, to_state=true, reason=true,
       recovery=true, checkpoint=true, mode=true, observer_session_id=true, transfer=true,
-      controller_session_id=true, policy_generation=true,
+      controller_session_id=true, policy_generation=true, parent_session_id=true, parent_agent_id=true,
+      child_session_id=true, child_agent_id=true, capability_delta=true,
     }) then return false, "event contains unknown fields" end
     local extras = {}
-    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "controller_session_id", "transfer", "policy_generation" }) do
+    for _, key in ipairs({ "reason", "recovery", "checkpoint", "mode", "observer_session_id", "controller_session_id", "transfer", "policy_generation", "parent_session_id", "parent_agent_id", "child_session_id", "child_agent_id", "capability_delta" }) do
       if event[key] ~= nil then extras[key] = event[key] end
     end
     local clean, err = event_extra(extras, true); if not clean then return false, err end
@@ -595,6 +606,16 @@ local function registry_shape(value)
       and event.reason ~= "role_transition" and event.reason ~= "role_widening" then
       return false, "role transition event reason is invalid"
     end
+    if event.type == "agent_session.authority_widened" then
+      if event.reason ~= "role_widening" or not event.checkpoint or not event.capability_delta
+        or event.session_id ~= event.child_session_id or event.agent_id ~= event.child_agent_id
+        or not value.sessions[event.parent_session_id] or not value.sessions[event.child_session_id]
+        or event.parent_agent_id ~= value.sessions[event.parent_session_id].agent_id
+        or event.child_agent_id ~= value.sessions[event.child_session_id].agent_id
+        or event.parent_session_id == event.child_session_id then
+        return false, "authority widening event is incomplete"
+      end
+    end
     if event.type ~= "agent_session.role_transition" and event.policy_generation ~= nil then
       return false, "policy generation belongs only to a role transition"
     end
@@ -602,6 +623,9 @@ local function registry_shape(value)
     if event.session_id ~= nil and not value.sessions[event.session_id] then return false, "event references unknown session" end
     if event.panel_id ~= nil and not value.panels[event.panel_id] then return false, "event references unknown panel" end
     if event.observer_session_id ~= nil and not value.sessions[event.observer_session_id] then return false, "event references unknown observer" end
+    for _, key in ipairs({ "parent_session_id", "child_session_id" }) do
+      if event[key] ~= nil and not value.sessions[event[key]] then return false, "event references unknown lineage session" end
+    end
     if event.type:match("^agent_session%.") and (not event.session_id or not event.panel_id or not event.agent_id) then
       return false, "session event lacks identity"
     end
@@ -834,6 +858,8 @@ function Lifecycle.new(opts)
     or self.policy.max_sessions_per_agent > MAX_SESSIONS) then error("invalid session policy") end
   self.revision, self.next_counter = 0, 0
   self.sessions, self.panels, self.events_log = {}, {}, {}
+  self._authority_tokens = {}
+  self._authority_resolvers = {}
   if self.path then
     local ok, err = self:load()
     if not ok then error(err, 0) end
@@ -966,6 +992,7 @@ function Lifecycle:load()
   local state = from_payload(decoded)
   self.revision, self.policy, self.next_counter = state.revision, state.policy, state.next_counter
   self.sessions, self.panels, self.events_log = state.sessions, state.panels, state.events
+  for session_id in pairs(self.sessions) do self._authority_tokens[session_id] = {} end
   return true
 end
 function Lifecycle:save() return self:_commit(self:_state()) end
@@ -1006,7 +1033,12 @@ function Lifecycle:ready_panel(panel_id)
 end
 function Lifecycle:create_agent_session(opts)
   opts = opts or {}
-  return self:_change(function(state)
+  local authority_reference = opts.authority_reference
+  local authority_resolver = opts.authority_resolver
+  if authority_resolver ~= nil and type(authority_resolver) ~= "function" then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="authority resolver must be canonical" }
+  end
+  local created, create_err = self:_change(function(state)
     local agent_id, err = identity_id(opts.agent_id, "agent_id", true); if not agent_id then return false, { code="E_LIFECYCLE_INVALID", message=err } end
     local panel_id; panel_id, err = id(opts.panel_id, "panel_id", true); if not panel_id then return false, { code="E_LIFECYCLE_INVALID", message=err } end
     if not state.panels[panel_id] then return false, { code="E_LIFECYCLE_NOT_FOUND", message="panel not found" } end
@@ -1047,6 +1079,44 @@ function Lifecycle:create_agent_session(opts)
     state.sessions[session_id] = record; local event, event_err = new_event(state, "agent_session.created", record, nil, S.CREATED, nil, function(prefix) return self:_next_id(state, prefix) end); if not event then return false, { code="E_LIFECYCLE_INVALID", message=event_err } end
     return copy(record)
   end)
+  if created and authority_resolver then
+    self._authority_tokens[created.session_id] = authority_reference or {}
+    self._authority_resolvers[created.session_id] = authority_resolver
+  end
+  return created, create_err
+end
+function Lifecycle:authority_reference(session_id)
+  if not self.sessions[session_id] then return nil end
+  return self._authority_tokens[session_id]
+end
+function Lifecycle:_authorize_session(session_id, reference)
+  local expected = self._authority_tokens[session_id]
+  return expected ~= nil and reference ~= nil and expected == reference
+end
+function Lifecycle:_resolve_session_authority(session_id, reference, candidate)
+  if not self:_authorize_session(session_id, reference) then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="session authority is not canonical" }
+  end
+  local resolver = self._authority_resolvers[session_id]
+  if type(resolver) ~= "function" then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="session is not bound to a canonical Agent" }
+  end
+  local called, resolved = pcall(resolver, candidate)
+  if not called or type(resolved) ~= "table"
+    or type(resolved.agent_id) ~= "string"
+    or type(resolved.role_binding) ~= "table"
+    or type(resolved.capabilities) ~= "table" then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="canonical Agent authority could not be resolved" }
+  end
+  local binding = resolved.role_binding
+  if binding.role ~= candidate.role or binding.binding_id ~= candidate.binding_id
+    or binding.policy_generation ~= candidate.policy_generation then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="role binding is not canonical" }
+  end
+  if #resolved.capabilities == 0 then
+    return nil, { code="E_LIFECYCLE_AUTHORITY", message="canonical Agent capabilities are empty" }
+  end
+  return resolved
 end
 function Lifecycle:_session_in(state, session_id)
   local record = state.sessions[session_id]; if not record then return nil, { code="E_LIFECYCLE_NOT_FOUND", message="agent session not found" } end; return record
@@ -1141,6 +1211,11 @@ function Lifecycle:record_role_transition(session_id, opts)
     if transition_reason ~= "role_transition" and transition_reason ~= "role_widening" then
       return false, { code="E_LIFECYCLE_INVALID", message="role transition requires a role reason code" }
     end
+    local canonical, authority_err = self:_resolve_session_authority(
+      session_id, opts.authority_reference, binding)
+    if not canonical or canonical.agent_id ~= record.agent_id then
+      return false, authority_err or { code="E_LIFECYCLE_AUTHORITY", message="role transition identity is not canonical" }
+    end
     local from = record.state
     record.role_binding, record.checkpoint, record.updated_at_ms = binding, checkpoint, now_ms()
     local event, event_err = new_event(state, "agent_session.role_transition", record, from, from, {
@@ -1149,6 +1224,42 @@ function Lifecycle:record_role_transition(session_id, opts)
     }, function(prefix) return self:_next_id(state, prefix) end)
     if not event then return false, { code="E_LIFECYCLE_INVALID", message=event_err } end
     return copy(record)
+  end)
+end
+function Lifecycle:record_authority_widening(parent_session_id, child_session_id, opts)
+  opts = opts or {}
+  return self:_change(function(state)
+    local parent, parent_err = self:_session_in(state, parent_session_id); if not parent then return false, parent_err end
+    local child, child_err = self:_session_in(state, child_session_id); if not child then return false, child_err end
+    local parent_authority, parent_authority_err = self:_resolve_session_authority(
+      parent_session_id, opts.parent_authority_reference, parent.role_binding)
+    local child_authority, child_authority_err = self:_resolve_session_authority(
+      child_session_id, opts.child_authority_reference, child.role_binding)
+    if not parent_authority or not child_authority
+      or parent_authority.agent_id ~= parent.agent_id
+      or child_authority.agent_id ~= child.agent_id then
+      return false, parent_authority_err or child_authority_err
+        or { code="E_LIFECYCLE_AUTHORITY", message="authority widening is not canonical" }
+    end
+    local added = {}
+    local parent_capabilities = {}
+    for _, capability in ipairs(parent_authority.capabilities) do parent_capabilities[capability] = true end
+    for _, capability in ipairs(child_authority.capabilities) do
+      if not parent_capabilities[capability] then added[#added + 1] = capability end
+    end
+    if #added == 0 or table.concat(added, ",") ~= opts.capability_delta then
+      return false, { code="E_LIFECYCLE_AUTHORITY", message="authority widening delta is not canonical" }
+    end
+    local checkpoint, checkpoint_err = id(opts.checkpoint, "checkpoint", true); if not checkpoint then return false, { code="E_LIFECYCLE_INVALID", message=checkpoint_err } end
+    local delta, delta_err = text(opts.capability_delta, "capability_delta", true); if not delta then return false, { code="E_LIFECYCLE_INVALID", message=delta_err } end
+    local event, event_err = new_event(state, "agent_session.authority_widened", child, child.state, child.state, {
+      reason = "role_widening", checkpoint = checkpoint,
+      parent_session_id = parent.session_id, parent_agent_id = parent.agent_id,
+      child_session_id = child.session_id, child_agent_id = child.agent_id,
+      capability_delta = delta,
+    }, function(prefix) return self:_next_id(state, prefix) end)
+    if not event then return false, { code="E_LIFECYCLE_INVALID", message=event_err } end
+    return copy(event)
   end)
 end
 function Lifecycle:resume_session(session_id)

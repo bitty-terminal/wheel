@@ -113,9 +113,13 @@ may narrow a role's matrix but never widen it.
 checkpoint boundary. A transition that would add a capability fails closed with
 `E_ROLE_AUTHORITY` unless the caller explicitly approves the widening; the
 approval and the previous generation are recorded in the checkpoint. When the
-Agent has a runtime session, the lifecycle registry records a bounded
+Agent has a runtime session, it must be bound to the Agent's canonical
+identity and capability state. The lifecycle registry records a bounded
 `agent_session.role_transition` event with the new generation and checkpoint,
-and rejects stale, skipped, reused, or forged generations on reload.
+and rejects caller-supplied, stale, skipped, reused, or forged generations on
+reload. Approved fork widening also requires independent parent and child
+runtime sessions and emits an `agent_session.authority_widened` event before
+the child is returned.
 
 `WheelAgent.fork_agent(parent, opts)` and `WheelTeam:fork_agent(...)` create an
 independent Agent identity from an immutable `ContextCommit`. The child records

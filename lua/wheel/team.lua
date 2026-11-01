@@ -207,13 +207,17 @@ function WheelTeam:fork_agent(agent_name, opts)
     return nil, { code = "E_TEAM_AGENT_NOT_FOUND", message = "agent not found: " .. tostring(agent_name) }
   end
   opts = opts or {}
+  if opts.approve_widening == true and opts.runtime == false then
+    return nil, { code = "E_FORK_AUTHORITY", message = "approved widening requires a runtime audit session" }
+  end
   local fork_opts = {}
   for key, value in pairs(opts) do fork_opts[key] = value end
   fork_opts.lifecycle = fork_opts.lifecycle or self.lifecycle
   local child, fork_err = WheelAgent.fork_agent(parent, fork_opts)
   if not child then return nil, fork_err end
   self:register_agent(child)
-  if self.lifecycle and opts.runtime ~= false then
+  local child_session_id = child:runtime_session_id()
+  if self.lifecycle and opts.runtime ~= false and not child_session_id then
     local session, session_err = child:create_runtime_session({
       task_id = opts.task_id,
       session_id = opts.session_id,
@@ -226,17 +230,18 @@ function WheelTeam:fork_agent(agent_name, opts)
       self.agent_states[child.name] = nil
       return nil, session_err
     end
-    if opts.activate ~= false then
+    child_session_id = child:runtime_session_id()
+  end
+  if self.lifecycle and opts.runtime ~= false and opts.activate ~= false then
       local activated, activate_err = child:activate_runtime_session()
       if not activated then
-        if child.session_id then
-          pcall(self.lifecycle.end_session, self.lifecycle, child.session_id, "explicit")
+        if child_session_id then
+          pcall(self.lifecycle.end_session, self.lifecycle, child_session_id, "explicit")
         end
         self.agents[child.name] = nil
         self.agent_states[child.name] = nil
         return nil, activate_err
       end
-    end
   end
   return child
 end

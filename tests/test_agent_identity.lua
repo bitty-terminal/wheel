@@ -143,11 +143,13 @@ return function(run_test)
     -- Widening back to a mutating role fails closed without explicit approval.
     local rejected, rejection = agent:transition_role(WheelAgent.Role.CODING, {
       reason = "resume implementation",
+      binding_id = "forged-authority-binding",
     })
     assert(rejected == nil)
     assert(rejection.code == "E_ROLE_AUTHORITY")
     assert(agent.role_binding.role == WheelAgent.Role.REVIEWER)
     assert(agent.role_binding.policy_generation == 2)
+    assert(agent.role_binding.binding_id ~= "forged-authority-binding")
 
     -- Explicit approval is audited with a new policy generation and checkpoint.
     local widened = assert(agent:transition_role(WheelAgent.Role.CODING, {
@@ -250,6 +252,38 @@ return function(run_test)
       "role-gated review must use the authoritative Reviewer binding")
   end)
 
+  run_test("Agent identity: runtime and provenance fields cannot cross agents", function()
+    local kernel = WheelKernel.new_mock()
+    local context = fixed_context(kernel)
+    local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4 })
+    local first = WheelAgent.new({ name = "runtime-first", role = WheelAgent.Role.CODING,
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    local second = WheelAgent.new({ name = "runtime-second", role = WheelAgent.Role.CODING,
+      kernel = kernel, context = context, lifecycle = lifecycle })
+    assert(first:create_runtime_session({ session_id = "runtime-first-session" }))
+    assert(second:create_runtime_session({ session_id = "runtime-second-session" }))
+    rawset(first, "session_id", "runtime-second-session")
+    rawset(first, "policy_generation", 99)
+    rawset(first, "last_role_checkpoint", "forged-checkpoint")
+    rawset(first, "context_refs", { session_id = "runtime-second-session", branch = "forged" })
+    assert(first:runtime_session_id() == "runtime-first-session")
+    assert(first:context_reference().session_id == "runtime-first-session")
+    assert(first:lineage_projection().policy_generation == 1)
+    assert(first:lineage_projection().role_checkpoint == nil)
+    assert(first:activate_runtime_session() ~= nil)
+    assert(lifecycle:get_session("runtime-first-session").state == WheelLifecycle.AgentSessionState.ACTIVE)
+    assert(lifecycle:get_session("runtime-second-session").state == WheelLifecycle.AgentSessionState.CREATED)
+  end)
+
+  run_test("Agent identity: exported read-only allowlist cannot authorize a new tool", function()
+    local kernel = WheelKernel.new_mock()
+    local agent = WheelAgent.new({ name = "allowlist-shadow", role = WheelAgent.Role.REVIEWER,
+      tools = { "forged_read_tool" }, kernel = kernel })
+    WheelAgent.READ_ONLY_TOOLS.forged_read_tool = true
+    local allowed, reason = agent:is_tool_allowed("forged_read_tool")
+    assert(allowed == false and reason:find("canonical read-only allowlist", 1, true) ~= nil)
+  end)
+
   run_test("Agent identity: exported Capability mutations cannot grant unregistered mutation", function()
     local agent = WheelAgent.new({
       name = "capability-table-agent",
@@ -315,10 +349,18 @@ return function(run_test)
       kernel = kernel,
       context = context,
     })
-    parent.session_id = "fork-parent-session"
     local base = checkpoint(context, "fork base", 1700000000000)
     assert(context:put_slot("workspace/project", "Wheel updated").success)
     local head = checkpoint(context, "fork head", 1700000001000)
+    local lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4 })
+    parent = WheelAgent.new({
+      name = "fork-parent-runtime",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+      lifecycle = lifecycle,
+    })
+    assert(parent:create_runtime_session({ session_id = "fork-parent-session" }))
 
     local child = assert(WheelAgent.fork_agent(parent, {
       name = "fork-child",
@@ -373,15 +415,43 @@ return function(run_test)
       base_context_commit = base.hash,
     })
     assert(widened == nil and widened_err.code == "E_FORK_AUTHORITY")
-    local approved = assert(WheelAgent.fork_agent(wide_parent, {
+    local approved, approved_err = WheelAgent.fork_agent(wide_parent, {
       name = "fork-wide-child",
       role = WheelAgent.Role.CODING,
       reason = "approved escalation",
       approve_widening = true,
       base_context_commit = base.hash,
+    })
+    assert(approved == nil and approved_err.code == "E_FORK_AUTHORITY",
+      "approved widening without lifecycle audit must fail closed")
+
+    local audited_lifecycle = WheelLifecycle.new({ max_sessions_per_agent = 4 })
+    local audited_parent = WheelAgent.new({
+      name = "audited-wide-parent",
+      role = WheelAgent.Role.REVIEWER,
+      kernel = kernel,
+      context = context,
+      lifecycle = audited_lifecycle,
+    })
+    assert(audited_parent:create_runtime_session({ session_id = "audited-wide-parent-session" }))
+    local audited_child = assert(WheelAgent.fork_agent(audited_parent, {
+      name = "audited-wide-child",
+      role = WheelAgent.Role.CODING,
+      reason = "approved audited escalation",
+      approve_widening = true,
+      base_context_commit = base.hash,
     }))
-    assert(approved.policy_generation == 1)
-    assert(approved:has_capability(WheelAgent.Capability.MODIFY))
+    assert(audited_child:runtime_session_id() ~= nil)
+    local widening_event
+    for _, event in ipairs(audited_lifecycle:events()) do
+      if event.type == "agent_session.authority_widened" then widening_event = event end
+    end
+    assert(widening_event)
+    assert(widening_event.parent_session_id == "audited-wide-parent-session")
+    assert(widening_event.child_session_id == audited_child:runtime_session_id())
+    assert(widening_event.parent_agent_id == audited_parent.agent_id)
+    assert(widening_event.child_agent_id == audited_child.agent_id)
+    assert(widening_event.capability_delta == "modify,execute")
 
     -- A public-field shadow must not make a read-only parent appear to hold
     -- capabilities that a fork would otherwise inherit.
