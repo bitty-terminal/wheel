@@ -5551,6 +5551,7 @@ run_test("WheelContext.ContextBus: in-memory pubsub event dispatch and agent not
   assert(#received_events == 1)
 end)
 
+--- Check local prefix stability without interpreting it as provider evidence.
 run_test("WheelContext: prefix-cache-friendly Three-Zone prompt compilation and key stability", function()
   local ctx = WheelContext.new()
   ctx:put_slot("workspace/overview", "Wheel Agent Framework")
@@ -6458,9 +6459,11 @@ run_test("WheelProvider.MockProvider: completions, streaming chunks, and tool ca
   assert(mock:describe().call_count == 2)
 end)
 
+--- Exercise native streaming formats and usage status in both arrival orders.
 run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming SSE", function()
   -- 1. Test OpenAIAdapter with mocked HTTP client emitting SSE stream
   local cache_usage_order = "hit_first"
+  --- Emit fragmented OpenAI content, tool calls, and ordered usage snapshots.
   local mock_http_openai = function(req)
     assert(req.method == "POST")
     assert(string.find(req.url, "/chat/completions", 1, true) ~= nil)
@@ -6519,6 +6522,7 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
     "streaming cache hit must remain dominant when it arrives after a miss")
 
   -- 2. Test AnthropicAdapter with mocked HTTP client emitting Anthropic SSE events
+  --- Emit Anthropic input/cache and output usage in their native event shapes.
   local mock_http_anthropic = function(req)
     assert(req.method == "POST")
     assert(string.find(req.url, "/messages", 1, true) ~= nil)
@@ -7708,7 +7712,9 @@ run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", 
   assert(st.model_profile.thinking.enabled == true)
 end)
 
+--- Validate run-level status precedence independently of accumulated tokens.
 run_test("WheelRunner: cache status aggregates observed turns without masking status", function()
+  --- Exercise observed statuses with independent positive cache-read totals.
   local function run_statuses(policy, supported, statuses)
     local kernel = WheelKernel.new_mock()
     local context = WheelContext.new({ kernel = kernel })
@@ -7738,6 +7744,7 @@ run_test("WheelRunner: cache status aggregates observed turns without masking st
           prompt_tokens = 10,
           completion_tokens = 2,
           total_tokens = 12,
+          cache_read_tokens = status == "verified_hit" and 4 or 0,
           provider_cache_status = status,
         },
       }
@@ -7762,10 +7769,10 @@ run_test("WheelRunner: cache status aggregates observed turns without masking st
     return WheelRunner.run_task(agent, task, { max_turns = #statuses })
   end
 
-  local cache_off = run_statuses("off", true, { "verified_hit" })
+  local cache_off = run_statuses("off", true, { "verified_hit", "verified_hit" })
   assert(cache_off.success and cache_off.usage.provider_cache_status == "not_requested",
     "cache-off-only runs must retain not_requested as their observed status")
-  local unsupported = run_statuses("prefer", false, { "verified_hit" })
+  local unsupported = run_statuses("prefer", false, { "verified_hit", "verified_hit" })
   assert(unsupported.success and unsupported.usage.provider_cache_status == "unsupported",
     "unsupported prefer-only runs must retain unsupported as their observed status")
 
@@ -7778,6 +7785,14 @@ run_test("WheelRunner: cache status aggregates observed turns without masking st
       "runner must preserve the strongest mixed status in either turn order")
     assert(mixed.usage.prompt_tokens == 20 and mixed.usage.total_tokens == 24,
       "cache status aggregation must remain independent of accumulated token totals")
+    assert(mixed.usage.cache_read_tokens == 4,
+      "hit/miss runs must preserve positive measured reads in either turn order")
+  end
+  for _, statuses in ipairs({ { "error", "verified_hit" }, { "verified_hit", "error" } }) do
+    local mixed = run_statuses("prefer", true, statuses)
+    assert(mixed.success and mixed.usage.provider_cache_status == "error"
+      and mixed.usage.cache_read_tokens == 4,
+      "runner cache errors must dominate hits in either order while retaining read totals")
   end
 end)
 
@@ -7892,6 +7907,7 @@ run_test("WheelProvider.SSEParser: buffer limits and StdioAdapter prompt stdin p
   assert(string.find(captured_prompt, "hello stdio", 1, true) ~= nil, "runner must receive prompt")
 end)
 
+--- Preserve configured cache policy across every stdio factory route.
 run_test("WheelProvider.StdioAdapter: direct and factory cache policy survives until validation", function()
   for _, construction in ipairs({ "direct", "stdio", "local", "ollama" }) do
     for _, policy in ipairs({ "off", "prefer", "required" }) do

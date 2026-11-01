@@ -559,6 +559,7 @@ local function bounded_message(message, budget)
   return bounded
 end
 
+--- Bound request fields and serialized prefix together before provider dispatch.
 local function bound_provider_request(request)
   local value_budget = make_budget(WheelRunner.MAX_REQUEST_NODES,
     WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_BYTES)

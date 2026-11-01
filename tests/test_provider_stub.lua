@@ -450,6 +450,7 @@ local function run_stub_once(label, env_key, arguments)
   return status, stderr
 end
 
+--- Exercise adapter payloads, usage evidence, and credential-safe loopback I/O.
 local function main()
   select_scratch_root()
   local pipe = assert(io.popen(
@@ -564,12 +565,12 @@ local function main()
   local unsupported_payload, unsupported_err = unsupported:_format_payload(cache_request, false)
   check(unsupported_payload == nil and unsupported_err:find("unsupported", 1, true),
     "required mode must fail closed when cache capability is unavailable")
-  local unsupported_stream = OpenAIAdapter.new({ base_url = base_url })
+  local unsupported_stream = OpenAIAdapter.new({ prompt_cache_supported = false })
   local unsupported_stream_payload = assert(unsupported_stream:_format_payload(cache_request, true))
   check(unsupported_stream_payload.prompt_cache_key == nil
     and unsupported_stream_payload.stream_options
     and unsupported_stream_payload.stream_options.include_usage == true,
-    "providers without cache capability must still request streaming usage telemetry")
+    "official OpenAI must request streaming usage even without cache capability")
   local false_policy, false_policy_err = cache_adapter:_format_payload({
     messages = cache_request.messages, stable_context_prefix = "stable", prompt_cache_policy = false,
   }, false)
@@ -580,8 +581,8 @@ local function main()
   check(mock_result == nil and mock_err:find("unsupported", 1, true),
     "unsupported MockProvider must reject required cache policy")
   local stream_payload = assert(cache_adapter:_format_payload(cache_request, true))
-  check(stream_payload.stream_options and stream_payload.stream_options.include_usage == true,
-    "OpenAI streaming must request explicit usage telemetry")
+  check(stream_payload.stream_options == nil and stream_payload.prompt_cache_key ~= nil,
+    "custom cache capability must not imply support for streaming usage options")
   local custom = assert(WheelProvider.create({ provider = "openai", model = STUB_MODEL }, {
     base_url = base_url .. "/custom", api_key = SYNTHETIC_KEY,
   }))
@@ -589,8 +590,38 @@ local function main()
   check(custom_payload.prompt_cache_key == nil,
     "custom endpoints must not receive cache controls without explicit capability")
   local custom_stream_payload = assert(custom:_format_payload(cache_request, true))
-  check(custom_stream_payload.stream_options and custom_stream_payload.stream_options.include_usage == true,
-    "custom OpenAI endpoints must still request streaming usage telemetry")
+  check(custom_stream_payload.stream_options == nil,
+    "custom OpenAI endpoints must omit streaming usage options by default")
+  for _, construction in ipairs({ "direct", "openai", "deepseek" }) do
+    for _, scenario in ipairs({
+      { official = true, expected = true },
+      { official = true, option = false, expected = false },
+      { official = false, expected = false },
+      { official = false, option = true, expected = true },
+      { official = false, option = false, expected = false },
+    }) do
+      local opts = {
+        api_key = SYNTHETIC_KEY,
+        base_url = scenario.official and unsupported_stream.base_url .. "/" or base_url,
+        stream_include_usage = scenario.option,
+        prompt_cache_supported = true,
+      }
+      local candidate = construction == "direct" and OpenAIAdapter.new(opts)
+        or assert(WheelProvider.create({ provider = construction, model = STUB_MODEL }, opts))
+      local payload = assert(candidate:_format_payload(cache_request, true))
+      check((payload.stream_options ~= nil) == scenario.expected,
+        construction .. " must honor endpoint defaults and explicit stream_include_usage")
+      if scenario.expected then
+        check(payload.stream_options.include_usage == true, "enabled streaming usage must request include_usage")
+      end
+      check(payload.prompt_cache_key ~= nil, "usage option must remain separate from cache capability")
+      check(candidate:_format_payload(cache_request, false).stream_options == nil,
+        "non-streaming payloads must never contain stream_options")
+    end
+  end
+  local deepseek_default = assert(WheelProvider.create({ provider = "deepseek" }, { api_key = SYNTHETIC_KEY }))
+  check(deepseek_default:_format_payload(cache_request, true).stream_options == nil,
+    "the default DeepSeek factory route must not assume streaming usage support")
   local off_adapter = OpenAIAdapter.new({ prompt_cache_policy = "off", prompt_cache_supported = true })
   local off_payload = assert(off_adapter:_format_payload(cache_request, false))
   check(off_payload.prompt_cache_key == nil, "off policy must not attach cache controls")
@@ -658,6 +689,10 @@ local function main()
     { details = { cache_write_tokens = 3 }, alias = "cache_write_tokens", value = 0, write = 3 },
     { details = { cache_write_tokens = 0 }, alias = "cache_creation_tokens", value = 3, write = 0 },
     { details = { cache_write_tokens = 3 }, alias = "cache_creation_tokens", value = -1, write = 3 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_creation_tokens", value = 9, write = 3 },
+    { details = { cache_write_tokens = 0 }, alias = "cache_write_tokens", value = 9, write = 0 },
+    { details = { cache_write_tokens = "bad" }, alias = "cache_write_tokens", value = 9 },
+    { details = { cache_write_tokens = "bad" }, alias = "cache_creation_tokens", value = 9 },
   }) do
     local raw = { prompt_tokens = 40, prompt_tokens_details = conflict.details }
     raw[conflict.alias] = conflict.value

@@ -832,6 +832,8 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `tests/test_bench.lua`                    | Benchmark harness tests: statistics, strict argument parsing, deterministic JSON, fail-closed CLI behavior, and short offline scenario runs.                                                                                                                                                                               |
 | `bench/`                                  | Offline benchmark suite (`bench/README.md`): activation, process, runner, orchestration, and context scenarios with human and JSON output.                                                                                                                                                                                 |
 | `tests/test_live_http_client_redirect.py` | Key-free loopback negative test: the HTTP client refuses cross-host and scheme-change 302 redirects and forwards no Authorization header.                                                                                                                                                                                  |
+| `tests/test_live_provider_selection.py`   | Key-free offline selector and helper tests: selection, per-provider key/host binding, HTTPS-only requests, credential-echo rejection, static diagnostics, synthetic legacy scenarios, and bounded OpenAI cache evidence.                                                                                                   |
+| `tests/test_live_provider_offline.lua`    | Key-free live regression using the real adapter and in-memory helper/runner doubles; covers legacy scenarios, credential-free request headers, forbidden Lua credential reads, static failures, and bounded repeated OpenAI cache prefixes with measured usage.                                                            |
 | `tests/e2e_cross_process.lua`             | End-to-end integration test suite exercising all 11 lifecycle stages against the real Rust `wheel_stdio_host` binary over Unix FIFOs.                                                                                                                                                                                      |
 | `VERSION`                                 | Canonical harness version (`0.1.0`); the single source used by `just package`.                                                                                                                                                                                                                                             |
 | `scripts/package.sh`                      | Deterministic artifact builder: archive, SHA-256 sidecar, and manifest; fails closed on dirty inputs.                                                                                                                                                                                                                      |
@@ -876,6 +878,18 @@ Wheel coordinates peer colleague agents through content-addressed shared state:
   the strongest evidence in this order: `error`, `verified_hit`, `write_only`,
   `verified_miss`, `unknown`, `not_requested`, `unsupported`. See
   [Context and Runtime Architecture](CONTEXT-ARCHITECTURE.md).
+
+`OpenAIAdapter.new` and the `openai`/`deepseek` factory routes accept
+`stream_include_usage` independently of prompt-cache capability. It defaults
+to enabled only for the canonical official OpenAI base URL (including trailing
+slashes); custom and compatible endpoints omit `stream_options` unless
+explicitly opted in with `stream_include_usage = true`. Set it to `false` to
+omit the option for any endpoint. Cache policy `off` and unsupported cache
+capability do not disable official OpenAI streaming usage collection.
+Usage normalization selects native cache counters first, then top-level
+`cache_read_tokens` and `cache_write_tokens`, then `cache_creation_tokens` for
+writes. Conflicting duplicate counters report `error` while retaining the
+selected valid count; malformed selected counters remain absent.
 
 ### Context Graph Projections (CTX-0037)
 
@@ -1292,7 +1306,8 @@ WHEEL_LIVE_PROVIDER=openai-cache just test-live  # OpenAI cache evidence
   successfully without contacting the provider.
 - `just test-live` is not part of `just check` or CI. Its key-free offline
   gates (`test-live-offline`: redirect policy, provider selection, host
-  binding, helper credential-echo rejection, and synthetic legacy scenarios)
+  binding, helper credential-echo rejection, synthetic legacy scenarios, and
+  bounded same-prefix OpenAI cache scenarios)
   run first and are also part of `check`; the live portion then skips
   with exit 0 and a clear message when the selected provider's key is absent.
 - The OpenRouter and Command Code live paths attempt a non-streaming

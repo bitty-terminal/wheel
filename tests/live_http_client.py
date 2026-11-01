@@ -221,6 +221,7 @@ def fetch(
 
 
 def main() -> int:
+    """Probe or call the selected host and reject credential-bearing output."""
     try:
         provider = select_provider(os.environ.get(PROVIDER_SELECTOR_ENV))
     except InvalidRequest as error:

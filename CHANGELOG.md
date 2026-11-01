@@ -53,6 +53,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   zero-read misses without requiring a write counter. Live OpenAI cache
   evidence uses a deterministic prefix above the documented cache minimum;
   hits still require a positive measured cached-read count.
+- OpenAI-compatible streaming usage options are separately configurable with
+  `stream_include_usage`. Official OpenAI defaults to enabled even with cache
+  policy off or unsupported cache capability; custom endpoints default to
+  omitted and can explicitly opt in or out. Regression tests retain selected
+  native cache counts on alias conflicts and exercise error/hit precedence
+  with positive cached-read totals in either turn order.
 
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,

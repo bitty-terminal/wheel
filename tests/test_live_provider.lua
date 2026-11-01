@@ -48,6 +48,7 @@ local function trim(value)
   return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- Select the configured live provider and reject unknown names before probing.
 local function select_provider()
   local raw = os.getenv(PROVIDER_SELECTOR_ENV)
   local name = DEFAULT_PROVIDER
@@ -85,6 +86,8 @@ local SMOKE_MAX_COMPLETION_TOKENS = provider.smoke_max_completion_tokens
 local RUNNER_MAX_COMPLETION_TOKENS = provider.runner_max_completion_tokens
 local STREAM_CHUNK_SIZE = 64
 local MAX_LIVE_REQUEST_BYTES = 1024 * 1024
+local OPENAI_CACHE_PREFIX_REPETITIONS = 192
+local OPENAI_CACHE_MIN_PROMPT_TOKENS = 1024
 
 local key_probe = assert(io.popen(PYTHON .. " " .. CLIENT_SCRIPT .. " --check-key", "r"))
 local key_state = (key_probe:read("*a") or ""):gsub("%s+$", "")
@@ -212,7 +215,9 @@ if provider.name == "openai-cache" then
   -- This evidence path is intentionally limited to two same-prefix requests;
   -- it does not invoke the unrelated tool, stream, or runner live scenarios.
   local stable_prefix = string.rep(
-    "Policy: preserve the stable context and report measured usage only.\n", 192)
+    "Policy: preserve the stable context and report measured usage only.\n", OPENAI_CACHE_PREFIX_REPETITIONS)
+  assert(#stable_prefix <= WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES,
+    "live stable prefix must fit the adapter cache-key byte bound")
   local request = {
     stable_context_prefix = stable_prefix,
     messages = {
@@ -234,6 +239,10 @@ if provider.name == "openai-cache" then
     assert(response.usage == nil or type(response.usage) == "table",
       "OpenAI cache completion usage must be normalized or absent")
     local usage = response.usage or {}
+    if usage.prompt_tokens ~= nil then
+      assert(usage.prompt_tokens > OPENAI_CACHE_MIN_PROMPT_TOKENS,
+        "reported live prompt usage must exceed the documented cache minimum")
+    end
     local status = usage.provider_cache_status or "unknown"
     assert(status == "verified_hit" or status == "verified_miss" or status == "write_only"
       or status == "unknown" or status == "unsupported" or status == "error",

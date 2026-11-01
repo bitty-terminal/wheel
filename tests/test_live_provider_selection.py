@@ -398,10 +398,15 @@ else:
     assert result.stderr == ""
     print("PASS live OpenAI cache test skips cleanly without its key")
 
-    for legacy_provider in (OPENROUTER, COMMANDCODE):
-        for mode in ("success", "failure"):
-            args = [lua, "tests/test_live_provider_offline.lua", legacy_provider.name]
-            if mode == "failure":
+    for provider in client.PROVIDERS.values():
+        modes = (
+            ("miss", "hit", "unknown", "error", "short")
+            if provider is OPENAI_CACHE
+            else ("success", "failure")
+        )
+        for mode in modes:
+            args = [lua, "tests/test_live_provider_offline.lua", provider.name]
+            if mode != "success":
                 args.append(mode)
             result = subprocess.run(
                 args,
@@ -413,9 +418,7 @@ else:
             )
             assert result.returncode == 0, result.stdout + result.stderr
             assert result.stderr == ""
-            assert "PASS offline legacy live scenarios" in result.stdout
-    print(
-        "PASS both legacy selectors complete synthetic adapter/runner scenarios and static failures"
-    )
+            assert "PASS offline live scenarios" in result.stdout
+    print("PASS legacy scenarios and bounded OpenAI cache evidence run offline")
 
 print("PASS live provider selection")
