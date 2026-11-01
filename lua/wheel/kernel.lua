@@ -33,6 +33,29 @@ local function task_transition_error(task, payload, allowed, owner_field)
   if type(owner) ~= "string" or owner == "" or task.worker_id ~= owner
     or task.assigned_agent ~= owner then return "task owner mismatch" end
 end
+
+local function task_start_error(task, payload, tasks)
+  local status = WheelKernel.normalize_lifecycle_status(task.status)
+  if status ~= "ready" or task.lifecycle_status ~= "ready" then return "task is not ready" end
+  if type(task.generation) ~= "number" or task.generation < 0
+    or task.generation >= MAX_TASK_GENERATION or task.generation % 1 ~= 0 then
+    return "task generation exhausted or invalid"
+  end
+  if payload.expected_generation ~= nil
+    and (type(payload.expected_generation) ~= "number"
+      or payload.expected_generation ~= task.generation) then
+    return "stale generation"
+  end
+  local worker = payload.assigned_agent or payload.worker_id
+  if type(worker) ~= "string" or worker == "" then return "worker identity is required" end
+  if task.worker_id and task.worker_id ~= "" and task.worker_id ~= worker then return "task owner mismatch" end
+  for _, dependency_id in ipairs(task.dependencies or {}) do
+    local dependency = tasks and tasks[dependency_id]
+    if not dependency or WheelKernel.normalize_lifecycle_status(dependency.status) ~= "completed" then
+      return "task dependencies are not completed"
+    end
+  end
+end
 WheelKernel.__index = WheelKernel
 
 local ok_action, WheelAction = pcall(require, "wheel.action")
@@ -557,23 +580,13 @@ local function create_mock_dispatcher()
       if not valid_dependency_graph(state.tasks) then
         return json_codec.encode({ success = false, error = "task dependency graph is invalid" })
       end
-      if lifecycle_status(task.status) ~= "ready" or task.lifecycle_status ~= "ready" then
-        return json_codec.encode({ success = false, error = "task is not ready: " .. tostring(task.status) })
-      end
-      if type(task.generation) ~= "number" or task.generation < 0 or task.generation >= MAX_TASK_GENERATION
-        or task.generation % 1 ~= 0 then return json_codec.encode({ success = false, error = "task generation exhausted or invalid" }) end
       local worker = payload.assigned_agent or payload.worker_id or "worker"
-      if type(worker) ~= "string" or worker == "" then
-        return json_codec.encode({ success = false, error = "worker identity is required" })
-      end
-      for _, dependency_id in ipairs(task.dependencies) do
-        if lifecycle_status(state.tasks[dependency_id].status) ~= "completed" then
-          return json_codec.encode({ success = false, error = "task dependencies are not completed" })
-        end
-      end
-      if task.worker_id and task.worker_id ~= "" and task.worker_id ~= worker then
-        return json_codec.encode({ success = false, error = "task owner mismatch" })
-      end
+      local start_error = task_start_error(task, {
+        expected_generation = payload.expected_generation,
+        assigned_agent = worker,
+        worker_id = worker,
+      }, state.tasks)
+      if start_error then return json_codec.encode({ success = false, error = start_error }) end
       task.status = "running"
       task.lifecycle_status = lifecycle_status(task.status)
       task.generation = task.generation + 1
@@ -980,6 +993,17 @@ end
 --- @param payload table?
 --- @return any
 function WheelKernel:call(command, payload)
+  payload = payload or {}
+  local expected_start_generation
+  if command == "task.start" then
+    local tasks = self:_validated_task_graph()
+    local task = tasks[payload.id]
+    if not task then error("task not found") end
+    local start_error = task_start_error(task, payload, tasks)
+    if start_error then error(start_error) end
+    expected_start_generation = task.generation
+    payload.expected_generation = expected_start_generation
+  end
   if not self._handoff_transaction and TASK_TRANSITIONS[command] then
     local task = self:get_task(payload.id)
     if not task then error("task not found") end
@@ -990,7 +1014,7 @@ function WheelKernel:call(command, payload)
       error("task generation exhausted")
     end
   end
-  local payload_str = json_codec.encode(payload or {})
+  local payload_str = json_codec.encode(payload)
   local resp_str = self.dispatcher(command, payload_str)
   local resp = json_codec.decode(resp_str)
   if not resp or not resp.success then
@@ -1015,6 +1039,26 @@ function WheelKernel:call(command, payload)
   if command == "task.list" then
     for _, task in ipairs(resp.data or {}) do project(task) end
   elseif command:match("^task%.") then project(resp.data) end
+  if command == "task.start" then
+    local started = resp.data
+    local worker = payload.assigned_agent or payload.worker_id
+    if type(started) ~= "table"
+      or WheelKernel.normalize_lifecycle_status(started.status) ~= "in_progress"
+      or started.lifecycle_status ~= "in_progress"
+      or started.generation ~= expected_start_generation + 1
+      or started.assigned_agent ~= worker or started.worker_id ~= worker then
+      error("task start response failed lifecycle fence")
+    end
+    local actual = self:get_task(payload.id)
+    if type(actual) ~= "table"
+      or WheelKernel.normalize_lifecycle_status(actual.status) ~= "in_progress"
+      or actual.lifecycle_status ~= "in_progress"
+      or actual.generation ~= expected_start_generation + 1
+      or actual.assigned_agent ~= worker or actual.worker_id ~= worker then
+      error("task start state failed lifecycle fence")
+    end
+    resp.data = actual
+  end
   return resp.data
 end
 
@@ -1076,7 +1120,7 @@ end
 --- @param worker_id string?
 --- @param now_ms number?
 --- @return table
-function WheelKernel:start_task(id, worker_id, now_ms)
+function WheelKernel:start_task(id, worker_id, now_ms, expected_generation)
   local worker = worker_id or "worker"
   if type(worker) == "table" then
     worker = worker.worker_id or worker.assigned_agent or "worker"
@@ -1086,6 +1130,7 @@ function WheelKernel:start_task(id, worker_id, now_ms)
     worker_id = worker,
     assigned_agent = worker,
     now_ms = now_ms or 0,
+    expected_generation = expected_generation,
   })
 end
 

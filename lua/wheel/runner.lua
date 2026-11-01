@@ -275,10 +275,11 @@ local function canonical_state(state, retained)
   return table.concat(parts, "|")
 end
 
-local function serialize_state(state, context_ref)
+local function serialize_state(state, context_ref, hash_function)
   local lines = {
     "ContextRef v1",
     "id=" .. context_ref.id,
+    "seed=" .. context_ref.hash,
     "turns=" .. tostring(context_ref.turns),
     "bytes=" .. tostring(context_ref.bytes),
   }
@@ -302,6 +303,9 @@ local function serialize_state(state, context_ref)
     if truncated then break end
   end
   if truncated then append_line("[state truncated]") end
+  local body = table.concat(lines, "\n")
+  local body_hash = hash_function(body)
+  table.insert(lines, 4, "body_hash=" .. body_hash)
   return table.concat(lines, "\n")
 end
 
@@ -723,6 +727,7 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
   }, "\0")
   local hash_function = context and context.compute_hash
     or (WheelConfig and WheelConfig.compute_hash)
+  hash_function = hash_function or function(value) return string.format("%08x", #value) end
   local ref_hash = hash_function and hash_function(ref_seed)
     or string.format("%08x", #ref_seed)
   local context_ref = {
@@ -736,15 +741,15 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
   -- `bytes` is part of the serialized payload, so converge its decimal width
   -- before writing the slot. The bound guarantees this loop remains tiny.
   for _ = 1, 4 do
-    encoded = serialize_state(state, context_ref)
+    encoded = serialize_state(state, context_ref, hash_function)
     local encoded_bytes = #encoded
     if context_ref.bytes == encoded_bytes then break end
     context_ref.bytes = encoded_bytes
   end
-  encoded = serialize_state(state, context_ref)
+  encoded = serialize_state(state, context_ref, hash_function)
   context_ref.bytes = #encoded
-  if #serialize_state(state, context_ref) ~= context_ref.bytes then
-    encoded = serialize_state(state, context_ref)
+  if #serialize_state(state, context_ref, hash_function) ~= context_ref.bytes then
+    encoded = serialize_state(state, context_ref, hash_function)
     context_ref.bytes = #encoded
   end
 

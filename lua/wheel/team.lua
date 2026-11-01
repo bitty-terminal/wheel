@@ -412,7 +412,7 @@ function WheelTeam:claim_task(agent_name, task_id)
     local stored, store_error = self.context:put_slot("tasks/" .. task_id .. "/worker", agent_name)
     if not stored or not stored.success then return false, store_error or { error = "task_claim_persist_failed" } end
     return true, started
-  end)
+  end, self.kernel)
   if not started_ok then return false, started_task end
 
   -- Record team claim
@@ -626,8 +626,14 @@ function WheelTeam:_valid_context_reference(reference, task_id, require_context_
   if not verified then return false end
   if require_context_slot then
     local slot = commit.slots["tasks/" .. task_id .. "/context_ref"]
-    if not slot or type(slot.content) ~= "string" or not slot.content:match("^ContextRef v1\nid=contextref:[0-9a-f]+\n")
-      or slot.hash ~= WheelContext.compute_hash(slot.content) then return false end
+    if not slot or type(slot.content) ~= "string" or slot.hash ~= WheelContext.compute_hash(slot.content) then return false end
+    local ref_id, seed, body_hash, turns, bytes = slot.content:match(
+      "^ContextRef v1\nid=(contextref:[0-9a-f]+)\nseed=([0-9a-f]+)\nbody_hash=([0-9a-f]+)\nturns=(%d+)\nbytes=(%d+)\n")
+    if not ref_id or #ref_id ~= 27 or #seed ~= 64 or #body_hash ~= 64
+      or ref_id ~= "contextref:" .. seed:sub(1, 16) or tonumber(turns) == nil
+      or tonumber(bytes) ~= #slot.content then return false end
+    local body = slot.content:gsub("\nbody_hash=[0-9a-f]+\n", "\n", 1)
+    if WheelContext.compute_hash(body) ~= body_hash then return false end
   end
   return true
 end
@@ -1106,12 +1112,16 @@ function WheelTeam:set_handoff_state(handoff_id, target_state, authority)
           if not persisted then return false, persist_error end
           local reassigned = self.kernel:reassign_task(record.task_id, record.generation,
             record.to_agent, nil, record.from_agent)
+          local actual = self.kernel:get_task(record.task_id)
           if not reassigned or normalize_lifecycle_status(reassigned.status) ~= "in_progress"
-            or reassigned.generation ~= updated.generation or reassigned.worker_id ~= record.to_agent then
+            or reassigned.generation ~= updated.generation or reassigned.worker_id ~= record.to_agent
+            or not actual or normalize_lifecycle_status(actual.status) ~= "in_progress"
+            or actual.lifecycle_status ~= "in_progress" or actual.generation ~= updated.generation
+            or actual.worker_id ~= record.to_agent or actual.assigned_agent ~= record.to_agent then
             return false, "handoff task reassignment rejected (stale generation or invalid state)"
           end
           return true
-        end)
+        end, self.kernel)
         if not accepted then return false, accept_error end
         local source_state, target_state_record = source, target
         self.agent_tasks[record.from_agent][record.task_id] = nil

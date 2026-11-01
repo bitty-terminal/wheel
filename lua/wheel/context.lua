@@ -771,29 +771,48 @@ end
 --- Commit local Context and owned kernel projections as one operation. Events
 -- become visible only after success; rollback does not invoke fallible bridge
 -- compensation. Injected external dispatchers fail before the first write.
-function WheelContext:_with_handoff_transaction(slot_name, operation)
+function WheelContext:_with_handoff_transaction(slot_name, operation, task_kernel)
   if self._handoff_transaction_active or self.bus._transaction_events then
     return false, { error = "context_transaction_busy" }
   end
-  if self.kernel and (type(self.kernel._with_handoff_transaction) ~= "function"
-    or not self.kernel._handoff_transaction) then
+  local kernels, seen_kernels = {}, {}
+  local function add_kernel(kernel)
+    if not kernel or seen_kernels[kernel] then return true end
+    if type(kernel._with_handoff_transaction) ~= "function" or not kernel._handoff_transaction then
+      return false
+    end
+    seen_kernels[kernel] = true
+    kernels[#kernels + 1] = kernel
+    return true
+  end
+  if not add_kernel(task_kernel) or not add_kernel(self.kernel) then
     return false, { error = "kernel_handoff_transaction_unavailable" }
   end
   local snapshot = self:_capture_handoff_state(slot_name)
   self._handoff_transaction_active = true
   self.bus._transaction_events = {}
-  local called, success, result
-  if self.kernel then
-    called, success, result = pcall(self.kernel._with_handoff_transaction, self.kernel, operation)
-  else
-    called, success, result = pcall(operation)
+  local function run_transaction(index)
+    if index > #kernels then
+      local called, success, result = pcall(operation)
+      if not called then return false, { error = "context_transaction_failed" } end
+      return success == true, result
+    end
+    local kernel = kernels[index]
+    local called, success, result = pcall(kernel._with_handoff_transaction, kernel, function()
+      local inner_success, inner_result = run_transaction(index + 1)
+      if not inner_success then return false, inner_result end
+      return true, inner_result
+    end)
+    if not called then return false, { error = "kernel_transaction_failed" } end
+    return success == true, result
   end
+  local success, result = run_transaction(1)
   local events = self.bus._transaction_events
   self.bus._transaction_events = nil
   self._handoff_transaction_active = nil
-  if not called or success ~= true then
+  if success ~= true then
     restore_handoff_state(self, snapshot)
-    return false, called and result or { error = "context_transaction_failed" }
+    return false, result
   end
   for _, event in ipairs(events) do self.bus:publish(event) end
   return true, result
@@ -893,6 +912,7 @@ function WheelContext:commit_checkpoint(opts)
       parents = {}
     end
   end
+  parents = deep_copy_value(parents)
 
   local tree_hash = self:tree_hash()
   local slots_snapshot = deep_copy_slots(self._slots)
@@ -925,7 +945,7 @@ function WheelContext:commit_checkpoint(opts)
     hash = commit_hash,
     tree_hash = tree_hash,
     slots = slots_snapshot,
-    parent_hashes = parents,
+    parent_hashes = deep_copy_value(parents),
     author = author,
     task_id = task_id,
     rationale = rationale,
@@ -1411,14 +1431,14 @@ function WheelContext:merge_branch(source, opts)
     -- Fast-forward checkout if current HEAD has no commits
     local ok = self:checkout(source)
     if ok then
-      return { success = true, fast_forward = true, commit = their_commit }
+      return { success = true, fast_forward = true, commit = deep_copy_value(their_commit) }
     else
       return nil, { error = "checkout_failed", message = "Could not checkout " .. source }
     end
   end
 
   if our_hash == their_hash then
-    return { success = true, fast_forward = false, already_up_to_date = true, commit = their_commit }
+    return { success = true, fast_forward = false, already_up_to_date = true, commit = deep_copy_value(their_commit) }
   end
 
   local base_hash = self:find_common_ancestor(our_hash, their_hash)
@@ -1438,7 +1458,7 @@ function WheelContext:merge_branch(source, opts)
       action = "merge",
       message = string.format("merge: fast-forward to %s", their_hash:sub(1, 8)),
     })
-    return { success = true, fast_forward = true, commit = their_commit }
+    return { success = true, fast_forward = true, commit = deep_copy_value(their_commit) }
   end
 
   local merge_res = WheelContext.merge_3way(base_slots, self._slots, their_commit.slots)

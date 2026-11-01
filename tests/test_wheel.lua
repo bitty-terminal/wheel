@@ -4494,6 +4494,44 @@ run_test("WheelKernel: injected bridge admission validates dependency and parent
   assert(admitted == 2)
 end)
 
+run_test("WheelKernel: external task starts enforce graph, readiness, ownership, generation, and result fences", function()
+  local backend = WheelKernel.new_mock()
+  backend:create_task({ id = "START-DEP" })
+  backend:create_task({ id = "START-BLOCKED", dependencies = { "START-DEP" } })
+  backend:create_task({ id = "START-OWNER", assigned_agent = "owner" })
+  local starts = 0
+  local bridge = WheelKernel.new(function(command, payload)
+    if command == "task.start" then starts = starts + 1 end
+    return backend.dispatcher(command, payload)
+  end)
+  assert(not pcall(bridge.start_task, bridge, "START-BLOCKED", "worker"))
+  assert(not pcall(bridge.start_task, bridge, "START-OWNER", "intruder"))
+  assert(not pcall(bridge.start_task, bridge, "START-DEP", "owner", nil, 99))
+  assert(starts == 0, "invalid readiness, owner, or generation must not reach bridge")
+  local state
+  for index = 1, 20 do
+    local name, value = debug.getupvalue(backend.dispatcher, index)
+    if name == "state" then state = value; break end
+  end
+  assert(state)
+  state.tasks["START-DEP"].dependencies = { "START-BLOCKED" }
+  assert(not pcall(bridge.start_task, bridge, "START-DEP", "worker"))
+  assert(starts == 0, "an invalid graph must not reach bridge")
+  state.tasks["START-DEP"].dependencies = {}
+  local started = bridge:start_task("START-DEP", "worker")
+  assert(started.lifecycle_status == "in_progress" and started.generation == 1 and starts == 1)
+
+  local noop = WheelKernel.new(function(command, payload)
+    if command == "task.list" then return backend.dispatcher(command, payload) end
+    if command == "task.get" then return backend.dispatcher(command, payload) end
+    if command == "task.start" then
+      return '{"success":true,"data":{"id":"START-OWNER","status":"running","lifecycle_status":"in_progress","generation":2,"assigned_agent":"owner","worker_id":"owner"}}'
+    end
+    return backend.dispatcher(command, payload)
+  end)
+  assert(not pcall(noop.start_task, noop, "START-OWNER", "owner"), "plausible no-op success must fail read-back")
+end)
+
 run_test("WheelKernel: injected bridge terminal mutations require current owner and generation", function()
   local backend = WheelKernel.new_mock()
   backend:create_task({ id = "WIRE-FENCE" })
@@ -4580,6 +4618,19 @@ run_test("WheelTeam: claim requires task-bound active owned controller sessions"
   assert(context:get_slot("tasks/CLAIM-NEXT/worker").content == agent.name)
 end)
 
+run_test("WheelTeam: claim rollback fences the team kernel when context uses another kernel", function()
+  local task_kernel, slot_kernel = WheelKernel.new_mock(), WheelKernel.new_mock()
+  local context = WheelContext.new({ kernel = slot_kernel })
+  local team = WheelTeam.new({ kernel = task_kernel, context = context })
+  team:spawn_agent({ name = "separate-kernel-worker", role = WheelAgent.Role.CODING })
+  task_kernel:create_task({ id = "SPLIT-KERNEL-CLAIM" })
+  context.put_slot = function() return nil, { error = "injected persistence failure" } end
+  local claimed = team:claim_task("separate-kernel-worker", "SPLIT-KERNEL-CLAIM")
+  local task = task_kernel:get_task("SPLIT-KERNEL-CLAIM")
+  assert(not claimed and task.lifecycle_status == "ready" and task.generation == 0,
+    "failed persistence must roll back the exact kernel mutated by claim")
+end)
+
 run_test("WheelTeam: terminal handoffs and stale terminal releases fail closed", function()
   for _, status in ipairs({ "succeeded", "failed", "cancelled" }) do
     local team, kernel, _, _, options = handoff_fixture("TERMINAL-" .. status)
@@ -4624,6 +4675,22 @@ run_test("WheelTeam: immutable checkpoint and ContextRef references are task sco
     force = true, context = context, task_id = "REF-TASK",
   })
   assert(ref and ref.commit_hash)
+  local ref_slot = context:get_slot("tasks/REF-TASK/context_ref")
+  local original_ref_body = ref_slot.content
+  assert(not team:_valid_context_reference(ref.commit_hash .. "garbage", "REF-TASK", true),
+    "reference identifiers must have the exact digest format")
+  for _, bad_body in ipairs({
+    (original_ref_body:gsub("id=contextref:[0-9a-f]+", "id=contextref:bad", 1)),
+    (original_ref_body:gsub("body_hash=[0-9a-f]+", "body_hash=" .. string.rep("0", 64), 1)),
+    (original_ref_body:gsub("bytes=%d+", "bytes=1", 1)),
+    (original_ref_body:gsub("seed=[0-9a-f]+", "seed=" .. string.rep("f", 64), 1)),
+  }) do
+    assert(context:put_slot("tasks/REF-TASK/context_ref", bad_body).success)
+    local malformed = context:commit_checkpoint({ task_id = "REF-TASK" })
+    assert(not team:_valid_context_reference(malformed.hash, "REF-TASK", true),
+      "malformed ContextRef digest/body/reference must be rejected")
+    assert(context:put_slot("tasks/REF-TASK/context_ref", original_ref_body).success)
+  end
   options.context_ref, options.checkpoint_hash = ref.commit_hash, ref.commit_hash
   local ok, offered = team:handoff("source", "target", "REF-TASK", options)
   assert(ok and offered.context_ref == ref.commit_hash)
@@ -4633,7 +4700,7 @@ end)
 run_test("WheelTeam: failure injection restores slots, history, ownership and generations", function()
   for _, phase in ipairs({ "offer-put", "offer-put-throws", "offer-second-put", "offer-second-checkpoint",
     "offer-checkpoint-after-write", "accept-put", "accept-handoff-put", "accept-checkpoint", "accept-reassign",
-    "accept-reassign-after-write", "kernel-put-compensation", "kernel-noop-put" }) do
+    "accept-reassign-after-write", "accept-reassign-noop", "kernel-put-compensation", "kernel-noop-put" }) do
     local team, kernel, context, _, options = handoff_fixture("ATOMIC")
     local offer, authority
     if phase:match("^accept") then
@@ -4663,6 +4730,10 @@ run_test("WheelTeam: failure injection restores slots, history, ownership and ge
       end
     elseif phase:find("reassign", 1, true) then
       kernel.reassign_task = function(self, ...)
+        if phase == "accept-reassign-noop" then
+          return { status = "running", lifecycle_status = "in_progress", generation = 2,
+            worker_id = "target", assigned_agent = "target" }
+        end
         if phase == "accept-reassign-after-write" then original_reassign(self, ...) end
         error("injected reassignment failure")
       end
@@ -8200,6 +8271,32 @@ run_test("WheelContext: Git-model context checkpoint commits and deterministic M
     end
   end
   assert(found_event, "checkpoint_committed event must be published on ContextBus")
+end)
+
+run_test("WheelContext: commits and merge results cannot alias immutable history", function()
+  local WheelContext = require("wheel.context")
+  local ctx = WheelContext.new()
+  assert(ctx:put_slot("workspace/root", "root").success)
+  local root = ctx:commit_checkpoint({ message = "root" })
+  local parents = { root.hash }
+  assert(ctx:put_slot("workspace/child", "child").success)
+  local child = ctx:commit_checkpoint({ parents = parents, message = "child" })
+  parents[1] = string.rep("f", 64)
+  child.parent_hashes[1] = string.rep("e", 64)
+  child.slots["workspace/child"].content = "forged"
+  local stored = assert(ctx:get_commit(child.hash))
+  assert(stored.parent_hashes[1] == root.hash and stored.slots["workspace/child"].content == "child")
+  local merged = ctx:merge_branch("main")
+  if merged and merged.commit then
+    merged.commit.parent_hashes[1] = "forged"
+    merged.commit.slots["workspace/root"].content = "forged"
+    local history = ctx:get_commit(merged.commit.hash)
+    assert(history.parent_hashes[1] ~= "forged" and history.slots["workspace/root"].content == "root")
+  end
+  local public = ctx:get_commit(root.hash)
+  public.parent_hashes[1] = "forged"
+  public.slots["workspace/root"].content = "forged"
+  assert(ctx:get_commit(root.hash).slots["workspace/root"].content == "root")
 end)
 
 run_test("WheelContext: Branch creation, listing, validation, and deletion guards", function()
