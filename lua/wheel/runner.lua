@@ -52,6 +52,7 @@ WheelRunner.MAX_REQUEST_KEYS = 512
 WheelRunner.MAX_REQUEST_DEPTH = 64
 WheelRunner.MAX_CONTEXT_REF_DEPTH = 64
 WheelRunner.MAX_CHECKPOINT_ID_BYTES = 128
+WheelRunner.MAX_CONTEXT_REF_TURNS = 9007199254740991
 
 -- The runner's checkpoint rationale keeps the historical six-field contract;
 -- structured rationale records add decision/risk/next_action/evidence fields.
@@ -275,34 +276,98 @@ local function canonical_state(state, retained)
   return table.concat(parts, "|")
 end
 
-local function serialize_state(state, context_ref)
+local function encode_state_line(value)
+  return "- " .. value:gsub("[%z\1-\31\127\\]", function(char)
+    return string.format("\\x%02x", char:byte())
+  end)
+end
+
+local function serialize_state(state, context_ref, hash_function)
   local lines = {
     "ContextRef v1",
     "id=" .. context_ref.id,
+    "seed=" .. context_ref.hash,
+    "body_hash=" .. string.rep("0", 64),
     "turns=" .. tostring(context_ref.turns),
     "bytes=" .. tostring(context_ref.bytes),
   }
-  local fields = { "tool_calls", "failures", "decisions", "evidence", "risks", "next_actions" }
+  local marker = "[state truncated]"
+  local used_bytes = #table.concat(lines, "\n")
+    + math.max(0, #tostring(WheelRunner.MAX_CONTEXT_REF_BYTES) - #tostring(context_ref.bytes))
+  -- Reserve every required section and the truncation marker before admitting
+  -- any value. The digest placeholder already occupies its final wire width.
+  local reserved_bytes = #marker + 1
+  for _, field in ipairs(STATE_FIELDS) do reserved_bytes = reserved_bytes + #field + 3 end
+  if used_bytes + reserved_bytes > WheelRunner.MAX_CONTEXT_REF_BYTES then return nil end
   local truncated = false
-  local function append_line(line)
-    local current_bytes = #table.concat(lines, "\n")
-    local extra_bytes = #line + (#lines > 0 and 1 or 0)
-    if current_bytes + extra_bytes > WheelRunner.MAX_CONTEXT_REF_BYTES then
-      truncated = true
-      return false
+  for _, field in ipairs(STATE_FIELDS) do
+    local section = "[" .. field .. "]"
+    reserved_bytes = reserved_bytes - #section - 1
+    lines[#lines + 1] = section
+    used_bytes = used_bytes + #section + 1
+    for index, value in ipairs(state[field] or {}) do
+      if index > WheelRunner.MAX_EVIDENCE_ITEMS then truncated = true; break end
+      local line = encode_state_line(redact_bounded(value, WheelRunner.MAX_STATE_FIELD_BYTES))
+      if used_bytes + #line + 1 + reserved_bytes > WheelRunner.MAX_CONTEXT_REF_BYTES then
+        truncated = true
+        break
+      end
+      lines[#lines + 1] = line
+      used_bytes = used_bytes + #line + 1
     end
-    lines[#lines + 1] = line
-    return true
   end
-  for _, field in ipairs(fields) do
-    if not append_line("[" .. field .. "]") then break end
-    for _, value in ipairs(state[field] or {}) do
-      if not append_line(redact_bounded(value, WheelRunner.MAX_STATE_FIELD_BYTES)) then break end
-    end
-    if truncated then break end
-  end
-  if truncated then append_line("[state truncated]") end
+  if truncated then lines[#lines + 1] = marker end
+  table.remove(lines, 4)
+  local body_hash = hash_function(table.concat(lines, "\n"))
+  table.insert(lines, 4, "body_hash=" .. body_hash)
   return table.concat(lines, "\n")
+end
+
+--- Validate the complete canonical ContextRef wire document, not just its hash.
+-- O(bytes) time and space, bounded by MAX_CONTEXT_REF_BYTES.
+function WheelRunner.validate_context_ref(content, hash_function)
+  if type(content) ~= "string" or #content > WheelRunner.MAX_CONTEXT_REF_BYTES
+    or content:find("[%z\1-\9\11-\31\127]") or content:sub(-1) == "\n" then return false end
+  local lines = {}
+  for line in (content .. "\n"):gmatch("([^\n]*)\n") do lines[#lines + 1] = line end
+  if lines[1] ~= "ContextRef v1" then return false end
+  local id = (lines[2] or ""):match("^id=(contextref:[0-9a-f]+)$")
+  local seed = (lines[3] or ""):match("^seed=([0-9a-f]+)$")
+  local body_hash = (lines[4] or ""):match("^body_hash=([0-9a-f]+)$")
+  if not id or #id ~= 27 or not seed or #seed ~= 64 or not body_hash or #body_hash ~= 64
+    or id ~= "contextref:" .. seed:sub(1, 16) then return false end
+  local function count_field(line, label, maximum)
+    local digits = (line or ""):match("^" .. label .. "=(%d+)$")
+    if not digits or #digits > 16 or (#digits > 1 and digits:sub(1, 1) == "0") then return nil end
+    local value = tonumber(digits)
+    if not value or value < 0 or value > maximum or value % 1 ~= 0 then return nil end
+    return value
+  end
+  if count_field(lines[5], "turns", WheelRunner.MAX_CONTEXT_REF_TURNS) == nil
+    or count_field(lines[6], "bytes", WheelRunner.MAX_CONTEXT_REF_BYTES) ~= #content then return false end
+  local section_index, item_count = 0, 0
+  for index = 7, #lines do
+    local line = lines[index]
+    if section_index < #STATE_FIELDS and line == "[" .. STATE_FIELDS[section_index + 1] .. "]" then
+      section_index, item_count = section_index + 1, 0
+    elseif line == "[state truncated]" then
+      if section_index ~= #STATE_FIELDS or index ~= #lines then return false end
+    else
+      if section_index == 0 or line:sub(1, 2) ~= "- " then return false end
+      local text = line:sub(3)
+      local decoded = text:gsub("\\x([0-9a-f][0-9a-f])", function(hex)
+        local byte = tonumber(hex, 16)
+        if byte <= 31 or byte == 127 or byte == 92 then return string.char(byte) end
+        return "\\x" .. hex
+      end)
+      if encode_state_line(decoded) ~= line or #decoded > WheelRunner.MAX_STATE_FIELD_BYTES then return false end
+      item_count = item_count + 1
+      if item_count > WheelRunner.MAX_EVIDENCE_ITEMS then return false end
+    end
+  end
+  if section_index ~= #STATE_FIELDS then return false end
+  table.remove(lines, 4)
+  return type(hash_function) == "function" and hash_function(table.concat(lines, "\n")) == body_hash
 end
 
 local function encoded_size(value)
@@ -723,6 +788,7 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
   }, "\0")
   local hash_function = context and context.compute_hash
     or (WheelConfig and WheelConfig.compute_hash)
+  hash_function = hash_function or function(value) return string.format("%08x", #value) end
   local ref_hash = hash_function and hash_function(ref_seed)
     or string.format("%08x", #ref_seed)
   local context_ref = {
@@ -736,17 +802,20 @@ function WheelRunner.compact_history(messages, turn_records, state, opts)
   -- `bytes` is part of the serialized payload, so converge its decimal width
   -- before writing the slot. The bound guarantees this loop remains tiny.
   for _ = 1, 4 do
-    encoded = serialize_state(state, context_ref)
+    encoded = serialize_state(state, context_ref, hash_function)
+    if not encoded then return messages, nil, nil, persistence_failure() end
     local encoded_bytes = #encoded
     if context_ref.bytes == encoded_bytes then break end
     context_ref.bytes = encoded_bytes
   end
-  encoded = serialize_state(state, context_ref)
+  encoded = serialize_state(state, context_ref, hash_function)
+  if not encoded then return messages, nil, nil, persistence_failure() end
   context_ref.bytes = #encoded
-  if #serialize_state(state, context_ref) ~= context_ref.bytes then
-    encoded = serialize_state(state, context_ref)
-    context_ref.bytes = #encoded
+  local final = serialize_state(state, context_ref, hash_function)
+  if not final or #final ~= context_ref.bytes or #final > WheelRunner.MAX_CONTEXT_REF_BYTES then
+    return messages, nil, nil, persistence_failure()
   end
+  encoded = final
 
   if context and type(context.put_slot) == "function" then
     local slot_name = "tasks/" .. task_id .. "/context_ref"

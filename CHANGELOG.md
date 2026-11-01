@@ -16,6 +16,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Add Lua 5.1/LuaJIT regressions for export replacement, approval/audit failure,
   ended and abandoned parents, forged replay, and changed workspace deltas.
 
+- Fence claim and external lifecycle responses and authoritative read-backs by
+  exact task ID, owner, status, and generation. Reject self-consistent malformed
+  ContextRefs with a complete canonical schema check, and count all final digest,
+  header, and state-section bytes within the serialized reference ceiling.
+
+- Reject unknown dependency IDs, cyclic dependency graphs, and invalid parent
+  hierarchies before task admission or scheduling. Fence task lifecycle
+  transitions and release by status, owner, and generation; retries advance
+  generation. Require task-bound active controller sessions on owned distinct
+  panels for concurrent claims and handoffs. Validate task-scoped immutable
+  checkpoint and ContextRef links, revalidate persisted handoff authority, and
+  accept the valid default-empty rationale on reload. Roll back local Context
+  history, events, kernel slots, ownership, and generation on injected
+  persistence or reassignment failures without fallible compensating writes.
+  The transaction covers the owned in-process Context/kernel projection;
+  CarryCtx remains the lifecycle and cross-process recovery system of record.
+
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
   exact revision conflicts, exception-safe lock cleanup, bounded recent history,
@@ -48,6 +65,13 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Session and Headless Panel, and lineage is visible in status and Context
   projections. No task hierarchy, durable handoff, Dashboard, provider-cache, or
   `bittyd` change is included.
+
+- Task hierarchy metadata independent of dependency edges and normalized task
+  lifecycle status; concurrent task ownership per agent with explicit distinct
+  runtime sessions/panels; bounded handoff routing, checkpoint, scope, evidence,
+  blocker, risk, next-step, and generation references. Handoff projections are
+  stored in the existing context slot store; CarryCtx remains the lifecycle
+  and recovery system of record.
 
 - Explicit AgentSession and Headless Panel lifecycle records (CTX-0045 /
   wheel#114): independent agent, session, panel, task, context branch/head,

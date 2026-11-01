@@ -230,6 +230,10 @@ function ContextBus:publish(event)
     error("ContextBus: event must be a table")
   end
   event.timestamp_ms = event.timestamp_ms or WheelHost.time.now() * 1000
+  if self._transaction_events then
+    self._transaction_events[#self._transaction_events + 1] = event
+    return 0
+  end
 
   -- Record event in bounded history ring
   table.insert(self._history, event)
@@ -442,12 +446,33 @@ function WheelContext:put_slot(name, content, expected_version)
     updated_at_ms = now_ms,
   }
 
+  local previous_tree_hash = self._tree_hash
   self._slots[name] = slot
   self._tree_hash = nil -- Invalidate cached Merkle tree root
 
-  -- Synchronize with underlying WheelKernel if present
+  -- Synchronize before exposing the slot. Handoff transactions own kernel
+  -- rollback; other callers receive a failure rather than a false success.
   if self.kernel and type(self.kernel.put_slot) == "function" then
-    pcall(function() self.kernel:put_slot(name, content) end)
+    local called, result = pcall(self.kernel.put_slot, self.kernel, name, content)
+    if called and type(result) == "table" and result.success ~= false and self._handoff_transaction_active then
+      local verified, persisted = pcall(self.kernel.get_slot, self.kernel, name)
+      called = verified and persisted and persisted.found == true and persisted.content == content
+    end
+    if not called or type(result) ~= "table" or result.success == false then
+      local prior = existing
+      local rollback_ok = self._handoff_transaction_active == true
+      if not rollback_ok and prior then
+        local called, rollback_result = pcall(self.kernel.put_slot, self.kernel, name, prior.content)
+        rollback_ok = called and type(rollback_result) == "table" and rollback_result.success ~= false
+      elseif not rollback_ok and type(self.kernel.remove_slot) == "function" then
+        local called, rollback_result = pcall(self.kernel.remove_slot, self.kernel, name)
+        rollback_ok = called and type(rollback_result) == "table" and rollback_result.success ~= false
+      end
+      self._slots[name] = existing
+      self._tree_hash = previous_tree_hash
+      if not rollback_ok then return nil, { error = "kernel_slot_compensation_failed" } end
+      return nil, { error = "kernel_slot_persist_failed" }
+    end
   end
 
   -- Publish slot update event to peer colleagues on the bus
@@ -705,6 +730,94 @@ local function deep_copy_slots(src)
   return dst
 end
 
+local function deep_copy_value(value, seen)
+  if type(value) ~= "table" then return value end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local copy = {}
+  seen[value] = copy
+  for key, item in pairs(value) do
+    copy[deep_copy_value(key, seen)] = deep_copy_value(item, seen)
+  end
+  return copy
+end
+
+--- Capture the complete local state touched by a handoff persistence attempt.
+-- This is intentionally private: it is a transaction boundary for team
+-- handoffs, not a general-purpose mutable context snapshot API.
+function WheelContext:_capture_handoff_state(slot_name)
+  return {
+    slot_name = slot_name,
+    slots = deep_copy_slots(self._slots),
+    tree_hash = self._tree_hash,
+    refs = deep_copy_value(self._refs),
+    head = self._head,
+    commits = deep_copy_value(self._commits),
+    reflog = deep_copy_value(self._reflog),
+    stash = deep_copy_value(self._stash),
+  }
+end
+
+local function restore_handoff_state(self, snapshot)
+  self._slots = deep_copy_slots(snapshot.slots)
+  self._tree_hash = snapshot.tree_hash
+  self._refs = deep_copy_value(snapshot.refs)
+  self._head = snapshot.head
+  self._commits = deep_copy_value(snapshot.commits)
+  self._reflog = deep_copy_value(snapshot.reflog)
+  self._stash = deep_copy_value(snapshot.stash)
+end
+
+--- Commit local Context and owned kernel projections as one operation. Events
+-- become visible only after success; rollback does not invoke fallible bridge
+-- compensation. Injected external dispatchers fail before the first write.
+function WheelContext:_with_handoff_transaction(slot_name, operation, task_kernel)
+  if self._handoff_transaction_active or self.bus._transaction_events then
+    return false, { error = "context_transaction_busy" }
+  end
+  local kernels, seen_kernels = {}, {}
+  local function add_kernel(kernel)
+    if not kernel or seen_kernels[kernel] then return true end
+    if type(kernel._with_handoff_transaction) ~= "function" or not kernel._handoff_transaction then
+      return false
+    end
+    seen_kernels[kernel] = true
+    kernels[#kernels + 1] = kernel
+    return true
+  end
+  if not add_kernel(task_kernel) or not add_kernel(self.kernel) then
+    return false, { error = "kernel_handoff_transaction_unavailable" }
+  end
+  local snapshot = self:_capture_handoff_state(slot_name)
+  self._handoff_transaction_active = true
+  self.bus._transaction_events = {}
+  local function run_transaction(index)
+    if index > #kernels then
+      local called, success, result = pcall(operation)
+      if not called then return false, { error = "context_transaction_failed" } end
+      return success == true, result
+    end
+    local kernel = kernels[index]
+    local called, success, result = pcall(kernel._with_handoff_transaction, kernel, function()
+      local inner_success, inner_result = run_transaction(index + 1)
+      if not inner_success then return false, inner_result end
+      return true, inner_result
+    end)
+    if not called then return false, { error = "kernel_transaction_failed" } end
+    return success == true, result
+  end
+  local success, result = run_transaction(1)
+  local events = self.bus._transaction_events
+  self.bus._transaction_events = nil
+  self._handoff_transaction_active = nil
+  if success ~= true then
+    restore_handoff_state(self, snapshot)
+    return false, result
+  end
+  for _, event in ipairs(events) do self.bus:publish(event) end
+  return true, result
+end
+
 --- Restore working slots from an immutable commit snapshot.
 -- @param commit table ContextCommit object
 function WheelContext:_restore_slots_from_commit(commit)
@@ -799,6 +912,7 @@ function WheelContext:commit_checkpoint(opts)
       parents = {}
     end
   end
+  parents = deep_copy_value(parents)
 
   local tree_hash = self:tree_hash()
   local slots_snapshot = deep_copy_slots(self._slots)
@@ -831,7 +945,7 @@ function WheelContext:commit_checkpoint(opts)
     hash = commit_hash,
     tree_hash = tree_hash,
     slots = slots_snapshot,
-    parent_hashes = parents,
+    parent_hashes = deep_copy_value(parents),
     author = author,
     task_id = task_id,
     rationale = rationale,
@@ -859,12 +973,12 @@ function WheelContext:commit_checkpoint(opts)
 
   self.bus:publish({
     type = "checkpoint_committed",
-    commit = commit,
+    commit = deep_copy_value(commit),
     ref = self._head,
     branch = self:current_branch(),
   })
 
-  return commit
+  return deep_copy_value(commit)
 end
 
 --- Resolve current HEAD to a commit hash.
@@ -890,7 +1004,7 @@ end
 -- @return table|nil ContextCommit
 function WheelContext:get_commit(hash)
   if type(hash) ~= "string" then return nil end
-  return self._commits[hash]
+  return deep_copy_value(self._commits[hash])
 end
 
 --- Create a new branch pointing to an existing commit or current HEAD.
@@ -1317,14 +1431,14 @@ function WheelContext:merge_branch(source, opts)
     -- Fast-forward checkout if current HEAD has no commits
     local ok = self:checkout(source)
     if ok then
-      return { success = true, fast_forward = true, commit = their_commit }
+      return { success = true, fast_forward = true, commit = deep_copy_value(their_commit) }
     else
       return nil, { error = "checkout_failed", message = "Could not checkout " .. source }
     end
   end
 
   if our_hash == their_hash then
-    return { success = true, fast_forward = false, already_up_to_date = true, commit = their_commit }
+    return { success = true, fast_forward = false, already_up_to_date = true, commit = deep_copy_value(their_commit) }
   end
 
   local base_hash = self:find_common_ancestor(our_hash, their_hash)
@@ -1344,7 +1458,7 @@ function WheelContext:merge_branch(source, opts)
       action = "merge",
       message = string.format("merge: fast-forward to %s", their_hash:sub(1, 8)),
     })
-    return { success = true, fast_forward = true, commit = their_commit }
+    return { success = true, fast_forward = true, commit = deep_copy_value(their_commit) }
   end
 
   local merge_res = WheelContext.merge_3way(base_slots, self._slots, their_commit.slots)
@@ -1404,7 +1518,7 @@ function WheelContext:log(limit)
     visited[curr] = true
     local c = self._commits[curr]
     if not c then break end
-    table.insert(list, c)
+    table.insert(list, deep_copy_value(c))
     if c.parent_hashes and #c.parent_hashes > 0 then
       curr = c.parent_hashes[1]
     else
@@ -1885,9 +1999,19 @@ local function projection_commit(context, reference)
     return hash and context:get_commit(hash) or nil
   end
   if type(reference) == "table" then
-    for _, commit in pairs(context._commits) do
-      if commit == reference then return commit end
-    end
+    local hash = rawget(reference, "hash")
+    local commit = type(hash) == "string" and context:get_commit(hash) or nil
+    if not commit then return nil end
+    -- Commit getters return caller-owned copies. Resolve table references by
+    -- their canonical immutable content, never by object identity or hash alone.
+    local ok, equal = pcall(function()
+      local copy_valid = validate_projection_value(reference)
+      if not copy_valid then return false end
+      local given = canonical_projection_value(reference)
+      local stored = canonical_projection_value(commit)
+      return type(given) == "string" and type(stored) == "string" and given == stored
+    end)
+    if ok and equal then return commit end
     return nil
   end
   if type(reference) ~= "string" then return nil end
@@ -2429,7 +2553,7 @@ function WheelContext:project(opts)
     return projection_byte_less(left.ref, right.ref)
   end)
 
-  local delta, delta_err = self:semantic_delta(base, current, {
+  local delta, delta_err = self:semantic_delta(base.hash, current.hash, {
     base_records = opts.base_records,
     current_records = current_records,
     task_id = opts.task_id,

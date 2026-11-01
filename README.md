@@ -71,7 +71,39 @@ Checkpoint, pause, detach, attach, resume, stale/recover, end, and abandon are
 explicit transitions. A panel has at most one controller session; observer
 attachments are recorded separately and do not acquire execution authority.
 The registry policy defaults to one live session per AgentId and can explicitly
-allow more sessions/tasks. Lifecycle events contain bounded identifiers and
+allow more sessions/tasks. Team task concurrency is also disabled by default
+and must be enabled with `allow_multiple_tasks`; every concurrent task requires
+its own active task-bound controller session and agent-owned panel. Kernel tasks expose `parent_task_id` separately from
+dependency edges and a normalized `lifecycle_status` beside kernel status. Team
+ownership is tracked per task, allowing one Agent identity to own multiple
+tasks; callers must provide distinct runtime AgentSessions/Panels for
+concurrent execution. Dependency IDs must already exist; malformed dependency
+graphs, cycles, and invalid parent hierarchies fail closed. Handoff records
+carry source/target agents, controller session references when a lifecycle
+registry is configured, bounded ContextRef, checkpoint, scope, evidence,
+blockers, risks, next steps, and task generation. ContextRef references resolve
+to immutable commits containing the same task's `context_ref` slot; checkpoint
+references resolve to immutable commits for that task. ContextRef admission checks
+the complete ordered schema, bounded canonical counts, state sections, and digest;
+the final serialized headers and body stay within the 12 KiB limit. Claim and
+external lifecycle responses and read-backs must match the requested task ID,
+owner, status, and generation before ownership is published. The checkpoint field
+anchors source evidence; a later immutable commit binds the full persisted
+handoff record. Reload validates both links and live agent/session/panel
+authority. Accept/reject/close requires the acting agent and expected session.
+Completed, failed, and cancelled tasks cannot be handed off. Completion,
+failure, cancellation, retry, and release fence task status, owner, and
+generation; retry advances the generation and clears the old owner.
+Handoff records are persisted transactionally in the current process's
+in-memory `WheelContext` store together with immutable Context commits and the
+owned in-process kernel projection. Write, checkpoint, and reassignment
+failures restore ownership, generation, slots, commits, refs, and reflog;
+events publish only after success. Injected external kernel dispatchers lack
+this transaction contract and refuse team claims/handoffs before mutation. This
+store is not durable cross-process storage: it is not a filesystem registry,
+daemon database, or CarryCtx publication. CarryCtx remains the lifecycle and
+recovery authority, including cross-process task ownership and recovery.
+Lifecycle events contain bounded identifiers and
 state metadata only: prompt, transcript, context-slot, provider-response, and
 tool-output content are not lifecycle or `bittyd` records. The local
 `wheel-session` daemon remains a subordinate development/transport prototype;

@@ -4,6 +4,58 @@
 -- and three-zone context compilation.
 
 local WheelKernel = {}
+local MAX_TASK_GENERATION = 9007199254740991
+
+local TASK_STATUS = {
+  pending = "pending", ready = "ready", running = "in_progress", in_progress = "in_progress",
+  succeeded = "completed", completed = "completed", failed = "failed",
+  cancelled = "cancelled", blocked = "blocked",
+}
+
+function WheelKernel.normalize_lifecycle_status(status)
+  return TASK_STATUS[type(status) == "string" and status:lower() or ""] or "unknown"
+end
+local TASK_TRANSITIONS = {
+  ["task.complete"] = { in_progress = true }, ["task.fail"] = { in_progress = true },
+  ["task.cancel"] = { in_progress = true }, ["task.reassign"] = { in_progress = true },
+  ["task.retry"] = { failed = true, cancelled = true },
+}
+
+local function task_transition_error(task, payload, allowed, owner_field)
+  local status = WheelKernel.normalize_lifecycle_status(task.status)
+  if not allowed[status] or task.lifecycle_status ~= status then return "task lifecycle state is invalid" end
+  if type(task.generation) ~= "number" or task.generation < 1
+    or task.generation > MAX_TASK_GENERATION or task.generation % 1 ~= 0
+    or type(payload.expected_generation) ~= "number" or payload.expected_generation ~= task.generation then
+    return "stale generation"
+  end
+  local owner = payload[owner_field or "assigned_agent"]
+  if type(owner) ~= "string" or owner == "" or task.worker_id ~= owner
+    or task.assigned_agent ~= owner then return "task owner mismatch" end
+end
+
+local function task_start_error(task, payload, tasks)
+  local status = WheelKernel.normalize_lifecycle_status(task.status)
+  if status ~= "ready" or task.lifecycle_status ~= "ready" then return "task is not ready" end
+  if type(task.generation) ~= "number" or task.generation < 0
+    or task.generation >= MAX_TASK_GENERATION or task.generation % 1 ~= 0 then
+    return "task generation exhausted or invalid"
+  end
+  if payload.expected_generation ~= nil
+    and (type(payload.expected_generation) ~= "number"
+      or payload.expected_generation ~= task.generation) then
+    return "stale generation"
+  end
+  local worker = payload.assigned_agent or payload.worker_id
+  if type(worker) ~= "string" or worker == "" then return "worker identity is required" end
+  if task.worker_id and task.worker_id ~= "" and task.worker_id ~= worker then return "task owner mismatch" end
+  for _, dependency_id in ipairs(task.dependencies or {}) do
+    local dependency = tasks and tasks[dependency_id]
+    if not dependency or WheelKernel.normalize_lifecycle_status(dependency.status) ~= "completed" then
+      return "task dependencies are not completed"
+    end
+  end
+end
 WheelKernel.__index = WheelKernel
 
 local ok_action, WheelAction = pcall(require, "wheel.action")
@@ -40,7 +92,7 @@ function JSON.encode(val)
     if val ~= val or val == math.huge or val == -math.huge then
       return "null"
     end
-    return tostring(val)
+    return string.format("%.17g", val)
   elseif t == "string" then
     return escape_str(val)
   elseif t == "table" then
@@ -272,7 +324,68 @@ WheelKernel.JSON = JSON
 -- In-Memory Mock Dispatcher
 -- ---------------------------------------------------------------------------
 
+local function valid_dependency_list(tasks, task_id, dependencies)
+  if type(dependencies) ~= "table" or getmetatable(dependencies) ~= nil then return false end
+  local count, seen = 0, {}
+  for key in pairs(dependencies) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then return false end
+    count = count + 1
+  end
+  if count ~= #dependencies then return false end
+  for _, dependency_id in ipairs(dependencies) do
+    if type(dependency_id) ~= "string" or dependency_id == "" or #dependency_id > 128
+      or not dependency_id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$")
+      or dependency_id == task_id or seen[dependency_id] or not tasks[dependency_id] then
+      return false
+    end
+    seen[dependency_id] = true
+  end
+  return true
+end
+
+-- Kahn validation plus a memoized parent walk: O(tasks + edges) time/space.
+local function valid_dependency_graph(tasks)
+  local indegree, downstream, count = {}, {}, 0
+  for task_id, task in pairs(tasks) do
+    if not valid_dependency_list(tasks, task_id, task.dependencies) then return false end
+    indegree[task_id], downstream[task_id] = #task.dependencies, {}
+    count = count + 1
+  end
+  for task_id, task in pairs(tasks) do
+    for _, dependency_id in ipairs(task.dependencies) do
+      downstream[dependency_id][#downstream[dependency_id] + 1] = task_id
+    end
+  end
+  local queue = {}
+  for task_id, degree in pairs(indegree) do
+    if degree == 0 then queue[#queue + 1] = task_id end
+  end
+  local index = 1
+  while index <= #queue do
+    for _, dependent in ipairs(downstream[queue[index]]) do
+      indegree[dependent] = indegree[dependent] - 1
+      if indegree[dependent] == 0 then queue[#queue + 1] = dependent end
+    end
+    index = index + 1
+  end
+  if #queue ~= count then return false end
+  local complete = {}
+  for task_id in pairs(tasks) do
+    local current, path = task_id, {}
+    while current and not complete[current] do
+      if path[current] or not tasks[current] then return false end
+      path[current] = true
+      local parent = tasks[current].parent_task_id
+      if parent ~= nil and (type(parent) ~= "string" or parent == "" or not tasks[parent]) then return false end
+      current = parent
+    end
+    for ancestor in pairs(path) do complete[ancestor] = true end
+  end
+  return true
+end
+
 local function create_mock_dispatcher()
+  local lifecycle_status = WheelKernel.normalize_lifecycle_status
   local state = {
     active_task = nil,
     head_checkpoint = nil,
@@ -313,7 +426,12 @@ local function create_mock_dispatcher()
     return true
   end
 
-  return function(command, payload_json)
+  local function transition_error(task, payload, allowed, owner_field)
+    if not valid_dependency_graph(state.tasks) then return "task dependency graph is invalid" end
+    return task_transition_error(task, payload, allowed, owner_field)
+  end
+
+  local function dispatch(command, payload_json)
     local payload = json_codec.decode(payload_json) or {}
 
     if command == "kernel.status" then
@@ -336,21 +454,87 @@ local function create_mock_dispatcher()
 
     elseif command == "task.create" then
       local id = payload.id
-      if not id or id == "" then
+      if type(id) ~= "string" or id == "" or #id > 128
+        or not id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$") then
         return json_codec.encode({ success = false, error = "missing or invalid 'id'" })
       end
       if state.tasks[id] then
         return json_codec.encode({ success = false, error = "task already exists" })
       end
-      local deps = payload.dependencies or {}
-      local status = (#deps == 0) and "ready" or "pending"
+      if not valid_dependency_graph(state.tasks) then
+        return json_codec.encode({ success = false, error = "task dependency graph is invalid" })
+      end
+      local deps = payload.dependencies == nil and {} or payload.dependencies
+      if type(deps) ~= "table" or getmetatable(deps) ~= nil then
+        return json_codec.encode({ success = false, error = "dependencies must be a plain dense list" })
+      end
+      local dep_count = 0
+      for key in pairs(deps) do
+        if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+          return json_codec.encode({ success = false, error = "dependencies must be a plain dense list" })
+        end
+        dep_count = dep_count + 1
+      end
+      if dep_count ~= #deps then
+        return json_codec.encode({ success = false, error = "dependencies must be a plain dense list" })
+      end
+      local seen_dependencies = {}
+      for _, dep_id in ipairs(deps) do
+        if type(dep_id) ~= "string" or dep_id == "" or #dep_id > 128
+          or not dep_id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$") then
+          return json_codec.encode({ success = false, error = "dependency id is invalid" })
+        end
+        if dep_id == id then
+          return json_codec.encode({ success = false, error = "task cannot depend on itself" })
+        end
+        if seen_dependencies[dep_id] then
+          return json_codec.encode({ success = false, error = "duplicate task dependency" })
+        end
+        if not state.tasks[dep_id] then
+          return json_codec.encode({ success = false, error = "dependency task not found: " .. dep_id })
+        end
+        seen_dependencies[dep_id] = true
+      end
+      if payload.parent_task_id ~= nil and (type(payload.parent_task_id) ~= "string"
+        or payload.parent_task_id == "" or #payload.parent_task_id > 128
+        or payload.parent_task_id:find("[%z\1-\31\127]")
+        or not payload.parent_task_id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$")) then
+        return json_codec.encode({ success = false, error = "parent_task_id is invalid" })
+      end
+      if payload.parent_task_id and not state.tasks[payload.parent_task_id] then
+        return json_codec.encode({ success = false, error = "parent task not found: " .. tostring(payload.parent_task_id) })
+      end
+      if payload.parent_task_id == id then
+        return json_codec.encode({ success = false, error = "task cannot be its own parent" })
+      end
+      local ancestor, seen_ancestors = payload.parent_task_id, {}
+      while ancestor do
+        if ancestor == id then
+          return json_codec.encode({ success = false, error = "parent task cycle detected" })
+        end
+        if seen_ancestors[ancestor] then
+          return json_codec.encode({ success = false, error = "parent task hierarchy is invalid" })
+        end
+        seen_ancestors[ancestor] = true
+        local ancestor_task = state.tasks[ancestor]
+        if not ancestor_task then
+          return json_codec.encode({ success = false, error = "parent task hierarchy is invalid" })
+        end
+        ancestor = ancestor_task.parent_task_id
+      end
+      local status = "ready"
+      for _, dependency_id in ipairs(deps) do
+        if lifecycle_status(state.tasks[dependency_id].status) ~= "completed" then status = "pending"; break end
+      end
       local task = {
         id = id,
         title = payload.title or id,
         description = payload.description or "",
         priority = payload.priority or 0,
         status = status,
+        lifecycle_status = lifecycle_status(status),
         dependencies = deps,
+        parent_task_id = payload.parent_task_id,
         generation = 0,
         assigned_agent = payload.assigned_agent or payload.worker_id,
         worker_id = payload.assigned_agent or payload.worker_id,
@@ -393,14 +577,37 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found: " .. tostring(id) })
       end
-      if (task.status or ""):lower() ~= "ready" then
-        return json_codec.encode({ success = false, error = "task is not ready: " .. tostring(task.status) })
+      if not valid_dependency_graph(state.tasks) then
+        return json_codec.encode({ success = false, error = "task dependency graph is invalid" })
       end
       local worker = payload.assigned_agent or payload.worker_id or "worker"
+      local start_error = task_start_error(task, {
+        expected_generation = payload.expected_generation,
+        assigned_agent = worker,
+        worker_id = worker,
+      }, state.tasks)
+      if start_error then return json_codec.encode({ success = false, error = start_error }) end
       task.status = "running"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.generation = task.generation + 1
       task.assigned_agent = worker
       task.worker_id = worker
+      task.updated_at_ms = payload.now_ms or 0
+      return json_codec.encode({ success = true, data = task })
+
+    elseif command == "task.reassign" then
+      local task = state.tasks[payload.id]
+      if not task then return json_codec.encode({ success = false, error = "task not found" }) end
+      local err = transition_error(task, payload, { in_progress = true }, "source_agent")
+      if err then return json_codec.encode({ success = false, error = err }) end
+      if task.generation >= MAX_TASK_GENERATION then return json_codec.encode({ success = false, error = "task generation exhausted" }) end
+      if type(payload.assigned_agent) ~= "string" or payload.assigned_agent == "" then
+        return json_codec.encode({ success = false, error = "assigned_agent is required" })
+      end
+      task.status = "running"
+      task.lifecycle_status = lifecycle_status(task.status)
+      task.generation = task.generation + 1
+      task.assigned_agent, task.worker_id = payload.assigned_agent, payload.assigned_agent
       task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
@@ -410,13 +617,10 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
-      if (task.status or ""):lower() ~= "running" then
-        return json_codec.encode({ success = false, error = "task is not running" })
-      end
-      if payload.expected_generation ~= task.generation then
-        return json_codec.encode({ success = false, error = "stale generation" })
-      end
+      local err = transition_error(task, payload, { in_progress = true })
+      if err then return json_codec.encode({ success = false, error = err }) end
       task.status = "succeeded"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.checkpoint = payload.checkpoint
       task.updated_at_ms = payload.now_ms or 0
 
@@ -433,6 +637,7 @@ local function create_mock_dispatcher()
           end
           if all_succeeded then
             other.status = "ready"
+            other.lifecycle_status = lifecycle_status(other.status)
             other.updated_at_ms = payload.now_ms or 0
           end
         end
@@ -445,22 +650,26 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
-      if payload.expected_generation ~= task.generation then
-        return json_codec.encode({ success = false, error = "stale generation" })
-      end
+      local err = transition_error(task, payload, { in_progress = true })
+      if err then return json_codec.encode({ success = false, error = err }) end
       local err_msg = payload.failure_reason or payload.error or "unknown failure"
       task.status = "failed"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.failure_reason = err_msg
       task.error = err_msg
       task.updated_at_ms = payload.now_ms or 0
 
       -- Cascade blocked to downstream dependents
+      local visited = {}
       local function block_dependents(failed_id)
+        if visited[failed_id] then return end
+        visited[failed_id] = true
         for _, other in pairs(state.tasks) do
           for _, dep_id in ipairs(other.dependencies) do
-            local other_st = (other.status or ""):lower()
-            if dep_id == failed_id and other_st ~= "succeeded" and other_st ~= "failed" then
+            local other_st = lifecycle_status(other.status)
+            if dep_id == failed_id and (other_st == "pending" or other_st == "ready" or other_st == "blocked") then
               other.status = "blocked"
+              other.lifecycle_status = lifecycle_status(other.status)
               other.updated_at_ms = payload.now_ms or 0
               block_dependents(other.id)
             end
@@ -476,7 +685,10 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
+      local err = transition_error(task, payload, { in_progress = true })
+      if err then return json_codec.encode({ success = false, error = err }) end
       task.status = "cancelled"
+      task.lifecycle_status = lifecycle_status(task.status)
       task.updated_at_ms = payload.now_ms or 0
       return json_codec.encode({ success = true, data = task })
 
@@ -486,6 +698,9 @@ local function create_mock_dispatcher()
       if not task then
         return json_codec.encode({ success = false, error = "task not found" })
       end
+      local err = transition_error(task, payload, { failed = true, cancelled = true })
+      if err then return json_codec.encode({ success = false, error = err }) end
+      if task.generation >= MAX_TASK_GENERATION then return json_codec.encode({ success = false, error = "task generation exhausted" }) end
       local all_succeeded = true
       for _, dep_id in ipairs(task.dependencies) do
         local dep = state.tasks[dep_id]
@@ -495,6 +710,9 @@ local function create_mock_dispatcher()
         end
       end
       task.status = all_succeeded and "ready" or "pending"
+      task.lifecycle_status = lifecycle_status(task.status)
+      task.generation = task.generation + 1
+      task.assigned_agent, task.worker_id = nil, nil
       task.failure_reason = nil
       task.error = nil
       task.updated_at_ms = payload.now_ms or 0
@@ -504,15 +722,18 @@ local function create_mock_dispatcher()
       -- Kahn's algorithm
       local in_degree = {}
       local adj = {}
+      local task_count = 0
+      if not valid_dependency_graph(state.tasks) then
+        return json_codec.encode({ success = false, error = "task dependency graph is invalid" })
+      end
       for id, t in pairs(state.tasks) do
+        task_count = task_count + 1
         in_degree[id] = #t.dependencies
         adj[id] = {}
       end
       for id, t in pairs(state.tasks) do
         for _, dep in ipairs(t.dependencies) do
-          if adj[dep] then
-            table.insert(adj[dep], id)
-          end
+          table.insert(adj[dep], id)
         end
       end
       local queue = {}
@@ -531,6 +752,9 @@ local function create_mock_dispatcher()
           end
         end
         table.sort(queue)
+      end
+      if #order ~= task_count then
+        return json_codec.encode({ success = false, error = "task dependency cycle detected" })
       end
       return json_codec.encode({ success = true, data = order })
 
@@ -706,6 +930,27 @@ local function create_mock_dispatcher()
       return json_codec.encode({ success = false, error = "unknown mock command: " .. tostring(command) })
     end
   end
+  local transaction_active = false
+  local function transaction(operation)
+    if transaction_active then return false, { error = "kernel_transaction_busy" } end
+    -- These projections belong to this in-process dispatcher. Keep the old
+    -- state outside the command surface so a failed compensating write cannot
+    -- strand an owner or advance its generation. No cross-process claim.
+    local function clone(value)
+      if type(value) ~= "table" then return value end
+      local result = {}
+      for key, item in pairs(value) do result[key] = clone(item) end
+      return result
+    end
+    local original = clone(state)
+    transaction_active = true
+    local called, success, result = pcall(operation)
+    transaction_active = false
+    if not called or success ~= true then state = original end
+    if not called then return false, { error = "kernel_transaction_failed" } end
+    return success == true, result
+  end
+  return dispatch, transaction
 end
 
 -- ---------------------------------------------------------------------------
@@ -720,14 +965,27 @@ function WheelKernel.new(dispatcher_or_opts)
     dispatcher = dispatcher_or_opts.dispatcher
   end
   local self = setmetatable({}, WheelKernel)
-  self.dispatcher = dispatcher or create_mock_dispatcher()
+  if dispatcher then
+    self.dispatcher = dispatcher
+  else
+    self.dispatcher, self._handoff_transaction = create_mock_dispatcher()
+  end
   return self
 end
 
 --- Create an in-memory mock WheelKernel instance for headless testing and previews.
 --- @return table
 function WheelKernel.new_mock()
-  return WheelKernel.new(create_mock_dispatcher())
+  return WheelKernel.new()
+end
+
+--- Atomic rollback is available only for the owned in-process dispatcher.
+--- An injected bridge must supply its own transaction contract before use.
+function WheelKernel:_with_handoff_transaction(operation)
+  if not self._handoff_transaction then
+    return false, { error = "kernel_handoff_transaction_unavailable" }
+  end
+  return self._handoff_transaction(operation)
 end
 
 --- Internal helper executing a command over the dispatcher and decoding JSON response.
@@ -735,11 +993,117 @@ end
 --- @param payload table?
 --- @return any
 function WheelKernel:call(command, payload)
-  local payload_str = json_codec.encode(payload or {})
+  payload = payload or {}
+  local expected_start_generation
+  local expected_transition
+  if command == "task.start" then
+    local tasks = self:_validated_task_graph()
+    local task = tasks[payload.id]
+    if not task then error("task not found") end
+    local start_error = task_start_error(task, payload, tasks)
+    if start_error then error(start_error) end
+    expected_start_generation = task.generation
+    payload.expected_generation = expected_start_generation
+  end
+  if not self._handoff_transaction and TASK_TRANSITIONS[command] then
+    local task = self:get_task(payload.id)
+    if not task or task.id ~= payload.id then error("task not found or identity mismatch") end
+    local err = task_transition_error(task, payload, TASK_TRANSITIONS[command],
+      command == "task.reassign" and "source_agent" or "assigned_agent")
+    if err then error(err) end
+    if (command == "task.retry" or command == "task.reassign") and task.generation >= MAX_TASK_GENERATION then
+      error("task generation exhausted")
+    end
+    local retrying = command == "task.retry"
+    local transition_status = command == "task.complete" and "completed"
+      or command == "task.fail" and "failed"
+      or command == "task.cancel" and "cancelled" or "in_progress"
+    if retrying then
+      transition_status = "ready"
+      local tasks = self:_validated_task_graph()
+      for _, dependency_id in ipairs(task.dependencies or {}) do
+        if WheelKernel.normalize_lifecycle_status(tasks[dependency_id].status) ~= "completed" then
+          transition_status = "pending"
+          break
+        end
+      end
+    end
+    expected_transition = {
+      id = payload.id,
+      generation = task.generation + ((command == "task.retry" or command == "task.reassign") and 1 or 0),
+      status = transition_status,
+      owner = payload.assigned_agent,
+    }
+    if retrying then expected_transition.owner = nil end
+  end
+  local payload_str = json_codec.encode(payload)
   local resp_str = self.dispatcher(command, payload_str)
   local resp = json_codec.decode(resp_str)
   if not resp or not resp.success then
     error((resp and resp.error) or "unknown wheel bridge error")
+  end
+  local function project(task)
+    if type(task) == "table" and task.status ~= nil then
+      local normalized = WheelKernel.normalize_lifecycle_status(task.status)
+      if normalized == "unknown" or (task.lifecycle_status ~= nil and task.lifecycle_status ~= normalized) then
+        error("task lifecycle state is invalid")
+      end
+      task.lifecycle_status = normalized
+      local owner = task.assigned_agent
+      if type(owner) ~= "string" or owner == "" then owner = task.worker_id end
+      if type(task.assigned_agent) == "string" and task.assigned_agent ~= ""
+        and type(task.worker_id) == "string" and task.worker_id ~= "" and task.worker_id ~= task.assigned_agent then
+        error("task owner fields are inconsistent")
+      end
+      if type(owner) == "string" and owner ~= "" then task.assigned_agent, task.worker_id = owner, owner end
+    end
+  end
+  if command == "task.list" then
+    for _, task in ipairs(resp.data or {}) do project(task) end
+  elseif command:match("^task%.") then project(resp.data) end
+  if command == "task.get" and resp.data ~= nil
+    and (type(resp.data) ~= "table" or resp.data.id ~= payload.id) then
+    error("task lookup failed identity fence")
+  end
+  if TASK_TRANSITIONS[command] and (type(resp.data) ~= "table" or resp.data.id ~= payload.id) then
+    error("task lifecycle response failed identity fence")
+  end
+  if command == "task.start" then
+    local started = resp.data
+    local worker = payload.assigned_agent or payload.worker_id
+    if type(started) ~= "table" or started.id ~= payload.id
+      or WheelKernel.normalize_lifecycle_status(started.status) ~= "in_progress"
+      or started.lifecycle_status ~= "in_progress"
+      or started.generation ~= expected_start_generation + 1
+      or started.assigned_agent ~= worker or started.worker_id ~= worker then
+      error("task start response failed lifecycle fence")
+    end
+    local actual = self:get_task(payload.id)
+    if type(actual) ~= "table" or actual.id ~= payload.id
+      or WheelKernel.normalize_lifecycle_status(actual.status) ~= "in_progress"
+      or actual.lifecycle_status ~= "in_progress"
+      or actual.generation ~= expected_start_generation + 1
+      or actual.assigned_agent ~= worker or actual.worker_id ~= worker then
+      error("task start state failed lifecycle fence")
+    end
+    resp.data = actual
+  end
+  if expected_transition then
+    local expected = expected_transition
+    local function matches(task)
+      if type(task) ~= "table" or task.id ~= expected.id
+        or task.generation ~= expected.generation
+        or WheelKernel.normalize_lifecycle_status(task.status) ~= expected.status
+        or task.lifecycle_status ~= expected.status then return false end
+      if expected.owner == nil then
+        return task.assigned_agent == nil and task.worker_id == nil
+      end
+      return task.assigned_agent == expected.owner and task.worker_id == expected.owner
+    end
+    if not matches(resp.data) then error("task lifecycle response failed identity fence") end
+    local actual = self:get_task(expected.id)
+    if not matches(actual) then error("task lifecycle state failed identity fence") end
+    resp.data = actual
   end
   return resp.data
 end
@@ -751,10 +1115,30 @@ function WheelKernel:status()
 end
 
 --- Create a new task in the control plane DAG.
---- @param draft table { id: string, title: string, description: string, priority: number?, dependencies: string[]?, now_ms: number? }
+--- @param draft table { id: string, title: string, description: string, priority: number?, dependencies: string[]?, parent_task_id: string?, now_ms: number? }
 --- @return table
 function WheelKernel:create_task(draft)
+  if not self._handoff_transaction then
+    local tasks = self:_validated_task_graph()
+    if type(draft) ~= "table" or type(draft.id) ~= "string" or draft.id == "" or #draft.id > 128
+      or not draft.id:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$") or tasks[draft.id]
+      or not valid_dependency_list(tasks, draft.id, draft.dependencies == nil and {} or draft.dependencies) then
+      error("invalid task or dependency list")
+    end
+    if draft.parent_task_id ~= nil and (type(draft.parent_task_id) ~= "string"
+      or not tasks[draft.parent_task_id] or draft.parent_task_id == draft.id) then error("invalid parent task hierarchy") end
+  end
   return self:call("task.create", draft)
+end
+
+function WheelKernel:_validated_task_graph()
+  local tasks = {}
+  for _, task in ipairs(self:list_tasks()) do
+    if type(task.id) ~= "string" or tasks[task.id] then error("invalid task graph identity") end
+    tasks[task.id] = task
+  end
+  if not valid_dependency_graph(tasks) then error("task dependency graph or parent hierarchy is invalid") end
+  return tasks
 end
 
 --- Retrieve a task by its identifier.
@@ -782,7 +1166,7 @@ end
 --- @param worker_id string?
 --- @param now_ms number?
 --- @return table
-function WheelKernel:start_task(id, worker_id, now_ms)
+function WheelKernel:start_task(id, worker_id, now_ms, expected_generation)
   local worker = worker_id or "worker"
   if type(worker) == "table" then
     worker = worker.worker_id or worker.assigned_agent or "worker"
@@ -792,6 +1176,24 @@ function WheelKernel:start_task(id, worker_id, now_ms)
     worker_id = worker,
     assigned_agent = worker,
     now_ms = now_ms or 0,
+    expected_generation = expected_generation,
+  })
+end
+
+--- Reassign a running task while fencing stale owners by advancing generation.
+--- @param id string
+--- @param expected_generation number
+--- @param assigned_agent string
+--- @param now_ms number?
+--- @param source_agent string Current owner of the expected generation
+--- @return table
+function WheelKernel:reassign_task(id, expected_generation, assigned_agent, now_ms, source_agent)
+  return self:call("task.reassign", {
+    id = id,
+    expected_generation = expected_generation,
+    source_agent = source_agent,
+    assigned_agent = assigned_agent,
+    now_ms = now_ms or 0,
   })
 end
 
@@ -800,11 +1202,13 @@ end
 --- @param expected_generation number
 --- @param checkpoint string? Optional ContentHash string
 --- @param now_ms number?
+--- @param assigned_agent string Current owner of the expected generation
 --- @return table
-function WheelKernel:complete_task(id, expected_generation, checkpoint, now_ms)
+function WheelKernel:complete_task(id, expected_generation, checkpoint, now_ms, assigned_agent)
   return self:call("task.complete", {
     id = id,
     expected_generation = expected_generation,
+    assigned_agent = assigned_agent,
     checkpoint = checkpoint,
     now_ms = now_ms or 0,
   })
@@ -815,35 +1219,45 @@ end
 --- @param expected_generation number
 --- @param error_message string
 --- @param now_ms number?
+--- @param assigned_agent string Current owner of the expected generation
 --- @return table
-function WheelKernel:fail_task(id, expected_generation, error_message, now_ms)
+function WheelKernel:fail_task(id, expected_generation, error_message, now_ms, assigned_agent)
   return self:call("task.fail", {
     id = id,
     expected_generation = expected_generation,
+    assigned_agent = assigned_agent,
     error = error_message,
     failure_reason = error_message,
     now_ms = now_ms or 0,
   })
 end
 
---- Cancel a task, propagating Blocked across downstream dependents.
+--- Cancel a running task with owner and generation fencing.
 --- @param id string
+--- @param expected_generation number
+--- @param assigned_agent string
 --- @param now_ms number?
 --- @return table
-function WheelKernel:cancel_task(id, now_ms)
+function WheelKernel:cancel_task(id, expected_generation, assigned_agent, now_ms)
   return self:call("task.cancel", {
     id = id,
+    expected_generation = expected_generation,
+    assigned_agent = assigned_agent,
     now_ms = now_ms or 0,
   })
 end
 
 --- Retry a failed or cancelled task.
 --- @param id string
+--- @param expected_generation number
+--- @param assigned_agent string
 --- @param now_ms number?
 --- @return table
-function WheelKernel:retry_task(id, now_ms)
+function WheelKernel:retry_task(id, expected_generation, assigned_agent, now_ms)
   return self:call("task.retry", {
     id = id,
+    expected_generation = expected_generation,
+    assigned_agent = assigned_agent,
     now_ms = now_ms or 0,
   })
 end
@@ -851,6 +1265,7 @@ end
 --- Compute topological ordering of tasks.
 --- @return string[]
 function WheelKernel:topological_sort()
+  if not self._handoff_transaction then self:_validated_task_graph() end
   return self:call("task.topological_sort", {})
 end
 
