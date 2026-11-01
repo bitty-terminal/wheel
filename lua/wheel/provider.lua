@@ -130,6 +130,291 @@ WheelProvider.DEFAULT_MAX_COMPLETION_TOKENS = 4096
 --- Hard upper bound for a caller-supplied completion-token budget.
 WheelProvider.MAX_COMPLETION_TOKENS = 32768
 
+WheelProvider.DEFAULT_PROMPT_CACHE_POLICY = "prefer"
+WheelProvider.PROMPT_CACHE_POLICIES = { off = true, prefer = true, required = true }
+WheelProvider.PROMPT_CACHE_CAPABILITY_VERSION = "wheel-prompt-cache/1"
+WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES = 64 * 1024
+local OPENAI_BASE_URL = "https://api.openai.com/v1"
+local ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+
+--- Hash cache identity through the shared configuration boundary, or decline.
+local function prompt_cache_digest(value)
+  local ok, config = pcall(require, "wheel.config")
+  if not ok then ok, config = pcall(require, "lua.wheel.config") end
+  if ok and type(config.compute_hash) == "function" then
+    return config.compute_hash(value)
+  end
+  return nil
+end
+
+--- Resolve request, adapter, then default policy and reject invalid values.
+function WheelProvider.resolve_prompt_cache_policy(request, configured)
+  local request_policy = request and request.prompt_cache_policy
+  if request_policy ~= nil and type(request_policy) ~= "string" then
+    return nil, "prompt_cache_policy must be off, prefer, or required"
+  end
+  if configured ~= nil and type(configured) ~= "string" then
+    return nil, "prompt_cache_policy must be off, prefer, or required"
+  end
+  local policy = request_policy
+  if policy == nil then policy = configured end
+  if policy == nil then policy = WheelProvider.DEFAULT_PROMPT_CACHE_POLICY end
+  if not WheelProvider.PROMPT_CACHE_POLICIES[policy] then
+    return nil, "prompt_cache_policy must be off, prefer, or required"
+  end
+  return policy
+end
+
+--- Reject required caching before transport when capability or prefix is absent.
+function WheelProvider.validate_prompt_cache_request(request, adapter)
+  local policy, err = WheelProvider.resolve_prompt_cache_policy(request, adapter and adapter.prompt_cache_policy)
+  if not policy then return nil, err end
+  if policy == "required" and not (adapter and adapter.prompt_cache_supported) then
+    return nil, "required prompt caching is unsupported by this provider"
+  end
+  if policy == "required" and (type(request.stable_context_prefix) ~= "string"
+    or #request.stable_context_prefix == 0) then
+    return nil, "required prompt caching needs a stable Context prefix"
+  end
+  return policy
+end
+
+--- Build the cache-key domain from provider identity, request policy, and schema.
+-- The returned digest intentionally excludes prompt content; callers combine
+-- it with the exact serialized stable prefix before producing a provider key.
+function WheelProvider.cache_domain(request, provider, model, endpoint, policy)
+  request = request or {}
+  local schema = request.tools and json.encode(request.tools) or "[]"
+  local material = table.concat({
+    tostring(provider or ""), tostring(model or ""), tostring(endpoint or ""),
+    tostring(policy or WheelProvider.DEFAULT_PROMPT_CACHE_POLICY), schema,
+    tostring(request.cache_policy_version or "1"), tostring(request.tool_schema_version or "1"),
+    WheelProvider.PROMPT_CACHE_CAPABILITY_VERSION,
+  }, "\0")
+  return prompt_cache_digest(material)
+end
+
+--- Normalize only explicit provider usage fields into cross-provider telemetry.
+-- Missing cache counters stay unknown, malformed counters produce `error`, and
+-- OpenAI uncached input excludes only explicitly reported cached reads.
+-- Native counters precede top-level read/write/creation aliases. Conflicting
+-- duplicates report error without replacing the first selected counter.
+function WheelProvider.normalize_usage(usage, provider)
+  if type(usage) ~= "table" then return nil end
+  local normalized = {}
+  local read_count, read_present, write_count
+  local malformed_cache_usage = false
+  --- Accept only finite, nonnegative integer token counts.
+  local function valid_cache_count(value)
+    return type(value) == "number" and value >= 0 and value % 1 == 0
+  end
+  --- Select the first present counter once; validate every duplicate alias.
+  local function select_cache_count(...)
+    local selected, count
+    for index = 1, select("#", ...) do
+      local value = select(index, ...)
+      if value ~= nil then
+        local valid = valid_cache_count(value)
+        if not valid then malformed_cache_usage = true end
+        if selected == nil then
+          selected = value
+          if valid then count = value end
+        elseif value ~= selected then
+          malformed_cache_usage = true
+        end
+      end
+    end
+    return count, selected ~= nil
+  end
+  --- Copy a valid usage count without coercing missing or malformed values.
+  local function copy(target, source)
+    local value = usage[source]
+    if type(value) == "number" and value >= 0 and value % 1 == 0 then
+      normalized[target] = value
+    end
+  end
+  if provider == "anthropic" then
+    -- Anthropic input_tokens excludes cache-read tokens; retain that exact
+    -- uncached-input meaning in the explicit cross-provider field.
+    copy("prompt_tokens", "input_tokens")
+    copy("uncached_input_tokens", "input_tokens")
+    copy("completion_tokens", "output_tokens")
+    copy("input_tokens", "input_tokens")
+    copy("output_tokens", "output_tokens")
+    read_count, read_present = select_cache_count(usage.cache_read_input_tokens, usage.cache_read_tokens)
+    write_count = select_cache_count(usage.cache_creation_input_tokens,
+      usage.cache_write_tokens, usage.cache_creation_tokens)
+  else
+    -- OpenAI prompt_tokens includes cached tokens when the provider reports
+    -- them. The uncached field removes cache reads; cache writes are not reads.
+    copy("prompt_tokens", "prompt_tokens")
+    local details = type(usage.prompt_tokens_details) == "table" and usage.prompt_tokens_details or {}
+    if usage.prompt_tokens_details ~= nil and type(usage.prompt_tokens_details) ~= "table" then
+      malformed_cache_usage = true
+    end
+    read_count, read_present = select_cache_count(details.cached_tokens, usage.cache_read_tokens)
+    write_count = select_cache_count(details.cache_write_tokens,
+      usage.cache_write_tokens, usage.cache_creation_tokens)
+  end
+  if provider ~= "anthropic" or usage.output_tokens == nil then
+    copy("completion_tokens", "completion_tokens")
+  end
+  copy("total_tokens", "total_tokens")
+  normalized.cache_read_tokens = read_count
+  normalized.cache_creation_tokens = write_count
+  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
+    and read_present and read_count ~= nil and not malformed_cache_usage
+    and read_count <= normalized.prompt_tokens then
+    normalized.uncached_input_tokens = normalized.prompt_tokens - read_count
+  end
+  if provider ~= "anthropic" and normalized.prompt_tokens ~= nil
+    and read_count ~= nil and read_count > normalized.prompt_tokens then
+    malformed_cache_usage = true
+  end
+  if malformed_cache_usage then
+    normalized.provider_cache_status = "error"
+  elseif read_count ~= nil and read_count > 0 then
+    normalized.provider_cache_status = "verified_hit"
+  elseif write_count ~= nil and write_count > 0 then
+    normalized.provider_cache_status = "write_only"
+  elseif provider == "openai" and read_present and read_count == 0 then
+    -- OpenAI reports cached_tokens=0 on an uncached request and normally has
+    -- no cache-write counter. Explicit zero read evidence is sufficient here;
+    -- Anthropic still needs both counters to prove a miss.
+    normalized.provider_cache_status = "verified_miss"
+  elseif read_count ~= nil and write_count ~= nil then
+    normalized.provider_cache_status = "verified_miss"
+  else
+    normalized.provider_cache_status = "unknown"
+  end
+  return next(normalized) and normalized or nil
+end
+
+--- Merge stream usage snapshots while retaining the strongest cache status.
+local function merge_usage(current, incoming)
+  current = current or {}
+  incoming = incoming or {}
+  local retained_status = WheelProvider.aggregate_cache_status(
+    current.provider_cache_status, incoming.provider_cache_status)
+  local retain_incoming_cache = retained_status == incoming.provider_cache_status
+    and incoming.provider_cache_status ~= nil
+  local cache_fields = {
+    cache_read_tokens = true,
+    cache_creation_tokens = true,
+    uncached_input_tokens = true,
+  }
+  if retain_incoming_cache then
+    for field in pairs(cache_fields) do current[field] = nil end
+  end
+  for field, value in pairs(incoming) do
+    if field == "provider_cache_status" then
+      current.provider_cache_status = retained_status
+    elseif not cache_fields[field] or retain_incoming_cache or current.provider_cache_status == nil then
+      current[field] = value
+    end
+  end
+  return current
+end
+
+-- Aggregated cache status reports the strongest evidence seen across turns.
+-- Errors dominate positive evidence; then a hit, write-only, verified miss,
+-- unknown, not-requested, and unsupported. This field is independent of token
+-- totals, which are always accumulated separately by the runner.
+local CACHE_STATUS_PRIORITY = {
+  unsupported = 1,
+  not_requested = 2,
+  unknown = 3,
+  verified_miss = 4,
+  write_only = 5,
+  verified_hit = 6,
+  error = 7,
+}
+
+--- Retain the strongest observed cache status regardless of arrival order.
+function WheelProvider.aggregate_cache_status(current, incoming)
+  local current_priority = CACHE_STATUS_PRIORITY[current] or 0
+  local incoming_priority = CACHE_STATUS_PRIORITY[incoming] or 0
+  if incoming_priority > current_priority then return incoming end
+  return current
+end
+
+--- Combine request policy and capability with explicit provider usage evidence.
+function WheelProvider.cache_usage_status(usage, request, adapter)
+  request = request or {}
+  local policy = WheelProvider.resolve_prompt_cache_policy(request, adapter and adapter.prompt_cache_policy)
+  if not policy then return "error" end
+  if policy == "off" or type(request.stable_context_prefix) ~= "string"
+    or #request.stable_context_prefix == 0 then
+    return "not_requested"
+  end
+  if not adapter or not adapter.prompt_cache_supported then return "unsupported" end
+  return usage and usage.provider_cache_status or "unknown"
+end
+
+--- Attach provider-native cache metadata when the serialized stable prefix matches.
+-- In `prefer` mode any unsupported or unverifiable setup leaves the payload
+-- unchanged; `required` mode returns an error instead.
+local function apply_prompt_cache(payload, request, adapter, provider, endpoint)
+  local policy, policy_err = WheelProvider.resolve_prompt_cache_policy(request, adapter.prompt_cache_policy)
+  if not policy then return nil, policy_err end
+  if policy == "off" then return payload end
+  local prefix = request.stable_context_prefix
+  if type(prefix) == "string" and #prefix > WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES then
+    if policy == "required" then
+      return nil, "required stable Context prefix exceeds the cache-key bound"
+    end
+    return payload
+  end
+  if type(prefix) ~= "string" or #prefix == 0 then
+    if policy == "required" then return nil, "required prompt caching needs a stable Context prefix" end
+    return payload
+  end
+  if not adapter.prompt_cache_supported then
+    if policy == "required" then return nil, "required prompt caching is unsupported by this provider" end
+    return payload
+  end
+  local wire_system
+  if provider == "anthropic" then
+    wire_system = type(payload.system) == "string" and payload.system or nil
+  else
+    for _, message in ipairs(payload.messages or {}) do
+      if message.role == "system" then
+        wire_system = type(message.content) == "string" and message.content or nil
+        break
+      end
+    end
+  end
+  local wire_prefix = wire_system and wire_system:sub(1, #prefix) or nil
+  if wire_prefix ~= prefix then
+    if policy == "required" then
+      return nil, "required stable Context prefix does not match the serialized system prefix"
+    end
+    return payload
+  end
+  local domain = WheelProvider.cache_domain(request, provider, request.model or adapter.model or "", endpoint, policy)
+  local cache_key = domain and prompt_cache_digest(table.concat({ domain, wire_prefix }, "\0")) or nil
+  if not cache_key then
+    if policy == "required" then return nil, "required prompt caching needs a stable SHA-256 implementation" end
+    return payload
+  end
+  if provider == "anthropic" then
+    if type(payload.system) ~= "string" or #payload.system == 0 then
+      if policy == "required" then return nil, "required prompt caching needs a stable Anthropic system prefix" end
+      return payload
+    end
+    payload.system = {
+      {
+        type = "text",
+        text = payload.system,
+        cache_control = { type = "ephemeral" },
+      },
+    }
+  else
+    payload.prompt_cache_key = cache_key
+  end
+  return payload
+end
+
 --- Validate a completion-token budget override.
 -- @param value number? Explicit bound; nil selects the named default.
 -- @return number? effective bound, table? typed validation error
@@ -815,6 +1100,8 @@ function MockProvider.new(opts)
   self.completion_fn = opts.completion_fn
   self.stream_chunk_size = opts.stream_chunk_size or 4
   self.max_completion_tokens = opts.max_completion_tokens
+  self.prompt_cache_policy = opts.prompt_cache_policy
+  self.prompt_cache_supported = opts.prompt_cache_supported == true
   self.call_history = {}
   self._call_count = 0
   return self
@@ -865,6 +1152,8 @@ end
 -- @param opts table?
 -- @return table response, string? error
 function MockProvider:complete(request, opts)
+  local policy, policy_err = WheelProvider.validate_prompt_cache_request(request or {}, self)
+  if not policy then return nil, policy_err end
   local res = self:_next_response(request)
   return res, nil
 end
@@ -875,6 +1164,8 @@ end
 -- @param opts table?
 -- @return table final_response, string? error
 function MockProvider:stream(request, on_chunk, opts)
+  local policy, policy_err = WheelProvider.validate_prompt_cache_request(request or {}, self)
+  if not policy then return nil, policy_err end
   local res = self:_next_response(request)
 
   -- Stream thinking content first if present
@@ -928,6 +1219,8 @@ OpenAIAdapter.__index = OpenAIAdapter
 --   opts.temperature number?
 --   opts.thinking table?
 --   opts.max_completion_tokens number?: validated completion bound override
+--   opts.stream_include_usage boolean?: send stream_options.include_usage;
+--     defaults true only for the canonical official OpenAI endpoint
 --   opts.attribution table?: opt-in caller attribution
 --     { referer = string, title = string, categories = string[]?, visibility = "hidden"? }
 --   opts.http_client function?: injectable client fn(req) -> { status, body, stream_fn }
@@ -941,11 +1234,18 @@ function OpenAIAdapter.new(opts)
   local self = setmetatable({}, OpenAIAdapter)
   self.name = "openai"
   self.api_key = opts.api_key or ""
-  self.base_url = opts.base_url or "https://api.openai.com/v1"
+  self.base_url = opts.base_url or OPENAI_BASE_URL
   self.model = opts.model or "gpt-4o"
   self.temperature = opts.temperature or 0.0
   self.thinking = opts.thinking
   self.max_completion_tokens = opts.max_completion_tokens
+  self.prompt_cache_policy = opts.prompt_cache_policy
+  self.prompt_cache_supported = opts.prompt_cache_supported == true
+  if opts.stream_include_usage == nil then
+    self.stream_include_usage = self.base_url:gsub("/+$", "") == OPENAI_BASE_URL
+  else
+    self.stream_include_usage = opts.stream_include_usage == true
+  end
   self.attribution = attribution
   -- Precompute the adapter-owned header table. Request and opts header maps
   -- are not a header channel, so a caller cannot inject or override these.
@@ -1009,6 +1309,14 @@ function OpenAIAdapter:_format_payload(request, stream)
     max_tokens = max_tokens,
     stream = stream and true or false,
   }
+
+  local endpoint = self.base_url:gsub("/+$", "") .. "/chat/completions"
+  local cache_payload, cache_err = apply_prompt_cache(payload, request, self, self.name, endpoint)
+  if not cache_payload then return nil, cache_err end
+  payload = cache_payload
+  if stream and self.stream_include_usage then
+    payload.stream_options = { include_usage = true }
+  end
 
   if request.tools and #request.tools > 0 then
     payload.tools = WheelProvider.format_tools_for_openai(request.tools)
@@ -1086,7 +1394,7 @@ function OpenAIAdapter:complete(request, opts)
     thinking_content = msg.reasoning_content or nil,
     tool_calls = tool_calls,
     finish_reason = choice.finish_reason or "stop",
-    usage = data.usage or {},
+    usage = WheelProvider.normalize_usage(data.usage, self.name),
   }, nil
 end
 
@@ -1128,8 +1436,10 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
     headers = headers,
     body = body_str,
     stream = true,
+    --- Parse OpenAI transport fragments without losing usage-only events.
     on_stream_chunk = function(chunk)
       if stream_err then return true end
+      --- Merge explicit usage before processing optional choice deltas.
       local ok, perr = parser:feed(chunk, function(evt)
         local raw = evt.data
         if not raw or raw == "[DONE]" then
@@ -1142,7 +1452,7 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
         end
 
         if chunk_data.usage then
-          usage = chunk_data.usage
+          usage = merge_usage(usage, WheelProvider.normalize_usage(chunk_data.usage, self.name))
         end
 
         local choices = chunk_data.choices
@@ -1241,7 +1551,7 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
     thinking_content = full_thinking,
     tool_calls = finalized_tool_calls,
     finish_reason = finish_reason,
-    usage = usage,
+    usage = next(usage) and usage or nil,
   }, nil
 end
 
@@ -1277,11 +1587,13 @@ function AnthropicAdapter.new(opts)
   local self = setmetatable({}, AnthropicAdapter)
   self.name = "anthropic"
   self.api_key = opts.api_key or getenv("ANTHROPIC_API_KEY") or ""
-  self.base_url = opts.base_url or "https://api.anthropic.com/v1"
+  self.base_url = opts.base_url or ANTHROPIC_BASE_URL
   self.model = opts.model or "claude-3-5-sonnet-20241022"
   self.version = opts.version or "2023-06-01"
   self.thinking = opts.thinking
   self.max_completion_tokens = opts.max_completion_tokens
+  self.prompt_cache_policy = opts.prompt_cache_policy
+  self.prompt_cache_supported = opts.prompt_cache_supported == true
   self.http_client = opts.http_client
   return self
 end
@@ -1370,6 +1682,11 @@ function AnthropicAdapter:_format_payload(request, stream)
     payload.system = table.concat(system_parts, "\n\n")
   end
 
+  local endpoint = self.base_url:gsub("/+$", "") .. "/messages"
+  local cache_payload, cache_err = apply_prompt_cache(payload, request, self, self.name, endpoint)
+  if not cache_payload then return nil, cache_err end
+  payload = cache_payload
+
   -- Thinking configuration
   local thinking = request.thinking or self.thinking
   if thinking and thinking.enabled and thinking.budget_tokens and thinking.budget_tokens > 0 then
@@ -1456,7 +1773,7 @@ function AnthropicAdapter:complete(request, opts)
     thinking_content = #thinking_parts > 0 and table.concat(thinking_parts, "") or nil,
     tool_calls = tool_calls,
     finish_reason = data.stop_reason or "end_turn",
-    usage = data.usage or {},
+    usage = WheelProvider.normalize_usage(data.usage, self.name),
   }, nil
 end
 
@@ -1499,8 +1816,10 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
     headers = headers,
     body = body_str,
     stream = true,
+    --- Parse Anthropic transport fragments and stop after a protocol error.
     on_stream_chunk = function(chunk)
       if stream_err then return true end
+      --- Merge native message-start and message-delta usage independently.
       local ok, perr = parser:feed(chunk, function(evt)
         if evt.event == "error" then
           local err_msg = evt.data or "unknown error"
@@ -1520,7 +1839,12 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
 
         local evt_type = data.type or evt.event
 
-        if evt_type == "content_block_start" then
+        if evt_type == "message_start" then
+          local message = data.message or {}
+          if message.usage then
+            usage = merge_usage(usage, WheelProvider.normalize_usage(message.usage, self.name))
+          end
+        elseif evt_type == "content_block_start" then
           active_block_index = data.index or 0
           local cb = data.content_block or {}
           if cb.type == "tool_use" then
@@ -1550,7 +1874,7 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
             stop_reason = data.delta.stop_reason
           end
           if data.usage then
-            usage = data.usage
+            usage = merge_usage(usage, WheelProvider.normalize_usage(data.usage, self.name))
           end
         elseif evt_type == "message_stop" then
           return true
@@ -1600,7 +1924,7 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
     thinking_content = #thinking_parts > 0 and table.concat(thinking_parts, "") or nil,
     tool_calls = tool_calls,
     finish_reason = stop_reason,
-    usage = usage,
+    usage = next(usage) and usage or nil,
   }, nil
 end
 
@@ -1736,6 +2060,7 @@ function StdioAdapter.new(opts)
   self.command = opts.command or "ollama run qwen2.5-coder"
   self.timeout_ms = opts.timeout_ms
   self.runner = opts.runner
+  self.prompt_cache_policy = opts.prompt_cache_policy
   return self
 end
 
@@ -1746,8 +2071,11 @@ function StdioAdapter:describe()
   }
 end
 
+--- Validate cache policy before invoking the bounded stdio completion runner.
 function StdioAdapter:complete(request, opts)
   opts = opts or {}
+  local policy, policy_err = WheelProvider.validate_prompt_cache_request(request or {}, self)
+  if not policy then return nil, policy_err end
   local runner = opts.runner or self.runner
   local prompt = ""
   for _, m in ipairs(request.messages or {}) do
@@ -1799,7 +2127,10 @@ function StdioAdapter:complete(request, opts)
   }, nil
 end
 
+--- Deliver stdio completion chunks after the same fail-closed policy checks.
 function StdioAdapter:stream(request, on_chunk, opts)
+  local policy, policy_err = WheelProvider.validate_prompt_cache_request(request or {}, self)
+  if not policy then return nil, policy_err end
   -- For stdio processes, stream line by line if possible or deliver in chunks
   local res, err = self:complete(request, opts)
   if not res then return nil, err end
@@ -1860,16 +2191,24 @@ function WheelProvider.create(profile, opts)
       completion_fn = opts.completion_fn,
       stream_chunk_size = opts.stream_chunk_size,
       max_completion_tokens = completion_budget,
+      prompt_cache_policy = opts.prompt_cache_policy,
+       prompt_cache_supported = opts.prompt_cache_supported == true,
     })
   elseif p_type == "openai" then
     local api_key = opts.api_key or getenv("OPENAI_API_KEY") or ""
+    local base_url = opts.base_url or OPENAI_BASE_URL
+    local cache_supported = base_url:gsub("/+$", "") == OPENAI_BASE_URL
+    if opts.prompt_cache_supported ~= nil then cache_supported = opts.prompt_cache_supported == true end
     return OpenAIAdapter.new({
       api_key = api_key,
-      base_url = opts.base_url or "https://api.openai.com/v1",
+      base_url = base_url,
       model = profile.model or opts.model or "gpt-4o",
       temperature = profile.temperature or opts.temperature or 0.0,
-      thinking = profile.thinking or opts.thinking,
-      max_completion_tokens = completion_budget,
+       thinking = profile.thinking or opts.thinking,
+       max_completion_tokens = completion_budget,
+       prompt_cache_policy = opts.prompt_cache_policy,
+       prompt_cache_supported = cache_supported,
+      stream_include_usage = opts.stream_include_usage,
       attribution = attribution,
       http_client = opts.http_client,
     })
@@ -1882,17 +2221,25 @@ function WheelProvider.create(profile, opts)
       temperature = profile.temperature or opts.temperature or 0.0,
       thinking = profile.thinking or opts.thinking,
       max_completion_tokens = completion_budget,
+      prompt_cache_policy = opts.prompt_cache_policy,
+       prompt_cache_supported = opts.prompt_cache_supported == true,
+      stream_include_usage = opts.stream_include_usage,
       attribution = attribution,
       http_client = opts.http_client,
     })
   elseif p_type == "anthropic" then
     local api_key = opts.api_key or getenv("ANTHROPIC_API_KEY") or ""
+    local base_url = opts.base_url or ANTHROPIC_BASE_URL
+    local cache_supported = base_url:gsub("/+$", "") == ANTHROPIC_BASE_URL
+    if opts.prompt_cache_supported ~= nil then cache_supported = opts.prompt_cache_supported == true end
     return AnthropicAdapter.new({
       api_key = api_key,
-      base_url = opts.base_url or "https://api.anthropic.com/v1",
+      base_url = base_url,
       model = profile.model or opts.model or "claude-3-5-sonnet-20241022",
       thinking = profile.thinking or opts.thinking,
       max_completion_tokens = completion_budget,
+      prompt_cache_policy = opts.prompt_cache_policy,
+      prompt_cache_supported = cache_supported,
       http_client = opts.http_client,
     })
   elseif p_type == "stdio" or p_type == "local" or p_type == "ollama" then
@@ -1911,6 +2258,7 @@ function WheelProvider.create(profile, opts)
       command = cmd,
       timeout_ms = opts.timeout_ms,
       runner = opts.runner,
+      prompt_cache_policy = opts.prompt_cache_policy,
     })
   else
     return nil, "Unknown or unsupported provider type: " .. tostring(p_type)

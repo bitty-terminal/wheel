@@ -6,6 +6,17 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Provider Cache
+
+- Provider prompt-cache negotiation for `off`, `prefer` (default), and
+  `required` policies. OpenAI adapters use an opaque, domain-bound
+  `prompt_cache_key`; Anthropic adapters mark the stable system prefix with a
+  provider-native ephemeral `cache_control` breakpoint. Unsupported providers
+  remain usable in `prefer` mode and fail closed in `required` mode. Normalized
+  cache read/write token counts and status are derived only from explicit
+  provider usage; local prefix hashes never imply a provider hit. No KV cache is
+  persisted and `bittyd` receives no cache or prompt content.
+
 ### Fixed
 
 - Close CTX-0046 PX-0451 findings: keep binding projection and normalization
@@ -32,6 +43,22 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   persistence or reassignment failures without fallible compensating writes.
   The transaction covers the owned in-process Context/kernel projection;
   CarryCtx remains the lifecycle and cross-process recovery system of record.
+
+- CTX-0048 review repairs: reject selected credentials in live-helper response
+  bytes and diagnostics before output, keep legacy live assertions key-free,
+  preserve configured stdio prompt-cache policies, and report contradictory
+  native/alias cache counters as errors using consistent normalization.
+  Offline regressions cover credential echoes, legacy selectors, direct and
+  factory stdio construction, cache telemetry conflicts, and OpenAI explicit
+  zero-read misses without requiring a write counter. Live OpenAI cache
+  evidence uses a deterministic prefix above the documented cache minimum;
+  hits still require a positive measured cached-read count.
+- OpenAI-compatible streaming usage options are separately configurable with
+  `stream_include_usage`. Official OpenAI defaults to enabled even with cache
+  policy off or unsupported cache capability; custom endpoints default to
+  omitted and can explicitly opt in or out. Regression tests retain selected
+  native cache counts on alias conflicts and exercise error/hit precedence
+  with positive cached-read totals in either turn order.
 
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,

@@ -559,6 +559,7 @@ local function bounded_message(message, budget)
   return bounded
 end
 
+--- Bound request fields and serialized prefix together before provider dispatch.
 local function bound_provider_request(request)
   local value_budget = make_budget(WheelRunner.MAX_REQUEST_NODES,
     WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_BYTES)
@@ -588,6 +589,21 @@ local function bound_provider_request(request)
   end
   if request.max_completion_tokens ~= nil and top_level_key("max_completion_tokens") then
     bounded.max_completion_tokens = request.max_completion_tokens
+  end
+  for _, field in ipairs({ "prompt_cache_policy", "local_prefix_hash",
+    "cache_policy_version", "tool_schema_version" }) do
+    local value = request[field]
+    if field == "prompt_cache_policy" and value ~= nil then
+      if top_level_key(field) then bounded[field] = value end
+    elseif type(value) == "string" and top_level_key(field) then
+      bounded[field] = safe_string(value, WheelRunner.MAX_REQUEST_VALUE_BYTES, value_budget)
+    end
+  end
+  if type(request.stable_context_prefix) == "string"
+    and #request.stable_context_prefix <= WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES
+    and top_level_key("stable_context_prefix") then
+    bounded.stable_context_prefix = safe_string(request.stable_context_prefix,
+      WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES, value_budget)
   end
 
   local source_messages = request.messages or {}
@@ -1013,9 +1029,15 @@ function WheelRunner.run_task(agent, task, opts)
   local context_ref = nil
   local total_usage = {
     prompt_tokens = 0,
+    uncached_input_tokens = 0,
     completion_tokens = 0,
     thinking_tokens = 0,
     total_tokens = 0,
+    cache_creation_tokens = 0,
+    cache_read_tokens = 0,
+    provider_cache_status = nil,
+    local_prefix_hash = nil,
+    local_prefix_reuse_ratio = nil,
   }
 
   local turn = 0
@@ -1046,6 +1068,8 @@ function WheelRunner.run_task(agent, task, opts)
       if ctx_res then
         agent.last_prefix_cache_key = ctx_res.prefix_cache_key
         agent.last_cache_share_ratio = ctx_res.cache_share_ratio
+        total_usage.local_prefix_hash = ctx_res.prefix_cache_key
+        total_usage.local_prefix_reuse_ratio = ctx_res.cache_share_ratio
         -- The projection/compiler is the provider request source. Only Zone 1
         -- is placed in the system message; its bytes remain stable while Zone
         -- 2/3 are supplied as a dynamic tail message.
@@ -1084,6 +1108,11 @@ function WheelRunner.run_task(agent, task, opts)
       temperature = (agent.model_profile and agent.model_profile.temperature) or 0.0,
       thinking = agent.model_profile and agent.model_profile.thinking,
       max_completion_tokens = completion_budget,
+      prompt_cache_policy = opts.prompt_cache_policy,
+      stable_context_prefix = ctx_res and ctx_res.zone1_prefix or nil,
+      local_prefix_hash = ctx_res and ctx_res.prefix_cache_key or nil,
+      cache_policy_version = opts.cache_policy_version,
+      tool_schema_version = opts.tool_schema_version,
     }
 
     -- Call model stream
@@ -1104,10 +1133,23 @@ function WheelRunner.run_task(agent, task, opts)
     -- Accumulate usage telemetry
     if res.usage then
       total_usage.prompt_tokens = total_usage.prompt_tokens + (res.usage.prompt_tokens or 0)
+      if total_usage.uncached_input_tokens ~= nil and res.usage.uncached_input_tokens ~= nil then
+        total_usage.uncached_input_tokens = total_usage.uncached_input_tokens
+          + res.usage.uncached_input_tokens
+      else
+        total_usage.uncached_input_tokens = nil
+      end
       total_usage.completion_tokens = total_usage.completion_tokens + (res.usage.completion_tokens or 0)
       total_usage.thinking_tokens = total_usage.thinking_tokens + (res.usage.thinking_tokens or 0)
       total_usage.total_tokens = total_usage.total_tokens + (res.usage.total_tokens or 0)
+      total_usage.cache_creation_tokens = total_usage.cache_creation_tokens + (res.usage.cache_creation_tokens or 0)
+      total_usage.cache_read_tokens = total_usage.cache_read_tokens + (res.usage.cache_read_tokens or 0)
+    else
+      total_usage.uncached_input_tokens = nil
     end
+    local cache_status = WheelProvider.cache_usage_status(res.usage, req, provider)
+    total_usage.provider_cache_status = WheelProvider.aggregate_cache_status(
+      total_usage.provider_cache_status, cache_status)
 
     -- Construct a bounded rationale.  Provider thinking is intentionally not
     -- copied here: it remains transient on `res` and cannot enter a prompt,

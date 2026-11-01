@@ -22,6 +22,7 @@ local WheelProvider = require("wheel.provider")
 
 local JSON = WheelProvider.JSON
 local OpenAIAdapter = WheelProvider.OpenAIAdapter
+local AnthropicAdapter = WheelProvider.AnthropicAdapter
 
 -- Fixed synthetic values: unmistakably test fixtures, never real credentials.
 local SYNTHETIC_KEY = "sk-wheel-provider-stub-synthetic-not-a-secret-0001"
@@ -449,6 +450,7 @@ local function run_stub_once(label, env_key, arguments)
   return status, stderr
 end
 
+--- Exercise adapter payloads, usage evidence, and credential-safe loopback I/O.
 local function main()
   select_scratch_root()
   local pipe = assert(io.popen(
@@ -492,6 +494,8 @@ local function main()
   check(result.content == STUB_CONTENT,
     "the stub completion content drifted: " .. safe_diagnostic(result.content))
   check(result.finish_reason == "stop", "the stub finish reason drifted")
+  check(result.usage.prompt_tokens == 1 and result.usage.completion_tokens == 1,
+    "explicit provider usage must be normalized")
   local bounded = WheelProvider.parse_rationale(result, { task_id = "stub-task" })
   check(bounded.source == "fallback" or bounded.decision == "Use the deterministic stub response",
     "provider-stub rationale must be deterministic")
@@ -500,6 +504,311 @@ local function main()
     "provider-stub rationale must not retain the thinking stream")
   capture("completion content", result.content)
   pass("provider-stub: deterministic completion through the loopback stub")
+
+  local cache_adapter = OpenAIAdapter.new({
+    base_url = base_url,
+    api_key = SYNTHETIC_KEY,
+    model = STUB_MODEL,
+    prompt_cache_supported = true,
+    http_client = make_http_client(SYNTHETIC_KEY),
+  })
+  local cache_request = {
+    messages = { { role = "system", content = "stable" }, { role = "user", content = "miss" } },
+    stable_context_prefix = "stable",
+    tools = {},
+    max_completion_tokens = 64,
+  }
+  local cache_payload = assert(cache_adapter:_format_payload(cache_request, false))
+  check(type(cache_payload.prompt_cache_key) == "string" and #cache_payload.prompt_cache_key == 64,
+    "supported provider must receive an opaque cache key")
+  local cache_request_variant = {}
+  for key, value in pairs(cache_request) do cache_request_variant[key] = value end
+  cache_request_variant.stable_context_prefix = "different stable prefix"
+  local variant_payload = assert(cache_adapter:_format_payload(cache_request_variant, false))
+  check(cache_payload.prompt_cache_key ~= variant_payload.prompt_cache_key,
+    "provider cache key must bind the stable prefix")
+  local mismatched_prefix_request = {}
+  for key, value in pairs(cache_request) do mismatched_prefix_request[key] = value end
+  mismatched_prefix_request.messages = {
+    { role = "system", content = "different serialized prefix" },
+    { role = "user", content = "miss" },
+  }
+  local mismatched_prefix_payload = assert(cache_adapter:_format_payload(mismatched_prefix_request, false))
+  check(mismatched_prefix_payload.prompt_cache_key == nil,
+    "cache key must be omitted when the declared prefix differs from serialized system bytes")
+  mismatched_prefix_request.prompt_cache_policy = "required"
+  local required_mismatch_payload, required_mismatch_err = cache_adapter:_format_payload(mismatched_prefix_request, false)
+  check(required_mismatch_payload == nil and required_mismatch_err:find("does not match", 1, true),
+    "required cache policy must fail closed on a serialized-prefix mismatch")
+  local oversized_prefix = string.rep("x", WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES + 1)
+  local max_bounded_prefix = string.rep("x", WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES)
+  local max_bounded_payload = assert(cache_adapter:_format_payload({
+    messages = { { role = "system", content = max_bounded_prefix } },
+    stable_context_prefix = max_bounded_prefix,
+  }, false))
+  check(type(max_bounded_payload.prompt_cache_key) == "string",
+    "cache key must bind a wire prefix exactly at the configured byte bound")
+  local bounded_prefix_payload = assert(cache_adapter:_format_payload({
+    messages = { { role = "system", content = oversized_prefix } },
+    stable_context_prefix = oversized_prefix,
+  }, false))
+  check(bounded_prefix_payload.prompt_cache_key == nil,
+    "cache key must be omitted when the declared system prefix exceeds its byte bound")
+  local domain_a = WheelProvider.cache_domain(cache_request, "openai", STUB_MODEL, base_url, "prefer")
+  local domain_b = WheelProvider.cache_domain(cache_request, "openai", STUB_MODEL, base_url, "required")
+  check(domain_a ~= domain_b, "cache domain must include policy")
+  local unsupported = OpenAIAdapter.new({
+    prompt_cache_policy = "required",
+    prompt_cache_supported = false,
+  })
+  unsupported.http_client = function() error("unsupported required mode must not send") end
+  local unsupported_payload, unsupported_err = unsupported:_format_payload(cache_request, false)
+  check(unsupported_payload == nil and unsupported_err:find("unsupported", 1, true),
+    "required mode must fail closed when cache capability is unavailable")
+  local unsupported_stream = OpenAIAdapter.new({ prompt_cache_supported = false })
+  local unsupported_stream_payload = assert(unsupported_stream:_format_payload(cache_request, true))
+  check(unsupported_stream_payload.prompt_cache_key == nil
+    and unsupported_stream_payload.stream_options
+    and unsupported_stream_payload.stream_options.include_usage == true,
+    "official OpenAI must request streaming usage even without cache capability")
+  local false_policy, false_policy_err = cache_adapter:_format_payload({
+    messages = cache_request.messages, stable_context_prefix = "stable", prompt_cache_policy = false,
+  }, false)
+  check(false_policy == nil and false_policy_err:find("must be off", 1, true),
+    "false cache policy must be rejected instead of defaulting")
+  local mock_required = WheelProvider.MockProvider.new({ prompt_cache_policy = "required" })
+  local mock_result, mock_err = mock_required:complete({ messages = cache_request.messages })
+  check(mock_result == nil and mock_err:find("unsupported", 1, true),
+    "unsupported MockProvider must reject required cache policy")
+  local stream_payload = assert(cache_adapter:_format_payload(cache_request, true))
+  check(stream_payload.stream_options == nil and stream_payload.prompt_cache_key ~= nil,
+    "custom cache capability must not imply support for streaming usage options")
+  local custom = assert(WheelProvider.create({ provider = "openai", model = STUB_MODEL }, {
+    base_url = base_url .. "/custom", api_key = SYNTHETIC_KEY,
+  }))
+  local custom_payload = assert(custom:_format_payload(cache_request, false))
+  check(custom_payload.prompt_cache_key == nil,
+    "custom endpoints must not receive cache controls without explicit capability")
+  local custom_stream_payload = assert(custom:_format_payload(cache_request, true))
+  check(custom_stream_payload.stream_options == nil,
+    "custom OpenAI endpoints must omit streaming usage options by default")
+  for _, construction in ipairs({ "direct", "openai", "deepseek" }) do
+    for _, scenario in ipairs({
+      { official = true, expected = true },
+      { official = true, option = false, expected = false },
+      { official = false, expected = false },
+      { official = false, option = true, expected = true },
+      { official = false, option = false, expected = false },
+    }) do
+      local opts = {
+        api_key = SYNTHETIC_KEY,
+        base_url = scenario.official and unsupported_stream.base_url .. "/" or base_url,
+        stream_include_usage = scenario.option,
+        prompt_cache_supported = true,
+      }
+      local candidate = construction == "direct" and OpenAIAdapter.new(opts)
+        or assert(WheelProvider.create({ provider = construction, model = STUB_MODEL }, opts))
+      local payload = assert(candidate:_format_payload(cache_request, true))
+      check((payload.stream_options ~= nil) == scenario.expected,
+        construction .. " must honor endpoint defaults and explicit stream_include_usage")
+      if scenario.expected then
+        check(payload.stream_options.include_usage == true, "enabled streaming usage must request include_usage")
+      end
+      check(payload.prompt_cache_key ~= nil, "usage option must remain separate from cache capability")
+      check(candidate:_format_payload(cache_request, false).stream_options == nil,
+        "non-streaming payloads must never contain stream_options")
+    end
+  end
+  local deepseek_default = assert(WheelProvider.create({ provider = "deepseek" }, { api_key = SYNTHETIC_KEY }))
+  check(deepseek_default:_format_payload(cache_request, true).stream_options == nil,
+    "the default DeepSeek factory route must not assume streaming usage support")
+  local off_adapter = OpenAIAdapter.new({ prompt_cache_policy = "off", prompt_cache_supported = true })
+  local off_payload = assert(off_adapter:_format_payload(cache_request, false))
+  check(off_payload.prompt_cache_key == nil, "off policy must not attach cache controls")
+  local off_stream_payload = assert(off_adapter:_format_payload(cache_request, true))
+  check(off_stream_payload.prompt_cache_key == nil
+    and off_stream_payload.stream_options and off_stream_payload.stream_options.include_usage == true,
+    "cache off policy must preserve streaming usage telemetry without cache controls")
+  local normalized = WheelProvider.normalize_usage({ prompt_tokens = "bad", prompt_tokens_details = { cached_tokens = -1 } }, "openai")
+  check(normalized.provider_cache_status == "error" and normalized.prompt_tokens == nil,
+    "malformed usage must be surfaced as error without inventing token counts")
+  local anthropic_usage = WheelProvider.normalize_usage({ input_tokens = 20,
+    cache_creation_input_tokens = 8, cache_read_input_tokens = 0 }, "anthropic")
+  check(anthropic_usage.cache_creation_tokens == 8 and anthropic_usage.cache_read_tokens == 0,
+    "explicit provider cache miss/create evidence must normalize")
+  check(anthropic_usage.prompt_tokens == 20 and anthropic_usage.uncached_input_tokens == 20,
+    "Anthropic input_tokens must remain uncached input; cache creation is separate")
+  check(anthropic_usage.provider_cache_status == "write_only",
+    "cache creation without reads must remain write-only, not a hit")
+  local openai_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40,
+    prompt_tokens_details = { cached_tokens = 16, cache_write_tokens = 4 },
+  }, "openai")
+  check(openai_usage.cache_read_tokens == 16 and openai_usage.cache_creation_tokens == 4
+    and openai_usage.provider_cache_status == "verified_hit",
+    "OpenAI explicit cached and cache-write usage must normalize as verified evidence")
+  check(openai_usage.prompt_tokens == 40 and openai_usage.uncached_input_tokens == 24,
+    "OpenAI prompt_tokens must include cached reads and expose uncached input separately")
+  check(openai_usage.uncached_input_tokens + openai_usage.cache_read_tokens
+      == openai_usage.prompt_tokens,
+    "OpenAI cached reads must be a subset of prompt_tokens, not counted twice")
+  local explicit_miss = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0, cache_write_tokens = 0 },
+  }, "openai")
+  check(explicit_miss.provider_cache_status == "verified_miss",
+    "explicit zero cached/write counts must represent a verified miss")
+  local openai_read_miss = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 },
+  }, "openai")
+  check(openai_read_miss.provider_cache_status == "verified_miss"
+    and openai_read_miss.cache_read_tokens == 0 and openai_read_miss.cache_creation_tokens == nil,
+    "explicit OpenAI zero cached tokens must prove a miss without a write counter")
+  local absent_usage = WheelProvider.normalize_usage({ prompt_tokens = 40 }, "openai")
+  check(absent_usage.provider_cache_status == "unknown" and absent_usage.uncached_input_tokens == nil,
+    "usage without cache fields must remain unknown without fabricating uncached input")
+  local explicit_zero_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 },
+  }, "openai")
+  check(explicit_zero_usage.uncached_input_tokens == 40,
+    "an explicit zero cached-read count must establish the full uncached input count")
+  local invalid_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = "bad" },
+  }, "openai")
+  check(invalid_usage.provider_cache_status == "error",
+    "malformed cache usage must not be reported as a miss or hit")
+  check(invalid_usage.uncached_input_tokens == nil,
+    "malformed cached-read telemetry must not produce an uncached input count")
+  local impossible_usage = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 45 },
+  }, "openai")
+  check(impossible_usage.provider_cache_status == "error",
+    "cached input greater than OpenAI prompt input must be an error")
+  check(impossible_usage.prompt_tokens == 40 and impossible_usage.cache_read_tokens == 45,
+    "impossible cache telemetry must retain independently valid provider counts")
+  check(impossible_usage.uncached_input_tokens == nil,
+    "impossible cached input must not produce a negative uncached count")
+  local conflicting_reads = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 }, cache_read_tokens = 0,
+  }, "openai")
+  check(conflicting_reads.provider_cache_status == "error" and conflicting_reads.uncached_input_tokens == nil,
+    "conflicting cached-read counters must not produce an uncached input count")
+
+  for _, conflict in ipairs({
+    { details = { cached_tokens = 16 }, alias = "cache_read_tokens", value = 0, read = 16 },
+    { details = { cached_tokens = 0 }, alias = "cache_read_tokens", value = 16, read = 0 },
+    { details = { cached_tokens = 16 }, alias = "cache_read_tokens", value = "bad", read = 16 },
+    { details = { cached_tokens = "bad" }, alias = "cache_read_tokens", value = 16 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_write_tokens", value = 0, write = 3 },
+    { details = { cache_write_tokens = 0 }, alias = "cache_creation_tokens", value = 3, write = 0 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_creation_tokens", value = -1, write = 3 },
+    { details = { cache_write_tokens = 3 }, alias = "cache_creation_tokens", value = 9, write = 3 },
+    { details = { cache_write_tokens = 0 }, alias = "cache_write_tokens", value = 9, write = 0 },
+    { details = { cache_write_tokens = "bad" }, alias = "cache_write_tokens", value = 9 },
+    { details = { cache_write_tokens = "bad" }, alias = "cache_creation_tokens", value = 9 },
+  }) do
+    local raw = { prompt_tokens = 40, prompt_tokens_details = conflict.details }
+    raw[conflict.alias] = conflict.value
+    local usage = WheelProvider.normalize_usage(raw, "openai")
+    check(usage.provider_cache_status == "error", "conflicting native/alias cache telemetry must be an error")
+    check(usage.cache_read_tokens == conflict.read and usage.cache_creation_tokens == conflict.write,
+      "native cache counts must take precedence over aliases, including zero and malformed counts")
+  end
+  for _, raw in ipairs({
+    { cache_read_tokens = 16, cache_write_tokens = 3 },
+    { cache_read_tokens = 16, cache_creation_tokens = 3 },
+    { prompt_tokens_details = { cached_tokens = 16, cache_write_tokens = 3 },
+      cache_read_tokens = 16, cache_write_tokens = 3, cache_creation_tokens = 3 },
+  }) do
+    raw.prompt_tokens = 40
+    local usage = WheelProvider.normalize_usage(raw, "openai")
+    check(usage.cache_read_tokens == 16 and usage.cache_creation_tokens == 3
+      and usage.uncached_input_tokens == 24 and usage.provider_cache_status == "verified_hit",
+      "matching native counts and supported top-level fallbacks must share normalization and status")
+  end
+  local alias_conflict = WheelProvider.normalize_usage({
+    prompt_tokens = 40, cache_write_tokens = 3, cache_creation_tokens = 0,
+  }, "openai")
+  check(alias_conflict.provider_cache_status == "error" and alias_conflict.cache_creation_tokens == 3,
+    "conflicting top-level fallbacks must preserve precedence and report an error")
+  local fallback_miss = WheelProvider.normalize_usage({
+    prompt_tokens = 40, cache_read_tokens = 0, cache_creation_tokens = 0,
+  }, "openai")
+  check(fallback_miss.provider_cache_status == "verified_miss"
+    and fallback_miss.uncached_input_tokens == 40,
+    "explicit zero fallback counts must yield a consistent verified miss")
+  local fallback_write = WheelProvider.normalize_usage({ cache_creation_tokens = 3 }, "openai")
+  check(fallback_write.provider_cache_status == "write_only" and fallback_write.cache_creation_tokens == 3,
+    "creation alias alone must support write-only evidence")
+  local invalid_fallback = WheelProvider.normalize_usage({ cache_read_tokens = "bad" }, "openai")
+  check(invalid_fallback.provider_cache_status == "error" and invalid_fallback.cache_read_tokens == nil,
+    "malformed fallback counts must fail without inventing normalized values")
+  local alias_impossible = WheelProvider.normalize_usage({ prompt_tokens = 40, cache_read_tokens = 45 }, "openai")
+  check(alias_impossible.provider_cache_status == "error" and alias_impossible.uncached_input_tokens == nil,
+    "impossible fallback cached reads must be rejected consistently")
+  local anthropic_conflict = WheelProvider.normalize_usage({ input_tokens = 20, output_tokens = 2,
+    completion_tokens = 9, cache_read_input_tokens = 12, cache_read_tokens = 0,
+    cache_creation_input_tokens = 3, cache_creation_tokens = 0 }, "anthropic")
+  check(anthropic_conflict.completion_tokens == 2 and anthropic_conflict.cache_read_tokens == 12
+    and anthropic_conflict.cache_creation_tokens == 3 and anthropic_conflict.provider_cache_status == "error",
+    "Anthropic native fields must retain precedence and contradictory cache aliases must be errors")
+  local anthropic_alias_conflict = WheelProvider.normalize_usage({ input_tokens = 20,
+    cache_read_input_tokens = 12, cache_read_tokens = 12,
+    cache_creation_input_tokens = 3, cache_write_tokens = 3, cache_creation_tokens = 4 }, "anthropic")
+  check(anthropic_alias_conflict.cache_read_tokens == 12
+    and anthropic_alias_conflict.cache_creation_tokens == 3
+    and anthropic_alias_conflict.provider_cache_status == "error",
+    "Anthropic conflicting fallback aliases must not overwrite selected native counts")
+  local anthropic_zero_read = WheelProvider.normalize_usage({ input_tokens = 20,
+    cache_read_input_tokens = 0 }, "anthropic")
+  check(anthropic_zero_read.provider_cache_status == "unknown",
+    "Anthropic zero reads alone must not prove a miss without cache-write evidence")
+
+  local status_order = { "unsupported", "not_requested", "unknown", "verified_miss",
+    "write_only", "verified_hit", "error" }
+  for _, stronger in ipairs(status_order) do
+    for _, weaker in ipairs(status_order) do
+      local forward = WheelProvider.aggregate_cache_status(stronger, weaker)
+      local reverse = WheelProvider.aggregate_cache_status(weaker, stronger)
+      local expected = 1
+      for index, status in ipairs(status_order) do
+        if status == stronger or status == weaker then
+          expected = math.max(expected, index)
+        end
+      end
+      check(forward == status_order[expected] and reverse == status_order[expected],
+        "cache status aggregation must be order independent: " .. stronger .. ", " .. weaker)
+    end
+  end
+  local function aggregate_sequence(first, second)
+    return WheelProvider.aggregate_cache_status(
+      WheelProvider.aggregate_cache_status("unknown", first), second)
+  end
+  check(aggregate_sequence("verified_hit", "verified_miss") == "verified_hit"
+    and aggregate_sequence("verified_miss", "verified_hit") == "verified_hit",
+    "mixed stream/turn cache statuses must preserve a hit in either order")
+  check(aggregate_sequence("error", "verified_hit") == "error"
+    and aggregate_sequence("verified_hit", "error") == "error",
+    "mixed stream/turn cache statuses must preserve an error in either order")
+
+  local anthropic = AnthropicAdapter.new({
+    api_key = SYNTHETIC_KEY,
+    prompt_cache_supported = true,
+  })
+  local anthropic_payload = assert(anthropic:_format_payload({
+    model = STUB_MODEL,
+    messages = {
+      { role = "system", content = "stable system prefix" },
+      { role = "user", content = "request" },
+    },
+    stable_context_prefix = "stable system prefix",
+    tools = {},
+    max_completion_tokens = 64,
+  }, false))
+  check(type(anthropic_payload.system) == "table"
+    and anthropic_payload.system[1].cache_control.type == "ephemeral"
+    and anthropic_payload.prompt_cache_key == nil,
+    "Anthropic must use documented cache_control breakpoints, not OpenAI cache keys")
+  pass("provider-stub: cache negotiation, domain key, unsupported required mode, and measured usage only")
 
   -- 2. The stub saw the exact synthetic key; the request record has no key.
   local current = records()

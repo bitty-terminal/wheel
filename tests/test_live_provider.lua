@@ -2,8 +2,8 @@
 -- Opt-in live provider test for Wheel's OpenAIAdapter and runner.
 --
 -- Manual only: run with `just test-live`. The recipe is deliberately absent
--- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default)
--- or `commandcode`, case-insensitively. The test skips with exit 0 when the
+-- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default),
+-- `commandcode`, or `openai-cache`, case-insensitively. The test skips with exit 0 when the
 -- selected provider's key environment variable is absent, and fails closed on
 -- an unknown selector. The key is read from the inherited environment by the
 -- test-only Python transport (tests/live_http_client.py); it is never passed
@@ -34,12 +34,21 @@ local PROVIDERS = {
     smoke_max_completion_tokens = 1024,
     runner_max_completion_tokens = 1024,
   },
+  ["openai-cache"] = {
+    name = "openai-cache",
+    api_key_env = "OPENAI_API_KEY",
+    base_url = "https://api.openai.com/v1",
+    model = "gpt-4o-mini",
+    smoke_max_completion_tokens = 64,
+    runner_max_completion_tokens = 64,
+  },
 }
 
 local function trim(value)
   return (value:gsub("^%s+", ""):gsub("%s+$", ""))
 end
 
+--- Select the configured live provider and reject unknown names before probing.
 local function select_provider()
   local raw = os.getenv(PROVIDER_SELECTOR_ENV)
   local name = DEFAULT_PROVIDER
@@ -52,7 +61,7 @@ local function select_provider()
   local config = PROVIDERS[name]
   if not config then
     io.stderr:write(string.format(
-      "test-live: unsupported %s value; expected openrouter or commandcode\n",
+      "test-live: unsupported %s value; expected openrouter, commandcode, or openai-cache\n",
       PROVIDER_SELECTOR_ENV
     ))
     os.exit(2)
@@ -61,15 +70,6 @@ local function select_provider()
 end
 
 local provider = select_provider()
-local api_key = os.getenv(provider.api_key_env)
-if not api_key or api_key == "" then
-  print(string.format(
-    "SKIP test-live: %s is not set for provider %s",
-    provider.api_key_env,
-    provider.name
-  ))
-  os.exit(0)
-end
 
 local WheelProvider = require("wheel.provider")
 local WheelRunner = require("wheel.runner")
@@ -85,26 +85,27 @@ local CLIENT_SCRIPT = "tests/live_http_client.py"
 local SMOKE_MAX_COMPLETION_TOKENS = provider.smoke_max_completion_tokens
 local RUNNER_MAX_COMPLETION_TOKENS = provider.runner_max_completion_tokens
 local STREAM_CHUNK_SIZE = 64
+local MAX_LIVE_REQUEST_BYTES = 1024 * 1024
+local OPENAI_CACHE_PREFIX_REPETITIONS = 192
+local OPENAI_CACHE_MIN_PROMPT_TOKENS = 1024
 
-local captured_outputs = {}
+local key_probe = assert(io.popen(PYTHON .. " " .. CLIENT_SCRIPT .. " --check-key", "r"))
+local key_state = (key_probe:read("*a") or ""):gsub("%s+$", "")
+key_probe:close()
+if key_state:match("^KEY_ABSENT ") then
+  print(string.format("SKIP test-live: %s is not set for provider %s",
+    provider.api_key_env, provider.name))
+  os.exit(0)
+end
+assert(key_state == "KEY_PRESENT", "live helper key probe failed closed")
+
 local observed_budgets = {}
 local helper_calls = 0
-
-local function remember(text)
-  if type(text) == "string" and #text > 0 then
-    table.insert(captured_outputs, text)
-  end
-end
-
-local function assert_no_key(text, label)
-  if type(text) == "string" and text:find(api_key, 1, true) then
-    error("credential material detected in " .. label, 0)
-  end
-end
+local cache_request_keys = {}
+local cache_usages = {}
 
 local function fail_without_key(label, err)
   local message = tostring(err)
-  assert_no_key(message, label .. " error")
   error(label .. " failed: " .. message, 0)
 end
 
@@ -121,7 +122,6 @@ local function run_helper(spec)
   local request_path = os.tmpname()
   local error_path = os.tmpname()
   local encoded = WheelProvider.JSON.encode(spec)
-  assert_no_key(encoded, "request JSON")
 
   local request_file = assert(io.open(request_path, "wb"))
   request_file:write(encoded)
@@ -140,15 +140,13 @@ local function run_helper(spec)
   os.remove(request_path)
   os.remove(error_path)
 
-  remember(stdout)
-  remember(stderr)
-  assert_no_key(stdout, "helper stdout")
-  assert_no_key(stderr, "helper stderr")
-
   local status, body = stdout:match("^STATUS (%d+)\n(.*)$")
   if not status then
-    return nil, "test HTTP helper produced no status: " .. stderr:sub(1, 256)
+    -- The Python helper filters response bytes and diagnostics against its
+    -- credential. Lua reports only a fixed failure, never helper output.
+    return nil, "test HTTP helper produced no status"
   end
+  assert(stderr == "", "successful test HTTP helper must have no diagnostics")
   return tonumber(status), body
 end
 
@@ -157,6 +155,9 @@ end
 local function http_client(req)
   helper_calls = helper_calls + 1
 
+  if type(req.body) ~= "string" or #req.body > MAX_LIVE_REQUEST_BYTES then
+    return nil, "live request body exceeds the test client bound"
+  end
   local decoded = WheelProvider.JSON.decode(req.body)
   if type(decoded) ~= "table" then
     return nil, "live request body is not JSON"
@@ -166,13 +167,17 @@ local function http_client(req)
     return nil, "live request is missing a bounded completion max_tokens"
   end
   table.insert(observed_budgets, budget)
+  if provider.name == "openai-cache" then
+    assert(decoded.prompt_cache_key ~= nil, "OpenAI cache request must include prompt_cache_key")
+    table.insert(cache_request_keys, decoded.prompt_cache_key)
+  end
 
   local headers = {}
   for name, value in pairs(req.headers or {}) do
     local lower = string.lower(name)
-    if lower ~= "authorization" and lower ~= "x-api-key" then
-      headers[name] = value
-    end
+    assert(lower ~= "authorization" and lower ~= "x-api-key",
+      "live adapter request must not contain credential headers")
+    headers[name] = value
   end
 
   local status, body = run_helper({
@@ -184,11 +189,6 @@ local function http_client(req)
   if not status then
     return nil, body
   end
-
-  remember(req.body)
-  remember(body)
-  assert_no_key(req.body, "provider request")
-  assert_no_key(body, "provider response")
 
   if req.stream and req.on_stream_chunk and #body > 0 then
     for i = 1, #body, STREAM_CHUNK_SIZE do
@@ -204,10 +204,82 @@ local adapter = WheelProvider.OpenAIAdapter.new({
   model = MODEL,
   temperature = 0.0,
   http_client = http_client,
+  prompt_cache_supported = provider.name == "openai-cache",
+  prompt_cache_policy = provider.name == "openai-cache" and "prefer" or nil,
 })
 
 -- The adapter never holds the key; only the out-of-process test helper does.
 assert(adapter:describe().has_api_key == false, "live adapter must not store an API key")
+
+if provider.name == "openai-cache" then
+  -- This evidence path is intentionally limited to two same-prefix requests;
+  -- it does not invoke the unrelated tool, stream, or runner live scenarios.
+  local stable_prefix = string.rep(
+    "Policy: preserve the stable context and report measured usage only.\n", OPENAI_CACHE_PREFIX_REPETITIONS)
+  assert(#stable_prefix <= WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES,
+    "live stable prefix must fit the adapter cache-key byte bound")
+  local request = {
+    stable_context_prefix = stable_prefix,
+    messages = {
+      { role = "system", content = stable_prefix },
+      { role = "user", content = "Reply with OK." },
+    },
+    max_completion_tokens = SMOKE_MAX_COMPLETION_TOKENS,
+  }
+  local expected_domain = WheelProvider.cache_domain(
+    request, "openai", MODEL, BASE_URL .. "/chat/completions", "prefer")
+  local config = require("wheel.config")
+  local expected_key = config.compute_hash(table.concat({ expected_domain, stable_prefix }, "\0"))
+
+  for attempt = 1, 2 do
+    local response = expect_response("OpenAI cache completion " .. tostring(attempt),
+      adapter:complete(request))
+    assert(type(response.content) == "string" and #response.content > 0,
+      "OpenAI cache completion must return content")
+    assert(response.usage == nil or type(response.usage) == "table",
+      "OpenAI cache completion usage must be normalized or absent")
+    local usage = response.usage or {}
+    if usage.prompt_tokens ~= nil then
+      assert(usage.prompt_tokens > OPENAI_CACHE_MIN_PROMPT_TOKENS,
+        "reported live prompt usage must exceed the documented cache minimum")
+    end
+    local status = usage.provider_cache_status or "unknown"
+    print(string.format(
+      "LIVE openai-cache attempt %d: provider_cache_status=%s prompt_tokens=%s cache_read_tokens=%s cache_creation_tokens=%s",
+      attempt, tostring(status), tostring(usage.prompt_tokens), tostring(usage.cache_read_tokens),
+      tostring(usage.cache_creation_tokens)))
+    assert(status == "verified_hit" or status == "verified_miss" or status == "write_only"
+      or status == "unknown" or status == "unsupported" or status == "error",
+      "OpenAI cache status must reflect provider usage without inventing a hit")
+    if usage.cache_read_tokens ~= nil then
+      assert(type(usage.cache_read_tokens) == "number" and usage.cache_read_tokens >= 0,
+        "normalized cache reads must come from a valid provider usage count")
+    end
+    if usage.cache_creation_tokens ~= nil then
+      assert(type(usage.cache_creation_tokens) == "number" and usage.cache_creation_tokens >= 0,
+        "normalized cache creation must come from a valid provider usage count")
+    end
+    if usage.prompt_tokens ~= nil and usage.cache_read_tokens ~= nil
+      and usage.cache_read_tokens <= usage.prompt_tokens then
+      assert(usage.uncached_input_tokens == usage.prompt_tokens - usage.cache_read_tokens,
+        "uncached input must subtract only explicitly reported cached reads")
+    end
+    if status == "verified_hit" then
+      assert(type(usage.cache_read_tokens) == "number" and usage.cache_read_tokens > 0,
+        "a cache hit requires positive cached tokens in provider usage")
+    end
+    table.insert(cache_usages, usage)
+  end
+  assert(helper_calls == 2 and #observed_budgets == 2,
+    "OpenAI cache evidence must use exactly two bounded requests")
+  assert(#cache_request_keys == 2 and cache_request_keys[1] == expected_key
+    and cache_request_keys[2] == expected_key,
+    "both OpenAI prompt_cache_keys must derive from the exact domain and serialized stable prefix")
+  assert(#cache_usages == 2, "both live responses must be checked independently")
+  print("LIVE openai-cache repeated-prefix evidence complete")
+  print(string.format("LIVE %s tests passed (%d bounded requests)", provider.name, helper_calls))
+  os.exit(0)
+end
 
 -- 1. Non-streaming completion with a bounded completion budget.
 do
@@ -338,7 +410,6 @@ do
   if not report.success then
     fail_without_key("runner", report.error)
   end
-  remember(report.artifacts)
   assert(report.iterations >= 2, "runner must complete a tool turn and a final turn")
   assert(#tools_called >= 1 and tools_called[1] == "get_time", "runner must dispatch the stub tool")
   assert(type(report.artifacts) == "string" and #report.artifacts > 0, "runner must produce deliverables")
@@ -355,10 +426,6 @@ for _, budget in ipairs(observed_budgets) do
     "live request budget must stay within the named bound")
 end
 assert(helper_calls == #observed_budgets, "every helper call must be a bounded provider request")
-
-for index, output in ipairs(captured_outputs) do
-  assert_no_key(output, "captured output " .. tostring(index))
-end
 
 print(string.format(
   "LIVE %s tests passed (%d bounded requests)",

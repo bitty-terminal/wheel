@@ -28,6 +28,7 @@ import live_http_client as client
 FAKE_KEY = "not-a-real-key"
 OPENROUTER = client.PROVIDERS["openrouter"]
 COMMANDCODE = client.PROVIDERS["commandcode"]
+OPENAI_CACHE = client.PROVIDERS["openai-cache"]
 
 
 class _BinarySink:
@@ -106,6 +107,7 @@ assert client.select_provider("openrouter") is OPENROUTER
 assert client.select_provider("OpenRouter") is OPENROUTER
 assert client.select_provider(" commandcode ") is COMMANDCODE
 assert client.select_provider("CommandCode") is COMMANDCODE
+assert client.select_provider(" OPENAI-CACHE ") is OPENAI_CACHE
 print("PASS live provider selector defaults to OpenRouter and is case-insensitive")
 
 # 2. Unknown values fail closed instead of falling back to another provider.
@@ -116,7 +118,7 @@ for _value in ("bogus", "open router", "command-code"):
     except client.InvalidRequest as error:
         message = str(error)
         assert client.PROVIDER_SELECTOR_ENV in message
-        assert "openrouter" in message and "commandcode" in message
+        assert all(name in message for name in client.PROVIDERS)
         assert _value not in message, "diagnostic must not echo the rejected value"
     else:
         raise AssertionError(f"selector accepted unknown value {_value!r}")
@@ -126,6 +128,14 @@ print("PASS live provider selector fails closed on unknown values")
 _expect_invalid_request(
     _wire_spec("https://openrouter.ai/api/v1/chat/completions"),
     allowed_host=COMMANDCODE.allowed_host,
+)
+_expect_invalid_request(
+    _wire_spec("https://api.openai.com/v1/chat/completions"),
+    allowed_host=COMMANDCODE.allowed_host,
+)
+_expect_invalid_request(
+    _wire_spec("https://api.commandcode.ai/provider/v1/chat/completions"),
+    allowed_host=OPENAI_CACHE.allowed_host,
 )
 _expect_invalid_request(
     _wire_spec("https://api.commandcode.ai/provider/v1/chat/completions"),
@@ -151,7 +161,7 @@ print("PASS live HTTP client binds HTTPS requests to the selected provider host"
 
 # 4. main() reads the selected provider's key environment and host, never the
 #    other provider's key, and never echoes the key.
-for _provider, _other in ((OPENROUTER, COMMANDCODE), (COMMANDCODE, OPENROUTER)):
+for _provider in client.PROVIDERS.values():
     captured: list[dict[str, Any]] = []
     fake_stdout = _FakeStdout()
     stderr = io.StringIO()
@@ -168,7 +178,11 @@ for _provider, _other in ((OPENROUTER, COMMANDCODE), (COMMANDCODE, OPENROUTER)):
             {
                 client.PROVIDER_SELECTOR_ENV: _provider.name,
                 _provider.api_key_env: FAKE_KEY,
-                _other.api_key_env: "wrong-provider-key",
+                **{
+                    other.api_key_env: "wrong-provider-key"
+                    for other in client.PROVIDERS.values()
+                    if other is not _provider
+                },
             },
         ),
         mock.patch.object(sys, "stdin", _FakeStdin(request_spec)),
@@ -187,9 +201,70 @@ for _provider, _other in ((OPENROUTER, COMMANDCODE), (COMMANDCODE, OPENROUTER)):
     assert stderr.getvalue() == ""
 print("PASS live HTTP client uses the selected provider key and host")
 
+# Provider bodies and transport diagnostics are untrusted, including errors.
+# Only this Python process sees the synthetic credential in these regressions.
+for _provider in client.PROVIDERS.values():
+    for _status in (200, 401):
+        fake_stdout = _FakeStdout()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    client.PROVIDER_SELECTOR_ENV: _provider.name,
+                    _provider.api_key_env: FAKE_KEY,
+                },
+            ),
+            mock.patch.object(sys, "argv", ["live_http_client.py"]),
+            mock.patch.object(sys, "stdin", _FakeStdin(b"{}")),
+            mock.patch.object(sys, "stdout", fake_stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(
+                client,
+                "fetch",
+                return_value=(_status, b"\xffecho: " + FAKE_KEY.encode()),
+            ),
+        ):
+            exit_code = client.main()
+        assert exit_code == 1
+        assert fake_stdout.buffer.data == b""
+        assert stderr.getvalue() == "test client refused credential-bearing output\n"
+        assert FAKE_KEY not in stderr.getvalue()
+
+    for _error in (
+        client.InvalidRequest("echo: " + FAKE_KEY),
+        client.InvalidRequest("x" * 600 + FAKE_KEY),
+        ValueError("echo: " + FAKE_KEY),
+    ):
+        fake_stdout = _FakeStdout()
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    client.PROVIDER_SELECTOR_ENV: _provider.name,
+                    _provider.api_key_env: FAKE_KEY,
+                },
+            ),
+            mock.patch.object(sys, "argv", ["live_http_client.py"]),
+            mock.patch.object(sys, "stdin", _FakeStdin(b"{}")),
+            mock.patch.object(sys, "stdout", fake_stdout),
+            mock.patch.object(sys, "stderr", stderr),
+            mock.patch.object(client, "fetch", side_effect=_error),
+        ):
+            exit_code = client.main()
+        assert exit_code == 1
+        assert fake_stdout.buffer.data == b""
+        assert stderr.getvalue() in (
+            "test client refused credential-bearing output\n",
+            "test HTTP request failed before a response was available\n",
+        )
+        assert FAKE_KEY not in stderr.getvalue()
+print("PASS helper rejects credential echoes before stdout or stderr emission")
+
 # 5. An unset selected-provider key produces a clear, key-free failure even
 #    when the other provider's key is present.
-for _provider, _other in ((OPENROUTER, COMMANDCODE), (COMMANDCODE, OPENROUTER)):
+for _provider in client.PROVIDERS.values():
     fake_stdout = _FakeStdout()
     stderr = io.StringIO()
     with (
@@ -199,7 +274,11 @@ for _provider, _other in ((OPENROUTER, COMMANDCODE), (COMMANDCODE, OPENROUTER)):
             {
                 client.PROVIDER_SELECTOR_ENV: _provider.name,
                 _provider.api_key_env: "",
-                _other.api_key_env: FAKE_KEY,
+                **{
+                    other.api_key_env: FAKE_KEY
+                    for other in client.PROVIDERS.values()
+                    if other is not _provider
+                },
             },
         ),
         mock.patch.object(sys, "stdin", _FakeStdin(b"{}")),
@@ -219,7 +298,33 @@ print(
     "PASS live HTTP client reports an unset selected-provider key without cross-provider fallback"
 )
 
-# 6. An unsupported selector fails before reading stdin or contacting a host.
+# 6. The key-presence probe uses only a fixed marker and never reads the live
+# request or contacts a provider when the selected key is absent.
+fake_stdout = _FakeStdout()
+stderr = io.StringIO()
+with (
+    mock.patch.object(client, "fetch") as fetch_mock,
+    mock.patch.dict(
+        os.environ,
+        {
+            client.PROVIDER_SELECTOR_ENV: OPENAI_CACHE.name,
+            OPENAI_CACHE.api_key_env: "",
+        },
+    ),
+    mock.patch.object(sys, "argv", ["live_http_client.py", "--check-key"]),
+    mock.patch.object(sys, "stdin", _FakeStdin(b"must remain unread")),
+    mock.patch.object(sys, "stdout", fake_stdout),
+    mock.patch.object(sys, "stderr", stderr),
+):
+    exit_code = client.main()
+
+fetch_mock.assert_not_called()
+assert exit_code == 0
+assert fake_stdout.buffer.data == b"KEY_ABSENT OPENAI_API_KEY\n"
+assert stderr.getvalue() == ""
+print("PASS key-presence probe skips without reading request data or contacting a host")
+
+# 7. An unsupported selector fails before reading stdin or contacting a host.
 fake_stdout = _FakeStdout()
 stderr = io.StringIO()
 with (
@@ -242,13 +347,13 @@ fetch_mock.assert_not_called()
 assert exit_code == 1
 message = stderr.getvalue()
 assert message == (
-    "unsupported WHEEL_LIVE_PROVIDER value; expected openrouter or commandcode\n"
+    "unsupported WHEEL_LIVE_PROVIDER value; expected openrouter or commandcode or openai-cache\n"
 )
 assert FAKE_KEY not in message
 assert fake_stdout.buffer.data == b""
 print("PASS live HTTP client fails closed on an unsupported selector")
 
-# 7. The Lua selector fails closed with exit 2 before reading a key.
+# 8. The Lua selector fails closed with exit 2 before invoking the helper.
 lua = next(
     (candidate for candidate in ("lua5.1", "luajit", "lua") if shutil.which(candidate)),
     None,
@@ -261,6 +366,7 @@ else:
     env[client.PROVIDER_SELECTOR_ENV] = "bogus"
     env.pop(OPENROUTER.api_key_env, None)
     env.pop(COMMANDCODE.api_key_env, None)
+    env.pop(OPENAI_CACHE.api_key_env, None)
     result = subprocess.run(
         [lua, "tests/test_live_provider.lua"],
         cwd=repo_root,
@@ -275,5 +381,44 @@ else:
     assert FAKE_KEY not in result.stdout and FAKE_KEY not in result.stderr
     assert client.PROVIDER_SELECTOR_ENV in result.stderr
     print("PASS live provider Lua selector fails closed with exit 2")
+
+    env[client.PROVIDER_SELECTOR_ENV] = "openai-cache"
+    result = subprocess.run(
+        [lua, "tests/test_live_provider.lua"],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"Lua OpenAI cache test must skip without its key, got {result.returncode}"
+    )
+    assert "SKIP test-live: OPENAI_API_KEY is not set" in result.stdout
+    assert result.stderr == ""
+    print("PASS live OpenAI cache test skips cleanly without its key")
+
+    for provider in client.PROVIDERS.values():
+        modes = (
+            ("miss", "hit", "unknown", "error", "short")
+            if provider is OPENAI_CACHE
+            else ("success", "failure")
+        )
+        for mode in modes:
+            args = [lua, "tests/test_live_provider_offline.lua", provider.name]
+            if mode != "success":
+                args.append(mode)
+            result = subprocess.run(
+                args,
+                cwd=repo_root,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert result.stderr == ""
+            assert "PASS offline live scenarios" in result.stdout
+    print("PASS legacy scenarios and bounded OpenAI cache evidence run offline")
 
 print("PASS live provider selection")

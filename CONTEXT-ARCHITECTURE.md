@@ -269,11 +269,35 @@ wheel#110 upgrades these into deterministic structured projections and semantic
 delta references. Issue #111 bounds the autonomous conversation history and
 replaces old messages with ContextRefs.
 
-The provider-level cache key currently identifies Wheel's local Zone 1 hash.
-Any local prefix-share ratio is a design/local-reuse signal, not a provider
-cache hit rate; neither proves a provider cache hit. Provider hit evidence
-requires response telemetry. Issue #118 owns provider capability negotiation
-and measured cache telemetry.
+Provider cache negotiation is implemented behind `off`, `prefer` (the
+default), and `required` policies. When supported and requested, the provider
+cache key is derived from the exact bounded system-prefix bytes serialized in
+the request and a domain containing the provider, model, endpoint, policy,
+tool-schema, and capability versions. A caller-declared prefix that does not
+match the serialized bytes, or exceeds the named bound, does not receive cache
+controls; `required` fails closed. Unsupported providers remain usable in
+`prefer` mode and fail closed in `required` mode.
+
+Local prefix hashes and prefix-share ratios remain design/local-reuse signals,
+not provider cache-hit evidence. Provider cache status and read/write token
+counts are reported only from explicit provider response usage, and are kept
+separate from local prefix telemetry. Wheel does not persist provider KV cache
+contents, and `bittyd` owns neither prompt content nor provider cache state.
+
+Normalized `prompt_tokens` preserves the provider's reported prompt/input
+count. OpenAI `usage.prompt_tokens` includes cached tokens when reported, with
+`prompt_tokens_details.cached_tokens` describing a subset of that count;
+Anthropic `usage.input_tokens` is uncached input, with cache-read and
+cache-creation counts reported separately. `uncached_input_tokens` is the
+cross-provider uncached count. Consumers must not add OpenAI cache-read tokens
+to `prompt_tokens`. Native cache counters take precedence over top-level
+aliases, including explicit zeroes; supported aliases are fallbacks only when
+the native field is absent. Normalized counts and cache status use the same
+selected counters. Malformed, impossible, or contradictory cache counters
+produce `error` while retaining independently valid native counts. Runner
+cache status is independent of token totals and
+aggregates by evidence priority: `error` > `verified_hit` > `write_only` >
+`verified_miss` > `unknown` > `not_requested` > `unsupported`.
 
 ## 8. Output and reasoning density
 
@@ -322,16 +346,16 @@ authorization, fencing, audit, and bounded-output paths as autonomous Agents.
 
 ## 10. Verification matrix
 
-| Area                | Existing evidence                                                                           | Remaining evidence                                                |
-| ------------------- | ------------------------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| Three-zone compiler | Unit tests for ordering, budgets, pruning, and tail truncation; cross-process compiler step | Role views, provenance, semantic deltas, full Runner integration  |
-| Tool spillover      | Unit spillover/blob recovery; real cross-process oversized action                           | Durable Action Record density; compiler middle-error extraction   |
-| Process output      | Real-host capture, timeout, truncation, cancellation                                        | Retention and raw-output lifecycle policy                         |
-| Thinking            | OpenAI/Anthropic stream parsing and bounded Rationale excerpt                               | Structured Rationale schema and no-replay tests                   |
-| Context history     | Commit/branch/merge/snapshot tests                                                          | Per-session branches and immutable projection refs                |
-| Agent/Panel/Session | Initial headless `panel_id` telemetry                                                       | Lifecycle state machine and attach/detach evidence                |
-| Tasks/Handoff       | DAG, claim, generation, handoff, reviewer tests                                             | Parent tasks, multi-task identity, durable handoff state          |
-| Provider cache      | Local prefix hash only                                                                      | Provider controls, actual cached-token telemetry, isolation tests |
+| Area                | Existing evidence                                                                                                                                                                                                                                                                                  | Remaining evidence                                                                                                     |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| Three-zone compiler | Unit tests for ordering, budgets, pruning, and tail truncation; cross-process compiler step                                                                                                                                                                                                        | Role views, provenance, semantic deltas, full Runner integration                                                       |
+| Tool spillover      | Unit spillover/blob recovery; real cross-process oversized action                                                                                                                                                                                                                                  | Durable Action Record density; compiler middle-error extraction                                                        |
+| Process output      | Real-host capture, timeout, truncation, cancellation                                                                                                                                                                                                                                               | Retention and raw-output lifecycle policy                                                                              |
+| Thinking            | OpenAI/Anthropic stream parsing and bounded Rationale excerpt                                                                                                                                                                                                                                      | Structured Rationale schema and no-replay tests                                                                        |
+| Context history     | Commit/branch/merge/snapshot tests                                                                                                                                                                                                                                                                 | Per-session branches and immutable projection refs                                                                     |
+| Agent/Panel/Session | Initial headless `panel_id` telemetry                                                                                                                                                                                                                                                              | Lifecycle state machine and attach/detach evidence                                                                     |
+| Tasks/Handoff       | DAG, claim, generation, handoff, reviewer tests                                                                                                                                                                                                                                                    | Parent tasks, multi-task identity, durable handoff state                                                               |
+| Provider cache      | Offline provider controls, exact prefix/domain isolation, policy negotiation including stdio fail-closed tests; normalized native/alias counters and conflict errors; usage-only stream parsing and status aggregation; helper credential isolation/echo rejection; key-absent live-selector skips | Credentialed provider evidence and actual cache-hit observation; Dashboard presentation; independent review acceptance |
 
 No row in this table authorizes implementation in `bittyd`. Wheel issues #110–#118
 own the follow-up work; issue #109 is the parent index.

@@ -5551,6 +5551,7 @@ run_test("WheelContext.ContextBus: in-memory pubsub event dispatch and agent not
   assert(#received_events == 1)
 end)
 
+--- Check local prefix stability without interpreting it as provider evidence.
 run_test("WheelContext: prefix-cache-friendly Three-Zone prompt compilation and key stability", function()
   local ctx = WheelContext.new()
   ctx:put_slot("workspace/overview", "Wheel Agent Framework")
@@ -5585,7 +5586,7 @@ run_test("WheelContext: prefix-cache-friendly Three-Zone prompt compilation and 
 
   local res2, err2 = ctx:compile_prompt(prompt_opts_shuffled)
   assert(res2 ~= nil and res2.success == true)
-  -- The prefix_cache_key MUST be byte-identical, achieving 100% prefix cache reuse!
+  -- Local prefix identity is deterministic; it does not imply provider cache reuse.
   assert(res2.prefix_cache_key == res1.prefix_cache_key, "Zone 1 prefix_cache_key must be byte-stable across orderings and turns")
   assert(res2.zone1_prefix == res1.zone1_prefix, "Zone 1 prefix string must match exactly")
 end)
@@ -6458,20 +6459,28 @@ run_test("WheelProvider.MockProvider: completions, streaming chunks, and tool ca
   assert(mock:describe().call_count == 2)
 end)
 
+--- Exercise native streaming formats and usage status in both arrival orders.
 run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming SSE", function()
   -- 1. Test OpenAIAdapter with mocked HTTP client emitting SSE stream
+  local cache_usage_order = "hit_first"
+  --- Emit fragmented OpenAI content, tool calls, and ordered usage snapshots.
   local mock_http_openai = function(req)
     assert(req.method == "POST")
     assert(string.find(req.url, "/chat/completions", 1, true) ~= nil)
     assert(req.headers["Authorization"] == "Bearer mock-token")
 
+    local hit_usage = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":0}}}\n\n"
+    local miss_usage = "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":10,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}\n\n"
+    local cache_usage_chunks = cache_usage_order == "hit_first"
+      and { hit_usage, miss_usage } or { miss_usage, hit_usage }
     local chunks = {
       "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"DeepSeek reasoner thinking...\"}}]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \",\"tool_calls\":[{\"index\":0,\"id\":\"call_01\",\"function\":{\"name\":\"search_code\",\"arguments\":\"{\\\"pattern\\\"\"}}]}}]}\n\n",
       "data: {\"choices\":[{\"delta\":{\"content\":\"world!\",\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"main\\\"}\"}}]}}]}\n\n",
       "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":15,\"total_tokens\":25}}\n\n",
-      "data: [DONE]\n\n",
     }
+    for _, usage_chunk in ipairs(cache_usage_chunks) do table.insert(chunks, usage_chunk) end
+    table.insert(chunks, "data: [DONE]\n\n")
 
     if req.stream and req.on_stream_chunk then
       for _, ch in ipairs(chunks) do
@@ -6502,8 +6511,26 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(oai_res.tool_calls[1].arguments.pattern == "main")
   assert(oai_res.finish_reason == "tool_calls")
   assert(oai_res.usage.total_tokens == 25)
+  assert(oai_res.usage.provider_cache_status == "verified_hit",
+    "a later streaming miss must not overwrite an earlier cache hit")
+  assert(oai_res.usage.cache_read_tokens == 4,
+    "cache counters must come from the snapshot whose stronger status is retained")
+  assert(oai_res.usage.uncached_input_tokens == 6,
+    "uncached input must match the snapshot whose stronger status is retained")
+  cache_usage_order = "miss_first"
+  local oai_reverse, oai_reverse_err = oai_adapter:stream({
+    messages = { { role = "user", content = "Test query" } },
+    tools = { { name = "search_code", description = "search", parameters = { type = "object" } } },
+  })
+  assert(oai_reverse_err == nil and oai_reverse.usage.provider_cache_status == "verified_hit",
+    "streaming cache hit must remain dominant when it arrives after a miss")
+  assert(oai_reverse.usage.cache_read_tokens == 4,
+    "reversed cache snapshots must retain counters matching the stronger hit status")
+  assert(oai_reverse.usage.uncached_input_tokens == 6,
+    "reversed snapshots must keep uncached input aligned with the retained hit")
 
   -- 2. Test AnthropicAdapter with mocked HTTP client emitting Anthropic SSE events
+  --- Emit Anthropic input/cache and output usage in their native event shapes.
   local mock_http_anthropic = function(req)
     assert(req.method == "POST")
     assert(string.find(req.url, "/messages", 1, true) ~= nil)
@@ -6511,7 +6538,7 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
     assert(req.headers["anthropic-version"] == "2023-06-01")
 
     local events = {
-      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":40}}}\n\n",
+      "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"role\":\"assistant\",\"usage\":{\"input_tokens\":40,\"cache_creation_input_tokens\":4,\"cache_read_input_tokens\":12}}}\n\n",
       "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
       "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Claude thinking process\"}}\n\n",
       "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
@@ -6547,6 +6574,12 @@ run_test("WheelProvider: OpenAI and Anthropic protocol adapters with streaming S
   assert(ant_res.thinking_content == "Claude thinking process")
   assert(ant_res.finish_reason == "end_turn")
   assert(ant_res.usage.output_tokens == 20)
+  assert(ant_res.usage.prompt_tokens == 40 and ant_res.usage.cache_read_tokens == 12
+    and ant_res.usage.cache_creation_tokens == 4
+    and ant_res.usage.uncached_input_tokens == 40,
+    "Anthropic stream must merge input/cache and output usage events")
+  assert(ant_res.usage.provider_cache_status == "verified_hit",
+    "explicit stream cache-read tokens must be a verified hit")
 end)
 
 run_test("WheelProvider: rationale is bounded, structured, and never replays thinking", function()
@@ -7687,6 +7720,132 @@ run_test("WheelAgent: execute_task integration with WheelRunner and telemetry", 
   assert(st.model_profile.thinking.enabled == true)
 end)
 
+--- Validate run-level status precedence independently of accumulated tokens.
+run_test("WheelRunner: cache status aggregates observed turns without masking status", function()
+  --- Exercise observed statuses with independent positive cache-read totals.
+  local function run_statuses(policy, supported, statuses)
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    local registry = WheelTool.Registry.new()
+    registry:register_tool({
+      name = "noop",
+      intent = WheelTool.ActionIntent.INSPECT,
+      description = "Return a stable test observation",
+      execute = function()
+        return { success = true, exit_code = 0, stdout = "ok" }
+      end,
+    })
+    local agent = WheelAgent.new({
+      name = "cache-status-runner",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+      tool_registry = registry,
+      tools = { "noop" },
+    })
+    local responses = {}
+    for index, status in ipairs(statuses) do
+      local response = {
+        content = "turn " .. tostring(index),
+        tool_calls = {},
+        usage = {
+          prompt_tokens = 10,
+          completion_tokens = 2,
+          total_tokens = 12,
+          cache_read_tokens = status == "verified_hit" and 4 or 0,
+          provider_cache_status = status,
+        },
+      }
+      if index < #statuses then
+        response.tool_calls = {
+          { id = "cache-status-" .. tostring(index), name = "noop", arguments = {} },
+        }
+      end
+      responses[index] = response
+    end
+    local provider = WheelProvider.MockProvider.new({
+      responses = responses,
+      prompt_cache_policy = policy,
+      prompt_cache_supported = supported,
+    })
+    agent:set_provider(provider)
+    local task = kernel:create_task({
+      id = "T-CACHE-STATUS-" .. policy .. "-" .. tostring(#statuses),
+      title = "Aggregate provider cache status",
+      priority = 1,
+    })
+    return WheelRunner.run_task(agent, task, { max_turns = #statuses })
+  end
+
+  local cache_off = run_statuses("off", true, { "verified_hit", "verified_hit" })
+  assert(cache_off.success and cache_off.usage.provider_cache_status == "not_requested",
+    "cache-off-only runs must retain not_requested as their observed status")
+  local unsupported = run_statuses("prefer", false, { "verified_hit", "verified_hit" })
+  assert(unsupported.success and unsupported.usage.provider_cache_status == "unsupported",
+    "unsupported prefer-only runs must retain unsupported as their observed status")
+
+  for _, statuses in ipairs({
+    { "verified_hit", "verified_miss" },
+    { "verified_miss", "verified_hit" },
+  }) do
+    local mixed = run_statuses("prefer", true, statuses)
+    assert(mixed.success and mixed.usage.provider_cache_status == "verified_hit",
+      "runner must preserve the strongest mixed status in either turn order")
+    assert(mixed.usage.prompt_tokens == 20 and mixed.usage.total_tokens == 24,
+      "cache status aggregation must remain independent of accumulated token totals")
+    assert(mixed.usage.cache_read_tokens == 4,
+      "hit/miss runs must preserve positive measured reads in either turn order")
+  end
+  for _, statuses in ipairs({ { "error", "verified_hit" }, { "verified_hit", "error" } }) do
+    local mixed = run_statuses("prefer", true, statuses)
+    assert(mixed.success and mixed.usage.provider_cache_status == "error"
+      and mixed.usage.cache_read_tokens == 4,
+      "runner cache errors must dominate hits in either order while retaining read totals")
+  end
+end)
+
+run_test("WheelRunner: uncached input totals require explicit valid OpenAI read telemetry", function()
+  local function run_usage(raw_usage)
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    local agent = WheelAgent.new({
+      name = "uncached-usage-runner",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+    })
+    local provider = WheelProvider.MockProvider.new({ responses = {
+      { content = "done", tool_calls = {}, usage = WheelProvider.normalize_usage(raw_usage, "openai") },
+    } })
+    agent:set_provider(provider)
+    local task = kernel:create_task({
+      id = "T-UNCACHED-USAGE-" .. tostring(raw_usage.prompt_tokens),
+      title = "Preserve unknown uncached usage",
+      priority = 1,
+    })
+    return WheelRunner.run_task(agent, task, { max_turns = 1 })
+  end
+
+  local absent = run_usage({ prompt_tokens = 40 })
+  assert(absent.success and absent.usage.prompt_tokens == 40 and absent.usage.uncached_input_tokens == nil,
+    "missing cached-read telemetry must remain unknown in runner totals")
+  local explicit_zero = run_usage({ prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 } })
+  assert(explicit_zero.success and explicit_zero.usage.uncached_input_tokens == 40,
+    "explicit zero cached reads must contribute the full prompt to uncached totals")
+  local positive_read = run_usage({ prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 } })
+  assert(positive_read.success and positive_read.usage.uncached_input_tokens == 24,
+    "valid positive cached reads must contribute only the measured uncached remainder")
+  for _, raw_usage in ipairs({
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = "bad" } },
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 16 }, cache_read_tokens = 0 },
+    { prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 45 } },
+  }) do
+    local invalid = run_usage(raw_usage)
+    assert(invalid.success and invalid.usage.uncached_input_tokens == nil,
+      "malformed, conflicting, and out-of-range telemetry must not enter runner uncached totals")
+  end
+end)
+
 run_test("WheelTeam: run_orchestration_loop with autonomous provider runner and models command", function()
   local kernel = WheelKernel.new_mock()
   local context = WheelContext.new({ kernel = kernel })
@@ -7796,6 +7955,41 @@ run_test("WheelProvider.SSEParser: buffer limits and StdioAdapter prompt stdin p
   assert(res.content == "mock CLI output")
   assert(captured_cmd == "mock_model_cli")
   assert(string.find(captured_prompt, "hello stdio", 1, true) ~= nil, "runner must receive prompt")
+end)
+
+--- Preserve configured cache policy across every stdio factory route.
+run_test("WheelProvider.StdioAdapter: direct and factory cache policy survives until validation", function()
+  for _, construction in ipairs({ "direct", "stdio", "local", "ollama" }) do
+    for _, policy in ipairs({ "off", "prefer", "required" }) do
+      local calls = 0
+      local opts = {
+        command = { "synthetic-model" },
+        prompt_cache_policy = policy,
+        runner = function()
+          calls = calls + 1
+          return "synthetic completion"
+        end,
+      }
+      local adapter
+      if construction == "direct" then
+        adapter = WheelProvider.StdioAdapter.new(opts)
+      else
+        adapter = assert(WheelProvider.create({ provider = construction }, opts))
+      end
+      assert(adapter.prompt_cache_policy == policy, "configured stdio policy must be preserved")
+      for _, method in ipairs({ "complete", "stream" }) do
+        local result, err = adapter[method](adapter, { messages = {} })
+        if policy == "required" then
+          assert(result == nil and err:find("unsupported", 1, true),
+            "unsupported stdio required policy must fail closed")
+          assert(calls == 0, "required policy must fail before runner execution")
+        else
+          assert(result and err == nil, "off and prefer must preserve stdio fallback")
+        end
+      end
+      assert(calls == (policy == "required" and 0 or 2))
+    end
+  end
 end)
 
 run_test("WheelProvider: OpenAI & Anthropic wire format, status check, and error stream rejection", function()
