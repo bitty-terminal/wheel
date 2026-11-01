@@ -271,6 +271,11 @@ function WheelProvider.normalize_usage(usage, provider)
     normalized.provider_cache_status = "verified_hit"
   elseif write_count ~= nil and write_count > 0 then
     normalized.provider_cache_status = "write_only"
+  elseif provider == "openai" and read_present and read_count == 0 then
+    -- OpenAI reports cached_tokens=0 on an uncached request and normally has
+    -- no cache-write counter. Explicit zero read evidence is sufficient here;
+    -- Anthropic still needs both counters to prove a miss.
+    normalized.provider_cache_status = "verified_miss"
   elseif read_count ~= nil and write_count ~= nil then
     normalized.provider_cache_status = "verified_miss"
   else

@@ -84,6 +84,7 @@ local CLIENT_SCRIPT = "tests/live_http_client.py"
 local SMOKE_MAX_COMPLETION_TOKENS = provider.smoke_max_completion_tokens
 local RUNNER_MAX_COMPLETION_TOKENS = provider.runner_max_completion_tokens
 local STREAM_CHUNK_SIZE = 64
+local MAX_LIVE_REQUEST_BYTES = 1024 * 1024
 
 local key_probe = assert(io.popen(PYTHON .. " " .. CLIENT_SCRIPT .. " --check-key", "r"))
 local key_state = (key_probe:read("*a") or ""):gsub("%s+$", "")
@@ -151,6 +152,9 @@ end
 local function http_client(req)
   helper_calls = helper_calls + 1
 
+  if type(req.body) ~= "string" or #req.body > MAX_LIVE_REQUEST_BYTES then
+    return nil, "live request body exceeds the test client bound"
+  end
   local decoded = WheelProvider.JSON.decode(req.body)
   if type(decoded) ~= "table" then
     return nil, "live request body is not JSON"
@@ -207,7 +211,8 @@ assert(adapter:describe().has_api_key == false, "live adapter must not store an 
 if provider.name == "openai-cache" then
   -- This evidence path is intentionally limited to two same-prefix requests;
   -- it does not invoke the unrelated tool, stream, or runner live scenarios.
-  local stable_prefix = "You are a concise assistant. Follow the user's request precisely."
+  local stable_prefix = string.rep(
+    "Policy: preserve the stable context and report measured usage only.\n", 192)
   local request = {
     stable_context_prefix = stable_prefix,
     messages = {

@@ -1284,10 +1284,12 @@ WHEEL_LIVE_PROVIDER=openai-cache just test-live  # OpenAI cache evidence
   `COMMANDCODE_API_KEY`, `https://api.commandcode.ai/provider/v1`, and the same
   model.
 - `openai-cache` uses only `OPENAI_API_KEY` and `https://api.openai.com/v1`.
-  It issues two bounded completions with the same stable prefix and reports
-  cache telemetry only from explicit response usage; absent, unsupported, or
-  malformed usage is not treated as a cache hit. Without `OPENAI_API_KEY`, the
-  live portion skips successfully without contacting the provider.
+  It issues two bounded completions with the same deterministic stable prefix,
+  sized above OpenAI's documented prompt-cache minimum, and reports cache
+  telemetry only from explicit response usage; a hit requires a positive
+  measured cached-read count. Absent, unsupported, or malformed usage is not
+  treated as a cache hit. Without `OPENAI_API_KEY`, the live portion skips
+  successfully without contacting the provider.
 - `just test-live` is not part of `just check` or CI. Its key-free offline
   gates (`test-live-offline`: redirect policy, provider selection, host
   binding, helper credential-echo rejection, and synthetic legacy scenarios)

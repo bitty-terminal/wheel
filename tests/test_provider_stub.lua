@@ -626,6 +626,12 @@ local function main()
   }, "openai")
   check(explicit_miss.provider_cache_status == "verified_miss",
     "explicit zero cached/write counts must represent a verified miss")
+  local openai_read_miss = WheelProvider.normalize_usage({
+    prompt_tokens = 40, prompt_tokens_details = { cached_tokens = 0 },
+  }, "openai")
+  check(openai_read_miss.provider_cache_status == "verified_miss"
+    and openai_read_miss.cache_read_tokens == 0 and openai_read_miss.cache_creation_tokens == nil,
+    "explicit OpenAI zero cached tokens must prove a miss without a write counter")
   local absent_usage = WheelProvider.normalize_usage({ prompt_tokens = 40 }, "openai")
   check(absent_usage.provider_cache_status == "unknown",
     "usage without cache fields must remain unknown")
@@ -698,6 +704,17 @@ local function main()
   check(anthropic_conflict.completion_tokens == 2 and anthropic_conflict.cache_read_tokens == 12
     and anthropic_conflict.cache_creation_tokens == 3 and anthropic_conflict.provider_cache_status == "error",
     "Anthropic native fields must retain precedence and contradictory cache aliases must be errors")
+  local anthropic_alias_conflict = WheelProvider.normalize_usage({ input_tokens = 20,
+    cache_read_input_tokens = 12, cache_read_tokens = 12,
+    cache_creation_input_tokens = 3, cache_write_tokens = 3, cache_creation_tokens = 4 }, "anthropic")
+  check(anthropic_alias_conflict.cache_read_tokens == 12
+    and anthropic_alias_conflict.cache_creation_tokens == 3
+    and anthropic_alias_conflict.provider_cache_status == "error",
+    "Anthropic conflicting fallback aliases must not overwrite selected native counts")
+  local anthropic_zero_read = WheelProvider.normalize_usage({ input_tokens = 20,
+    cache_read_input_tokens = 0 }, "anthropic")
+  check(anthropic_zero_read.provider_cache_status == "unknown",
+    "Anthropic zero reads alone must not prove a miss without cache-write evidence")
 
   local status_order = { "unsupported", "not_requested", "unknown", "verified_miss",
     "write_only", "verified_hit", "error" }

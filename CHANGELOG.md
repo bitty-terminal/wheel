@@ -49,7 +49,10 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preserve configured stdio prompt-cache policies, and report contradictory
   native/alias cache counters as errors using consistent normalization.
   Offline regressions cover credential echoes, legacy selectors, direct and
-  factory stdio construction, and cache telemetry conflicts.
+  factory stdio construction, cache telemetry conflicts, and OpenAI explicit
+  zero-read misses without requiring a write counter. Live OpenAI cache
+  evidence uses a deterministic prefix above the documented cache minimum;
+  hits still require a positive measured cached-read count.
 
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
