@@ -4553,6 +4553,33 @@ run_test("WheelKernel: injected bridge terminal mutations require current owner 
   assert(retried.generation == 2 and mutations == 2)
 end)
 
+run_test("WheelKernel: every external lifecycle result and read-back fences the exact task ID", function()
+  for _, command in ipairs({ "task.start", "task.reassign", "task.complete", "task.fail", "task.cancel", "task.retry" }) do
+    for _, phase in ipairs({ "result", "readback" }) do
+      local backend = WheelKernel.new_mock()
+      backend:create_task({ id = "REQUESTED" })
+      if command ~= "task.start" then backend:start_task("REQUESTED", "owner") end
+      if command == "task.retry" then backend:cancel_task("REQUESTED", 1, "owner") end
+      local mutated = false
+      local bridge = WheelKernel.new(function(name, payload)
+        local response = WheelKernel.json.decode(backend.dispatcher(name, payload))
+        if name == command then
+          mutated = true
+          if phase == "result" then response.data.id = "FOREIGN" end
+        elseif name == "task.get" and mutated and phase == "readback" then
+          response.data.id = "FOREIGN"
+        end
+        return WheelKernel.json.encode(response)
+      end)
+      local payload = { id = "REQUESTED", expected_generation = 1,
+        assigned_agent = command == "task.reassign" and "target" or "owner", source_agent = "owner" }
+      if command == "task.start" then payload.expected_generation = 0 end
+      local accepted = pcall(bridge.call, bridge, command, payload)
+      assert(not accepted and mutated, command .. " accepted foreign " .. phase .. " identity")
+    end
+  end
+end)
+
 run_test("WheelKernel: corrupted parent hierarchy cannot admit tasks or be scheduled", function()
   local kernel = WheelKernel.new_mock()
   kernel:create_task({ id = "ROOT" })
@@ -4629,6 +4656,82 @@ run_test("WheelTeam: claim rollback fences the team kernel when context uses ano
   local task = task_kernel:get_task("SPLIT-KERNEL-CLAIM")
   assert(not claimed and task.lifecycle_status == "ready" and task.generation == 0,
     "failed persistence must roll back the exact kernel mutated by claim")
+end)
+
+run_test("WheelTeam: claim verifies start response and authoritative ID, lifecycle, owner, and generation", function()
+  for _, phase in ipairs({ "noop", "foreign-result", "result-owner", "result-generation", "result-status",
+    "foreign-readback", "status", "owner", "generation" }) do
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    local team = WheelTeam.new({ kernel = kernel, context = context })
+    team:spawn_agent({ name = "owner", role = WheelAgent.Role.CODING })
+    kernel:create_task({ id = "CLAIM-FENCE" })
+    local start, get = kernel.start_task, kernel.get_task
+    local started = false
+    kernel.start_task = function(self, ...)
+      local result
+      if phase == "noop" then
+        result = { id = "CLAIM-FENCE", status = "running", lifecycle_status = "in_progress",
+          generation = 1, assigned_agent = "owner", worker_id = "owner" }
+      else result = start(self, ...) end
+      started = true
+      if phase == "foreign-result" then result.id = "FOREIGN" end
+      if phase == "result-owner" then result.assigned_agent = "FOREIGN" end
+      if phase == "result-generation" then result.generation = result.generation + 1 end
+      if phase == "result-status" then result.lifecycle_status = "completed" end
+      return result
+    end
+    kernel.get_task = function(self, id)
+      local task = get(self, id)
+      if started then
+        if phase == "foreign-readback" then task.id = "FOREIGN"
+        elseif phase == "status" then task.lifecycle_status = "completed"
+        elseif phase == "owner" then task.worker_id = "FOREIGN"
+        elseif phase == "generation" then task.generation = task.generation + 1 end
+      end
+      return task
+    end
+    local before = assert(WheelContext.canonical_snapshot(assert(context:export_snapshot())))
+    assert(not team:claim_task("owner", "CLAIM-FENCE"), phase .. " must fail claim")
+    kernel.start_task, kernel.get_task = start, get
+    local task = kernel:get_task("CLAIM-FENCE")
+    assert(task.status == "ready" and task.generation == 0 and not task.worker_id, phase .. " leaked kernel claim")
+    assert(not team.task_assignments[task.id] and not team.agent_tasks.owner[task.id])
+    assert(team.agent_states.owner.state == "idle" and not team.agent_states.owner.active_task_id)
+    assert(WheelContext.canonical_snapshot(assert(context:export_snapshot())) == before)
+    assert(team:claim_task("owner", "CLAIM-FENCE"), "a valid retry must succeed after " .. phase)
+  end
+end)
+
+run_test("WheelTeam: handoff rejects foreign reassignment result and read-back task IDs", function()
+  for _, phase in ipairs({ "result", "readback" }) do
+    local team, kernel, context, _, options = handoff_fixture("HANDOFF-ID")
+    local ok, offered = team:handoff("source", "target", "HANDOFF-ID", options)
+    assert(ok)
+    local before = assert(WheelContext.canonical_snapshot(assert(context:export_snapshot())))
+    local reassign, get = kernel.reassign_task, kernel.get_task
+    local mutated = false
+    kernel.reassign_task = function(self, ...)
+      local result = reassign(self, ...)
+      mutated = true
+      if phase == "result" then result.id = "FOREIGN" end
+      return result
+    end
+    kernel.get_task = function(self, id)
+      local result = get(self, id)
+      if mutated and phase == "readback" then result.id = "FOREIGN" end
+      return result
+    end
+    local accepted = team:set_handoff_state(offered.handoff_id, "accepted", {
+      agent_name = "target", session_id = options.target_session_id,
+    })
+    kernel.reassign_task, kernel.get_task = reassign, get
+    assert(not accepted, phase .. " foreign task must fail acceptance")
+    local task = kernel:get_task("HANDOFF-ID")
+    assert(task.worker_id == "source" and task.generation == 1)
+    assert(team.task_assignments[task.id] == "source" and not team.agent_tasks.target[task.id])
+    assert(WheelContext.canonical_snapshot(assert(context:export_snapshot())) == before)
+  end
 end)
 
 run_test("WheelTeam: terminal handoffs and stale terminal releases fail closed", function()
@@ -4731,7 +4834,7 @@ run_test("WheelTeam: failure injection restores slots, history, ownership and ge
     elseif phase:find("reassign", 1, true) then
       kernel.reassign_task = function(self, ...)
         if phase == "accept-reassign-noop" then
-          return { status = "running", lifecycle_status = "in_progress", generation = 2,
+          return { id = "ATOMIC", status = "running", lifecycle_status = "in_progress", generation = 2,
             worker_id = "target", assigned_agent = "target" }
         end
         if phase == "accept-reassign-after-write" then original_reassign(self, ...) end

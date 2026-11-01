@@ -995,6 +995,7 @@ end
 function WheelKernel:call(command, payload)
   payload = payload or {}
   local expected_start_generation
+  local expected_transition
   if command == "task.start" then
     local tasks = self:_validated_task_graph()
     local task = tasks[payload.id]
@@ -1006,13 +1007,34 @@ function WheelKernel:call(command, payload)
   end
   if not self._handoff_transaction and TASK_TRANSITIONS[command] then
     local task = self:get_task(payload.id)
-    if not task then error("task not found") end
+    if not task or task.id ~= payload.id then error("task not found or identity mismatch") end
     local err = task_transition_error(task, payload, TASK_TRANSITIONS[command],
       command == "task.reassign" and "source_agent" or "assigned_agent")
     if err then error(err) end
     if (command == "task.retry" or command == "task.reassign") and task.generation >= MAX_TASK_GENERATION then
       error("task generation exhausted")
     end
+    local retrying = command == "task.retry"
+    local transition_status = command == "task.complete" and "completed"
+      or command == "task.fail" and "failed"
+      or command == "task.cancel" and "cancelled" or "in_progress"
+    if retrying then
+      transition_status = "ready"
+      local tasks = self:_validated_task_graph()
+      for _, dependency_id in ipairs(task.dependencies or {}) do
+        if WheelKernel.normalize_lifecycle_status(tasks[dependency_id].status) ~= "completed" then
+          transition_status = "pending"
+          break
+        end
+      end
+    end
+    expected_transition = {
+      id = payload.id,
+      generation = task.generation + ((command == "task.retry" or command == "task.reassign") and 1 or 0),
+      status = transition_status,
+      owner = payload.assigned_agent,
+    }
+    if retrying then expected_transition.owner = nil end
   end
   local payload_str = json_codec.encode(payload)
   local resp_str = self.dispatcher(command, payload_str)
@@ -1039,10 +1061,17 @@ function WheelKernel:call(command, payload)
   if command == "task.list" then
     for _, task in ipairs(resp.data or {}) do project(task) end
   elseif command:match("^task%.") then project(resp.data) end
+  if command == "task.get" and resp.data ~= nil
+    and (type(resp.data) ~= "table" or resp.data.id ~= payload.id) then
+    error("task lookup failed identity fence")
+  end
+  if TASK_TRANSITIONS[command] and (type(resp.data) ~= "table" or resp.data.id ~= payload.id) then
+    error("task lifecycle response failed identity fence")
+  end
   if command == "task.start" then
     local started = resp.data
     local worker = payload.assigned_agent or payload.worker_id
-    if type(started) ~= "table"
+    if type(started) ~= "table" or started.id ~= payload.id
       or WheelKernel.normalize_lifecycle_status(started.status) ~= "in_progress"
       or started.lifecycle_status ~= "in_progress"
       or started.generation ~= expected_start_generation + 1
@@ -1050,13 +1079,30 @@ function WheelKernel:call(command, payload)
       error("task start response failed lifecycle fence")
     end
     local actual = self:get_task(payload.id)
-    if type(actual) ~= "table"
+    if type(actual) ~= "table" or actual.id ~= payload.id
       or WheelKernel.normalize_lifecycle_status(actual.status) ~= "in_progress"
       or actual.lifecycle_status ~= "in_progress"
       or actual.generation ~= expected_start_generation + 1
       or actual.assigned_agent ~= worker or actual.worker_id ~= worker then
       error("task start state failed lifecycle fence")
     end
+    resp.data = actual
+  end
+  if expected_transition then
+    local expected = expected_transition
+    local function matches(task)
+      if type(task) ~= "table" or task.id ~= expected.id
+        or task.generation ~= expected.generation
+        or WheelKernel.normalize_lifecycle_status(task.status) ~= expected.status
+        or task.lifecycle_status ~= expected.status then return false end
+      if expected.owner == nil then
+        return task.assigned_agent == nil and task.worker_id == nil
+      end
+      return task.assigned_agent == expected.owner and task.worker_id == expected.owner
+    end
+    if not matches(resp.data) then error("task lifecycle response failed identity fence") end
+    local actual = self:get_task(expected.id)
+    if not matches(actual) then error("task lifecycle state failed identity fence") end
     resp.data = actual
   end
   return resp.data

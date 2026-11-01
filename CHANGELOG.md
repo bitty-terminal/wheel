@@ -16,6 +16,11 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Add Lua 5.1/LuaJIT regressions for export replacement, approval/audit failure,
   ended and abandoned parents, forged replay, and changed workspace deltas.
 
+- Fence claim and external lifecycle responses and authoritative read-backs by
+  exact task ID, owner, status, and generation. Reject self-consistent malformed
+  ContextRefs with a complete canonical schema check, and count all final digest,
+  header, and state-section bytes within the serialized reference ceiling.
+
 - Reject unknown dependency IDs, cyclic dependency graphs, and invalid parent
   hierarchies before task admission or scheduling. Fence task lifecycle
   transitions and release by status, owner, and generation; retries advance

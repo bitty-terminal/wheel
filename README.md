@@ -83,7 +83,11 @@ carry source/target agents, controller session references when a lifecycle
 registry is configured, bounded ContextRef, checkpoint, scope, evidence,
 blockers, risks, next steps, and task generation. ContextRef references resolve
 to immutable commits containing the same task's `context_ref` slot; checkpoint
-references resolve to immutable commits for that task. The checkpoint field
+references resolve to immutable commits for that task. ContextRef admission checks
+the complete ordered schema, bounded canonical counts, state sections, and digest;
+the final serialized headers and body stay within the 12 KiB limit. Claim and
+external lifecycle responses and read-backs must match the requested task ID,
+owner, status, and generation before ownership is published. The checkpoint field
 anchors source evidence; a later immutable commit binds the full persisted
 handoff record. Reload validates both links and live agent/session/panel
 authority. Accept/reject/close requires the acting agent and expected session.

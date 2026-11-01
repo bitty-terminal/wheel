@@ -387,7 +387,7 @@ function WheelTeam:claim_task(agent_name, task_id)
 
   -- Query task from kernel
   local task = self.kernel:get_task(task_id)
-  if not task then
+  if not task or task.id ~= task_id then
     return false, "task not found: " .. tostring(task_id)
   end
 
@@ -406,12 +406,22 @@ function WheelTeam:claim_task(agent_name, task_id)
   end
   local started_ok, started_task = self.context:_with_handoff_transaction("tasks/" .. task_id .. "/worker", function()
     local started = self.kernel:start_task(task_id, agent_name)
-    if not started or normalize_lifecycle_status(started.status) ~= "in_progress" then
+    local expected_generation = (task.generation or 0) + 1
+    local function valid_started(value)
+      return type(value) == "table" and value.id == task_id
+        and normalize_lifecycle_status(value.status) == "in_progress"
+        and value.lifecycle_status == "in_progress"
+        and value.generation == expected_generation
+        and value.assigned_agent == agent_name and value.worker_id == agent_name
+    end
+    if not valid_started(started) then
       return false, "kernel refused task claim"
     end
+    local actual = self.kernel:get_task(task_id)
+    if not valid_started(actual) then return false, "kernel task claim failed authoritative read-back" end
     local stored, store_error = self.context:put_slot("tasks/" .. task_id .. "/worker", agent_name)
     if not stored or not stored.success then return false, store_error or { error = "task_claim_persist_failed" } end
-    return true, started
+    return true, actual
   end, self.kernel)
   if not started_ok then return false, started_task end
 
@@ -627,13 +637,8 @@ function WheelTeam:_valid_context_reference(reference, task_id, require_context_
   if require_context_slot then
     local slot = commit.slots["tasks/" .. task_id .. "/context_ref"]
     if not slot or type(slot.content) ~= "string" or slot.hash ~= WheelContext.compute_hash(slot.content) then return false end
-    local ref_id, seed, body_hash, turns, bytes = slot.content:match(
-      "^ContextRef v1\nid=(contextref:[0-9a-f]+)\nseed=([0-9a-f]+)\nbody_hash=([0-9a-f]+)\nturns=(%d+)\nbytes=(%d+)\n")
-    if not ref_id or #ref_id ~= 27 or #seed ~= 64 or #body_hash ~= 64
-      or ref_id ~= "contextref:" .. seed:sub(1, 16) or tonumber(turns) == nil
-      or tonumber(bytes) ~= #slot.content then return false end
-    local body = slot.content:gsub("\nbody_hash=[0-9a-f]+\n", "\n", 1)
-    if WheelContext.compute_hash(body) ~= body_hash then return false end
+    local runner = load_submodule("runner")
+    if not runner.validate_context_ref(slot.content, WheelContext.compute_hash) then return false end
   end
   return true
 end
@@ -1113,9 +1118,10 @@ function WheelTeam:set_handoff_state(handoff_id, target_state, authority)
           local reassigned = self.kernel:reassign_task(record.task_id, record.generation,
             record.to_agent, nil, record.from_agent)
           local actual = self.kernel:get_task(record.task_id)
-          if not reassigned or normalize_lifecycle_status(reassigned.status) ~= "in_progress"
+          if not reassigned or reassigned.id ~= record.task_id
+            or normalize_lifecycle_status(reassigned.status) ~= "in_progress"
             or reassigned.generation ~= updated.generation or reassigned.worker_id ~= record.to_agent
-            or not actual or normalize_lifecycle_status(actual.status) ~= "in_progress"
+            or not actual or actual.id ~= record.task_id or normalize_lifecycle_status(actual.status) ~= "in_progress"
             or actual.lifecycle_status ~= "in_progress" or actual.generation ~= updated.generation
             or actual.worker_id ~= record.to_agent or actual.assigned_agent ~= record.to_agent then
             return false, "handoff task reassignment rejected (stale generation or invalid state)"

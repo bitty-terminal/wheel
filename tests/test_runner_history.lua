@@ -119,6 +119,110 @@ return function(run_test)
     assert(#compacted < #messages, "compaction must replace older messages")
   end)
 
+  run_test("WheelRunner history: canonical ContextRefs reject self-consistent malformed bodies", function()
+    local Context = require("wheel.context")
+    local Kernel = require("wheel.kernel")
+    local Team = require("wheel.team")
+    local context = Context.new()
+    local team = Team.new({ kernel = Kernel.new_mock(), context = context })
+    local _, ref = WheelRunner.compact_history({}, {}, nil, {
+      context = context, task_id = "CANONICAL-REF", force = true,
+    })
+    local valid = context:get_slot("tasks/CANONICAL-REF/context_ref").content
+    assert(WheelRunner.validate_context_ref(valid, Context.compute_hash))
+    assert(team:_valid_context_reference(ref.commit_hash, "CANONICAL-REF", true))
+    -- Recompute both length and digest after each forgery: rejecting only bad
+    -- hashes would not reject these syntactically invalid, immutable documents.
+    local function reseal(content)
+      for _ = 1, 4 do
+        content = content:gsub("\nbytes=%d+", "\nbytes=" .. tostring(#content), 1)
+      end
+      local body = content:gsub("\nbody_hash=[0-9a-f]+\n", "\n", 1)
+      return (content:gsub("\nbody_hash=[0-9a-f]+\n",
+        "\nbody_hash=" .. Context.compute_hash(body) .. "\n", 1))
+    end
+    local variants = {
+      (valid:gsub("\n%[tool_calls%].*", "\nINVALID BODY")),
+      (valid:gsub("\n%[failures%]", "")),
+      (valid:gsub("\n%[failures%]", "\n[failures]\n[failures]")),
+      (valid:gsub("\n%[failures%]", "\n[UNKNOWN]")),
+      (valid:gsub("\n%[tool_calls%]\n%[failures%]", "\n[failures]\n[tool_calls]")),
+      (valid:gsub("\nturns=0", "\nturns=0\nturns=0")),
+      (valid:gsub("\nturns=0", "\nturns=00")),
+      (valid:gsub("\nturns=0", "\nturns=9007199254740992")),
+      (valid:gsub("\nturns=0", "\nturns=" .. string.rep("9", 400))),
+      (valid:gsub("\nturns=0", "\nturns=nan")),
+      (valid:gsub("\nturns=0", "\nturns=-1")),
+      (valid:gsub("\nturns=0", "\nturns=1.5")),
+      (valid:gsub("\n%[decisions%]", "\n[decisions]\n- " .. string.rep("x", WheelRunner.MAX_STATE_FIELD_BYTES + 1))),
+      (valid:gsub("\n%[evidence%]", "\n[evidence]" .. string.rep("\n- item", WheelRunner.MAX_EVIDENCE_ITEMS + 1))),
+      (valid:gsub("\n%[risks%]", "\n[risks]\n- " .. string.rep("x", WheelRunner.MAX_CONTEXT_REF_BYTES))),
+      valid .. "\n[UNKNOWN]",
+      valid .. "\n",
+      (valid:gsub("ContextRef v1", "ContextRef v2", 1)),
+      (valid:gsub("\n%[next_actions%]", "\n[next_actions]\n- \\x41")),
+    }
+    for index, content in ipairs(variants) do
+      local malformed = reseal(content)
+      assert(context:put_slot("tasks/CANONICAL-REF/context_ref", malformed).success)
+      local commit = context:commit_checkpoint({ task_id = "CANONICAL-REF" })
+      assert(not WheelRunner.validate_context_ref(malformed, Context.compute_hash), "variant " .. index)
+      assert(not team:_valid_context_reference(commit.hash, "CANONICAL-REF", true), "stored variant " .. index)
+    end
+    local invalid_bytes = valid:gsub("\nbytes=%d+", "\nbytes=0", 1)
+    assert(not WheelRunner.validate_context_ref(invalid_bytes, Context.compute_hash))
+    local state = { decisions = { "[failures]\nturns=99\\x00" } }
+    local _, escaped = WheelRunner.compact_history({}, {}, state, {
+      context = context, task_id = "CANONICAL-REF", force = true,
+    })
+    assert(escaped and team:_valid_context_reference(escaped.commit_hash, "CANONICAL-REF", true),
+      "reserved syntax inside a state value must round-trip as escaped data")
+    local largest = reseal(valid:gsub("\nturns=0", "\nturns=" .. string.format("%.0f", WheelRunner.MAX_CONTEXT_REF_TURNS)))
+    assert(WheelRunner.validate_context_ref(largest, Context.compute_hash), "exact finite turn ceiling must be valid")
+  end)
+
+  run_test("WheelRunner history: ContextRef byte ceiling includes all final digest and header bytes", function()
+    local Context = require("wheel.context")
+    local fields = { "tool_calls", "failures", "decisions", "evidence", "risks", "next_actions" }
+    local function compact(state)
+      local context = Context.new()
+      local _, ref = WheelRunner.compact_history({}, {}, state, {
+        context = context, task_id = "EXACT-CEILING", force = true,
+      })
+      assert(ref)
+      local content = context:get_slot("tasks/EXACT-CEILING/context_ref").content
+      assert(ref.bytes == #content and #content <= WheelRunner.MAX_CONTEXT_REF_BYTES)
+      assert(WheelRunner.validate_context_ref(content, Context.compute_hash))
+      return content
+    end
+    local empty = compact({})
+    local state, remaining = {}, WheelRunner.MAX_CONTEXT_REF_BYTES - #empty
+      - (#tostring(WheelRunner.MAX_CONTEXT_REF_BYTES) - #tostring(#empty)) - #"\n[state truncated]"
+    for _, field in ipairs(fields) do
+      state[field] = {}
+      for _ = 1, WheelRunner.MAX_EVIDENCE_ITEMS do
+        local bytes = math.min(WheelRunner.MAX_STATE_FIELD_BYTES, remaining - 3)
+        if bytes < 1 then break end
+        state[field][#state[field] + 1] = string.rep("x", bytes)
+        remaining = remaining - bytes - 3
+      end
+    end
+    assert(remaining == 0, "boundary fixture must consume the exact value budget")
+    state.next_actions[#state.next_actions + 1] = string.rep("y", WheelRunner.MAX_STATE_FIELD_BYTES)
+    local first, second = compact(state), compact(state)
+    assert(first == second, "equal bounded input must serialize deterministically")
+    assert(#first == WheelRunner.MAX_CONTEXT_REF_BYTES, "final ref must exercise the exact named byte ceiling")
+    assert(first:sub(-#"[state truncated]") == "[state truncated]")
+    local reported = { tool_calls = {}, failures = {} }
+    for index = 1, WheelRunner.MAX_EVIDENCE_ITEMS do
+      reported.tool_calls[index] = string.rep("t", WheelRunner.MAX_STATE_FIELD_BYTES)
+    end
+    for index, length in ipairs({ 1024, 1024, 1024, 750 }) do
+      reported.failures[index] = string.rep("f", length)
+    end
+    assert(compact(reported) == compact(reported), "the reported near-limit input must remain bounded and deterministic")
+  end)
+
   run_test("WheelRunner history: retained turn window resets compaction counter", function()
     local messages = { message("user", "start") }
     local records = {}
