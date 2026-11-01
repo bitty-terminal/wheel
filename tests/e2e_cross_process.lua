@@ -241,7 +241,7 @@ local function run_drill()
   -- =============================================================================
   -- Step 6: Completion & Cascade Readiness
   -- =============================================================================
-  local completed_t1 = kernel:complete_task("TASK-01", 1, nil)
+  local completed_t1 = kernel:complete_task("TASK-01", 1, nil, nil, worker.name)
   assert(completed_t1.status == "succeeded", "TASK-01 must be succeeded")
 
   -- Downstream dependents TASK-02 and TASK-03 must be automatically promoted to Ready

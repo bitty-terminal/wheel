@@ -651,6 +651,10 @@ local function registry_shape(value)
         replay_panels[event.panel_id] = { state = event.to_state, controller = nil, observers = {} }
       end
     elseif event.type == "agent_session.created" then
+      local record = value.sessions[event.session_id]
+      local panel = value.panels[event.panel_id]
+      if not record or not panel or event.agent_id ~= record.agent_id or event.task_id ~= record.task_id
+        or panel.agent_id ~= record.agent_id then return false, "session creation owner mismatch" end
       if replay_sessions[event.session_id] and replay_sessions[event.session_id].created then
         if complete_history then return false, "session history contains duplicate creation" end
         replay_sessions[event.session_id].incomplete = true
@@ -1056,7 +1060,9 @@ function Lifecycle:create_agent_session(opts)
   local created, create_err = self:_change(function(state)
     local agent_id, err = identity_id(opts.agent_id, "agent_id", true); if not agent_id then return false, { code="E_LIFECYCLE_INVALID", message=err } end
     local panel_id; panel_id, err = id(opts.panel_id, "panel_id", true); if not panel_id then return false, { code="E_LIFECYCLE_INVALID", message=err } end
-    if not state.panels[panel_id] then return false, { code="E_LIFECYCLE_NOT_FOUND", message="panel not found" } end
+    local panel = state.panels[panel_id]
+    if not panel then return false, { code="E_LIFECYCLE_NOT_FOUND", message="panel not found" } end
+    if panel.agent_id ~= agent_id then return false, { code="E_LIFECYCLE_AUTHORITY", message="session agent does not own panel" } end
     local live_count = 0; for _, item in pairs(state.sessions) do if item.agent_id == agent_id and LIVE[item.state] then live_count = live_count + 1 end end
     if state.policy.max_sessions_per_agent and live_count >= state.policy.max_sessions_per_agent then return false, { code="E_LIFECYCLE_POLICY", message="agent session policy limit reached" } end
     if not state.policy.allow_multiple_tasks then

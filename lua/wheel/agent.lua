@@ -957,7 +957,8 @@ end
 ---     done: boolean?
 ---     error: string?
 --- @return table { success: boolean, task: table, checkpoints: string[], iterations: number, error: string? }
-function WheelAgent:execute_task(task_id, step_fn)
+function WheelAgent:execute_task(task_id, step_fn, execution_opts)
+  execution_opts = execution_opts or {}
   local task = self.kernel:get_task(task_id)
   if not task then
     error("Task not found: " .. tostring(task_id))
@@ -984,16 +985,18 @@ function WheelAgent:execute_task(task_id, step_fn)
   if type(step_fn) ~= "function" then
     if WheelRunner and type(WheelRunner.run_task) == "function" then
       local runner_opts = (type(step_fn) == "table") and step_fn or {}
+      runner_opts.defer_release = runner_opts.defer_release or execution_opts.defer_release
+      -- Capture this execution's fence before provider callbacks can transfer
+      -- or retry the task. Never complete a newer owner's generation.
+      local generation = (task.generation or 0) + (st_lower == "ready" and 1 or 0)
       local runner_res = WheelRunner.run_task(self, task, runner_opts)
-      local cur = self.kernel:get_task(task_id) or task
-      local generation = cur.generation or task.generation or 0
       local last_cp = runner_res.checkpoints and runner_res.checkpoints[#runner_res.checkpoints]
       local finished
       if not runner_opts.defer_release then
         if runner_res.success then
-          finished = self.kernel:complete_task(task_id, generation, last_cp)
+          finished = self.kernel:complete_task(task_id, generation, last_cp, nil, self.name)
         else
-          finished = self.kernel:fail_task(task_id, generation, runner_res.error or "unknown failure")
+          finished = self.kernel:fail_task(task_id, generation, runner_res.error or "unknown failure", nil, self.name)
         end
       end
       self.kernel:set_active_task(nil)
@@ -1128,10 +1131,12 @@ function WheelAgent:execute_task(task_id, step_fn)
   end
 
   local finished_task
-  if execution_success then
-    finished_task = self.kernel:complete_task(task_id, generation, last_checkpoint_hash)
-  else
-    finished_task = self.kernel:fail_task(task_id, generation, final_error or "unknown failure")
+  if not execution_opts.defer_release then
+    if execution_success then
+      finished_task = self.kernel:complete_task(task_id, generation, last_checkpoint_hash, nil, self.name)
+    else
+      finished_task = self.kernel:fail_task(task_id, generation, final_error or "unknown failure", nil, self.name)
+    end
   end
 
   -- Clear active task
@@ -1139,7 +1144,7 @@ function WheelAgent:execute_task(task_id, step_fn)
 
   return {
     success = execution_success,
-    task = finished_task,
+    task = finished_task or self.kernel:get_task(task_id),
     checkpoints = checkpoints,
     iterations = iterations,
     error = final_error,

@@ -16,6 +16,18 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Add Lua 5.1/LuaJIT regressions for export replacement, approval/audit failure,
   ended and abandoned parents, forged replay, and changed workspace deltas.
 
+- Reject unknown dependency IDs, cyclic dependency graphs, and invalid parent
+  hierarchies before task admission or scheduling. Fence task lifecycle
+  transitions and release by status, owner, and generation; retries advance
+  generation. Require task-bound active controller sessions on owned distinct
+  panels for concurrent claims and handoffs. Validate task-scoped immutable
+  checkpoint and ContextRef links, revalidate persisted handoff authority, and
+  accept the valid default-empty rationale on reload. Roll back local Context
+  history, events, kernel slots, ownership, and generation on injected
+  persistence or reassignment failures without fallible compensating writes.
+  The transaction covers the owned in-process Context/kernel projection;
+  CarryCtx remains the lifecycle and cross-process recovery system of record.
+
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
   exact revision conflicts, exception-safe lock cleanup, bounded recent history,

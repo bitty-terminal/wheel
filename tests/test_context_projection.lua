@@ -407,6 +407,9 @@ return function(run_test)
     assert(delta == nil and err.code == "E_PROJECTION_INVALID")
     local valid_table = context:get_commit(commit.hash)
     assert(context:project({ current_commit = valid_table }).current_commit == commit.hash)
+    valid_table.slots["workspace/project"].content = "forged projection state"
+    assert_projection_error(context, { current_commit = valid_table }, "mutated immutable commit copy")
+    assert(context:get_commit(commit.hash).slots["workspace/project"].content == "Wheel")
   end)
 
   run_test("Context projections: explicit unresolved bases fail with typed errors", function()

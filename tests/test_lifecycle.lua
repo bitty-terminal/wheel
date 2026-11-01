@@ -90,12 +90,14 @@ end
 local ok, err = pcall(function()
   local function fixture()
     local life = Lifecycle.new({ max_sessions_per_agent = 3 })
-    for _, id in ipairs({ "p1", "p2" }) do
-      assert(life:create_panel({ panel_id = id }))
-      assert(life:ready_panel(id))
-    end
+    assert(life:create_panel({ panel_id = "p1", agent_id = "s1" }))
+    assert(life:ready_panel("p1"))
+    assert(life:create_panel({ panel_id = "p2" }))
+    assert(life:ready_panel("p2"))
+    assert(life:create_panel({ panel_id = "p3", agent_id = "s1" }))
+    assert(life:ready_panel("p3"))
     for _, id in ipairs({ "s1", "s2" }) do
-      assert(life:create_agent_session({ session_id = id, agent_id = id, panel_id = "p1" }))
+      assert(life:create_agent_session({ session_id = id, agent_id = "s1", panel_id = id == "s1" and "p1" or "p3" }))
     end
     return life
   end
@@ -132,8 +134,8 @@ local ok, err = pcall(function()
 
   run_test("Lifecycle: multiple task sessions require explicit agent policy", function()
     local restricted = Lifecycle.new({ max_sessions_per_agent = 2 })
-    assert(restricted:create_panel({ panel_id = "policy-panel-a" }))
-    assert(restricted:create_panel({ panel_id = "policy-panel-b" }))
+    assert(restricted:create_panel({ panel_id = "policy-panel-a", agent_id = "policy-agent" }))
+    assert(restricted:create_panel({ panel_id = "policy-panel-b", agent_id = "policy-agent" }))
     assert(restricted:ready_panel("policy-panel-a"))
     assert(restricted:ready_panel("policy-panel-b"))
     assert(restricted:create_agent_session({ session_id = "policy-session-a", agent_id = "policy-agent", task_id = "task-a", panel_id = "policy-panel-a" }))
@@ -141,20 +143,36 @@ local ok, err = pcall(function()
     assert(not denied and policy_error.code == "E_LIFECYCLE_POLICY")
 
     local allowed = Lifecycle.new({ max_sessions_per_agent = 2, allow_multiple_tasks = true })
-    assert(allowed:create_panel({ panel_id = "multi-panel-a" }))
-    assert(allowed:create_panel({ panel_id = "multi-panel-b" }))
+    assert(allowed:create_panel({ panel_id = "multi-panel-a", agent_id = "multi-agent" }))
+    assert(allowed:create_panel({ panel_id = "multi-panel-b", agent_id = "multi-agent" }))
     assert(allowed:ready_panel("multi-panel-a"))
     assert(allowed:ready_panel("multi-panel-b"))
     assert(allowed:create_agent_session({ session_id = "multi-session-a", agent_id = "multi-agent", task_id = "task-a", panel_id = "multi-panel-a" }))
     assert(allowed:create_agent_session({ session_id = "multi-session-b", agent_id = "multi-agent", task_id = "task-b", panel_id = "multi-panel-b" }))
   end)
 
+  run_test("Lifecycle: session creation rejects foreign and unowned panels without mutation", function()
+    local life = Lifecycle.new({ max_sessions_per_agent = 2 })
+    assert(life:create_panel({ panel_id = "foreign", agent_id = "owner" }))
+    assert(life:create_panel({ panel_id = "unowned" }))
+    for _, panel_id in ipairs({ "foreign", "unowned" }) do
+      local before = Session.json_encode(life:_state())
+      local session, denied = life:create_agent_session({
+        session_id = "intruder", agent_id = "intruder", panel_id = panel_id,
+      })
+      assert(not session and denied.code == "E_LIFECYCLE_AUTHORITY")
+      assert(Session.json_encode(life:_state()) == before)
+      assert(not life:get_session("intruder"))
+    end
+    assert(life:create_agent_session({ session_id = "valid-owner", agent_id = "owner", panel_id = "foreign" }))
+  end)
+
   run_test("Lifecycle: persisted transfer and detach history remains valid", function()
     local path = root .. "/transfer-history.json"
     local life = Lifecycle.new({ path = path, max_sessions_per_agent = 2 })
-    assert(life:create_panel({ panel_id = "history-p1" }))
+    assert(life:create_panel({ panel_id = "history-p1", agent_id = "history-agent" }))
     assert(life:ready_panel("history-p1"))
-    assert(life:create_panel({ panel_id = "history-p2" }))
+    assert(life:create_panel({ panel_id = "history-p2", agent_id = "history-agent" }))
     assert(life:ready_panel("history-p2"))
     assert(life:create_agent_session({
       session_id = "history-session", agent_id = "history-agent", panel_id = "history-p1",
@@ -172,7 +190,7 @@ local ok, err = pcall(function()
   run_test("Lifecycle: replay rejects controller event rewritten to detached observer", function()
     local path = root .. "/attachment-event-replay.json"
     local life = Lifecycle.new({ path = path, max_sessions_per_agent = 2 })
-    assert(life:create_panel({ panel_id = "replay-panel" }))
+    assert(life:create_panel({ panel_id = "replay-panel", agent_id = "replay-agent" }))
     assert(life:ready_panel("replay-panel"))
     assert(life:create_agent_session({
       session_id = "replay-controller", agent_id = "replay-agent", task_id = "replay-task", panel_id = "replay-panel",
@@ -205,7 +223,7 @@ local ok, err = pcall(function()
     local path = root .. "/transfer-event-replay.json"
     local life = Lifecycle.new({ path = path })
     for _, panel_id in ipairs({ "replay-p1", "replay-p2", "replay-p3" }) do
-      assert(life:create_panel({ panel_id = panel_id }))
+      assert(life:create_panel({ panel_id = panel_id, agent_id = "replay-transfer-agent" }))
       assert(life:ready_panel(panel_id))
     end
     assert(life:create_agent_session({
@@ -255,7 +273,7 @@ local ok, err = pcall(function()
 
   run_test("Lifecycle: panel transitions require readiness and matching state", function()
     local life = Lifecycle.new()
-    assert(life:create_panel({ panel_id = "p" }))
+    assert(life:create_panel({ panel_id = "p", agent_id = "a" }))
     assert(life:create_agent_session({ session_id = "s", agent_id = "a", panel_id = "p" }))
     assert(not life:activate_session("s"))
     assert(not life:attach_session("s", "p"))
@@ -546,7 +564,7 @@ local ok, err = pcall(function()
     local ids = {}
     for _ = 1, 10 do
       local life = Lifecycle.new()
-      local panel = assert(life:create_panel())
+      local panel = assert(life:create_panel({ agent_id = "a" }))
       assert(not ids[panel.panel_id]); ids[panel.panel_id] = true
       local session = assert(life:create_agent_session({ agent_id = "a", panel_id = panel.panel_id }))
       assert(not ids[session.session_id]); ids[session.session_id] = true
@@ -621,11 +639,15 @@ local ok, err = pcall(function()
   run_test("Lifecycle: loaded events reject forged session and attachment identities", function()
     local life = fixture()
     assert(life:attach_session("s1", "p1"))
-    assert(life:attach_session("s2", "p1", { mode = "observer" }))
-    assert(life:create_agent_session({ session_id = "s3", agent_id = "agent3", panel_id = "p2" }))
-    assert(life:attach_session("s3", "p2"))
-    assert(life:create_agent_session({ session_id = "s4", agent_id = "agent4", panel_id = "p2" }))
-    assert(life:attach_session("s4", "p2", { mode = "observer" }))
+    assert(life:attach_session("s2", "p3", { mode = "observer" }))
+    assert(life:create_panel({ panel_id = "p2-agent3", agent_id = "agent3" }))
+    assert(life:ready_panel("p2-agent3"))
+    assert(life:create_agent_session({ session_id = "s3", agent_id = "agent3", panel_id = "p2-agent3" }))
+    assert(life:attach_session("s3", "p2-agent3"))
+    assert(life:create_panel({ panel_id = "p4", agent_id = "agent4" }))
+    assert(life:ready_panel("p4"))
+    assert(life:create_agent_session({ session_id = "s4", agent_id = "agent4", panel_id = "p4" }))
+    assert(life:attach_session("s4", "p4", { mode = "observer" }))
     local good = life:_state(); good.version = 1
     local mutations = {
       function(value)
@@ -672,19 +694,19 @@ local ok, err = pcall(function()
       end,
       function(value)
         for _, event in ipairs(value.events) do
-          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.panel_id = "p2"; return end
+          if event.type == "panel.observer_attached" and event.panel_id == "p4" then event.panel_id = "p1"; return end
         end
         error("observer event fixture missing")
       end,
       function(value)
         for _, event in ipairs(value.events) do
-          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.observer_session_id = "s4"; return end
+          if event.type == "panel.observer_attached" and event.panel_id == "p4" then event.observer_session_id = "s3"; return end
         end
         error("observer event fixture missing")
       end,
       function(value)
         for _, event in ipairs(value.events) do
-          if event.type == "panel.observer_attached" and event.panel_id == "p1" then event.observer_session_id = "s1"; return end
+          if event.type == "panel.observer_attached" and event.panel_id == "p4" then event.observer_session_id = "s1"; return end
         end
         error("observer event fixture missing")
       end,
@@ -807,7 +829,7 @@ local ok, err = pcall(function()
   run_test("Lifecycle: commit exceptions release owned locks and preserve retry state", function()
     local path = root .. "/exception.json"
     local life = Lifecycle.new({ path = path })
-    assert(life:create_panel({ panel_id = "p" }))
+    assert(life:create_panel({ panel_id = "p", agent_id = "a" }))
     local before = assert(WheelHost.fs.read_file(path))
     local cases = {
       { target = WheelHost.fs, key = "random_bytes" },
@@ -847,10 +869,11 @@ local ok, err = pcall(function()
     local terminal = life:get_session("s2"); terminal.state = "ended"
     for index = 1, 510 do
       local record = Session.json_decode(Session.json_encode(terminal))
-      record.session_id, record.agent_id = "terminal-" .. index, "terminal-" .. index
+      record.session_id = "terminal-" .. index
       life.sessions[record.session_id] = record
     end
-    local new = assert(life:create_agent_session({ session_id="after-cap", agent_id="new", panel_id="p2" }))
+    assert(life:create_panel({ panel_id = "after-cap-panel", agent_id = "new" }))
+    local new = assert(life:create_agent_session({ session_id="after-cap", agent_id="new", panel_id="after-cap-panel" }))
     assert(new.state == "created" and #life:list_sessions() == 512)
     assert(life:get_session("s1").checkpoint == nil and life:get_session("s1").state == "paused")
     assert(life:resume_session("s1"))
@@ -931,13 +954,16 @@ local ok, err = pcall(function()
 
   run_test("Lifecycle: observer and conflicting controller separation", function()
     local lifecycle = Lifecycle.new({ max_sessions_per_agent = 3 })
-    assert(lifecycle:create_panel({ panel_id = "observer-panel" }))
+    assert(lifecycle:create_panel({ panel_id = "observer-panel", agent_id = "a" }))
     assert(lifecycle:ready_panel("observer-panel"))
     assert(lifecycle:create_agent_session({ session_id = "controller", agent_id = "a", panel_id = "observer-panel" }))
-    assert(lifecycle:create_agent_session({ session_id = "observer", agent_id = "b", panel_id = "observer-panel" }))
+    assert(lifecycle:create_panel({ panel_id = "observer-origin", agent_id = "b" }))
+    assert(lifecycle:ready_panel("observer-origin"))
+    assert(lifecycle:create_agent_session({ session_id = "observer", agent_id = "b", panel_id = "observer-origin" }))
     assert(lifecycle:activate_session("controller"))
-    assert(lifecycle:attach_session("observer", "observer-panel", { mode = Lifecycle.AttachMode.OBSERVER }))
-    local controller = lifecycle:create_agent_session({ session_id = "controller-2", agent_id = "c", panel_id = "observer-panel" })
+    assert(lifecycle:attach_session("observer", "observer-origin", { mode = Lifecycle.AttachMode.OBSERVER }))
+    assert(lifecycle:transfer_session("observer", "observer-panel"))
+    local controller = lifecycle:create_agent_session({ session_id = "controller-2", agent_id = "a", panel_id = "observer-panel" })
     assert(controller)
     local activated, activation_err = lifecycle:activate_session(controller.session_id)
     assert(not activated and activation_err.code == "E_LIFECYCLE_PANEL_BUSY")
