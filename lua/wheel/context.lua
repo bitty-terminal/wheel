@@ -1896,11 +1896,88 @@ local function projection_commit(context, reference)
       and context:get_commit(context._refs["refs/heads/" .. reference]))
 end
 
+local PROJECTION_IDENTITY_BINDING_KEYS = { role=true, binding_id=true, policy_generation=true }
+local PROJECTION_IDENTITY_LINEAGE_KEYS = {
+  forked_from_agent=true, forked_from_session=true, base_context_commit=true, reason=true,
+}
+
+local function projection_identity_text(value, label)
+  local valid, err = validate_projection_scalar(value, label, PROJECTION_MAX_REFERENCE_BYTES)
+  if not valid then return nil, err end
+  if value ~= nil and value:find("[%z\1-\31\127]") then
+    return nil, label .. " contains a control character"
+  end
+  return true
+end
+
+--- Normalize the optional Agent identity provenance attached to a projection.
+-- The projection `role` lens selects content; the RoleBinding role is provenance
+-- only. Identity never selects context content, and lineage is a set of
+-- references rather than copied transcript or slot content.
+-- @param opts table Project options
+-- @return table|nil identity, string|nil error
+local function projection_identity(opts)
+  local identity = {}
+  local valid, err = projection_identity_text(opts.agent_id, "agent_id")
+  if not valid then return nil, err end
+  if opts.agent_id ~= nil then identity.agent_id = opts.agent_id end
+  if opts.role_binding ~= nil then
+    local binding = opts.role_binding
+    if type(binding) ~= "table" or getmetatable(binding) ~= nil then
+      return nil, "role_binding must be a plain table with role, binding_id, and policy_generation"
+    end
+    for key in pairs(binding) do
+      if not PROJECTION_IDENTITY_BINDING_KEYS[key] then
+        return nil, "role_binding contains an unknown field"
+      end
+    end
+    valid, err = projection_identity_text(binding.role, "role_binding.role")
+    if not valid or binding.role == nil then return nil, err or "role_binding.role is required" end
+    valid, err = projection_identity_text(binding.binding_id, "role_binding.binding_id")
+    if not valid then return nil, err end
+    if binding.policy_generation ~= nil and (type(binding.policy_generation) ~= "number"
+      or binding.policy_generation ~= binding.policy_generation
+      or binding.policy_generation < 1 or binding.policy_generation % 1 ~= 0
+      or binding.policy_generation > PROJECTION_MAX_SCALAR) then
+      return nil, "role_binding.policy_generation must be a positive integer"
+    end
+    identity.role_binding = {
+      role = binding.role,
+      binding_id = binding.binding_id,
+      policy_generation = binding.policy_generation,
+    }
+  end
+  if opts.lineage ~= nil then
+    local lineage = opts.lineage
+    if type(lineage) ~= "table" or getmetatable(lineage) ~= nil then
+      return nil, "lineage must be a plain table"
+    end
+    for key in pairs(lineage) do
+      if not PROJECTION_IDENTITY_LINEAGE_KEYS[key] then
+        return nil, "lineage contains an unknown field"
+      end
+    end
+    local clean = {}
+    for key, value in pairs(lineage) do
+      valid, err = projection_identity_text(value, "lineage." .. key)
+      if not valid then return nil, err end
+      clean[key] = value
+    end
+    if not clean.forked_from_agent then return nil, "lineage.forked_from_agent is required" end
+    if not clean.base_context_commit then return nil, "lineage.base_context_commit is required" end
+    identity.lineage = clean
+  end
+  if next(identity) == nil then return nil end
+  return identity
+end
+
 local function projection_provenance(commit, opts, revision)
   return {
     source_commit = commit and commit.hash or nil,
     source_task = (commit and commit.task_id) or opts.task_id,
     source_session = opts.session_id,
+    agent_id = opts.agent_id,
+    policy_generation = opts.role_binding and opts.role_binding.policy_generation or nil,
     revision = revision or (commit and commit.timestamp_ms) or 0,
     confidence = opts.confidence or 1.0,
   }
@@ -2055,6 +2132,8 @@ function WheelContext:semantic_delta(base_ref, current_ref, opts)
   if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
   local options_valid, options_err = validate_projection_options(opts)
   if not options_valid then return nil, projection_error(options_err) end
+  local _, identity_err = projection_identity(opts)
+  if identity_err then return nil, projection_error(identity_err) end
   local semantic_nodes_limit = projection_internal_limit(opts._projection_nodes_limit,
     PROJECTION_MAX_VALUE_NODES, PROJECTION_MAX_VALUE_NODES)
   local semantic_records_limit = projection_internal_limit(opts._projection_records_limit,
@@ -2156,6 +2235,8 @@ function WheelContext:semantic_delta(base_ref, current_ref, opts)
     base_commit = base.hash,
     source_task = current.task_id or opts.task_id,
     source_session = opts.session_id,
+    agent_id = opts.agent_id,
+    policy_generation = opts.role_binding and opts.role_binding.policy_generation or nil,
     revision = current.timestamp_ms,
     confidence = opts.confidence or 1.0,
   }
@@ -2175,6 +2256,8 @@ function WheelContext:project(opts)
   if type(opts) ~= "table" then return nil, projection_error("options must be a table") end
   local options_valid, options_err = validate_projection_options(opts)
   if not options_valid then return nil, projection_error(options_err) end
+  local identity, identity_err = projection_identity(opts)
+  if identity_err then return nil, projection_error(identity_err) end
   local role = opts.role or WheelContext.Role.CODING
   if not ROLE_VALUES[role] then return nil, projection_error("unknown role: " .. tostring(role)) end
   local current = projection_commit(self, opts.current_commit)
@@ -2351,6 +2434,8 @@ function WheelContext:project(opts)
     current_records = current_records,
     task_id = opts.task_id,
     session_id = opts.session_id,
+    agent_id = identity and identity.agent_id,
+    role_binding = identity and copy_projection_value(identity.role_binding),
     relevant_scopes = copy_projection_value(scopes),
     confidence = opts.confidence,
     _projection_nodes_limit = work_nodes,
@@ -2438,6 +2523,7 @@ function WheelContext:project(opts)
     budgets = budgets,
     max_budget_bytes = total_budget,
     total_bytes = total_bytes,
+    identity = identity,
     layers = layers,
     omitted_references = omitted,
     provenance = provenance,

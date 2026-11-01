@@ -454,4 +454,55 @@ return function(run_test)
       }, "malformed revision")
     end
   end)
+
+  run_test("Context projections: agent identity and fork lineage stay structured references", function()
+    local context = fixed_context()
+    local commit = assert(context:commit_checkpoint({
+      author = "fixture", message = "identity provenance", timestamp_ms = 1700000000000,
+    }))
+    local options = {
+      current_commit = commit.hash,
+      role = WheelContext.Role.REVIEWER,
+      agent_id = "agent-fork-1",
+      role_binding = { role = "reviewer", binding_id = "role-binding:agent-fork-1:2", policy_generation = 2 },
+      lineage = {
+        forked_from_agent = "agent-parent",
+        forked_from_session = "session-parent",
+        base_context_commit = commit.hash,
+        reason = "independent verification",
+      },
+    }
+    local projection = assert(context:project(options))
+    assert(projection.identity.agent_id == "agent-fork-1")
+    assert(projection.identity.role_binding.policy_generation == 2)
+    assert(projection.identity.lineage.forked_from_agent == "agent-parent")
+    assert(projection.identity.lineage.base_context_commit == commit.hash)
+    assert(projection.provenance.agent_id == "agent-fork-1")
+    assert(projection.provenance.policy_generation == 2)
+    local replay = assert(context:project(options))
+    assert(replay.canonical_bytes == projection.canonical_bytes)
+    assert(not projection.canonical_bytes:find("prompt", 1, true))
+    assert(not projection.canonical_bytes:find("transcript", 1, true))
+
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      lineage = { forked_from_agent = "parent", transcript = "not a reference" },
+    }, "unknown lineage field")
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      lineage = { base_context_commit = commit.hash },
+    }, "lineage without a source agent")
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      agent_id = "agent\ninjected",
+    }, "control characters in agent identity")
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      role_binding = { role = "reviewer", policy_generation = 0 },
+    }, "non-positive policy generation")
+    assert_projection_error(context, {
+      current_commit = commit.hash,
+      role_binding = { role = "reviewer", binding_id = "id", extra = "field" },
+    }, "unknown role binding field")
+  end)
 end

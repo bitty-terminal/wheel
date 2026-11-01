@@ -99,6 +99,55 @@ missing persisted metadata is invalid. Controller detach always pauses active
 work, observers cannot promote through activation or transfer, and an explicit
 transfer moves an existing attachment without changing its authority mode.
 
+### Agent identity, RoleBindings, and fork lineage
+
+A stable `AgentId` is separate from the role it currently holds. Each Agent
+carries a `RoleBinding` (`role`, `binding_id`, monotonic `policy_generation`,
+and a capability set derived from the role matrix) plus an optional immutable
+lineage record. Runtime authorization reads the binding's capability state;
+prompt or identity text never grants authority, and an explicit capability list
+may narrow a role's matrix but never widen it.
+
+Agents are opaque Lua 5.1/LuaJIT userdata handles with the existing field and
+method API. Mutable runtime fields remain available; identity, lineage, and
+RoleBinding reads come from private storage, and `rawset` rejects the handle
+without changing public identity or routing. Table introspection of an Agent
+is unsupported; use `status()` for a defensive table projection.
+
+RoleBinding normalization, issuance, and reference projection use private
+helpers. Replacing the exported compatibility helpers cannot receive private
+bindings or grant authority; a fork issues exactly the binding checked for its
+capability delta. The canonical Commander binding permits declared Execute
+tools and denies direct Modify; explicit narrowed bindings retain their limits.
+
+`agent:transition_role(role, { reason = ..., approve_widening = ... })` keeps the
+`AgentId`, issues the next policy generation, and commits an immutable Context
+checkpoint boundary. A transition that would add a capability fails closed with
+`E_ROLE_AUTHORITY` unless the caller explicitly approves the widening; the
+approval and the previous generation are recorded in the checkpoint. The Agent
+must have a runtime session bound to its privately issued authority reference.
+Caller-provided resolvers and fabricated or borrowed references are rejected;
+metadata-only and reloaded sessions cannot authorize role changes or widening.
+The lifecycle registry resolves identity and pending bindings through the
+protected Agent issuer and records a bounded
+`agent_session.role_transition` event with the new generation and checkpoint,
+and rejects caller-supplied, stale, skipped, reused, or forged generations on
+reload. Approved fork widening also requires independent parent and child
+runtime sessions and emits an `agent_session.authority_widened` event before
+the child is returned. An ended or abandoned parent session cannot authorize
+fork widening; refusal occurs before child runtime creation.
+
+`WheelAgent.fork_agent(parent, opts)` and `WheelTeam:fork_agent(...)` create an
+independent Agent identity from an immutable `ContextCommit`. The child records
+`forked_from_agent`, `forked_from_session`, `base_context_commit`, the reason,
+and its initial `RoleBinding`; it shares the Context engine by reference and
+receives no copied transcript or slot snapshot. A fork that would exceed its
+parent's capability state is refused without explicit approval. Forked Agents
+can run in their own `AgentSession` and Headless Panel, and status, team status,
+and Context projections expose the identity and lineage references. P3 semantic
+delta records retain the same validated AgentId and policy generation as the
+root projection.
+
 ### Scope
 
 Wheel is the agent harness for the Bitty terminal, scoped to software
@@ -724,12 +773,12 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/job.lua`                       | Private process-job record and recorded-group cancellation: `0700`/`0600` metadata, random job/generation tokens, generation validation against the live retained leader, TERM/grace/KILL, terminal-reason lock, and typed job failures.                                                                                   |
 | `lua/wheel/audit.lua`                     | Local append-only execution audit sink: `0700`/`0600` JSONL, 16 KiB records, 1 MiB x 4 rotation, SHA-256 previous-hash chain, redaction markers, cancellation fields, size-based tail refresh for sequential cross-process writers, and typed `E_AUDIT_UNAVAILABLE` failures.                                              |
 | `lua/wheel/kernel.lua`                    | WheelKernel Lua client: JSON-RPC dispatch, DAG control plane, Merkle slots, cognitive checkpoints.                                                                                                                                                                                                                         |
-| `lua/wheel/agent.lua`                     | WheelAgent runtime: Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                                                                                                                                    |
+| `lua/wheel/agent.lua`                     | WheelAgent runtime: stable Agent identity, RoleBindings and capability-based authorization, fork lineage, Headless Panel working containers, Commander, Worker (Coding, Debug, Research), and Reviewer roles.                                                                                                              |
 | `lua/wheel/team.lua`                      | WheelTeam coordinator: multi-agent peer colleague collaboration, autonomous wave orchestration, atomic claims, and handoffs.                                                                                                                                                                                               |
 | `lua/wheel/context.lua`                   | WheelContext engine: shared semantic slots, CAS concurrency, ContextBus pubsub, 3-way merge, and Three-Zone prefix-cache compiler.                                                                                                                                                                                         |
 | `lua/wheel/context_snapshot.lua`          | Versioned snapshot schema validation, bounded plain-data copying, and canonical encoding for WheelContext.                                                                                                                                                                                                                 |
 | `lua/wheel/session.lua`                   | Local session control plane (client/shared): bounded strict JSON framing, session-name and private-path validation, metadata, serialization lock, and RPC.                                                                                                                                                                 |
-| `lua/wheel/lifecycle.lua`                 | Explicit AgentSession and Headless Panel records, state transitions, observer separation, stale recovery, policy bounds, lifecycle events, and optional file-backed registry persistence.                                                                                                                                  |
+| `lua/wheel/lifecycle.lua`                 | Explicit AgentSession and Headless Panel records, state transitions, observer separation, audited role-transition policy generations, stale recovery, policy bounds, lifecycle events, and optional file-backed registry persistence.                                                                                      |
 | `lua/wheel/daemon.lua`                    | Detached session daemon: owns one WheelContext, serves the `wheel-session/1` methods over private FIFOs, and shuts down explicitly.                                                                                                                                                                                        |
 | `lua/wheel/session_cli.lua`               | Script entry point used by `scripts/wheel-session`; bootstraps the module path and prints structured results.                                                                                                                                                                                                              |
 | `lua/wheel/tool.lua`                      | WheelTool engine: standardized ActionIntent protocol, path sandboxing, core tools, role gating, and auto-spillover pipeline.                                                                                                                                                                                               |
@@ -739,6 +788,7 @@ false`, and does not evaluate the entry. Inspect it with `trust`, then
 | `lua/wheel/ui.lua`                        | WheelUI visualizer: ASCII Task DAG, topological wave decomposition, and telemetry renderer.                                                                                                                                                                                                                                |
 | `tests/test_wheel.lua`                    | Comprehensive test suite covering kernel dispatch, agent role loops, UI rendering, configuration layering, trust gates, and README contract parity.                                                                                                                                                                        |
 | `tests/test_context_snapshot.lua`         | Focused snapshot tests: round-trip, tamper, bounds, reflog wrap, stash redaction, caller-bus behavior, and canonical ordering.                                                                                                                                                                                             |
+| `tests/test_agent_identity.lua`           | Agent identity, RoleBinding policy generations, audited role transitions without silent widening, fork lineage from immutable Context commits, independent Sessions/Panels, and capability-based authorization denial.                                                                                                     |
 | `tests/test_live_provider.lua`            | Opt-in live test (`just test-live`) selected by `WHEEL_LIVE_PROVIDER` (OpenRouter default, Command Code): complete, tool call, stream, and runner.                                                                                                                                                                         |
 | `tests/test_session.lua`                  | Integration suite for the local session daemon: real detached start, cross-process context reads, snapshots, shutdown, invalid/oversized frames, unsafe paths, and stale-pid recovery.                                                                                                                                     |
 | `tests/test_lifecycle.lua`                | AgentSession and Headless Panel lifecycle tests, including observer/controller separation and cross-process registry reload/recovery.                                                                                                                                                                                      |

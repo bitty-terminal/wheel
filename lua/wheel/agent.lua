@@ -4,7 +4,61 @@
 -- Roles vary by configuration inside that domain, bounded by budgets and permissions.
 
 local WheelAgent = {}
-WheelAgent.__index = WheelAgent
+local AGENT_IDENTITY = setmetatable({}, { __mode = "k" })
+local AGENT_AUTHORITY = setmetatable({}, { __mode = "k" })
+local AGENT_RUNTIME = setmetatable({}, { __mode = "k" })
+local AGENT_FIELDS = setmetatable({}, { __mode = "k" })
+local AUTHORITY_AGENTS = setmetatable({}, { __mode = "kv" })
+local PENDING_FORK_WIDENING = setmetatable({}, { __mode = "k" })
+local agent_index, agent_newindex
+
+local function authoritative_identity(agent)
+  return AGENT_IDENTITY[agent]
+end
+
+local function authoritative_binding(agent)
+  local authority = AGENT_AUTHORITY[agent]
+  return authority and authority.role_binding or nil
+end
+
+local function authoritative_binding_token(agent)
+  local authority = AGENT_AUTHORITY[agent]
+  return authority and authority.token or nil
+end
+
+local function authoritative_session_id(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.session_id or nil
+end
+
+local function authoritative_panel_id(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.panel_id or nil
+end
+
+local function authoritative_lifecycle(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.lifecycle or nil
+end
+
+local function authoritative_context_refs(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.context_refs or {}
+end
+
+local function authoritative_context_session_id(agent)
+  return authoritative_session_id(agent) or authoritative_context_refs(agent).session_id
+end
+
+local function authoritative_policy_generation(agent)
+  local binding = authoritative_binding(agent)
+  return binding and binding.policy_generation or nil
+end
+
+local function authoritative_role_checkpoint(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.last_role_checkpoint or nil
+end
 
 local ok_tool, WheelTool = pcall(require, "wheel.tool")
 if not ok_tool then
@@ -44,12 +98,18 @@ local WheelLifecycle = load_lifecycle()
 WheelAgent.Lifecycle = WheelLifecycle
 
 --- Agent role definitions.
+local ROLE_COMMANDER = "commander"
+local ROLE_CODING = "coding"
+local ROLE_DEBUG = "debug"
+local ROLE_RESEARCH = "research"
+local ROLE_REVIEWER = "reviewer"
+
 WheelAgent.Role = {
-  COMMANDER = "commander",
-  CODING = "coding",
-  DEBUG = "debug",
-  RESEARCH = "research",
-  REVIEWER = "reviewer",
+  COMMANDER = ROLE_COMMANDER,
+  CODING = ROLE_CODING,
+  DEBUG = ROLE_DEBUG,
+  RESEARCH = ROLE_RESEARCH,
+  REVIEWER = ROLE_REVIEWER,
 }
 
 --- Read-only tool allowlist enforced for Research and Reviewer roles.
@@ -71,7 +131,261 @@ local READ_ONLY_TOOLS = {
   ["get_outline"] = true,
 }
 
-WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS
+-- Compatibility projection only. Authorization uses the private allowlist above.
+local READ_ONLY_TOOLS_VIEW = {}
+for tool_name, allowed in pairs(READ_ONLY_TOOLS) do READ_ONLY_TOOLS_VIEW[tool_name] = allowed end
+WheelAgent.READ_ONLY_TOOLS = READ_ONLY_TOOLS_VIEW
+
+-- Capability vocabulary. Authorization is decided from the granted capability
+-- set on the current RoleBinding, never from a role word in prompt or identity
+-- text. Keep the canonical values private: the exported table remains for
+-- compatibility inspection, but is not an authorization source.
+local CAPABILITY_INSPECT = "inspect"
+local CAPABILITY_VERIFY = "verify"
+local CAPABILITY_ORCHESTRATE = "orchestrate"
+local CAPABILITY_MODIFY = "modify"
+local CAPABILITY_EXECUTE = "execute"
+
+WheelAgent.Capability = {
+  INSPECT = CAPABILITY_INSPECT,
+  VERIFY = CAPABILITY_VERIFY,
+  ORCHESTRATE = CAPABILITY_ORCHESTRATE,
+  MODIFY = CAPABILITY_MODIFY,
+  EXECUTE = CAPABILITY_EXECUTE,
+}
+
+local CAPABILITY_ORDER = {
+  CAPABILITY_INSPECT,
+  CAPABILITY_VERIFY,
+  CAPABILITY_ORCHESTRATE,
+  CAPABILITY_MODIFY,
+  CAPABILITY_EXECUTE,
+}
+local CAPABILITY_VALUES = {}
+for _, capability in ipairs(CAPABILITY_ORDER) do CAPABILITY_VALUES[capability] = true end
+
+--- Canonical role capability matrix. Read-only roles never hold Modify or
+-- Execute, and Commander orchestrates without direct code modification.
+local ROLE_CAPABILITIES = {
+  [ROLE_COMMANDER] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_ORCHESTRATE] = true, [CAPABILITY_EXECUTE] = true,
+  },
+  [ROLE_CODING] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_MODIFY] = true, [CAPABILITY_EXECUTE] = true,
+  },
+  [ROLE_DEBUG] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+    [CAPABILITY_MODIFY] = true, [CAPABILITY_EXECUTE] = true,
+  },
+  [ROLE_RESEARCH] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+  },
+  [ROLE_REVIEWER] = {
+    [CAPABILITY_INSPECT] = true, [CAPABILITY_VERIFY] = true,
+  },
+}
+local ROLE_VALUES = {}
+for _, role in ipairs({ ROLE_COMMANDER, ROLE_CODING, ROLE_DEBUG, ROLE_RESEARCH, ROLE_REVIEWER }) do
+  ROLE_VALUES[role] = true
+end
+
+local MAX_IDENTITY_BYTES = 128
+local MAX_REASON_BYTES = 256
+local MAX_BINDING_ID_BYTES = 128
+local BINDING_ID_AGENT_BYTES = 48
+local POLICY_GENERATION_START = 1
+local MAX_POLICY_GENERATION = 9007199254740991
+local IDENTIFIER_PATTERN = "^[A-Za-z0-9][A-Za-z0-9._:/%-]*$"
+local COMMIT_HASH_PATTERN = "^[0-9a-f]+$"
+local COMMIT_HASH_BYTES = 64
+
+local function canonical_role_capabilities(role)
+  local matrix = ROLE_CAPABILITIES[role]
+  if not matrix then return nil end
+  local result = {}
+  for _, capability in ipairs(CAPABILITY_ORDER) do
+    if matrix[capability] then result[#result + 1] = capability end
+  end
+  return result
+end
+
+--- Return a defensive ordered copy of a capability set for a role.
+-- This compatibility view is not consulted by authorization.
+-- @param role string Role from WheelAgent.Role
+-- @return table|nil capabilities
+function WheelAgent.role_capabilities(role)
+  return canonical_role_capabilities(role)
+end
+
+local function bounded_string(value, limit)
+  if type(value) ~= "string" or value == "" or #value > limit then return nil end
+  if value:find("[%z\1-\31\127]") then return nil end
+  return value
+end
+
+local function capability_map(list)
+  local result = {}
+  for _, capability in ipairs(list or {}) do result[capability] = true end
+  return result
+end
+
+local function authoritative_capabilities(agent)
+  local binding = authoritative_binding(agent)
+  return binding and capability_map(binding.capabilities) or {}
+end
+
+local function capability_diff(left, right)
+  local other = capability_map(right)
+  local result = {}
+  for _, capability in ipairs(left or {}) do
+    if not other[capability] then result[#result + 1] = capability end
+  end
+  return result
+end
+
+local function normalize_capabilities(role, requested)
+  local matrix = ROLE_CAPABILITIES[role]
+  local canonical = canonical_role_capabilities(role)
+  if not matrix or not canonical then return nil, "unknown role: " .. tostring(role) end
+  if requested == nil then return canonical end
+  if type(requested) ~= "table" then return nil, "capabilities must be an array" end
+  local seen = {}
+  for key in pairs(requested) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      return nil, "capabilities must be a dense array"
+    end
+  end
+  local count = 0
+  for index = 1, #requested do
+    local capability = requested[index]
+    if not CAPABILITY_VALUES[capability] then
+      return nil, "unknown capability: " .. tostring(capability)
+    end
+    if seen[capability] then return nil, "duplicate capability: " .. capability end
+    if not matrix[capability] then
+      return nil, "role '" .. role .. "' may not hold capability '" .. capability .. "'"
+    end
+    seen[capability] = true
+    count = count + 1
+  end
+  if count ~= #requested then return nil, "capabilities must be a dense array" end
+  if count == 0 then return nil, "capabilities must not be empty" end
+  local ordered = {}
+  for _, capability in ipairs(CAPABILITY_ORDER) do
+    if seen[capability] then ordered[#ordered + 1] = capability end
+  end
+  return ordered
+end
+
+local function default_binding_id(agent_id, generation)
+  local component = tostring(agent_id or "agent"):gsub("[^A-Za-z0-9._%-]", "-")
+  component = component:sub(1, BINDING_ID_AGENT_BYTES)
+  if component == "" or component:sub(1, 1):match("^[A-Za-z0-9]$") == nil then
+    component = "agent-" .. component
+  end
+  return string.format("role-binding:%s:%d", component, generation)
+end
+
+--- Validate and normalize a RoleBinding. A binding carries the granted
+-- capability state and a monotonic policy generation. Explicit capabilities may
+-- only narrow the canonical role matrix.
+-- @param binding table|nil { role, binding_id?, policy_generation?, capabilities? }
+-- @param agent_id string|nil Stable Agent identity the binding is issued to
+-- @return table|nil normalized binding, string? error
+local function normalize_role_binding(binding, agent_id)
+  if type(binding) ~= "table" then return nil, "role binding must be a table" end
+  local role = binding.role
+  if type(role) ~= "string" or not ROLE_VALUES[role] then
+    return nil, "invalid role: " .. tostring(role)
+  end
+  local generation = binding.policy_generation
+  if generation == nil then generation = POLICY_GENERATION_START end
+  if type(generation) ~= "number" or generation ~= generation or generation % 1 ~= 0
+    or generation < POLICY_GENERATION_START or generation > MAX_POLICY_GENERATION then
+    return nil, "policy_generation must be a positive integer"
+  end
+  local capabilities, capability_err = normalize_capabilities(role, binding.capabilities)
+  if not capabilities then return nil, capability_err end
+  local binding_id = binding.binding_id
+  if binding_id == nil then
+    binding_id = default_binding_id(agent_id, generation)
+  else
+    if not bounded_string(binding_id, MAX_BINDING_ID_BYTES) or not binding_id:match(IDENTIFIER_PATTERN) then
+      return nil, "binding_id must be a bounded identifier"
+    end
+  end
+  return {
+    role = role,
+    binding_id = binding_id,
+    policy_generation = generation,
+    capabilities = capabilities,
+  }
+end
+
+-- Compatibility exports are views only. Issuance must never dispatch through a
+-- replaceable module field or hand private authority to caller-controlled code.
+function WheelAgent.normalize_role_binding(binding, agent_id)
+  return normalize_role_binding(binding, agent_id)
+end
+
+local function binding_reference(binding)
+  if type(binding) ~= "table" then return nil end
+  return {
+    role = binding.role,
+    binding_id = binding.binding_id,
+    policy_generation = binding.policy_generation,
+  }
+end
+
+local function copy_lineage(lineage)
+  if type(lineage) ~= "table" then return nil end
+  return {
+    forked_from_agent = lineage.forked_from_agent,
+    forked_from_session = lineage.forked_from_session,
+    base_context_commit = lineage.base_context_commit,
+    reason = lineage.reason,
+  }
+end
+
+--- Validate immutable fork lineage. Lineage records references only; it never
+-- carries transcripts, prompts, or copied context content.
+-- @param lineage table
+-- @return table|nil normalized lineage, string? error
+local function validate_lineage(lineage)
+  if type(lineage) ~= "table" then return nil, "lineage must be a table" end
+  local allowed = {
+    forked_from_agent = true, forked_from_session = true,
+    base_context_commit = true, reason = true,
+  }
+  for key in pairs(lineage) do
+    if not allowed[key] then return nil, "lineage contains an unknown field" end
+  end
+  local parent = bounded_string(lineage.forked_from_agent, MAX_IDENTITY_BYTES)
+  if not parent then return nil, "lineage forked_from_agent is invalid" end
+  local session = lineage.forked_from_session
+  if session ~= nil and not bounded_string(session, MAX_IDENTITY_BYTES) then
+    return nil, "lineage forked_from_session is invalid"
+  end
+  local base = lineage.base_context_commit
+  if not bounded_string(base, COMMIT_HASH_BYTES) or #base ~= COMMIT_HASH_BYTES
+    or not base:match(COMMIT_HASH_PATTERN) then
+    return nil, "lineage base_context_commit must be an immutable commit hash"
+  end
+  local reason = bounded_string(lineage.reason, MAX_REASON_BYTES)
+  if not reason then return nil, "lineage reason is invalid" end
+  return copy_lineage({
+    forked_from_agent = parent,
+    forked_from_session = session,
+    base_context_commit = base,
+    reason = reason,
+  })
+end
+
+function WheelAgent.validate_lineage(lineage)
+  return validate_lineage(lineage)
+end
 
 --- Default heterogeneous model profiles per role.
 local DEFAULT_MODEL_PROFILES = {
@@ -184,37 +498,72 @@ end
 ---   opts.budget table?: Budget limits { max_iterations = number, max_tokens = number }
 ---   opts.workspace table?: Workspace config { root = string }
 --- @return table
-function WheelAgent.new(opts)
+local function new_agent(opts, issued_binding)
   opts = opts or {}
   if not opts.name or opts.name == "" then
     error("Agent requires a non-empty 'name'")
   end
-  local role = opts.role or WheelAgent.Role.CODING
-  local valid_role = false
-  for _, r in pairs(WheelAgent.Role) do
-    if r == role then
-      valid_role = true
-      break
-    end
+  local agent_id = opts.agent_id or opts.name
+  if not bounded_string(agent_id, MAX_IDENTITY_BYTES) then
+    error("Agent requires a bounded, control-free 'agent_id'")
   end
-  if not valid_role then
+  local role = opts.role
+  if role ~= nil and (type(role) ~= "string" or not ROLE_VALUES[role]) then
     error("Invalid agent role: " .. tostring(role))
+  end
+  local binding_input = opts.role_binding
+  if binding_input == nil and role ~= nil then
+    binding_input = {
+      role = role,
+      binding_id = opts.binding_id,
+      capabilities = opts.capabilities,
+    }
+  end
+  if binding_input == nil then binding_input = { role = ROLE_CODING } end
+  -- Only the private fork path supplies an issued binding. Reuse exactly the
+  -- normalized capability state checked for widening, without a second read of
+  -- caller-controlled input or a replaceable compatibility export.
+  local role_binding, binding_err = issued_binding, nil
+  if not role_binding then role_binding, binding_err = normalize_role_binding(binding_input, agent_id) end
+  if not role_binding then
+    error("Invalid role binding for agent '" .. opts.name .. "': " .. tostring(binding_err))
+  end
+  if role ~= nil and role ~= role_binding.role then
+    error("Agent 'role' conflicts with its role_binding role")
+  end
+  local lineage
+  if opts.lineage ~= nil then
+    local lineage_err
+    lineage, lineage_err = validate_lineage(opts.lineage)
+    if not lineage then
+      error("Invalid lineage for agent '" .. opts.name .. "': " .. tostring(lineage_err))
+    end
   end
   if not opts.kernel then
     error("Agent requires a 'kernel' (WheelKernel instance)")
   end
 
-  local self = setmetatable({}, WheelAgent)
+  -- Lua 5.1/LuaJIT userdata preserves field syntax without a raw table surface.
+  -- A table proxy cannot protect identity because rawset bypasses __newindex.
+  if type(newproxy) ~= "function" then error("Agent requires Lua 5.1/LuaJIT opaque handles") end
+  local self = newproxy(true)
+  local handle_meta = getmetatable(self)
+  handle_meta.__index = agent_index
+  handle_meta.__newindex = agent_newindex
+  handle_meta.__metatable = "WheelAgent"
+  AGENT_FIELDS[self] = {}
+  AGENT_IDENTITY[self] = { agent_id = agent_id, lineage = lineage }
+  AGENT_AUTHORITY[self] = { role_binding = role_binding, token = {} }
+  AUTHORITY_AGENTS[authoritative_binding_token(self)] = self
   self.name = opts.name
-  self.agent_id = opts.agent_id or self.name
-  self.role = role
+  self.role = role_binding.role
   self.kernel = opts.kernel
 
   -- Role config resolution from opts.config if present
-  local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role]) or {}
+  local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role_binding.role]) or {}
 
   -- Model profile resolution (heterogeneous model profile support)
-  local default_profile = WheelAgent.get_default_model_profile(role)
+  local default_profile = WheelAgent.get_default_model_profile(role_binding.role)
   local user_profile = opts.model_profile or (role_cfg and role_cfg.model_profile)
   if user_profile then
     local ok_val, val_err = WheelAgent.validate_model_profile(user_profile)
@@ -256,7 +605,19 @@ function WheelAgent.new(opts)
   -- Every agent defaults to running inside a Headless Panel working container.
   -- Presentation UI panels are optional observation projections.
   local cfg_panel = (opts.config and opts.config.panel) or {}
-  self.panel_id = opts.panel_id or cfg_panel.panel_id or ("headless:panel:" .. self.name)
+  AGENT_RUNTIME[self] = {
+    -- Runtime sessions are issued only by create_runtime_session. Constructor
+    -- input must never select an existing session owned by another Agent.
+    session_id = nil,
+    panel_id = opts.panel_id or cfg_panel.panel_id or ("headless:panel:" .. opts.name),
+    lifecycle = opts.lifecycle,
+    context_refs = {
+      base_context_commit = opts.context_refs and opts.context_refs.base_context_commit,
+      session_id = opts.context_refs and opts.context_refs.session_id,
+      branch = opts.context_refs and opts.context_refs.branch,
+    },
+    last_role_checkpoint = opts.last_role_checkpoint,
+  }
   if opts.headless ~= nil then
     self.headless = opts.headless
   elseif cfg_panel.headless ~= nil then
@@ -273,8 +634,6 @@ function WheelAgent.new(opts)
   -- Lifecycle records are opt-in so existing in-process agents remain
   -- compatible. When supplied, the registry keeps identity, session, panel,
   -- task, context, role, model, and worktree references separate.
-  self.lifecycle = opts.lifecycle
-  self.session_id = opts.session_id
   self.worktree_id = opts.worktree_id
 
   self.provider = opts.provider
@@ -282,7 +641,13 @@ function WheelAgent.new(opts)
     self.provider = WheelProvider.create(self.model_profile)
   end
 
+  -- Structured references only. A forked agent points at immutable commits and
+  -- identifiers; it never receives a copied transcript or slot snapshot.
   return self
+end
+
+function WheelAgent.new(opts)
+  return new_agent(opts)
 end
 
 --- Create the explicit runtime AgentSession and Headless Panel records for
@@ -291,16 +656,18 @@ end
 --- @param opts table? lifecycle record overrides
 --- @return table session, table panel
 function WheelAgent:create_runtime_session(opts)
-  if not self.lifecycle or not WheelLifecycle then
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not WheelLifecycle then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "no lifecycle registry configured" }
   end
   opts = opts or {}
-  local panel = self.lifecycle:get_panel(opts.panel_id or self.panel_id)
+  local panel_id = opts.panel_id or authoritative_panel_id(self)
+  local panel = lifecycle:get_panel(panel_id)
   local panel_err
   if not panel then
-    panel, panel_err = self.lifecycle:create_panel({
-      panel_id = opts.panel_id or self.panel_id,
-      agent_id = self.agent_id,
+    panel, panel_err = lifecycle:create_panel({
+      panel_id = panel_id,
+      agent_id = authoritative_identity(self).agent_id,
       headless = self.headless,
       kind = opts.panel_kind or "headless",
     })
@@ -309,62 +676,101 @@ function WheelAgent:create_runtime_session(opts)
     end
   end
   if panel.state == WheelLifecycle.PanelState.CREATED then
-    panel, panel_err = self.lifecycle:ready_panel(panel.panel_id)
+    panel, panel_err = lifecycle:ready_panel(panel.panel_id)
     if not panel then return nil, panel_err end
   end
-  local session, session_err = self.lifecycle:create_agent_session({
+  local runtime = AGENT_RUNTIME[self]
+  runtime.pending_session_panel = panel.panel_id
+  local session, session_err = lifecycle:create_agent_session({
     session_id = opts.session_id,
-    agent_id = self.agent_id,
+    agent_id = authoritative_identity(self).agent_id,
     panel_id = panel.panel_id,
     task_id = opts.task_id or self.active_task_id,
     context_branch = opts.context_branch or self:current_branch(),
     context_head = opts.context_head,
-    role_binding = opts.role_binding or { role = self.role },
+    role_binding = binding_reference(authoritative_binding(self)),
+    authority_reference = authoritative_binding_token(self),
     model_profile = opts.model_profile or self.model_profile,
     worktree_id = opts.worktree_id or self.worktree_id,
   })
+  runtime.pending_session_panel = nil
   if not session then
     return nil, session_err
   end
-  self.session_id = session.session_id
-  self.panel_id = panel.panel_id
+  runtime.session_id = session.session_id
+  runtime.panel_id = panel.panel_id
   return session, panel
+end
+
+function WheelAgent:runtime_session_id()
+  return authoritative_session_id(self)
+end
+
+function WheelAgent:runtime_panel_id()
+  return authoritative_panel_id(self)
+end
+
+function WheelAgent:runtime_lifecycle()
+  return authoritative_lifecycle(self)
+end
+
+function WheelAgent:authority_reference()
+  return authoritative_binding_token(self)
+end
+
+function WheelAgent:resume_runtime_session()
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
+    return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
+  end
+  return lifecycle:resume_session(session_id)
 end
 
 --- Start this agent's runtime session after its panel is ready.
 function WheelAgent:activate_runtime_session()
-  if not self.lifecycle or not self.session_id then
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
   end
-  return self.lifecycle:activate_session(self.session_id)
+  return lifecycle:activate_session(session_id)
 end
 
 function WheelAgent:pause_runtime_session(reason)
-  if not self.lifecycle or not self.session_id then
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
   end
-  return self.lifecycle:pause_session(self.session_id, reason)
+  return lifecycle:pause_session(session_id, reason)
 end
 
 function WheelAgent:checkpoint_runtime_session(checkpoint)
-  if not self.lifecycle or not self.session_id then
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
   end
-  return self.lifecycle:checkpoint_session(self.session_id, checkpoint)
+  return lifecycle:checkpoint_session(session_id, checkpoint)
 end
 
 function WheelAgent:detach_runtime_session(opts)
-  if not self.lifecycle or not self.session_id then
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
   end
-  return self.lifecycle:detach_session(self.session_id, opts)
+  return lifecycle:detach_session(session_id, opts)
 end
 
 function WheelAgent:attach_runtime_session(panel_id, opts)
-  if not self.lifecycle or not self.session_id then
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id then
     return nil, { code = "E_LIFECYCLE_UNAVAILABLE", message = "runtime session is not configured" }
   end
-  return self.lifecycle:attach_session(self.session_id, panel_id, opts)
+  return lifecycle:attach_session(session_id, panel_id, opts)
 end
 
 --- Get the active LLM Provider adapter.
@@ -411,10 +817,19 @@ function WheelAgent:put_slot(name, content, expected_version)
   return nil, { error = "no_context", message = "No context engine available" }
 end
 
---- Check if a tool can be invoked under this agent's role authority.
---- @param tool_name string
---- @return boolean, string?
+--- Check if a tool can be invoked under this agent's current RoleBinding.
+-- Authorization is derived from the granted capability set on the binding, not
+-- from `name`, prompt identity text, or a role word alone.
+-- @param tool_name string
+-- @return boolean, string?
 function WheelAgent:is_tool_allowed(tool_name)
+  local binding = authoritative_binding(self)
+  if type(binding) ~= "table" then
+    return false, "agent '" .. tostring(self.name) .. "' has no role binding"
+  end
+  local granted = authoritative_capabilities(self)
+  local role = binding.role
+
   -- 1. Check if tool is in agent's declared tools
   local declared = false
   for _, t in ipairs(self.tools) do
@@ -427,25 +842,48 @@ function WheelAgent:is_tool_allowed(tool_name)
     return false, "tool '" .. tool_name .. "' is not in declared tools for " .. self.name
   end
 
-  -- 2. If tool is in registry, enforce intent-based role authority gating
+  -- 2. Map the tool intent to the capability it needs.
+  local required
+  local intent
+  local mutating = false
   if self.tool_registry and type(self.tool_registry.get_tool) == "function" and WheelTool then
     local tool_def = self.tool_registry:get_tool(tool_name)
     if tool_def then
-      local ok_auth, auth_err = WheelTool.check_role_authority(self.role, tool_def)
-      if not ok_auth then
-        return false, auth_err
+      intent = tool_def.intent or WheelTool.ActionIntent.INSPECT
+      if intent == WheelTool.ActionIntent.INSPECT or intent == WheelTool.ActionIntent.VERIFY then
+        required = intent
+      elseif intent == WheelTool.ActionIntent.MODIFY or intent == WheelTool.ActionIntent.EXECUTE then
+        required = intent
+        mutating = true
+      elseif intent == WheelTool.ActionIntent.CUSTOM then
+        required = tool_def.read_only and CAPABILITY_INSPECT or CAPABILITY_MODIFY
+        mutating = not tool_def.read_only
+      else
+        return false, "tool '" .. tool_name .. "' has an unknown intent"
+      end
+      if not granted[required] then
+        if mutating and not (granted[CAPABILITY_MODIFY] or granted[CAPABILITY_EXECUTE]) then
+          return false, string.format(
+            "role_authority_violation: role '%s' has read-only authority; lacks '%s' capability for tool '%s' with intent '%s'",
+            role, required,
+            tool_name, tostring(intent))
+        end
+        return false, string.format(
+          "role_authority_violation: role '%s' lacks '%s' capability for tool '%s'",
+          role, required, tool_name)
       end
       return true, nil
     end
   end
 
-  -- 3. Fallback role-based read-only gating: Research and Reviewer cannot call mutating tools
-  if self.role == WheelAgent.Role.RESEARCH or self.role == WheelAgent.Role.REVIEWER then
-    if not READ_ONLY_TOOLS[tool_name] then
-      return false, "role '" .. self.role .. "' has read-only authority; denied: " .. tool_name
-    end
+  -- 3. Unregistered tools still obey the same capability state.
+  if not READ_ONLY_TOOLS[tool_name] then
+    return false, "role '" .. role .. "' has read-only authority; tool '" .. tool_name
+      .. "' is not in the canonical read-only allowlist"
   end
-
+  if not granted[CAPABILITY_INSPECT] then
+    return false, "role '" .. role .. "' lacks 'inspect' capability; denied: " .. tool_name
+  end
   return true, nil
 end
 
@@ -476,7 +914,7 @@ function WheelAgent:execute_tool(tool_name, args)
   end
 
   return self.tool_registry:dispatch(tool_name, args, {
-    role = self.role,
+    role = authoritative_binding(self).role,
     agent_name = self.name,
     workspace_root = self.workspace and self.workspace.root or ".",
     kernel = self.kernel,
@@ -705,7 +1143,7 @@ function WheelAgent:execute_task(task_id, step_fn)
     checkpoints = checkpoints,
     iterations = iterations,
     error = final_error,
-    panel_id = self.panel_id,
+    panel_id = authoritative_panel_id(self),
     headless = self.headless,
     model_profile = self.model_profile,
     prefix_cache_key = self.last_prefix_cache_key,
@@ -723,8 +1161,10 @@ end
 --- @param plan_items table[] Array of { id = string, title = string, description = string, priority = number?, dependencies = string[]? }
 --- @return table[] List of created task records
 function WheelAgent:decompose_plan(plan_items)
-  if self.role ~= WheelAgent.Role.COMMANDER then
-    error("Only Commander role may decompose project plans (current role: " .. self.role .. ")")
+  local binding = authoritative_binding(self)
+  local role = binding and binding.role or nil
+  if role ~= ROLE_COMMANDER or not authoritative_capabilities(self)[CAPABILITY_ORCHESTRATE] then
+    error("Only Commander role with orchestrate capability may decompose project plans (current role: " .. tostring(role) .. ")")
   end
   local created = {}
   for _, item in ipairs(plan_items) do
@@ -739,8 +1179,10 @@ end
 --- @param review_fn fun(agent: table, task: table, history: table[])?: boolean, string
 --- @return table { approved: boolean, reason: string?, checkpoint: string? }
 function WheelAgent:review_task(task_id, review_fn)
-  if self.role ~= WheelAgent.Role.REVIEWER then
-    error("Only Reviewer role may review tasks (current role: " .. self.role .. ")")
+  local binding = authoritative_binding(self)
+  local role = binding and binding.role or nil
+  if role ~= ROLE_REVIEWER or not authoritative_capabilities(self)[CAPABILITY_VERIFY] then
+    error("Only Reviewer role with verify capability may review tasks (current role: " .. tostring(role) .. ")")
   end
   local task = self.kernel:get_task(task_id)
   if not task then
@@ -827,13 +1269,443 @@ function WheelAgent:current_branch()
   return "(detached)"
 end
 
---- Get current agent status summary including headless panel container telemetry and model profile.
---- @return table
+--- Project a RoleBinding into the bounded reference shape used by lifecycle
+-- records. Capability state is runtime authority and is not persisted as prompt
+-- or tool content.
+-- @param binding table
+-- @return table|nil
+function WheelAgent.binding_reference(binding)
+  return binding_reference(binding)
+end
+
+local function binding_copy(binding)
+  if type(binding) ~= "table" then return nil end
+  local capabilities = {}
+  for index, capability in ipairs(binding.capabilities or {}) do capabilities[index] = capability end
+  return {
+    role = binding.role,
+    binding_id = binding.binding_id,
+    policy_generation = binding.policy_generation,
+    capabilities = capabilities,
+  }
+end
+
+local function capabilities_equal(left, right)
+  if #left ~= #right then return false end
+  for index = 1, #left do
+    if left[index] ~= right[index] then return false end
+  end
+  return true
+end
+
+--- Current authoritative role, read from the RoleBinding.
+-- @return string|nil
+function WheelAgent:current_role()
+  local binding = authoritative_binding(self)
+  return binding and binding.role or nil
+end
+
+--- Check whether the current RoleBinding grants a capability.
+-- @param capability string WheelAgent.Capability value
+-- @return boolean
+function WheelAgent:has_capability(capability)
+  local binding = authoritative_binding(self)
+  return capability_map(binding and binding.capabilities)[capability] == true
+end
+
+--- Get a defensive copy of the granted capability set.
+-- @return table
+function WheelAgent:capabilities()
+  local result = {}
+  local binding = authoritative_binding(self)
+  for index, capability in ipairs(binding and binding.capabilities or {}) do
+    result[index] = capability
+  end
+  return result
+end
+
+--- Audited role transition that preserves the stable Agent identity.
+-- The transition issues a new RoleBinding with the next policy generation and
+-- commits an immutable Context checkpoint boundary. A transition that would add
+-- a capability fails closed unless the caller explicitly approves the widening;
+-- there is no silent path from a wider-capability role to a narrower one.
+-- @param target string|table Role name or a partial RoleBinding { role, capabilities }
+-- @param opts table { reason = string, approve_widening = boolean?, model_profile = table? }
+-- @return table|nil new binding projection, table|nil typed error
+function WheelAgent:transition_role(target, opts)
+  opts = opts or {}
+  local requested = type(target) == "table" and target or { role = target }
+  local reason = bounded_string(opts.reason, MAX_REASON_BYTES)
+  if not reason then
+    return nil, { code = "E_ROLE_INVALID", message = "role transition requires a bounded reason" }
+  end
+  local current = authoritative_binding(self)
+  local identity = authoritative_identity(self)
+  if type(current) ~= "table" then
+    return nil, { code = "E_ROLE_INVALID", message = "agent has no role binding" }
+  end
+  local generation = (current.policy_generation or POLICY_GENERATION_START) + 1
+  local normalized, binding_err = normalize_role_binding({
+    role = requested.role,
+    capabilities = requested.capabilities or opts.capabilities,
+    -- Binding identifiers are issued by the canonical authority, never by a
+    -- caller-provided transition request.
+    binding_id = nil,
+    policy_generation = generation,
+  }, identity and identity.agent_id)
+  if not normalized then
+    return nil, { code = "E_ROLE_INVALID", message = tostring(binding_err) }
+  end
+  if normalized.role == current.role
+    and capabilities_equal(normalized.capabilities, current.capabilities) then
+    return nil, { code = "E_ROLE_NOOP", message = "role binding is already in the requested state" }
+  end
+  local added = capability_diff(normalized.capabilities, current.capabilities)
+  if #added > 0 and opts.approve_widening ~= true then
+    return nil, {
+      code = "E_ROLE_AUTHORITY",
+      message = string.format(
+        "role transition '%s' -> '%s' would widen authority (%s); explicit approval required",
+        current.role, normalized.role, table.concat(added, ",")),
+    }
+  end
+  if not self.context or type(self.context.commit_checkpoint) ~= "function" then
+    return nil, {
+      code = "E_ROLE_CHECKPOINT",
+      message = "role transition requires an immutable Context checkpoint boundary",
+    }
+  end
+  local task_id = self.kernel and self.kernel.active_task_id or nil
+  local checkpoint = self.context:commit_checkpoint({
+    author = identity and identity.agent_id,
+    task_id = task_id,
+    message = string.format("Role transition %s -> %s (policy generation %d)",
+      current.role, normalized.role, generation),
+    rationale = {
+      why = "Role transition requested: " .. reason,
+      what = string.format("Reissued RoleBinding %s at policy generation %d",
+        tostring(normalized.binding_id), generation),
+      where_focus = "agent " .. tostring(identity and identity.agent_id),
+      how = #added > 0
+        and ("explicit widening approval granted for: " .. table.concat(added, ","))
+        or "narrowed or re-scoped capabilities without widening authority",
+      expected = "authority follows the new RoleBinding capability state only",
+      observed = "previous generation " .. tostring(current.policy_generation or POLICY_GENERATION_START),
+    },
+  })
+  if not checkpoint or not checkpoint.hash then
+    return nil, { code = "E_ROLE_CHECKPOINT", message = "role transition checkpoint was not committed" }
+  end
+  -- The checkpoint is immutable and may remain if a later record fails; the
+  -- in-memory binding is not applied until the lifecycle record succeeds, so a
+  -- failure never widens authority.
+  local session_id = authoritative_session_id(self)
+  local lifecycle = authoritative_lifecycle(self)
+  if not lifecycle or not session_id
+    or type(lifecycle.record_role_transition) ~= "function" then
+    return nil, {
+      code = "E_ROLE_AUDIT",
+      message = "role transition requires a lifecycle session for audit",
+    }
+  end
+  AGENT_RUNTIME[self].pending_role_binding = normalized
+  local recorded, record_err = lifecycle:record_role_transition(session_id, {
+    role_binding = binding_reference(normalized),
+    checkpoint = checkpoint.hash,
+    reason = #added > 0 and "role_widening" or "role_transition",
+    authority_reference = authoritative_binding_token(self),
+  })
+  AGENT_RUNTIME[self].pending_role_binding = nil
+  if not recorded then
+    return nil, record_err or {
+      code = "E_ROLE_AUDIT",
+      message = "role transition could not be recorded in the lifecycle registry",
+    }
+  end
+  AGENT_AUTHORITY[self] = { role_binding = normalized, token = authoritative_binding_token(self) }
+  self.role = normalized.role
+  AGENT_RUNTIME[self].last_role_checkpoint = checkpoint.hash
+  local projection = binding_copy(normalized)
+  projection.checkpoint = checkpoint.hash
+  projection.widened = #added > 0
+  projection.added_capabilities = added
+  return projection
+end
+
+--- Structured lineage projection shared by status, checkpoint, and context
+-- projections. It contains references only.
+-- @return table
+function WheelAgent:lineage_projection()
+  local identity = authoritative_identity(self)
+  local lineage = identity and identity.lineage
+  return {
+    agent_id = identity and identity.agent_id or nil,
+    name = self.name,
+    policy_generation = authoritative_policy_generation(self),
+    role_binding = binding_reference(authoritative_binding(self)),
+    forked_from_agent = lineage and lineage.forked_from_agent or nil,
+    forked_from_session = lineage and lineage.forked_from_session or nil,
+    base_context_commit = lineage and lineage.base_context_commit or nil,
+    reason = lineage and lineage.reason or nil,
+    role_checkpoint = authoritative_role_checkpoint(self),
+  }
+end
+
+--- Structured Context references for this agent. A forked agent receives these
+-- references instead of a copied transcript or slot snapshot.
+-- @return table
+function WheelAgent:context_reference()
+  local refs = authoritative_context_refs(self)
+  return {
+    agent_id = authoritative_identity(self).agent_id,
+    base_context_commit = refs.base_context_commit,
+    session_id = authoritative_context_session_id(self),
+    branch = refs.branch or self:current_branch(),
+    head = self.context and type(self.context.head_commit_hash) == "function"
+      and self.context:head_commit_hash() or nil,
+  }
+end
+
+--- Build a role-aware Context projection with this agent's identity, RoleBinding,
+-- and lineage attached as provenance. Lineage is therefore visible in every
+-- checkpoint projection without entering prompt or transcript content.
+-- @param opts table WheelContext:project options
+-- @return table|nil projection, table|nil typed error
+function WheelAgent:context_projection(opts)
+  opts = opts or {}
+  if not self.context or type(self.context.project) ~= "function" then
+    return nil, { code = "E_NO_CONTEXT", message = "agent has no context engine configured" }
+  end
+  local projection_opts = {}
+  for key, value in pairs(opts) do projection_opts[key] = value end
+  local identity = authoritative_identity(self)
+  local authoritative_id = identity and identity.agent_id
+  local expected_binding = binding_reference(authoritative_binding(self))
+  local expected_lineage = identity and copy_lineage(identity.lineage) or nil
+  if projection_opts.agent_id ~= nil and projection_opts.agent_id ~= authoritative_id then
+    return nil, { code = "E_IDENTITY_PROJECTION", message = "projection agent_id conflicts with Agent identity" }
+  end
+  if projection_opts.role_binding ~= nil then
+    local supplied = binding_reference(projection_opts.role_binding)
+    if not supplied or supplied.agent_id ~= expected_binding.agent_id
+      or supplied.role ~= expected_binding.role
+      or supplied.binding_id ~= expected_binding.binding_id
+      or supplied.policy_generation ~= expected_binding.policy_generation then
+      return nil, { code = "E_IDENTITY_PROJECTION", message = "projection RoleBinding conflicts with Agent authority" }
+    end
+  else
+    projection_opts.role_binding = expected_binding
+  end
+  if projection_opts.lineage ~= nil then
+    local supplied = validate_lineage(projection_opts.lineage)
+    if not supplied or not expected_lineage
+      or supplied.forked_from_agent ~= expected_lineage.forked_from_agent
+      or supplied.forked_from_session ~= expected_lineage.forked_from_session
+      or supplied.base_context_commit ~= expected_lineage.base_context_commit
+      or supplied.reason ~= expected_lineage.reason then
+      return nil, { code = "E_IDENTITY_PROJECTION", message = "projection lineage conflicts with Agent identity" }
+    end
+  elseif expected_lineage then
+    projection_opts.lineage = expected_lineage
+  end
+  projection_opts.agent_id = authoritative_id
+  local canonical_session_id = authoritative_session_id(self)
+  local canonical_context_session_id = canonical_session_id or authoritative_context_session_id(self)
+  if projection_opts.session_id ~= nil and projection_opts.session_id ~= canonical_context_session_id then
+    return nil, { code = "E_IDENTITY_PROJECTION", message = "projection session_id conflicts with Agent runtime" }
+  end
+  projection_opts.session_id = canonical_context_session_id
+  return self.context:project(projection_opts)
+end
+
+local commit_fork_widening
+
+--- Fork an independent Agent identity from an immutable ContextCommit.
+-- The child shares the context engine by reference, records lineage identifiers,
+-- and starts with its own RoleBinding. No transcript, prompt, or slot content is
+-- copied, and a fork may not silently widen authority beyond its parent.
+-- @param parent table WheelAgent instance
+-- @param opts table { name, agent_id?, role?, role_binding?, reason,
+--   base_context_commit?, forked_from_session?, approve_widening?, tools?,
+--   budget?, workspace?, lifecycle?, panel_id?, headless? }
+-- @return table|nil child agent, table|nil typed error
+function WheelAgent.fork_agent(parent, opts)
+  opts = opts or {}
+  local parent_binding = authoritative_binding(parent)
+  local parent_identity = authoritative_identity(parent)
+  if not parent_binding or not parent_identity then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a parent Agent" }
+  end
+  local name = bounded_string(opts.name, MAX_IDENTITY_BYTES)
+  if not name then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded child name" }
+  end
+  local agent_id = opts.agent_id or name
+  if not bounded_string(agent_id, MAX_IDENTITY_BYTES) then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded child agent_id" }
+  end
+  if name == parent.name or agent_id == parent_identity.agent_id then
+    return nil, {
+      code = "E_FORK_IDENTITY",
+      message = "fork requires an independent Agent identity",
+    }
+  end
+  if not parent.context or type(parent.context.get_commit) ~= "function" then
+    return nil, {
+      code = "E_FORK_CONTEXT",
+      message = "fork requires a parent context engine with immutable commits",
+    }
+  end
+  local base = opts.base_context_commit or parent.context:head_commit_hash()
+  local commit = type(base) == "string" and parent.context:get_commit(base) or nil
+  if not commit or type(commit.hash) ~= "string" or #commit.hash ~= COMMIT_HASH_BYTES then
+    return nil, {
+      code = "E_FORK_CONTEXT",
+      message = "fork requires an immutable ContextCommit as base_context_commit",
+    }
+  end
+  local reason = bounded_string(opts.reason, MAX_REASON_BYTES)
+  if not reason then
+    return nil, { code = "E_FORK_INVALID", message = "fork requires a bounded reason" }
+  end
+  local initial, binding_err = normalize_role_binding(
+    opts.role_binding or { role = opts.role or parent_binding.role,
+      capabilities = opts.capabilities }, agent_id)
+  if not initial then
+    return nil, { code = "E_FORK_INVALID", message = tostring(binding_err) }
+  end
+  local added = capability_diff(initial.capabilities, parent_binding.capabilities)
+  if #added > 0 and opts.approve_widening ~= true then
+    return nil, {
+      code = "E_FORK_AUTHORITY",
+      message = "fork would widen authority (" .. table.concat(added, ",")
+        .. "); explicit approval required",
+    }
+  end
+  local canonical_parent_session = authoritative_session_id(parent)
+  if #added > 0 then
+    local lifecycle = authoritative_lifecycle(parent)
+    local session = lifecycle and canonical_parent_session and lifecycle:get_session(canonical_parent_session)
+    if not session or session.state == WheelLifecycle.AgentSessionState.ENDED
+      or session.state == WheelLifecycle.AgentSessionState.ABANDONED then
+      return nil, { code = "E_FORK_AUTHORITY", message = "fork widening requires a nonterminal canonical parent session" }
+    end
+  end
+  if opts.forked_from_session ~= nil and opts.forked_from_session ~= canonical_parent_session then
+    return nil, { code = "E_FORK_AUTHORITY", message = "fork parent session does not match canonical parent state" }
+  end
+  local forked_from_session = canonical_parent_session
+  if not forked_from_session and opts.forked_from_session ~= nil then
+    return nil, { code = "E_FORK_AUTHORITY", message = "fork requires a canonical parent session" }
+  end
+  local lineage, lineage_err = validate_lineage({
+    forked_from_agent = parent_identity.agent_id,
+    forked_from_session = forked_from_session,
+    base_context_commit = commit.hash,
+    reason = reason,
+  })
+  if not lineage then
+    return nil, { code = "E_FORK_INVALID", message = tostring(lineage_err) }
+  end
+  local context_refs = {
+    base_context_commit = commit.hash,
+    session_id = forked_from_session,
+    branch = opts.base_context_branch or parent:current_branch(),
+  }
+  local child = new_agent({
+    name = name,
+    agent_id = agent_id,
+    kernel = opts.kernel or parent.kernel,
+    config = opts.config or parent.config,
+    tools = opts.tools or deep_copy(parent.tools),
+    budget = opts.budget or deep_copy(parent.budget),
+    workspace = opts.workspace or deep_copy(parent.workspace),
+    context = parent.context,
+    tool_registry = opts.tool_registry or parent.tool_registry,
+    provider = opts.provider,
+    lifecycle = opts.lifecycle or parent.lifecycle,
+    headless = opts.headless,
+    panel_id = opts.panel_id,
+    lineage = lineage,
+    context_refs = context_refs,
+  }, initial)
+  if #added > 0 and opts.approve_widening == true then
+    local lifecycle = authoritative_lifecycle(parent)
+    if not canonical_parent_session or not lifecycle
+      or type(lifecycle.record_authority_widening) ~= "function" then
+      return nil, { code = "E_FORK_AUTHORITY", message = "approved widening requires an auditable parent lifecycle session" }
+    end
+    PENDING_FORK_WIDENING[child] = {
+      parent = parent,
+      parent_session_id = canonical_parent_session,
+      checkpoint = commit.hash,
+      capability_delta = table.concat(added, ","),
+    }
+    local child_session, child_session_err = child:create_runtime_session({
+      session_id = opts.session_id,
+      panel_id = opts.panel_id,
+      task_id = opts.task_id,
+      context_branch = opts.context_branch,
+      context_head = opts.context_head or commit.hash,
+    })
+    if not child_session then
+      PENDING_FORK_WIDENING[child] = nil
+      return nil, child_session_err
+    end
+    local audited, audit_err = commit_fork_widening(parent, child)
+    if not audited then
+      pcall(lifecycle.end_session, lifecycle, child_session.session_id, "explicit")
+      return nil, audit_err
+    end
+  end
+  return child
+end
+
+--- Commit the dedicated lifecycle audit for an approved fork widening. The
+-- pending record is private and can only be created by fork_agent.
+commit_fork_widening = function(parent, child)
+  local pending = PENDING_FORK_WIDENING[child]
+  if not pending or pending.parent ~= parent then
+    return nil, { code = "E_FORK_AUTHORITY", message = "fork widening was not approved canonically" }
+  end
+  local lifecycle = authoritative_lifecycle(child)
+  local child_session_id = authoritative_session_id(child)
+  if not lifecycle or lifecycle ~= authoritative_lifecycle(parent) or not child_session_id then
+    return nil, { code = "E_FORK_AUTHORITY", message = "fork widening requires parent and child lifecycle sessions" }
+  end
+  local event, err = lifecycle:record_authority_widening(
+    pending.parent_session_id, child_session_id, {
+      parent_authority_reference = authoritative_binding_token(parent),
+      child_authority_reference = authoritative_binding_token(child),
+      checkpoint = pending.checkpoint,
+      capability_delta = pending.capability_delta,
+    })
+  if not event then return nil, err end
+  PENDING_FORK_WIDENING[child] = nil
+  child.approved_widening = true
+  return event
+end
+
+function WheelAgent.commit_fork_widening(parent, child)
+  return commit_fork_widening(parent, child)
+end
+
+--- Get current agent status summary including headless panel container telemetry
+-- and model profile. Identity, RoleBinding, policy generation, and lineage are
+-- separate fields so no caller has to parse a role word out of prompt text.
+-- @return table
 function WheelAgent:status()
+  local identity = authoritative_identity(self)
+  local binding = authoritative_binding(self)
   return {
     name = self.name,
-    role = self.role,
-    panel_id = self.panel_id,
+    agent_id = identity and identity.agent_id or nil,
+    role = binding and binding.role or nil,
+    role_binding = binding_copy(binding),
+    policy_generation = binding and binding.policy_generation or nil,
+    lineage = self:lineage_projection(),
+    context_refs = self:context_reference(),
+    panel_id = authoritative_panel_id(self),
     headless = self.headless,
     model_profile = self.model_profile,
     model = self.model,
@@ -848,6 +1720,85 @@ function WheelAgent:status()
     context_branch = self:current_branch(),
     context_head = self.context and type(self.context.head_commit_hash) == "function" and self.context:head_commit_hash() or nil,
   }
+end
+
+-- Stable Agent identity, fork lineage, and the current RoleBinding are immutable
+-- after construction. RoleBinding changes flow only through transition_role,
+-- which issues a new binding and policy generation instead of rewriting history.
+local IMMUTABLE_FIELDS = {
+  agent_id = true, lineage = true, role_binding = true, session_id = true,
+  panel_id = true, policy_generation = true, context_refs = true,
+  last_role_checkpoint = true,
+}
+
+agent_index = function(target, key)
+  if key == "agent_id" or key == "lineage" then
+    local identity = AGENT_IDENTITY[target]
+    if not identity then return nil end
+    if key == "lineage" then return copy_lineage(identity.lineage) end
+    return identity.agent_id
+  end
+  if key == "role_binding" then
+    local authority = AGENT_AUTHORITY[target]
+    return authority and binding_copy(authority.role_binding) or nil
+  end
+  if key == "session_id" then return authoritative_session_id(target) end
+  if key == "panel_id" then return authoritative_panel_id(target) end
+  if key == "policy_generation" then return authoritative_policy_generation(target) end
+  if key == "last_role_checkpoint" then return authoritative_role_checkpoint(target) end
+  if key == "context_refs" then
+    return deep_copy(authoritative_context_refs(target))
+  end
+  if key == "lifecycle" then return authoritative_lifecycle(target) end
+  local fields = AGENT_FIELDS[target]
+  if fields and fields[key] ~= nil then return fields[key] end
+  return WheelAgent[key]
+end
+
+agent_newindex = function(target, key, value)
+  if IMMUTABLE_FIELDS[key] then
+    error("agent identity field '" .. tostring(key) .. "' is immutable", 2)
+  end
+  local fields = AGENT_FIELDS[target]
+  if not fields then error("invalid Agent handle", 2) end
+  fields[key] = value
+end
+WheelAgent.__index = agent_index
+WheelAgent.__newindex = agent_newindex
+
+-- The protected module metatable is a read-only issuer bridge. Lifecycle reads
+-- this bridge rather than any replaceable module export or caller callback.
+-- References resolve only through the private registry populated by new().
+local function resolve_authority(reference, lifecycle, session_id, candidate, creation)
+  local agent = AUTHORITY_AGENTS[reference]
+  local runtime = agent and AGENT_RUNTIME[agent]
+  local identity = agent and authoritative_identity(agent)
+  local current = agent and authoritative_binding(agent)
+  if not runtime or not identity or not current or runtime.lifecycle ~= lifecycle
+    or type(candidate) ~= "table" then return nil end
+  if creation then
+    if runtime.pending_session_panel ~= creation.panel_id
+      or identity.agent_id ~= creation.agent_id then return nil end
+  elseif runtime.session_id ~= session_id then
+    return nil
+  end
+  local binding = (not creation and runtime.pending_role_binding) or current
+  if candidate.role ~= binding.role or candidate.binding_id ~= binding.binding_id
+    or candidate.policy_generation ~= binding.policy_generation then return nil end
+  return {
+    agent_id = identity.agent_id,
+    role_binding = { role = binding.role, binding_id = binding.binding_id,
+      policy_generation = binding.policy_generation },
+    capabilities = deep_copy(binding.capabilities),
+  }
+end
+if type(newproxy) == "function" then
+  local issuer = newproxy(true)
+  local issuer_meta = getmetatable(issuer)
+  issuer_meta.__index = function(_, key) if key == "resolve" then return resolve_authority end end
+  issuer_meta.__newindex = function() error("Agent issuer is immutable", 2) end
+  issuer_meta.__metatable = "WheelAgent issuer"
+  setmetatable(WheelAgent, { __metatable = issuer })
 end
 
 return WheelAgent

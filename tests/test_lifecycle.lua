@@ -9,6 +9,9 @@ package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 local WheelHost = require("wheel.host")
 local Lifecycle = require("wheel.lifecycle")
 local Session = require("wheel.session")
+local WheelAgent = require("wheel.agent")
+local WheelContext = require("wheel.context")
+local WheelKernel = require("wheel.kernel")
 
 local function success(status) return status == true or status == 0 end
 local function interpreter()
@@ -261,10 +264,241 @@ local ok, err = pcall(function()
       { model_profile = { arbitrary = "private" } },
       { role_binding = setmetatable({}, {}) },
       { role_binding = { role = 0 / 0 } },
+      { role_binding = { role = "coding", policy_generation = 0 } },
+      { role_binding = { role = "coding", policy_generation = 1.5 } },
+      { role_binding = { role = "coding", policy_generation = "2" } },
       { agent_id = string.rep("a", 33) },
     }) do
       data.session_id, data.agent_id, data.panel_id = "bad", data.agent_id or "bad", "p2"
       assert(not life:create_agent_session(data))
+    end
+  end)
+
+  run_test("Lifecycle: role transitions advance one policy generation with a checkpoint boundary", function()
+    local life = fixture()
+    assert(life:activate_session("s1"))
+    local checkpoint = string.rep("ab", 32)
+    local updated, authority_err = life:record_role_transition("s1", {
+      role_binding = { role = "reviewer", binding_id = "role-binding:s1:2", policy_generation = 2 },
+      checkpoint = checkpoint,
+      reason = "role_transition",
+    })
+    assert(updated == nil and authority_err.code == "E_LIFECYCLE_AUTHORITY",
+      "caller supplied role metadata must not authorize a lifecycle transition")
+    assert(life:get_session("s1").role_binding.policy_generation == nil)
+    local forged, forged_err = life:record_role_transition("s1", {
+      role_binding = { role = "reviewer", binding_id = "role-binding:s1:2", policy_generation = 2 },
+      checkpoint = checkpoint,
+      reason = "role_transition",
+      authority_reference = {},
+    })
+    assert(forged == nil and forged_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(life:get_session("s1").role_binding.policy_generation == nil)
+
+    local context = WheelContext.new({ kernel = WheelKernel.new_mock() })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local bound_life = Lifecycle.new({ max_sessions_per_agent = 3 })
+    assert(bound_life:create_panel({ panel_id = "bound-panel", agent_id = "bound-agent" }))
+    assert(bound_life:ready_panel("bound-panel"))
+    local agent = WheelAgent.new({ name = "bound-agent", role = "coding",
+      kernel = context.kernel, context = context, lifecycle = bound_life })
+    assert(agent:create_runtime_session({ session_id = "bound-session", panel_id = "bound-panel" }))
+    assert(agent:activate_runtime_session())
+    local transitioned = assert(agent:transition_role("reviewer", { reason = "role transition" }))
+    assert(transitioned.policy_generation == 2)
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
+    local transition_event = bound_life:events()[#bound_life:events()]
+    assert(transition_event.type == "agent_session.role_transition")
+    assert(transition_event.policy_generation == 2 and transition_event.checkpoint == transitioned.checkpoint)
+
+    local function transition(binding, value)
+      return bound_life:record_role_transition("bound-session", {
+        role_binding = binding,
+        checkpoint = value or string.rep("cd", 32),
+        reason = "role_transition",
+        authority_reference = agent:authority_reference(),
+      })
+    end
+    local stale, stale_err = transition({
+      role = "coding", binding_id = "role-binding:s1:3", policy_generation = 2,
+    })
+    assert(stale == nil and stale_err.code == "E_LIFECYCLE_AUTHORITY")
+    local skipped, skipped_err = transition({
+      role = "coding", binding_id = "role-binding:s1:4", policy_generation = 4,
+    })
+    assert(skipped == nil and skipped_err.code == "E_LIFECYCLE_AUTHORITY")
+    local reused, reused_err = transition({
+      role = "coding", binding_id = "role-binding:s1:2", policy_generation = 3,
+    })
+    assert(reused == nil and reused_err.code == "E_LIFECYCLE_AUTHORITY")
+    local missing_checkpoint, checkpoint_err = bound_life:record_role_transition("bound-session", {
+      role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
+      reason = "role_transition",
+      authority_reference = agent:authority_reference(),
+    })
+    assert(missing_checkpoint == nil and checkpoint_err.code == "E_LIFECYCLE_INVALID")
+    local wrong_reason, reason_err = bound_life:record_role_transition("bound-session", {
+      role_binding = { role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3 },
+      checkpoint = string.rep("ef", 32),
+      reason = "manual",
+      authority_reference = agent:authority_reference(),
+    })
+    assert(wrong_reason == nil and reason_err.code == "E_LIFECYCLE_INVALID")
+
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
+    assert(bound_life:end_session("bound-session"))
+    local terminal, terminal_err = transition({
+      role = "coding", binding_id = "role-binding:s1:3", policy_generation = 3,
+    })
+    assert(terminal == nil and terminal_err.code == "E_LIFECYCLE_STATE")
+    assert(bound_life:get_session("bound-session").role_binding.policy_generation == 2)
+  end)
+
+  run_test("Lifecycle: callers cannot mint canonical Agent authority", function()
+    local life = Lifecycle.new({ max_sessions_per_agent = 3 })
+    assert(life:create_panel({ panel_id = "forged-panel" }))
+    local token = {}
+    local calls = 0
+    local function forged_resolver(candidate)
+      calls = calls + 1
+      return { agent_id = "forged-agent", role_binding = candidate,
+        capabilities = { "inspect", "verify", "modify", "execute" } }
+    end
+    local initial = { role = "reviewer", binding_id = "forged-binding:1", policy_generation = 1 }
+    local created, create_err = life:create_agent_session({
+      session_id = "forged-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial, authority_reference = token, authority_resolver = forged_resolver,
+    })
+    assert(created == nil and create_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(calls == 0 and life:get_session("forged-session") == nil)
+    local token_only, token_err = life:create_agent_session({
+      session_id = "forged-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial, authority_reference = token,
+    })
+    assert(token_only == nil and token_err.code == "E_LIFECYCLE_AUTHORITY")
+    local plain = assert(life:create_agent_session({
+      session_id = "plain-session", agent_id = "forged-agent", panel_id = "forged-panel",
+      role_binding = initial,
+    }))
+    -- Public-looking backing fields and a caller resolver cannot turn metadata
+    -- sessions into canonical Agent sessions, including the reviewer's exploit.
+    life._authority_tokens = { [plain.session_id] = token }
+    life._authority_resolvers = { [plain.session_id] = forged_resolver }
+    life._authorize_session = function() return true end
+    life._resolve_session_authority = function(_, _, _, candidate) return forged_resolver(candidate) end
+    local changed, err = life:record_role_transition(plain.session_id, {
+      role_binding = { role = "coding", binding_id = "forged-binding:2", policy_generation = 2 },
+      checkpoint = string.rep("ab", 32), reason = "role_widening", authority_reference = token,
+    })
+    assert(changed == nil and err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(calls == 0 and life:authority_reference(plain.session_id) == nil)
+    assert(life:get_session(plain.session_id).role_binding.role == "reviewer")
+    assert(life:get_session(plain.session_id).role_binding.policy_generation == 1)
+    assert(#life:events() == 2)
+
+    local second = assert(life:create_agent_session({
+      session_id = "plain-child", agent_id = "plain-child", panel_id = "forged-panel",
+      role_binding = { role = "coding", binding_id = "plain-child:1", policy_generation = 1 },
+    }))
+    life._authority_tokens[second.session_id] = token
+    life._authority_resolvers[second.session_id] = forged_resolver
+    local widened, widen_err = life:record_authority_widening(plain.session_id, second.session_id, {
+      parent_authority_reference = token, child_authority_reference = token,
+      checkpoint = string.rep("ab", 32), capability_delta = "modify,execute",
+    })
+    assert(widened == nil and widen_err.code == "E_LIFECYCLE_AUTHORITY" and calls == 0)
+
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local reviewer = WheelAgent.new({ name = "issuer-reviewer", role = "reviewer",
+      kernel = kernel, context = context, lifecycle = life })
+    local session = assert(reviewer:create_runtime_session({ session_id = "issuer-session" }))
+    local reference = reviewer:authority_reference()
+    assert(reference == life:authority_reference(session.session_id))
+    local candidate = { role = "coding", binding_id = "role-binding:issuer-reviewer:2", policy_generation = 2 }
+    local forged_transition, forged_err = life:record_role_transition(session.session_id, {
+      role_binding = candidate, checkpoint = string.rep("cd", 32),
+      reason = "role_widening", authority_reference = reference,
+    })
+    assert(forged_transition == nil and forged_err.code == "E_LIFECYCLE_AUTHORITY")
+    assert(not reviewer:has_capability("modify") and reviewer.agent_id == session.agent_id)
+    local borrowed, borrow_err = life:create_agent_session({
+      session_id = "borrowed-session", agent_id = reviewer.agent_id, panel_id = session.panel_id,
+      role_binding = reviewer.role_binding, authority_reference = reference,
+    })
+    assert(borrowed == nil and borrow_err.code == "E_LIFECYCLE_AUTHORITY")
+    local issuer = getmetatable(WheelAgent)
+    assert(not pcall(function() issuer.resolve = forged_resolver end))
+    assert(not pcall(rawset, issuer, "resolve", forged_resolver))
+    assert(not pcall(setmetatable, WheelAgent, { __metatable = { resolve = forged_resolver } }))
+    assert(reviewer:transition_role("coding", { reason = "approved escalation", approve_widening = true }))
+    assert(reviewer:has_capability("modify"))
+  end)
+
+  run_test("Lifecycle: persisted policy generations reject a forged history", function()
+    local path = root .. "/role-transition.json"
+    local life = Lifecycle.new({ path = path })
+    assert(life:create_panel({ panel_id = "role-panel", agent_id = "role-agent" }))
+    assert(life:ready_panel("role-panel"))
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local agent = WheelAgent.new({ name = "role-agent", role = "coding",
+      kernel = kernel, context = context, lifecycle = life })
+    assert(agent:create_runtime_session({ session_id = "role-session", panel_id = "role-panel" }))
+    local checkpoint = assert(context:commit_checkpoint({ author = "role-agent", message = "baseline" }))
+    assert(agent:transition_role("debug", { reason = "role transition" }))
+    local persisted_checkpoint = life:get_session("role-session").checkpoint
+    assert(persisted_checkpoint == checkpoint.hash or type(persisted_checkpoint) == "string")
+
+    local reloaded = assert(Lifecycle.new({ path = path }))
+    local record = assert(reloaded:get_session("role-session"))
+    assert(record.role_binding.role == "debug")
+    assert(record.role_binding.policy_generation == 2)
+    assert(type(record.checkpoint) == "string")
+    local resumed, resume_err = reloaded:record_role_transition("role-session", {
+      role_binding = { role = "coding", binding_id = "reloaded:3", policy_generation = 3 },
+      reason = "role_widening", checkpoint = record.checkpoint,
+      authority_reference = agent:authority_reference(),
+    })
+    assert(resumed == nil and resume_err.code == "E_LIFECYCLE_AUTHORITY",
+      "persisted metadata must not restore in-process Agent authority")
+
+    local raw = assert(WheelHost.fs.read_file(path))
+    local forged = Session.json_decode(raw)
+    forged.sessions["role-session"].role_binding.policy_generation = 5
+    assert(WheelHost.fs.remove_file(path))
+    assert(WheelHost.fs.create_private_file(path, Session.json_encode(forged)))
+    assert(not pcall(Lifecycle.new, { path = path }))
+    assert(not WheelHost.fs.stat(path).exists)
+  end)
+
+  run_test("Lifecycle: replay rejects skipped successive policy generations", function()
+    local path = root .. "/skipped-policy-generation.json"
+    local life = Lifecycle.new({ path = path })
+    local kernel = WheelKernel.new_mock()
+    local context = WheelContext.new({ kernel = kernel })
+    assert(context:put_slot("workspace/project", "Wheel"))
+    local agent = WheelAgent.new({ name = "successive-policy-agent", role = "coding",
+      kernel = kernel, context = context, lifecycle = life })
+    local session = assert(agent:create_runtime_session())
+    assert(agent:transition_role("debug", { reason = "first successive generation" }))
+    assert(agent:transition_role("coding", { reason = "second successive generation" }))
+    assert(Lifecycle.new({ path = path }):get_session(session.session_id).role_binding.policy_generation == 3)
+    local forged = Session.json_decode(assert(WheelHost.fs.read_file(path)))
+    for _, event in ipairs(forged.events) do
+      if event.type == "agent_session.role_transition" and event.policy_generation == 3 then
+        event.policy_generation = 4
+      end
+    end
+    forged.sessions[session.session_id].role_binding.policy_generation = 4
+    assert(WheelHost.fs.remove_file(path))
+    for _, retained in ipairs({ false, true }) do
+      if retained then table.remove(forged.events, 1) end
+      assert(WheelHost.fs.create_private_file(path, Session.json_encode(forged)))
+      assert(not pcall(Lifecycle.new, { path = path }), "forged 2 -> 4 transition must fail full and retained replay")
+      assert(not WheelHost.fs.stat(path).exists)
     end
   end)
 
@@ -626,7 +860,13 @@ local ok, err = pcall(function()
       ready_panel = function() return nil, marker end,
       create_agent_session = function() error("must not create session", 0) end,
     }
-    local agent = setmetatable({ lifecycle=fake, panel_id="p" }, { __index=Agent })
+    local agent = Agent.new({
+      name = "typed-lifecycle-agent",
+      role = Agent.Role.CODING,
+      kernel = require("wheel.kernel").new_mock(),
+      lifecycle = fake,
+      panel_id = "p",
+    })
     local result, failure = agent:create_runtime_session()
     assert(not result and failure == marker)
   end)

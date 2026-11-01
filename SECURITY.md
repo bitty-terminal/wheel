@@ -68,8 +68,20 @@ Findings that contradict those boundaries are security-relevant defects.
 Examples: an escape from the workspace path sandbox, execution of an untrusted
 `.wheel/init.lua` or execution on load, secret material in logs, artifacts,
 prompts, or child environments, a shell or network path that bypasses audit or
-redaction, an unauthorized privilege transition, or any authority wider than the
-approved ceiling.
+redaction, an unauthorized privilege transition, a role change that widens
+capability without an audited policy generation and checkpoint, a fork that
+exceeds its parent's authority, or any authority wider than the approved
+ceiling.
+
+Lifecycle authority references must be issued by the Agent's private registry;
+caller resolvers, forged tokens, or restored metadata cannot authorize role
+transitions or widening. Public Agent handles reject `rawset`, keeping direct
+identity and lineage reads consistent with status, authorization, and routing.
+Private binding helpers keep replaceable compatibility exports outside the
+authority path. Fork issuance uses the checked binding, terminal parent
+sessions cannot authorize widening, and lifecycle replay rejects skipped
+successive policy generations. Context delta provenance retains the validated
+Agent identity and policy generation.
 
 ### Superseded plugin-sandbox scope (historical)
 

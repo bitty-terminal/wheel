@@ -133,6 +133,20 @@
 - Read secret environment values only from the named allowlist through the
   provider boundary; never log, persist, display, or pass them to child
   processes. Redaction applies before every persistence sink.
+- Agent authority comes from the current RoleBinding capability state, never
+  from prompt or identity text. A role transition preserves the AgentId, issues
+  a new policy generation, and commits a Context checkpoint boundary; a
+  transition or fork that widens capability requires explicit approval.
+- Lifecycle authority uses private Agent-issued references and a protected
+  issuer bridge, never caller resolvers or restored metadata. Agent instances
+  are opaque Lua 5.1/LuaJIT handles; use their field/method API or `status()`,
+  never table introspection or `rawset`.
+- Canonical binding normalization, issuance, and reference projection stay
+  private; replaceable public helpers cannot receive canonical bindings or
+  determine authority. Fork issuance reuses the checked binding, terminal
+  parent sessions cannot authorize widening, and replay requires successive
+  generations to advance by exactly one. Context delta provenance carries the
+  validated AgentId and policy generation.
 - High-risk operations (shell strings, secret reads, trust approval, new
   network destinations) fail closed when audit cannot record them.
 - The experimental local session daemon (`scripts/wheel-session`) is

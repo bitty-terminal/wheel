@@ -8,6 +8,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Close CTX-0046 PX-0451 findings: keep binding projection and normalization
+  private, issue the exact fork binding checked for widening, restore canonical
+  Commander Execute while retaining narrowed grants, refuse terminal-parent
+  fork widening before child creation, reject skipped replay generations, and
+  preserve validated AgentId and policy generation in P3 delta provenance.
+  Add Lua 5.1/LuaJIT regressions for export replacement, approval/audit failure,
+  ended and abandoned parents, forged replay, and changed workspace deltas.
+
 - Harden CTX-0045 lifecycle authority, observer cleanup, panel transitions,
   schema validation, loaded-data sanitization, private registry persistence,
   exact revision conflicts, exception-safe lock cleanup, bounded recent history,
@@ -15,6 +23,31 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   capacity, rollback, and cross-process regressions; no daemon authority change.
 
 ### Added
+
+- Close CTX-0046 PX-0417 authority and identity defects: lifecycle session
+  creation rejects caller resolvers and forged references, while transitions
+  and fork widening validate private Agent-issued references against a protected
+  issuer. Persisted metadata cannot recreate authority. Public Agents use opaque
+  Lua 5.1/LuaJIT handles that reject `rawset`, preserving canonical direct
+  identity, lineage, authorization, and session routing. Adversarial regressions
+  cover fabricated and borrowed tokens, the Reviewer-to-Coding resolver exploit,
+  restored metadata, issuer tampering, and public identity shadow attempts.
+
+- Agent identity, RoleBinding, policy generations, and fork lineage (CTX-0046 /
+  wheel#115): a stable, immutable `AgentId` is separate from the role it holds;
+  each Agent carries a `RoleBinding` with a monotonic `policy_generation` and a
+  capability set derived from the role matrix, and runtime authorization reads
+  that capability state instead of prompt or identity text. `transition_role`
+  preserves the Agent, commits an immutable Context checkpoint boundary, records
+  an audited `agent_session.role_transition` lifecycle event, and fails closed
+  when a change would add a capability without explicit approval.
+  `WheelAgent.fork_agent` creates an independent Agent from an immutable
+  `ContextCommit` with `forked_from_agent`, `forked_from_session`,
+  `base_context_commit`, reason, and an initial `RoleBinding`; the child shares
+  Context by reference only (never copied transcripts), can run in its own
+  Session and Headless Panel, and lineage is visible in status and Context
+  projections. No task hierarchy, durable handoff, Dashboard, provider-cache, or
+  `bittyd` change is included.
 
 - Explicit AgentSession and Headless Panel lifecycle records (CTX-0045 /
   wheel#114): independent agent, session, panel, task, context branch/head,
