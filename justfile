@@ -104,6 +104,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/session.lua
     bun run luaparse --quiet --file lua/wheel/daemon.lua
     bun run luaparse --quiet --file lua/wheel/session_cli.lua
+    bun run luaparse --quiet --file lua/wheel/cache_telemetry.lua
     bun run luaparse --quiet --file bench/run.lua
     bun run luaparse --quiet --file bench/lib/cli.lua
     bun run luaparse --quiet --file bench/lib/env.lua
@@ -129,6 +130,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_lifecycle.lua
     bun run luaparse --quiet --file tests/test_audit.lua
     bun run luaparse --quiet --file tests/test_cancel.lua
+    bun run luaparse --quiet --file tests/test_cache_telemetry.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
