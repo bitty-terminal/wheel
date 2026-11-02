@@ -156,4 +156,7 @@ status=0
 if [ "$status" -eq 0 ]; then
   "$interpreter" "$REPO_ROOT/tests/test_cache_telemetry.lua" || status=$?
 fi
+if [ "$status" -eq 0 ]; then
+  "$interpreter" "$REPO_ROOT/tests/test_runner_request.lua" || status=$?
+fi
 exit "$status"
