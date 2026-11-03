@@ -473,6 +473,9 @@ local function bounded_value(value, byte_limit, budget, depth)
   end
   if type(value) ~= "table" then
     if type(value) == "number" or type(value) == "boolean" then
+      if type(value) == "number" and (value ~= value or value == math.huge or value == -math.huge) then
+        return nil
+      end
       local size = encoded_size(value)
       return size and budget_bytes(budget, size) and value or nil
     end
@@ -481,18 +484,65 @@ local function bounded_value(value, byte_limit, budget, depth)
   if (depth or 0) >= budget.depth or budget.seen[value] then return nil end
   budget.seen[value] = true
   if not budget_bytes(budget, 2) then budget.seen[value] = nil; return nil end
+  local key_count = 0
+  local has_numeric_key = false
+  local has_string_key = false
+  local array_length = 0
+  for key in pairs(value) do
+    key_count = key_count + 1
+    if key_count > budget.keys then budget.seen[value] = nil; return nil end
+    if type(key) == "number" then
+      if key ~= key or key == math.huge or key == -math.huge
+        or key < 1 or key % 1 ~= 0 then
+        budget.seen[value] = nil
+        return nil
+      end
+      has_numeric_key = true
+      if key > array_length then array_length = key end
+    elseif type(key) == "string" then
+      has_string_key = true
+    else
+      budget.seen[value] = nil
+      return nil
+    end
+  end
+  if has_numeric_key and has_string_key then budget.seen[value] = nil; return nil end
+  if has_numeric_key and array_length ~= key_count then budget.seen[value] = nil; return nil end
   local keys, overflow = sorted_keys(value, budget.keys)
   if overflow then budget.seen[value] = nil; return nil end
+  -- JSON arrays are represented by contiguous positive-integer Lua keys.
+  -- Mixed, sparse, and unsupported key shapes are rejected rather than
+  -- stringified into a different object (or silently compacted).
+  table.sort(keys, function(a, b)
+    if has_numeric_key then return a < b end
+    return a < b
+  end)
   budget.keys = budget.keys - #keys
   local result = {}
+  local output_keys = {}
   for _, key in ipairs(keys) do
-    local bounded_key = type(key) == "string" and redact_bounded(key, WheelRunner.MAX_REQUEST_VALUE_BYTES)
-      or tostring(key)
+    local bounded_key
+    if has_numeric_key then
+      bounded_key = key
+    else
+      bounded_key = redact_bounded(key, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+      if output_keys[bounded_key] then budget.seen[value] = nil; return nil end
+      output_keys[bounded_key] = true
+    end
     local key_size = encoded_size(bounded_key)
-    if not key_size or not budget_bytes(budget, key_size + 1) then break end
+    if not key_size or not budget_bytes(budget, key_size + 1) then
+      if not has_numeric_key then break end
+      budget.seen[value] = nil
+      return nil
+    end
     local bounded_item = bounded_value(value[key], byte_limit, budget, (depth or 0) + 1)
     if bounded_item ~= nil then
       result[bounded_key] = bounded_item
+    elseif has_numeric_key then
+      -- Dropping an array member would shift later values under Lua's length
+      -- and JSON array rules. Reject the sequence as a whole instead.
+      budget.seen[value] = nil
+      return nil
     end
   end
   budget.seen[value] = nil
