@@ -125,6 +125,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_runner_request.lua
     bun run luaparse --quiet --file tests/test_context_projection.lua
     bun run luaparse --quiet --file tests/test_agent_identity.lua
+    bun run luaparse --quiet --file tests/test_dashboard.lua
     bun run luaparse --quiet --file tests/test_live_provider.lua
     bun run luaparse --quiet --file tests/test_provider_stub.lua
     bun run luaparse --quiet --file tests/test_session.lua

@@ -234,4 +234,231 @@ function WheelUI.render_scene_node(kernel)
   }
 end
 
+--- Schema version for the Agent Dashboard projection (`CTX-0050`).
+WheelUI.DASHBOARD_SCHEMA = "wheel-dashboard/1"
+
+local function clone_ui_value(value)
+  if type(value) ~= "table" then
+    return value
+  end
+  local out = {}
+  for k, v in pairs(value) do
+    out[clone_ui_value(k)] = clone_ui_value(v)
+  end
+  return out
+end
+
+--- Build a structured, non-authoritative Dashboard view from a `WheelTeam` or
+--- pre-computed `dashboard_snapshot` table.
+--- @param team_or_snapshot table
+--- @param opts table|nil
+--- @return table|nil, table|nil
+function WheelUI.build_dashboard_view(team_or_snapshot, opts)
+  opts = type(opts) == "table" and opts or {}
+  if type(team_or_snapshot) ~= "table" then
+    return nil, { error = "invalid_dashboard_source" }
+  end
+  local snapshot
+  if type(team_or_snapshot.dashboard_snapshot) == "function" then
+    local err
+    snapshot, err = team_or_snapshot:dashboard_snapshot(opts)
+    if not snapshot then
+      return nil, err
+    end
+  elseif team_or_snapshot.schema == WheelUI.DASHBOARD_SCHEMA then
+    snapshot = clone_ui_value(team_or_snapshot)
+  else
+    return nil, { error = "invalid_dashboard_source" }
+  end
+
+  local cards = {}
+  local idle_count, busy_count = 0, 0
+  for i = 1, #(snapshot.agents or {}) do
+    local entry = snapshot.agents[i]
+    local team_st = entry.lifecycle_state and entry.lifecycle_state.team_state or "idle"
+    if team_st == "busy" then
+      busy_count = busy_count + 1
+    else
+      idle_count = idle_count + 1
+    end
+    cards[i] = {
+      name = entry.name,
+      selected = entry.name == snapshot.selected_agent,
+      agent_id = entry.agent_id,
+      role_binding = clone_ui_value(entry.role_binding),
+      agent_session = clone_ui_value(entry.agent_session),
+      panel = clone_ui_value(entry.panel),
+      task = clone_ui_value(entry.task),
+      context_branch = clone_ui_value(entry.context_branch),
+      context_head = clone_ui_value(entry.context_head),
+      context_refs = clone_ui_value(entry.context_refs),
+      lineage = clone_ui_value(entry.lineage),
+      provider_status = clone_ui_value(entry.provider_status),
+      lifecycle_state = clone_ui_value(entry.lifecycle_state),
+      requests = clone_ui_value(entry.requests),
+      diagnostics = clone_ui_value(entry.diagnostics),
+    }
+  end
+
+  local open_requests = 0
+  for _, req in ipairs(snapshot.requests or {}) do
+    if req.status == "pending" then
+      open_requests = open_requests + 1
+    end
+  end
+  local pending_handoffs = 0
+  for _, ho in ipairs(snapshot.handoffs or {}) do
+    if ho.state == "offered" then
+      pending_handoffs = pending_handoffs + 1
+    end
+  end
+
+  local sel_view = snapshot.selected_view
+  return {
+    schema = WheelUI.DASHBOARD_SCHEMA,
+    presentation_only = true,
+    authority_bearing = false,
+    selected_agent = snapshot.selected_agent,
+    summary = {
+      total_agents = #cards,
+      idle_count = idle_count,
+      busy_count = busy_count,
+      open_requests = open_requests,
+      pending_handoffs = pending_handoffs,
+    },
+    context_head = {
+      branch = sel_view and sel_view.context_branch or "main",
+      commit_hash = sel_view and sel_view.context_head or nil,
+    },
+    cards = cards,
+    selected_view = clone_ui_value(sel_view),
+    requests = clone_ui_value(snapshot.requests or {}),
+    handoffs = clone_ui_value(snapshot.handoffs or {}),
+    diagnostics = clone_ui_value(snapshot.diagnostics),
+  }
+end
+
+--- Inspect one Agent's structured Dashboard card and Context projection.
+--- @param team table
+--- @param agent_name string
+--- @param opts table|nil
+--- @return table|nil, table|nil
+function WheelUI.inspect_agent_card(team, agent_name, opts)
+  if type(team) ~= "table" or type(team.inspect_agent) ~= "function" then
+    return nil, { error = "invalid_team_instance" }
+  end
+  return team:inspect_agent(agent_name, opts)
+end
+
+--- Render a human-readable ASCII summary of the Agent Dashboard without
+--- exposing unbounded raw logs (raw outputs remain referenced by `blob_hash`).
+--- @param team_or_snapshot table
+--- @param opts table|nil
+--- @return string
+function WheelUI.format_dashboard(team_or_snapshot, opts)
+  local view, err = WheelUI.build_dashboard_view(team_or_snapshot, opts)
+  if not view then
+    return string.format("(dashboard unavailable: %s)", tostring(err and err.error or "unknown"))
+  end
+
+  local head_short = view.context_head and type(view.context_head.commit_hash) == "string"
+    and view.context_head.commit_hash:sub(1, 12) or "(none)"
+  local lines = {
+    "=======================================================",
+    "  🐹 Bitty Wheel Agent Dashboard (wheel-dashboard/1)   ",
+    "=======================================================",
+    string.format(
+      "Agents: %d total [idle %d | busy %d] | Selected: %s",
+      view.summary and view.summary.total_agents or 0,
+      view.summary and view.summary.idle_count or 0,
+      view.summary and view.summary.busy_count or 0,
+      view.selected_agent or "(none)"
+    ),
+    string.format(
+      "Context Head: %s (branch %s)",
+      head_short,
+      view.context_head and view.context_head.branch or "main"
+    ),
+    string.format(
+      "Collaboration: %d open requests | %d pending handoffs",
+      view.summary and view.summary.open_requests or 0,
+      view.summary and view.summary.pending_handoffs or 0
+    ),
+    "-------------------------------------------------------",
+  }
+
+  for _, card in ipairs(view.cards) do
+    local marker = card.selected and "*" or " "
+    local role_name = card.role_binding and card.role_binding.role or "unknown"
+    local role_gen = card.role_binding and card.role_binding.policy_generation or 1
+    local state = card.lifecycle_state and card.lifecycle_state.session_state
+      or (card.lifecycle_state and card.lifecycle_state.team_state) or "idle"
+    local task_id = card.task and card.task.task_id or "(idle)"
+    local panel_id = card.panel and card.panel.panel_id or "(detached)"
+    local provider = card.provider_status and card.provider_status.model or "(none)"
+    local branch_name = type(card.context_branch) == "string" and card.context_branch or "main"
+    local commit_short = type(card.context_head) == "string"
+      and card.context_head:sub(1, 12) or "(none)"
+    table.insert(lines, string.format(
+      "%s [%s] id=%s role=%s@g%d state=%s task=%s",
+      marker,
+      card.name,
+      card.agent_id or "?",
+      role_name,
+      role_gen,
+      state,
+      task_id
+    ))
+    table.insert(lines, string.format(
+      "    session=%s panel=%s branch=%s@%s model=%s",
+      card.agent_session and card.agent_session.session_id or "(none)",
+      panel_id,
+      branch_name,
+      commit_short,
+      provider
+    ))
+  end
+
+  if view.selected_view and view.selected_view.context_projection then
+    local cp = view.selected_view.context_projection
+    table.insert(lines, "-------------------------------------------------------")
+    table.insert(lines, string.format(
+      "Selected Context View (%s): branch=%s head=%s bytes=%d/%d",
+      view.selected_agent or "?",
+      cp.context_branch or "main",
+      type(cp.context_head) == "string" and cp.context_head:sub(1, 12) or "(none)",
+      cp.total_bytes or 0,
+      cp.max_budget_bytes or 0
+    ))
+    table.insert(lines, string.format(
+      "  Scopes: project=%d team=%d task=%d session=%d delta=%d omitted=%d",
+      #(cp.project and cp.project.records or {}),
+      #(cp.team and cp.team.role_lenses or {}),
+      #(cp.task and cp.task.records or {}),
+      #(cp.session and cp.session.records or {}),
+      #(cp.delta and cp.delta.records or {}),
+      #(cp.omitted_references or {})
+    ))
+  end
+
+  table.insert(lines, "=======================================================")
+  return table.concat(lines, "\n")
+end
+
+--- Build a declarative Bitty UI scene node for the Agent Dashboard.
+--- @param team_or_snapshot table
+--- @param opts table|nil
+--- @return table BittySceneNode
+function WheelUI.render_dashboard_scene(team_or_snapshot, opts)
+  local view = WheelUI.build_dashboard_view(team_or_snapshot, opts)
+  return {
+    type = "Text",
+    content = WheelUI.format_dashboard(view or team_or_snapshot, opts),
+    metadata = {
+      schema = WheelUI.DASHBOARD_SCHEMA,
+      selected_agent = view and view.selected_agent or nil,
+    },
+  }
+end
+
 return WheelUI
