@@ -451,7 +451,7 @@ end
 
 local function decode_number(text, position)
   local number_text = text:match("^-?%d+", position)
-  if not number_text then
+  if not number_text or number_text:match("^-?0%d") then
     decode_error()
   end
   local stop = position + #number_text - 1

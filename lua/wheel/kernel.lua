@@ -223,11 +223,30 @@ local function parse_string(str, pos)
 end
 
 local function parse_number(str, pos)
-  local _, p, num_str = str:find("^(-?%d+%.?%d*[eE]?[+-]?%d*)", pos)
-  if num_str then
-    return tonumber(num_str), p + 1
+  local int_part = str:match("^-?%d+", pos)
+  if not int_part or int_part:match("^-?0%d") then
+    error("invalid number at pos " .. pos)
   end
-  error("invalid number at pos " .. pos)
+  local stop = pos + #int_part - 1
+  local frac = str:match("^%.%d+", stop + 1)
+  if frac then
+    int_part = int_part .. frac
+    stop = stop + #frac
+  elseif str:sub(stop + 1, stop + 1) == "." then
+    error("invalid number at pos " .. pos)
+  end
+  local exp = str:match("^[eE][+-]?%d+", stop + 1)
+  if exp then
+    int_part = int_part .. exp
+    stop = stop + #exp
+  elseif str:sub(stop + 1, stop + 1):match("^[eE]$") then
+    error("invalid number at pos " .. pos)
+  end
+  local n = tonumber(int_part)
+  if n == nil or n ~= n or n == math.huge or n == -math.huge then
+    error("invalid number at pos " .. pos)
+  end
+  return n, stop + 1
 end
 
 local function parse_array(str, pos)

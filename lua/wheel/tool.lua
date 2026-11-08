@@ -247,6 +247,9 @@ function WheelTool.sanitize_path(path, workspace_root)
   if type(path) ~= "string" or #path == 0 then
     return nil, "empty_path"
   end
+  if path:find("%z") or (type(workspace_root) == "string" and workspace_root:find("%z")) then
+    return nil, "null_byte_in_path"
+  end
 
   local root = workspace_root or "."
   -- Normalize slashes
@@ -961,7 +964,7 @@ local tool_list_directory = {
       stdout = table.concat(entries, "\n"),
       stderr = "",
       total_entries = count,
-      truncated = listing.truncated == true,
+      truncated = (listing.truncated == true) or (count > max_entries),
     }
   end,
 }
@@ -1028,7 +1031,7 @@ local tool_search_code = {
       end
       return {
         success = false,
-        exit_code = res.exit_code or 1,
+        exit_code = res.code or res.exit_code or 1,
         stderr = detail:sub(1, 512),
         outcome = res.outcome,
         truncated = res.truncated == true,
@@ -1100,8 +1103,17 @@ local tool_read_blob = {
     end
 
     local offset = args.offset or 0
+    if type(offset) ~= "number" or offset < 0 or offset % 1 ~= 0 then
+      return { success = false, exit_code = 1, stderr = "Invalid negative or non-integer offset" }
+    end
     local len = args.length or #content
-    local slice = content:sub(offset + 1, offset + len)
+    if type(len) ~= "number" or len < 0 or len % 1 ~= 0 then
+      return { success = false, exit_code = 1, stderr = "Invalid negative or non-integer length" }
+    end
+    local slice = ""
+    if len > 0 and offset < #content then
+      slice = content:sub(offset + 1, offset + len)
+    end
 
     return {
       success = true,

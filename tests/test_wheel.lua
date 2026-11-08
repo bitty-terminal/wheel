@@ -10896,6 +10896,84 @@ run_agent_identity_tests(run_test)
 local run_dashboard_tests = assert(loadfile("tests/test_dashboard.lua"))()
 run_dashboard_tests(run_test)
 
+run_test("CTX-0052: tool NUL-byte path, truncation, exit-code, blob offset, and JSON number defects", function()
+  local nul_clean, nul_err = WheelTool.sanitize_path("src/foo\0bar.lua", "/workspace")
+  assert(nul_clean == nil and nul_err == "null_byte_in_path",
+    "sanitize_path must reject NUL bytes in path")
+  local root_nul_clean, root_nul_err = WheelTool.sanitize_path("src/foo.lua", "/work\0space")
+  assert(root_nul_clean == nil and root_nul_err == "null_byte_in_path",
+    "sanitize_path must reject NUL bytes in workspace_root")
+
+  local reg = WheelTool.Registry.new({ workspace_root = "/workspace" })
+  local saved_list_dir = WheelHost.fs.list_dir
+  WheelHost.fs.list_dir = function()
+    return {
+      ok = true,
+      entries = { "a.lua", "b.lua", "c.lua" },
+      truncated = false,
+    }
+  end
+  local list_res = reg:get_tool("list_directory").execute({ path = ".", max_entries = 2 }, {
+    workspace_root = "/workspace",
+    role = "coding",
+  })
+  WheelHost.fs.list_dir = saved_list_dir
+  assert(list_res.success == true, "list_directory must succeed")
+  assert(list_res.total_entries == 3, "total_entries must reflect all entries")
+  assert(list_res.truncated == true, "truncated must be true when count exceeds max_entries")
+
+  local saved_run_program = WheelHost.proc.run_program
+  WheelHost.proc.run_program = function()
+    return {
+      ok = true,
+      code = 2,
+      stdout = "",
+      stderr = "grep: invalid option",
+      truncated = false,
+    }
+  end
+  local search_res = reg:dispatch("search_code", { query = "needle", path = "." }, {
+    workspace_root = "/workspace",
+    role = "coding",
+  })
+  WheelHost.proc.run_program = saved_run_program
+  assert(search_res.success == false, "search_code must fail on grep exit code 2")
+  assert(search_res.exit_code == 2, "search_code must preserve res.code=2, got " .. tostring(search_res.exit_code))
+
+  local ctx = WheelContext.new({})
+  ctx:put_slot("blobs/deadbeef", "0123456789")
+  local neg_offset = reg:dispatch("read_blob", { hash = "deadbeef", offset = -3, length = 4 }, {
+    workspace_root = "/workspace",
+    role = "coding",
+    context = ctx,
+  })
+  assert(neg_offset.success == false and neg_offset.exit_code == 1,
+    "read_blob must reject negative offset")
+  local neg_length = reg:dispatch("read_blob", { hash = "deadbeef", offset = 0, length = -1 }, {
+    workspace_root = "/workspace",
+    role = "coding",
+    context = ctx,
+  })
+  assert(neg_length.success == false and neg_length.exit_code == 1,
+    "read_blob must reject negative length")
+  local zero_length = reg:dispatch("read_blob", { hash = "deadbeef", offset = 2, length = 0 }, {
+    workspace_root = "/workspace",
+    role = "coding",
+    context = ctx,
+  })
+  assert(zero_length.success == true and zero_length.stdout == "",
+    "read_blob with length=0 must return empty stdout")
+
+  local ok_zero1 = pcall(WheelKernel.JSON.decode, "01")
+  assert(ok_zero1 == false, "WheelKernel.JSON.decode must reject leading-zero integer 01")
+  local ok_zero2 = pcall(WheelKernel.JSON.decode, "-00")
+  assert(ok_zero2 == false, "WheelKernel.JSON.decode must reject leading-zero integer -00")
+  local ok_exp = pcall(WheelKernel.JSON.decode, "1e+")
+  assert(ok_exp == false, "WheelKernel.JSON.decode must reject incomplete exponent 1e+")
+  assert(WheelKernel.JSON.decode("0") == 0, "WheelKernel.JSON.decode must accept 0")
+  assert(WheelKernel.JSON.decode("0.5") == 0.5, "WheelKernel.JSON.decode must accept 0.5")
+end)
+
 -- Remove only this run's root; any caller-owned WHEEL_TEST_TMP base remains.
 cleanup_test_run_root()
 
