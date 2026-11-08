@@ -223,6 +223,13 @@ selected through scopes, graph references, symbol maps, and bounded reads.
 
 ### 6.2 Role-aware projections
 
+Runtime implementation roles (`Commander`, `Coding`, `Debug`, `Research`, and
+`Reviewer`) govern execution capability policy, whereas projection lenses
+(`Planner`, `Documentation`, `Coding`, `Reviewer`, and `Research`) shape which
+Context slots and deltas are compiled into the prompt view. Candidate or
+domain-specific roles may compose a projection lens with a narrowed capability
+binding, but a lens never widens runtime authority.
+
 The same project must yield different views:
 
 | Role          | Default high-value view                                                                  |
@@ -344,7 +351,136 @@ Issue #117 exposes these operations to a Dashboard. Dashboard controls must
 remain presentation and user-control surfaces; they must call the same runtime
 authorization, fencing, audit, and bounded-output paths as autonomous Agents.
 
-## 10. Verification matrix
+## 10. Capability ecosystem roadmap (#120)
+
+> Status: **target architecture roadmap only (issue #120).** None of the
+> candidate families below is implemented in current Wheel; each family requires
+> a dedicated follow-up issue, conformance vectors, and independent security
+> review before implementation.
+
+Wheel remains a peer-Team harness (`AgentId != SessionId != PanelId != TaskId !=
+ContextCommitId != WorktreeId`). Comparing external agent ecosystems (such as
+OpenCode V2) informs capability coverage without importing a Main Agent ->
+Subagent hierarchy or moving harness logic into `bittyd`.
+
+### 10.1 Ownership matrix
+
+| Capability family               | Wheel core (deterministic mechanism)                                                              | External adapter (out-of-process / stdio / IPC)                                           | Project extension (`.wheel/` / `~/.config/wheel/`)                         | Future sibling repository                                   | `bittyd` (forbidden beyond session host) |
+| ------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------------- | ---------------------------------------- |
+| **LSP adapter**                 | Bounded diagnostic/symbol/reference schema, capability gate, Context slot projection              | Language-server process lifecycle, JSON-RPC framing, workspace root & timeout enforcement | Per-project server selection and read-only file-type bindings              | Shared multi-language LSP bridge if reused outside Wheel    | No LSP state, symbols, or authority      |
+| **Project commands**            | Parameterized argv template validator, shell-refusal gate, output spillover, audit record         | Host process runner (`WheelHost.proc.run_program`)                                        | Named command definitions with explicit parameter schemas and role scopes  | None                                                        | No command templates or execution        |
+| **Custom tools & MCP**          | Namespaced tool registry, schema/bound validator, per-request tool snapshot hash, capability gate | Local stdio or remote MCP client transport behind explicit capability & network policy    | Declarative tool/MCP server registrations pinned by digest and trust state | Standalone MCP protocol/transport library if shared         | No tool registry, dispatch, or MCP state |
+| **Skills, instructions & refs** | Provenance record, SHA-256 content pin, trust-state gate, Context P0/P2 projection rules          | Git/filesystem fetcher under read-only path and size bounds                               | Skill packages and pinned documentation references                         | Curated skill/reference corpus repository                   | No prompt, skill, or reference storage   |
+| **Formatter & lifecycle hooks** | Ordered hook runner, deterministic timeout/cancellation, byte bounds, failure policy, audit trail | External formatter binaries invoked as argv-only subprocesses                             | Hook bindings (`post_edit`, `pre_prompt`, `pre_compact`) with pinned argv  | None                                                        | No hook scheduling or execution          |
+| **Permission & policy**         | Deterministic `allow`/`ask`/`deny` evaluator, policy-generation fence, fail-closed unattended ask | Optional interactive approval surface (Dashboard / CLI)                                   | Project/user policy files narrowing (never widening) higher scopes         | Shared policy-schema validator if adopted across Bitty AI   | Session lease/fence only; no tool policy |
+| **Session & VCS integrations**  | `SessionId`, `ContextCommitId`, `WorktreeId`, compaction checkpoints, durable evidence links      | `bittyd` session-host client adapter; Git worktree CLI adapter                            | Project branch/worktree naming conventions                                 | CarryCtx (`carryctx`) for durable project lifecycle records | Session registry, leases, fences, audit  |
+
+### 10.2 Audit separation (`bittyd` vs Wheel execution vs Dashboard)
+
+Audit streams are partitioned by authority boundary:
+
+1. **`bittyd` mechanism audit**: records only session-host mechanism facts
+   (session creation/termination, attach/detach role, lease acquisition/expiry,
+   generation fences, protocol handshake, and transport refusals). It never
+   contains prompts, tool arguments, file contents, or model outputs.
+2. **Wheel execution audit**: records harness authorization and activity
+   (tool calls, command template expansions, LSP queries, MCP requests, hook
+   executions, provider calls, policy-generation IDs, and redaction-safe
+   summaries).
+3. **Dashboard projections**: read-only observation views compiled from bounded
+   Wheel execution audit and session status. Dashboard views never bypass
+   execution audit or mutate state directly.
+
+### 10.3 Permission and policy precedence
+
+Authorization evaluates an ordered lattice across scopes:
+
+```text
+1. Organization ceiling (highest authority)
+2. Project policy (.wheel/)
+3. User policy (~/.config/wheel/)
+4. Team policy
+5. Agent role binding
+6. Session binding
+7. Task scope
+8. Extension manifest (lowest authority)
+```
+
+Evaluation rules:
+
+- **Deny wins**: an explicit `deny` at any layer is final; no lower layer may
+  widen a capability denied or omitted by a higher ceiling.
+- **Effective rule**: among non-denying layers, the most restrictive outcome
+  (`deny` > `ask` > `allow`) applies over `(action, resource, capability_scope)`.
+- **Generation binding**: every authorization decision records the active
+  `capability_version` and `policy_generation` in the Action/Audit record; a
+  policy change increments `policy_generation` and invalidates cached approvals.
+- **Unattended `ask` fails closed**: in headless, batch, or unattended Sessions
+  where no interactive approval channel is attached within the bounded deadline,
+  `ask` evaluates to `deny` (`E_CAPABILITY_DENIED`).
+- **Prompt text is never authority**: model output, skill prose, and reference
+  documents cannot alter the policy lattice or grant capabilities.
+
+### 10.4 Family safety, provenance, and bounds
+
+- **LSP safety**: servers launch strictly via explicit `argv` (never shell
+  evaluation), rooted at the validated workspace path with a scrubbed
+  environment, no implicit network access, per-request deadlines, cancellation
+  propagation, and bounded structured responses (diagnostics, symbols,
+  definitions, references). The minimal first slice is **read-only**; workspace
+  edits or code actions require the same write capability and path-sandbox check
+  as `edit_file`.
+- **Command-template safety**: project commands declare typed parameters and an
+  `argv` array. Parameter values are passed as discrete `argv` elements without
+  shell interpolation; raw shell blocks are refused unless an explicit,
+  organization-permitted shell capability is granted and audited. Output obeys
+  the 256 KiB stream cap and 4 KiB spillover boundary.
+- **Custom tools, MCP, and stable snapshots**: each registered tool or MCP
+  source carries `namespace`, `name`, `version`, `source_identity`,
+  `schema_hash`, `capability_scope`, `timeout_ms`, and cancellation support.
+  Before the first turn of a Session (or upon an explicit policy generation
+  bump), Wheel freezes an immutable tool snapshot so mid-run registry changes
+  cannot invalidate the provider prompt-cache domain or inject unreviewed tools.
+- **Skills and references provenance**: every skill package or reference carries
+  `source_uri`, `commit_or_version`, `sha256`, `trust_state` (`trusted`,
+  `pinned`, `untrusted`, `revoked`), and refresh policy. Revoked or hash-mismatched
+  entries fail closed before compilation. Untrusted reference text is fenced as
+  quoted data in P2/P3 and never enters P0/P1 system instructions.
+- **Formatter and lifecycle hooks**: hooks execute in deterministic declared
+  order under explicit `timeout_ms`, byte bounds, cancellation propagation, and
+  audit logging. A failing `pre_prompt` or `pre_compact` hook fails closed; a
+  failing `post_edit` formatter hook records structured diagnostics without
+  corrupting the working tree.
+
+### 10.5 Minimal first slice and required conformance vectors
+
+The minimal first implementation slice is limited to:
+
+1. Deterministic permission/policy evaluator with generation fencing and
+   fail-closed unattended `ask`;
+2. Read-only argv-only LSP diagnostic/symbol query adapter;
+3. Argv-only parameterized project commands with audit records.
+
+Before any slice lands, its test suite must cover these conformance vectors:
+
+- **Identity non-equivalence**: `AgentId`, `SessionId`, `PanelId`, `TaskId`,
+  `ContextCommitId`, and `WorktreeId` remain distinct across capability calls.
+- **Peer dispatch**: peer Agents invoke capabilities under their own role
+  bindings without parent/subagent privilege inheritance.
+- **Multi-session and multi-task isolation**: concurrent Sessions/Tasks cannot
+  bleed tool snapshots, approvals, or hook state across bindings.
+- **Handoff continuity**: transferring a Task preserves recorded Action/Audit
+  provenance while re-evaluating capabilities against the receiving Agent's role
+  and current `policy_generation`.
+- **Branch and worktree isolation**: LSP, command, and hook side effects stay
+  confined to the bound Context branch and `WorktreeId`.
+- **Extension trust and revocation**: unpinned, hash-mismatched, or revoked
+  skills/tools/MCP descriptors are rejected before execution or prompt
+  compilation.
+- **`bittyd` boundary**: zero LSP, command, MCP, skill, hook, or permission
+  payloads cross the `bittyd` session-host wire protocol.
+
+## 11. Verification matrix
 
 | Area                | Existing evidence                                                                                                                                                                                                                                                                                  | Remaining evidence                                                                                                     |
 | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
@@ -360,7 +496,7 @@ authorization, fencing, audit, and bounded-output paths as autonomous Agents.
 No row in this table authorizes implementation in `bittyd`. Wheel issues #110–#118
 own the follow-up work; issue #109 is the parent index.
 
-## 11. References
+## 12. References
 
 - [Wheel README](README.md), especially the existing Context, spillover,
   provider, and Git-inspired versioning sections.
