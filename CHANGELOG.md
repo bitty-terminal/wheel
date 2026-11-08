@@ -19,10 +19,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Preserve numeric indices in bounded provider tool arrays and nested JSON
-  schema arrays. Reject sparse, mixed-key, unsupported-key, and colliding maps
-  rather than changing their shape; retain existing request limits and
-  redaction.
+- Preserve numeric indices and boolean `false` values in bounded provider tool
+  arrays and nested JSON schema structures. Reject sparse, mixed-key,
+  unsupported-key, colliding, cyclic, truncated, or redacted tool schemas as a
+  whole rather than silently altering constraints or dropping tools during final
+  request byte trimming. OpenAI and Anthropic formatter copies share an aggregate
+  traversal and escaped-JSON byte budget across the tool sequence (including tool
+  names and descriptions) and omit only empty schema-object `required` arrays,
+  preserving schema-map entries and instance-data objects named `required`.
 
 - Close CTX-0046 PX-0451 findings: keep binding projection and normalization
   private, issue the exact fork binding checked for widening, restore canonical

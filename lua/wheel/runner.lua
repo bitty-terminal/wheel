@@ -464,10 +464,21 @@ canonical_value = function(value, budget, depth)
   return table.concat(parts) .. "}"
 end
 
-local function bounded_value(value, byte_limit, budget, depth)
+--- Copy an untrusted Lua value under the request budgets.
+-- Numeric tables are retained only as contiguous arrays. When strict is true,
+-- any failed child rejects the enclosing table instead of silently weakening a
+-- provider tool schema.
+-- @param value any source value
+-- @param byte_limit number maximum string value size
+-- @param budget table mutable node/key/byte/depth budget
+-- @param depth number? current nesting depth
+-- @param strict boolean? propagate child-bound failures
+-- @return any? bounded copy
+local function bounded_value(value, byte_limit, budget, depth, strict)
   if not budget_node(budget) then return nil end
   if type(value) == "string" then
     local text = redact_bounded(value, byte_limit)
+    if strict and text ~= value then return nil end
     local size = encoded_size(text)
     return size and budget_bytes(budget, size) and text or nil
   end
@@ -477,7 +488,8 @@ local function bounded_value(value, byte_limit, budget, depth)
         return nil
       end
       local size = encoded_size(value)
-      return size and budget_bytes(budget, size) and value or nil
+      if not size or not budget_bytes(budget, size) then return nil end
+      return value
     end
     return nil
   end
@@ -526,19 +538,20 @@ local function bounded_value(value, byte_limit, budget, depth)
       bounded_key = key
     else
       bounded_key = redact_bounded(key, WheelRunner.MAX_REQUEST_VALUE_BYTES)
+      if strict and bounded_key ~= key then budget.seen[value] = nil; return nil end
       if output_keys[bounded_key] then budget.seen[value] = nil; return nil end
       output_keys[bounded_key] = true
     end
     local key_size = encoded_size(bounded_key)
     if not key_size or not budget_bytes(budget, key_size + 1) then
-      if not has_numeric_key then break end
+      if not has_numeric_key and not strict then break end
       budget.seen[value] = nil
       return nil
     end
-    local bounded_item = bounded_value(value[key], byte_limit, budget, (depth or 0) + 1)
+    local bounded_item = bounded_value(value[key], byte_limit, budget, (depth or 0) + 1, strict)
     if bounded_item ~= nil then
       result[bounded_key] = bounded_item
-    elseif has_numeric_key then
+    elseif has_numeric_key or strict then
       -- Dropping an array member would shift later values under Lua's length
       -- and JSON array rules. Reject the sequence as a whole instead.
       budget.seen[value] = nil
@@ -629,9 +642,12 @@ local function bound_provider_request(request)
     return { model = bounded.model, messages = {}, tools = {} }
   end
   if top_level_key("tools") then
-    bounded.tools = bounded_value(request.tools or {}, WheelRunner.MAX_REQUEST_VALUE_BYTES, value_budget) or {}
+    bounded.tools = bounded_value(request.tools or {}, WheelRunner.MAX_REQUEST_VALUE_BYTES, value_budget, nil, true)
+    if bounded.tools == nil then
+      return nil, "provider tool definitions exceed request bounds or contain an unsupported shape"
+    end
   else
-    bounded.tools = {}
+    return nil, "provider tool definitions exceed request bounds"
   end
   bounded.temperature = request.temperature
   if request.thinking ~= nil and top_level_key("thinking") then
@@ -674,7 +690,7 @@ local function bound_provider_request(request)
   end
   local pinned_bounded = nil
   if pinned_task then
-    pinned_bounded = bounded_message(pinned_task, value_budget)
+    pinned_bounded = bounded_message(pinned_task, value_budget) or bounded_message(pinned_task)
     if pinned_bounded then bounded.messages[#bounded.messages + 1] = pinned_bounded end
   end
 
@@ -765,8 +781,9 @@ local function bound_provider_request(request)
     if pinned_bounded then bounded.messages[1] = pinned_bounded end
     bounded.messages[#bounded.messages + 1] =
       { role = "user", content = "[request content omitted: request byte bound]" }
-    bounded.tools = {}
     bounded.thinking = nil
+    bounded.stable_context_prefix = nil
+    bounded.local_prefix_hash = nil
     encoded = encoded_request(bounded)
   end
   if not encoded or #encoded > WheelRunner.MAX_REQUEST_BYTES then
@@ -774,6 +791,18 @@ local function bound_provider_request(request)
       model = "default-model",
       messages = pinned_bounded and { pinned_bounded }
         or { { role = "user", content = "[request omitted: request byte bound]" } },
+      tools = bounded.tools,
+      max_completion_tokens = request.max_completion_tokens,
+    }
+    encoded = encoded_request(bounded)
+  end
+  if not encoded or #encoded > WheelRunner.MAX_REQUEST_BYTES then
+    if next(bounded.tools) ~= nil then
+      return nil, "provider tool definitions exceed request bounds or contain an unsupported shape"
+    end
+    bounded = {
+      model = "default-model",
+      messages = { { role = "user", content = "[request omitted: request byte bound]" } },
       tools = {},
       max_completion_tokens = request.max_completion_tokens,
     }
@@ -1173,6 +1202,11 @@ function WheelRunner.run_task(agent, task, opts)
     end
 
     req = bound_provider_request(req)
+    if not req then
+      final_error = "Provider tool definitions exceed request bounds"
+      append_unique_bounded(retained_state.failures, final_error, WheelRunner.MAX_STATE_FIELD_BYTES)
+      break
+    end
     local res, stream_err = provider:stream(req, stream_cb, opts)
     if not res then
       final_error = "Provider streaming failed: " .. tostring(stream_err)

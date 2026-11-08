@@ -359,7 +359,7 @@ return function(run_test)
     local request = {
       model = string.rep("model", 1000),
       messages = {},
-      tools = { { type = "function", ["function"] = { name = "inspect", parameters = { huge = huge } } } },
+      tools = { { type = "function", ["function"] = { name = "inspect", parameters = { huge = "bounded" } } } },
       thinking = { enabled = true, details = { huge = huge } },
       max_completion_tokens = 128,
     }

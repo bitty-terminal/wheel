@@ -1033,47 +1033,311 @@ WheelProvider.SSEParser = SSEParser
 -- Tool Schema Formatters
 -- ---------------------------------------------------------------------------
 
+local MAX_FORMAT_SCHEMA_NODES = 512
+local MAX_FORMAT_SCHEMA_KEYS = 512
+local MAX_FORMAT_SCHEMA_DEPTH = 64
+local MAX_FORMAT_SCHEMA_BYTES = 48 * 1024
+
+local SCHEMA_MAP_KEYWORDS = {
+  properties = true,
+  patternProperties = true,
+  ["$defs"] = true,
+  definitions = true,
+  dependentSchemas = true,
+  dependencies = true,
+}
+
+local SCHEMA_SEQUENCE_KEYWORDS = {
+  allOf = true,
+  anyOf = true,
+  oneOf = true,
+  prefixItems = true,
+}
+
+local SUBSCHEMA_KEYWORDS = {
+  additionalProperties = true,
+  unevaluatedItems = true,
+  unevaluatedProperties = true,
+  propertyNames = true,
+  contains = true,
+  ["not"] = true,
+  ["if"] = true,
+  ["then"] = true,
+  ["else"] = true,
+  contentSchema = true,
+}
+
+local INSTANCE_DATA_KEYWORDS = {
+  default = true,
+  const = true,
+  enum = true,
+  examples = true,
+}
+
+local function empty_array(value)
+  return type(value) == "table" and next(value) == nil
+end
+
+local function encoded_json_size(value)
+  local ok, encoded = pcall(json.encode, value)
+  if not ok or type(encoded) ~= "string" then return nil end
+  return #encoded
+end
+
+local function next_schema_context(context, child_key, child_value)
+  if context == "instance" then
+    return "instance"
+  end
+  if context == "schema_map" then
+    return "schema"
+  end
+  if context == "schema_sequence" then
+    return "schema"
+  end
+  if context == "schema" then
+    if SCHEMA_MAP_KEYWORDS[child_key] then
+      return "schema_map"
+    end
+    if SCHEMA_SEQUENCE_KEYWORDS[child_key] then
+      return "schema_sequence"
+    end
+    if child_key == "items" or child_key == "additionalItems" then
+      if type(child_value) == "table" and child_value[1] ~= nil then
+        return "schema_sequence"
+      end
+      return "schema"
+    end
+    if SUBSCHEMA_KEYWORDS[child_key] then
+      return "schema"
+    end
+    if INSTANCE_DATA_KEYWORDS[child_key] then
+      return "instance"
+    end
+    return "other"
+  end
+  return "other"
+end
+
+--- Copy a provider tool schema while removing only empty schema-object `required` arrays.
+-- The copy is bounded and cycle-safe because formatters are also public helpers;
+-- invalid schemas are refused instead of reaching a permissive default.
+-- @param value table schema or nested schema value
+-- @param state table traversal counters and active references
+-- @param depth number current nesting depth
+-- @param context string? "schema" | "schema_map" | "schema_sequence" | "instance" | "other"
+-- @param object_only boolean? require a string-keyed JSON object at the root
+-- @return table? normalized copy
+local function normalize_tool_schema(value, state, depth, context, object_only)
+  context = context or "schema"
+  if type(value) ~= "table" then return nil end
+  if depth > MAX_FORMAT_SCHEMA_DEPTH or state.nodes >= MAX_FORMAT_SCHEMA_NODES or state.bytes <= 0 then return nil end
+  if state.seen[value] then return nil end
+  state.nodes = state.nodes + 1
+  state.bytes = state.bytes - 2
+  if state.bytes < 0 then return nil end
+  state.seen[value] = true
+
+  local keys = {}
+  local numeric = false
+  local string_keys = false
+  local maximum = 0
+  for child_key in pairs(value) do
+    state.keys = state.keys + 1
+    if state.keys > MAX_FORMAT_SCHEMA_KEYS then state.seen[value] = nil; return nil end
+    if type(child_key) == "number" then
+      if child_key < 1 or child_key % 1 ~= 0 then state.seen[value] = nil; return nil end
+      if object_only then state.seen[value] = nil; return nil end
+      numeric = true
+      if child_key > maximum then maximum = child_key end
+    elseif type(child_key) == "string" then
+      string_keys = true
+    else
+      state.seen[value] = nil
+      return nil
+    end
+    keys[#keys + 1] = child_key
+  end
+  if numeric and string_keys or numeric and maximum ~= #keys then
+    state.seen[value] = nil
+    return nil
+  end
+  if context == "schema_map" and numeric then
+    -- Draft-07 `dependencies` allows either a property-name array or a subschema object.
+    context = "other"
+  end
+  table.sort(keys, function(a, b)
+    if numeric then return a < b end
+    return a < b
+  end)
+
+  local copy = {}
+  local emitted = 0
+  for _, child_key in ipairs(keys) do
+    local child = value[child_key]
+    if context == "schema" and not numeric and child_key == "required" and empty_array(child) then
+      -- Omit empty schema-level `required` arrays so empty Lua tables do not
+      -- serialize as `{}` where JSON Schema expects an array. Map entries and
+      -- instance-data objects named `required` remain untouched.
+    else
+      if emitted > 0 then
+        state.bytes = state.bytes - 1
+      end
+      if not numeric then
+        local key_bytes = encoded_json_size(child_key)
+        if not key_bytes then state.seen[value] = nil; return nil end
+        state.bytes = state.bytes - key_bytes - 1
+      end
+      if state.bytes < 0 then state.seen[value] = nil; return nil end
+
+      local normalized
+      if type(child) == "table" then
+        local child_ctx = next_schema_context(context, child_key, child)
+        normalized = normalize_tool_schema(child, state, depth + 1, child_ctx, false)
+        if normalized == nil then state.seen[value] = nil; return nil end
+      elseif type(child) == "string" or type(child) == "boolean" or type(child) == "number" then
+        if type(child) == "number" and (child ~= child or child == math.huge or child == -math.huge) then
+          state.seen[value] = nil
+          return nil
+        end
+        local child_bytes = encoded_json_size(child)
+        if not child_bytes then state.seen[value] = nil; return nil end
+        state.bytes = state.bytes - child_bytes
+        if state.bytes < 0 then state.seen[value] = nil; return nil end
+        normalized = child
+      else
+        state.seen[value] = nil
+        return nil
+      end
+      copy[child_key] = normalized
+      emitted = emitted + 1
+    end
+  end
+  state.seen[value] = nil
+  return copy
+end
+
+--- Normalize one tool's parameters with the formatter's shared bounded copy state.
+-- @param parameters table? caller-owned JSON schema
+-- @param state table? shared traversal state across the tool sequence
+-- @return table? normalized schema
+local function normalized_parameters(parameters, state)
+  state = state or {
+    nodes = 0, keys = 0, seen = {}, bytes = MAX_FORMAT_SCHEMA_BYTES,
+  }
+  local source = parameters
+  if source == nil then
+    source = { type = "object", properties = {} }
+  end
+  return normalize_tool_schema(source, state, 0, "schema", true)
+end
+
+--- Validate the bounded top-level tool sequence before either provider formatter.
+-- @param tools table caller-supplied tool sequence
+-- @return number? contiguous member count, string? validation error
+local function tool_sequence_count(tools)
+  local count = 0
+  local maximum = 0
+  for key in pairs(tools) do
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
+      return nil, "tool definitions must be a contiguous numeric array"
+    end
+    count = count + 1
+    if count > MAX_FORMAT_SCHEMA_NODES then return nil, "tool schema exceeds formatter bounds" end
+    if key > maximum then maximum = key end
+  end
+  if maximum ~= count then return nil, "tool definitions must be a contiguous numeric array" end
+  return count
+end
+
 --- Format tool schemas for OpenAI-compatible function calling API.
 -- @param tools table[] List of tool descriptors { name, description, parameters }
--- @return table[] List of OpenAI tool definitions
+-- @return table[]? List of OpenAI tool definitions, string? validation error
 function WheelProvider.format_tools_for_openai(tools)
-  if type(tools) ~= "table" then return {} end
+  if type(tools) ~= "table" then return nil, "tool definitions must be a table array" end
+  local count, count_err = tool_sequence_count(tools)
+  if not count then return nil, count_err end
+  local state = {
+    nodes = 0,
+    keys = 0,
+    seen = {},
+    bytes = MAX_FORMAT_SCHEMA_BYTES - 2,
+  }
   local formatted = {}
-  for _, tool in ipairs(tools) do
-    if tool.name then
-      table.insert(formatted, {
-        type = "function",
-        ["function"] = {
-          name = tool.name,
-          description = tool.description or "",
-          parameters = tool.parameters or {
-            type = "object",
-            properties = {},
-          },
-        },
-      })
+  for index = 1, count do
+    local tool = tools[index]
+    if type(tool) ~= "table" or type(tool.name) ~= "string" or tool.name == ""
+      or type(tool.description or "") ~= "string" then
+      return nil, "tool name and description must be valid strings"
     end
+    local name_bytes = encoded_json_size(tool.name)
+    local desc_bytes = encoded_json_size(tool.description or "")
+    if not name_bytes or not desc_bytes then
+      return nil, "tool name and description must be valid strings"
+    end
+    -- Charge wrapper overhead: {"type":"function","function":{"name":...,"description":...,"parameters":...}}
+    state.bytes = state.bytes - name_bytes - desc_bytes - 70 - (index > 1 and 1 or 0)
+    if state.bytes < 0 then
+      return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds"
+    end
+    local parameters = normalized_parameters(tool.parameters, state)
+    if not parameters then return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds" end
+    table.insert(formatted, {
+      type = "function",
+      ["function"] = {
+        name = tool.name,
+        description = tool.description or "",
+        parameters = parameters,
+      },
+    })
+  end
+  local total_bytes = encoded_json_size(formatted)
+  if not total_bytes or total_bytes > MAX_FORMAT_SCHEMA_BYTES then
+    return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds"
   end
   return formatted
 end
 
 --- Format tool schemas for Anthropic Messages API tool definitions.
 -- @param tools table[] List of tool descriptors { name, description, parameters }
--- @return table[] List of Anthropic tool definitions
+-- @return table[]? List of Anthropic tool definitions, string? validation error
 function WheelProvider.format_tools_for_anthropic(tools)
-  if type(tools) ~= "table" then return {} end
+  if type(tools) ~= "table" then return nil, "tool definitions must be a table array" end
+  local count, count_err = tool_sequence_count(tools)
+  if not count then return nil, count_err end
+  local state = {
+    nodes = 0,
+    keys = 0,
+    seen = {},
+    bytes = MAX_FORMAT_SCHEMA_BYTES - 2,
+  }
   local formatted = {}
-  for _, tool in ipairs(tools) do
-    if tool.name then
-      table.insert(formatted, {
-        name = tool.name,
-        description = tool.description or "",
-        input_schema = tool.parameters or {
-          type = "object",
-          properties = {},
-        },
-      })
+  for index = 1, count do
+    local tool = tools[index]
+    if type(tool) ~= "table" or type(tool.name) ~= "string" or tool.name == ""
+      or type(tool.description or "") ~= "string" then
+      return nil, "tool name and description must be valid strings"
     end
+    local name_bytes = encoded_json_size(tool.name)
+    local desc_bytes = encoded_json_size(tool.description or "")
+    if not name_bytes or not desc_bytes then
+      return nil, "tool name and description must be valid strings"
+    end
+    -- Charge wrapper overhead: {"name":...,"description":...,"input_schema":...}
+    state.bytes = state.bytes - name_bytes - desc_bytes - 41 - (index > 1 and 1 or 0)
+    if state.bytes < 0 then
+      return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds"
+    end
+    local input_schema = normalized_parameters(tool.parameters, state)
+    if not input_schema then return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds" end
+    table.insert(formatted, {
+      name = tool.name,
+      description = tool.description or "",
+      input_schema = input_schema,
+    })
+  end
+  local total_bytes = encoded_json_size(formatted)
+  if not total_bytes or total_bytes > MAX_FORMAT_SCHEMA_BYTES then
+    return nil, "tool schema is cyclic, unsupported, or exceeds formatter bounds"
   end
   return formatted
 end
@@ -1318,8 +1582,10 @@ function OpenAIAdapter:_format_payload(request, stream)
     payload.stream_options = { include_usage = true }
   end
 
-  if request.tools and #request.tools > 0 then
-    payload.tools = WheelProvider.format_tools_for_openai(request.tools)
+  if type(request.tools) == "table" and next(request.tools) ~= nil then
+    local formatted_tools, tools_err = WheelProvider.format_tools_for_openai(request.tools)
+    if not formatted_tools then return nil, tools_err end
+    payload.tools = formatted_tools
     payload.tool_choice = request.tool_choice or "auto"
   end
 
@@ -1700,8 +1966,10 @@ function AnthropicAdapter:_format_payload(request, stream)
     payload.temperature = request.temperature
   end
 
-  if request.tools and #request.tools > 0 then
-    payload.tools = WheelProvider.format_tools_for_anthropic(request.tools)
+  if type(request.tools) == "table" and next(request.tools) ~= nil then
+    local formatted_tools, tools_err = WheelProvider.format_tools_for_anthropic(request.tools)
+    if not formatted_tools then return nil, tools_err end
+    payload.tools = formatted_tools
   end
 
   return payload
