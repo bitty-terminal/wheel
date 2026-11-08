@@ -122,9 +122,12 @@ function WheelTeam.new(opts)
   self.agents = {} -- map of agent_name -> WheelAgent instance
   self.agent_states = {} -- map of agent_name -> { state = "idle"|"busy"|"waiting_review", active_task_id = string?, tasks_completed = number }
   self.handoffs = {} -- array of structured handoff records
+  self.requests = {} -- array of durable collaboration request/reply records
   self.task_assignments = {} -- map of task_id -> agent_name
   self.agent_tasks = {} -- map of agent_name -> set of active task ids
   self.handoff_counter = 0
+  self.request_counter = 0
+  self.selected_agent = nil
   self.allow_multiple_tasks = opts.allow_multiple_tasks == true
 
   -- Shared context engine and event bus across peer colleagues
@@ -1604,6 +1607,1273 @@ function WheelTeam:run_orchestration_loop(opts)
     total_checkpoints = total_checkpoints,
     duration_ms = duration_ms,
     blocked_reason = blocked_reason,
+  }
+end
+
+-- ---------------------------------------------------------------------------
+-- Agent Dashboard & Bidirectional Collaboration Controls (CTX-0050)
+-- ---------------------------------------------------------------------------
+
+WheelTeam.DASHBOARD_PROTOCOL = "wheel-dashboard/1"
+WheelTeam.CollaborationKind = {
+  ASK = "ask",
+  CLARIFICATION = "clarification",
+  CONTEXT_SHARE = "context-share",
+}
+WheelTeam.DashboardAction = {
+  CHECKPOINT = "checkpoint",
+  BRANCH = "branch",
+  FORK = "fork",
+  PAUSE = "pause",
+  RESUME = "resume",
+  ATTACH = "attach",
+  DETACH = "detach",
+  CANCEL = "cancel",
+  ASK = "ask",
+  REPLY = "reply",
+  CLARIFICATION = "clarification",
+  CONTEXT_SHARE = "context-share",
+  HANDOFF_RESPOND = "handoff_respond",
+}
+
+local MAX_REQUEST_RECORD_BYTES = 8192
+local MAX_REQUEST_MESSAGE_BYTES = 512
+local MAX_DIAGNOSTIC_ITEMS = 16
+local MAX_DIAGNOSTIC_PREVIEW_BYTES = 256
+local COLLABORATION_KINDS = {
+  ["ask"] = true,
+  ["clarification"] = true,
+  ["context-share"] = true,
+}
+
+--- Construct a typed Dashboard error object.
+-- @param code string
+-- @param message string
+-- @param class string|nil
+-- @return table
+local function dashboard_error(code, message, class)
+  return {
+    class = class or (WheelErrors and WheelErrors.CLASS_RUNTIME) or "runtime",
+    code = code,
+    message = tostring(message or "dashboard operation failed"),
+  }
+end
+
+--- Recursively deep-copy a plain Lua value or table.
+-- @param value any
+-- @param seen table|nil
+-- @return any
+local function deep_copy_plain(value, seen)
+  if type(value) ~= "table" then return value end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local copy = {}
+  seen[value] = copy
+  for k, v in pairs(value) do
+    copy[deep_copy_plain(k, seen)] = deep_copy_plain(v, seen)
+  end
+  return copy
+end
+
+--- Validate and redact a bounded control-character-free string.
+-- @param value any
+-- @param label string
+-- @param max_bytes number|nil
+-- @param allow_empty boolean|nil
+-- @return string|nil, string|nil
+local function bounded_clean_text(value, label, max_bytes, allow_empty)
+  max_bytes = max_bytes or MAX_REQUEST_MESSAGE_BYTES
+  if type(value) ~= "string" or #value > max_bytes or value:find("[%z\1-\31\127]") then
+    return nil, label .. " must be a bounded control-free string"
+  end
+  if not allow_empty and value == "" then
+    return nil, label .. " must not be empty"
+  end
+  return WheelAudit.redact_bounded(value, max_bytes)
+end
+
+--- Validate a bounded ASCII identifier reference.
+-- @param value any
+-- @param label string
+-- @param allow_nil boolean|nil
+-- @return string|nil, string|nil
+local function bounded_id_ref(value, label, allow_nil)
+  if value == nil and allow_nil then return nil end
+  if type(value) ~= "string" or value == "" or #value > 128
+    or not value:match("^[A-Za-z0-9][A-Za-z0-9._:/%-]*$") then
+    return nil, label .. " must be a bounded identifier"
+  end
+  return value
+end
+
+--- Verify that a 64-hex hash names an existing immutable ContextCommit.
+-- @param context table|nil
+-- @param hash string|nil
+-- @return table|nil
+local function verify_commit_exists(context, hash)
+  if type(hash) ~= "string" or #hash ~= 64 or not hash:match("^[0-9a-f]+$") then
+    return nil
+  end
+  if not context or type(context.get_commit) ~= "function" then
+    return nil
+  end
+  local ok, commit = pcall(context.get_commit, context, hash)
+  if not ok or type(commit) ~= "table" or commit.hash ~= hash then
+    return nil
+  end
+  return commit
+end
+
+--- Resolve and verify the canonical runtime session for an Agent.
+-- @param agent table
+-- @param explicit_session_id string|nil
+-- @return table|nil, table|nil
+function WheelTeam:_canonical_agent_session(agent, explicit_session_id)
+  if not self.lifecycle or type(self.lifecycle.get_session) ~= "function" then
+    return nil, nil
+  end
+  local runtime_sid = agent:runtime_session_id()
+  local sid = explicit_session_id or runtime_sid
+  if not sid then
+    return nil, dashboard_error("E_DASHBOARD_SESSION",
+      "agent '" .. tostring(agent.name) .. "' has no active runtime session")
+  end
+  if runtime_sid and sid ~= runtime_sid then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "session_id does not match the agent's canonical runtime session")
+  end
+  local session = self.lifecycle:get_session(sid)
+  if not session or session.agent_id ~= agent.agent_id then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "runtime session is missing or belongs to another agent")
+  end
+  if type(self.lifecycle._authorize_session) == "function"
+    and not self.lifecycle:_authorize_session(sid, agent:authority_reference()) then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "runtime session authority token is not canonical")
+  end
+  return session, nil
+end
+
+--- Verify an Agent's canonical RoleBinding, capability grant, and runtime session.
+-- @param agent_name string
+-- @param required_capability string|table|nil
+-- @param opts table|nil
+-- @return table|nil, table|nil, table|nil
+function WheelTeam:_verify_agent_authority(agent_name, required_capability, opts)
+  opts = opts or {}
+  local agent = self.agents[agent_name]
+  if not agent then
+    return nil, nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND",
+      "agent not found: " .. tostring(agent_name))
+  end
+  local binding = agent.role_binding
+  if type(binding) ~= "table" or type(binding.role) ~= "string" then
+    return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "agent has no canonical RoleBinding")
+  end
+  if opts.agent_id ~= nil and opts.agent_id ~= agent.agent_id then
+    return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "supplied agent_id conflicts with canonical AgentId")
+  end
+  if opts.policy_generation ~= nil and opts.policy_generation ~= binding.policy_generation then
+    return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "stale or mismatched RoleBinding policy_generation")
+  end
+  if opts.role_binding ~= nil then
+    if type(opts.role_binding) ~= "table"
+      or (opts.role_binding.role ~= nil and opts.role_binding.role ~= binding.role)
+      or (opts.role_binding.binding_id ~= nil and opts.role_binding.binding_id ~= binding.binding_id)
+      or (opts.role_binding.policy_generation ~= nil and opts.role_binding.policy_generation ~= binding.policy_generation) then
+      return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+        "supplied role_binding conflicts with canonical RoleBinding")
+    end
+  end
+  if opts.authority_reference ~= nil and opts.authority_reference ~= agent:authority_reference() then
+    return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "forged authority_reference rejected")
+  end
+  if required_capability then
+    local granted = false
+    if type(required_capability) == "table" then
+      for _, cap in ipairs(required_capability) do
+        if agent:has_capability(cap) then
+          granted = true
+          break
+        end
+      end
+    else
+      granted = agent:has_capability(required_capability)
+    end
+    if not granted then
+      return nil, nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+        string.format("agent '%s' (role '%s') lacks required capability for dashboard action",
+          tostring(agent.name), tostring(binding.role)))
+    end
+  end
+  local session = nil
+  if self.lifecycle and opts.require_session ~= false then
+    local session_err
+    session, session_err = self:_canonical_agent_session(agent, opts.session_id)
+    if not session then
+      return nil, nil, session_err
+    end
+    if session.state == "ended" or session.state == "abandoned" then
+      return nil, nil, dashboard_error("E_DASHBOARD_STATE",
+        "terminal runtime session cannot perform dashboard actions")
+    end
+    if opts.disallow_stale ~= false and session.state == "stale" then
+      return nil, nil, dashboard_error("E_DASHBOARD_STATE",
+        "stale runtime session must be recovered before performing dashboard actions")
+    end
+    if opts.require_active_session and session.state ~= "active" then
+      return nil, nil, dashboard_error("E_DASHBOARD_STATE",
+        "dashboard action requires an active runtime session")
+    end
+  end
+  return agent, session, nil
+end
+
+--- Atomically persist a collaboration request/reply record and anchor it in an
+--- immutable ContextCommit.
+-- @param record table
+-- @param is_new boolean|nil
+-- @return boolean, table|nil
+function WheelTeam:_persist_collaboration_request(record, is_new)
+  if not self.context or type(self.context.put_slot) ~= "function"
+    or type(self.context.commit_checkpoint) ~= "function" then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "collaboration requests require a context persistence store")
+  end
+  local slot_name = "collaboration/requests/" .. record.request_id
+  if type(self.context._with_handoff_transaction) == "function"
+    and not self.context._handoff_transaction_active then
+    local orig_cp = record.checkpoint_hash
+    local orig_reply_cp = record.reply and record.reply.checkpoint_hash or nil
+    local tx_err = nil
+    local tx_ok, tx_res = self.context:_with_handoff_transaction(slot_name, function()
+      local ok_inner, err_inner = self:_persist_collaboration_request(record, is_new)
+      if not ok_inner then
+        tx_err = err_inner
+        return false, err_inner
+      end
+      return true, nil
+    end, self.kernel)
+    if not tx_ok then
+      record.checkpoint_hash = orig_cp
+      if record.reply then
+        record.reply.checkpoint_hash = orig_reply_cp
+      end
+      return false, tx_err or dashboard_error("E_DASHBOARD_PERSIST",
+        (type(tx_res) == "table" and (tx_res.message or tx_res.error))
+        or "collaboration request transaction failed")
+    end
+    return true, nil
+  end
+
+  local copy = deep_copy_plain(record)
+  copy.checkpoint_hash = nil
+  local ok_enc, encoded = pcall(self.kernel.json.encode, copy)
+  if not ok_enc or type(encoded) ~= "string" or #encoded > MAX_REQUEST_RECORD_BYTES then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "collaboration request record exceeds size bound")
+  end
+  local existing = self.context:get_slot(slot_name)
+  local expected_version
+  if is_new then
+    if existing and existing.found then
+      return false, dashboard_error("E_DASHBOARD_PERSIST",
+        "collaboration request slot already exists: " .. tostring(record.request_id))
+    end
+    expected_version = 0
+  else
+    if not existing or not existing.found then
+      return false, dashboard_error("E_DASHBOARD_PERSIST",
+        "collaboration request slot does not exist: " .. tostring(record.request_id))
+    end
+    expected_version = existing.version
+  end
+  local put_res, put_err = self.context:put_slot(slot_name, encoded, expected_version)
+  if not put_res or not put_res.success then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      (type(put_err) == "table" and put_err.message) or "failed to persist collaboration request")
+  end
+  local cp = self.context:commit_checkpoint({
+    author = "wheel:dashboard",
+    task_id = record.task_id,
+    message = string.format("Collaboration %s %s (%s)",
+      record.kind, record.request_id, record.status),
+    rationale = {
+      why = "Persist durable collaboration request/reply record",
+      what = string.format("%s %s -> %s (%s)", record.kind, record.from, record.to, record.status),
+    },
+  })
+  if not cp or not cp.hash then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "failed to commit collaboration request checkpoint")
+  end
+  record.checkpoint_hash = cp.hash
+  if record.reply and not record.reply.checkpoint_hash then
+    record.reply.checkpoint_hash = cp.hash
+  end
+  local final_encoded = self.kernel.json.encode(record)
+  if #final_encoded > MAX_REQUEST_RECORD_BYTES then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "collaboration request record exceeds size bound after checkpoint binding")
+  end
+  local final_put = self.context:put_slot(slot_name, final_encoded, put_res.version)
+  if not final_put or not final_put.success then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "failed to bind checkpoint hash to collaboration request slot")
+  end
+  local final_cp = self.context:commit_checkpoint({
+    author = "wheel:dashboard",
+    task_id = record.task_id,
+    message = string.format("Collaboration %s %s checkpoint reference",
+      record.kind, record.request_id),
+    rationale = {
+      why = "Bind collaboration request record to immutable ContextCommit",
+      what = record.request_id,
+    },
+  })
+  if not final_cp or not final_cp.hash then
+    return false, dashboard_error("E_DASHBOARD_PERSIST",
+      "failed to commit collaboration checkpoint reference")
+  end
+  return true, nil
+end
+
+--- Look up and verify a committed collaboration request record by ID.
+-- @param request_id string
+-- @return table|nil
+function WheelTeam:_find_collaboration_request(request_id)
+  if type(request_id) ~= "string" or request_id == "" then return nil end
+  local slot_name = "collaboration/requests/" .. request_id
+  if not self.context or type(self.context.get_slot) ~= "function" then
+    return nil
+  end
+  local slot = self.context:get_slot(slot_name)
+  if not slot or not slot.found or type(slot.content) ~= "string"
+    or #slot.content > MAX_REQUEST_RECORD_BYTES then
+    return nil
+  end
+  local ok, decoded = pcall(self.kernel.json.decode, slot.content)
+  if not ok or type(decoded) ~= "table" or decoded.request_id ~= request_id
+    or not COLLABORATION_KINDS[decoded.kind] then
+    return nil
+  end
+  -- Verify the slot content is anchored in an immutable ContextCommit.
+  local committed = false
+  for _, commit in ipairs(self.context:log(WheelContext.MAX_REFLOG_INDEX)) do
+    local saved = commit.slots and commit.slots[slot_name]
+    if saved and saved.content == slot.content then
+      committed = true
+      break
+    end
+  end
+  if not committed then return nil end
+  for idx, existing in ipairs(self.requests) do
+    if existing.request_id == request_id then
+      self.requests[idx] = decoded
+      return decoded
+    end
+  end
+  self.requests[#self.requests + 1] = decoded
+  return decoded
+end
+
+--- Create and persist a new collaboration request (`ask`, `clarification`, or `context-share`).
+-- @param kind string
+-- @param from_actor string
+-- @param to_actor string
+-- @param message string
+-- @param opts table|nil
+-- @return table|nil, table|nil
+function WheelTeam:_create_collaboration_request(kind, from_actor, to_actor, message, opts)
+  opts = opts or {}
+  if not COLLABORATION_KINDS[kind] then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "unsupported collaboration request kind", "validation")
+  end
+  if opts.reply ~= nil or opts.reply_fn ~= nil then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "replies must be submitted by the recipient through reply_request", "validation")
+  end
+  local clean_from, from_err = bounded_id_ref(from_actor, "from")
+  if not clean_from then return nil, dashboard_error("E_DASHBOARD_INVALID", from_err, "validation") end
+  local clean_to, to_err = bounded_id_ref(to_actor, "to")
+  if not clean_to then return nil, dashboard_error("E_DASHBOARD_INVALID", to_err, "validation") end
+  if clean_from == clean_to then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "collaboration request requires distinct sender and recipient", "validation")
+  end
+  local clean_msg, msg_err = bounded_clean_text(message, "message", MAX_REQUEST_MESSAGE_BYTES, false)
+  if not clean_msg then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", msg_err, "validation")
+  end
+
+  local from_agent, from_session
+  if clean_from ~= "user" then
+    local auth_err
+    from_agent, from_session, auth_err = self:_verify_agent_authority(
+      clean_from, WheelAgent.Capability.INSPECT, opts)
+    if not from_agent then return nil, auth_err end
+  end
+  local to_agent = nil
+  if clean_to ~= "user" then
+    to_agent = self.agents[clean_to]
+    if not to_agent then
+      return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "recipient agent not found: " .. tostring(clean_to))
+    end
+  end
+  if clean_from == "user" and clean_to == "user" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "at least one participant must be a Team Agent", "validation")
+  end
+
+  local task_id, task_err = bounded_id_ref(opts.task_id, "task_id", true)
+  if opts.task_id ~= nil and not task_id then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", task_err, "validation")
+  end
+  if task_id and not self.kernel:get_task(task_id) then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "referenced task_id does not exist", "validation")
+  end
+
+  local context_ref = opts.context_ref
+  local commit = nil
+  if kind == WheelTeam.CollaborationKind.CONTEXT_SHARE or context_ref ~= nil then
+    commit = verify_commit_exists(self.context, context_ref)
+    if not commit then
+      return nil, dashboard_error("E_DASHBOARD_CONTEXT_REF",
+        "context_ref must identify an existing immutable ContextCommit", "validation")
+    end
+  end
+
+  local slot_refs = {}
+  if opts.slot_refs ~= nil then
+    if type(opts.slot_refs) ~= "table" or #opts.slot_refs > 16 then
+      return nil, dashboard_error("E_DASHBOARD_INVALID", "slot_refs must be a bounded list of at most 16 slot names", "validation")
+    end
+    for _, slot_name in ipairs(opts.slot_refs) do
+      local clean_slot = bounded_clean_text(slot_name, "slot_ref", 128, false)
+      if not clean_slot then
+        return nil, dashboard_error("E_DASHBOARD_INVALID", "invalid slot_ref entry", "validation")
+      end
+      if commit and (not commit.slots or not commit.slots[clean_slot]) then
+        return nil, dashboard_error("E_DASHBOARD_CONTEXT_REF",
+          "slot_ref '" .. clean_slot .. "' does not exist in context_ref commit", "validation")
+      end
+      slot_refs[#slot_refs + 1] = clean_slot
+    end
+  end
+
+  local now_ms = math.floor(WheelHost.time.now() * 1000)
+  local clean_kind = kind:gsub("[^a-z]", "")
+  local request_id
+  repeat
+    self.request_counter = (self.request_counter or 0) + 1
+    request_id = string.format("req-%d-%d-%s", now_ms, self.request_counter, clean_kind)
+    local taken = self.context and type(self.context.get_slot) == "function"
+      and self.context:get_slot("collaboration/requests/" .. request_id) or nil
+  until not (taken and taken.found)
+
+  local record = {
+    request_id = request_id,
+    kind = kind,
+    from = clean_from,
+    to = clean_to,
+    from_agent_id = from_agent and from_agent.agent_id or nil,
+    to_agent_id = to_agent and to_agent.agent_id or nil,
+    from_role_binding = from_agent and WheelAgent.binding_reference(from_agent.role_binding) or nil,
+    session_id = from_session and from_session.session_id or (from_agent and from_agent:runtime_session_id()) or nil,
+    task_id = task_id,
+    message = clean_msg,
+    context_ref = context_ref,
+    slot_refs = slot_refs,
+    status = "pending",
+    reply = nil,
+    created_at_ms = now_ms,
+    updated_at_ms = now_ms,
+  }
+
+  local ok_persist, persist_err = self:_persist_collaboration_request(record, true)
+  if not ok_persist then
+    return nil, persist_err
+  end
+  self.requests[#self.requests + 1] = record
+  if self.context and self.context.bus and type(self.context.bus.publish) == "function" then
+    self.context.bus:publish({
+      type = "collaboration_request_created",
+      request_id = record.request_id,
+      kind = record.kind,
+      from = record.from,
+      to = record.to,
+      task_id = record.task_id,
+      checkpoint_hash = record.checkpoint_hash,
+    })
+  end
+
+  return deep_copy_plain(record), nil
+end
+
+--- Ask a Team Agent a question (from user or another peer Agent) and record a
+--- durable request/reply record.
+function WheelTeam:ask_agent(target_agent, question, opts)
+  opts = opts or {}
+  local sender = opts.from or "user"
+  return self:_create_collaboration_request(
+    WheelTeam.CollaborationKind.ASK, sender, target_agent, question, opts)
+end
+
+--- Record a bidirectional clarification request from a Team Agent to the user
+--- or another peer Agent.
+function WheelTeam:request_clarification(from_agent, target, question, opts)
+  opts = opts or {}
+  return self:_create_collaboration_request(
+    WheelTeam.CollaborationKind.CLARIFICATION, from_agent, target or "user", question, opts)
+end
+
+--- Share an immutable ContextCommit reference (and optional slot names) with
+--- another Agent or user without copying raw slot contents or transcripts.
+function WheelTeam:share_context(from_agent, to_agent, opts)
+  opts = opts or {}
+  local summary = opts.message or ("Shared context commit " .. tostring(opts.context_ref or ""):sub(1, 12))
+  return self:_create_collaboration_request(
+    WheelTeam.CollaborationKind.CONTEXT_SHARE, from_agent, to_agent, summary, opts)
+end
+
+--- Reply to an open collaboration request (`ask`, `clarification`, or `context-share`).
+function WheelTeam:reply_request(request_id, reply_text, opts)
+  opts = opts or {}
+  local record = self:_find_collaboration_request(request_id)
+  if not record then
+    return nil, dashboard_error("E_DASHBOARD_NOT_FOUND",
+      "collaboration request not found: " .. tostring(request_id))
+  end
+  if record.status ~= "pending" then
+    return nil, dashboard_error("E_DASHBOARD_STATE",
+      "collaboration request is already " .. tostring(record.status))
+  end
+  local responder = opts.responder or record.to
+  if responder ~= record.to then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "only the designated recipient '" .. tostring(record.to) .. "' may reply to this request")
+  end
+  local clean_reply, reply_err = bounded_clean_text(reply_text, "reply", MAX_REQUEST_MESSAGE_BYTES, false)
+  if not clean_reply then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", reply_err, "validation")
+  end
+
+  local responder_agent, responder_session
+  if responder ~= "user" then
+    local auth_err
+    responder_agent, responder_session, auth_err = self:_verify_agent_authority(
+      responder, WheelAgent.Capability.INSPECT, opts)
+    if not responder_agent then return nil, auth_err end
+  end
+
+  if opts.context_ref ~= nil and not verify_commit_exists(self.context, opts.context_ref) then
+    return nil, dashboard_error("E_DASHBOARD_CONTEXT_REF",
+      "reply context_ref must identify an existing immutable ContextCommit", "validation")
+  end
+
+  local now_ms = math.floor(WheelHost.time.now() * 1000)
+  local updated = deep_copy_plain(record)
+  updated.status = "replied"
+  updated.updated_at_ms = now_ms
+  updated.reply = {
+    responder = responder,
+    responder_agent_id = responder_agent and responder_agent.agent_id or nil,
+    role_binding = responder_agent and WheelAgent.binding_reference(responder_agent.role_binding) or nil,
+    session_id = responder_session and responder_session.session_id
+      or (responder_agent and responder_agent:runtime_session_id()) or nil,
+    content = clean_reply,
+    context_ref = opts.context_ref,
+    timestamp_ms = now_ms,
+  }
+
+  local ok_persist, persist_err = self:_persist_collaboration_request(updated)
+  if not ok_persist then
+    return nil, persist_err
+  end
+  for k in pairs(record) do record[k] = nil end
+  for k, v in pairs(updated) do record[k] = v end
+
+  if self.context and self.context.bus and type(self.context.bus.publish) == "function" then
+    self.context.bus:publish({
+      type = "collaboration_request_replied",
+      request_id = record.request_id,
+      kind = record.kind,
+      from = record.from,
+      to = record.to,
+      responder = responder,
+      checkpoint_hash = record.checkpoint_hash,
+    })
+  end
+
+  return deep_copy_plain(record), nil
+end
+
+--- Retrieve a durable collaboration request by ID.
+function WheelTeam:get_request(request_id)
+  local record = self:_find_collaboration_request(request_id)
+  return record and deep_copy_plain(record) or nil
+end
+
+--- List durable collaboration requests with optional filtering by agent, kind, or status.
+function WheelTeam:list_requests(filter)
+  filter = filter or {}
+  local out = {}
+  for _, req in ipairs(self.requests) do
+    local verified = self:_find_collaboration_request(req.request_id) or req
+    local matches = true
+    if filter.agent_name and verified.from ~= filter.agent_name and verified.to ~= filter.agent_name then
+      matches = false
+    end
+    if filter.kind and verified.kind ~= filter.kind then
+      matches = false
+    end
+    if filter.status and verified.status ~= filter.status then
+      matches = false
+    end
+    if filter.task_id and verified.task_id ~= filter.task_id then
+      matches = false
+    end
+    if matches then
+      out[#out + 1] = deep_copy_plain(verified)
+    end
+  end
+  return out
+end
+
+--- Accept, decline (reject), or close an offered handoff subject to RoleBinding,
+--- session controller authority, and task generation fencing.
+function WheelTeam:respond_handoff(handoff_id, decision, authority)
+  local normalized = decision
+  if decision == "accept" then normalized = "accepted"
+  elseif decision == "decline" or decision == "reject" then normalized = "rejected"
+  elseif decision == "close" then normalized = "closed" end
+  local ok, res = self:set_handoff_state(handoff_id, normalized, authority)
+  if not ok then
+    return nil, dashboard_error("E_DASHBOARD_HANDOFF", tostring(res))
+  end
+  return deep_copy_plain(res), nil
+end
+
+--- Build bounded diagnostics and raw-output references without dumping unbounded logs.
+function WheelTeam:bounded_diagnostics(opts)
+  opts = opts or {}
+  local limit = math.min(opts.limit or MAX_DIAGNOSTIC_ITEMS, MAX_DIAGNOSTIC_ITEMS)
+  local actions = {}
+  if self.kernel and type(self.kernel.recent_actions) == "function" then
+    local ok, list = pcall(self.kernel.recent_actions, self.kernel)
+    if ok and type(list) == "table" then actions = list end
+  end
+  local items = {}
+  local start_idx = math.max(1, #actions - limit + 1)
+  for idx = #actions, start_idx, -1 do
+    local act = actions[idx]
+    if type(act) == "table" then
+      local raw_preview = act.preview or act.stdout_preview or act.stderr_preview or ""
+      local preview = WheelAudit.redact_bounded(tostring(raw_preview), MAX_DIAGNOSTIC_PREVIEW_BYTES)
+      local stage = type(act.diagnostics) == "table" and act.diagnostics.final_failure_stage or nil
+      items[#items + 1] = {
+        action_id = act.action_id or ("action-" .. tostring(idx)),
+        tool = act.tool or "unknown",
+        intent = act.intent,
+        success = act.success == true,
+        exit_code = act.exit_code or 0,
+        duration_ms = act.duration_ms or 0,
+        timed_out = act.timed_out == true,
+        truncated = act.truncated == true,
+        spilled = act.spilled == true,
+        failure_stage = stage,
+        preview = preview,
+        raw_output_ref = {
+          blob_hash = act.blob_hash,
+          slot_ref = type(act.blob_hash) == "string" and ("blobs/" .. act.blob_hash) or nil,
+          size_bytes = act.size_bytes or 0,
+          stdout_bytes = act.stdout_bytes or 0,
+          stderr_bytes = act.stderr_bytes or 0,
+          spillover_bytes = act.spillover_bytes or 0,
+          omitted_reason = act.spilled and "spilled_to_blob"
+            or (act.truncated and "truncated_preview" or nil),
+        },
+      }
+    end
+  end
+  return {
+    bounded = true,
+    max_items = limit,
+    max_preview_bytes = MAX_DIAGNOSTIC_PREVIEW_BYTES,
+    total_recorded = #actions,
+    items = items,
+  }
+end
+
+--- Execute an explicit Dashboard control action (`checkpoint`, `branch`, `fork`,
+--- `pause`, `resume`, `attach`, `detach`, `cancel`, `ask`, `reply`,
+--- `clarification`, `context-share`, `handoff_respond`) subject to runtime
+--- RoleBinding, capability grants, audit, and lifecycle fencing.
+function WheelTeam:dashboard_action(action, params)
+  if type(action) ~= "string" or action == "" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "dashboard action name is required", "validation")
+  end
+  if type(params) ~= "table" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "dashboard action params must be a table", "validation")
+  end
+
+  if action == WheelTeam.DashboardAction.ASK then
+    return self:ask_agent(params.to or params.target_agent or params.agent_name, params.message or params.question, params)
+  elseif action == WheelTeam.DashboardAction.CLARIFICATION then
+    return self:request_clarification(params.from or params.agent_name, params.to or "user", params.message or params.question, params)
+  elseif action == WheelTeam.DashboardAction.CONTEXT_SHARE then
+    return self:share_context(params.from or params.agent_name, params.to or params.target_agent, params)
+  elseif action == WheelTeam.DashboardAction.REPLY then
+    return self:reply_request(params.request_id, params.reply or params.message or params.content, params)
+  elseif action == WheelTeam.DashboardAction.HANDOFF_RESPOND then
+    return self:respond_handoff(params.handoff_id, params.decision or params.state, {
+      agent_name = params.agent_name,
+      agent_id = params.agent_id,
+      session_id = params.session_id,
+    })
+  end
+
+  local agent_name = params.agent_name
+  if type(agent_name) ~= "string" or agent_name == "" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "agent_name is required for action '" .. action .. "'", "validation")
+  end
+
+  if action == WheelTeam.DashboardAction.CHECKPOINT then
+    local agent, session, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, params)
+    if not agent then return nil, auth_err end
+    local message, msg_err = bounded_clean_text(
+      params.message or ("Dashboard checkpoint by " .. agent.name), "message", 256, false)
+    if not message then return nil, dashboard_error("E_DASHBOARD_INVALID", msg_err, "validation") end
+    local rationale = params.rationale or {
+      why = "Explicit dashboard checkpoint requested",
+      what = message,
+    }
+    local commit = agent:commit_checkpoint(rationale, message)
+    if not commit or not commit.hash then
+      return nil, dashboard_error("E_DASHBOARD_CHECKPOINT", "failed to commit context checkpoint")
+    end
+    local session_record = nil
+    if self.lifecycle and (session or agent:runtime_session_id()) then
+      local cp_err
+      session_record, cp_err = agent:checkpoint_runtime_session(commit.hash)
+      if not session_record then
+        return nil, cp_err or dashboard_error("E_DASHBOARD_CHECKPOINT", "failed to checkpoint runtime session")
+      end
+    end
+    return {
+      action = action,
+      agent_id = agent.agent_id,
+      checkpoint_hash = commit.hash,
+      tree_hash = commit.tree_hash,
+      session = session_record,
+    }, nil
+
+  elseif action == WheelTeam.DashboardAction.BRANCH then
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, { WheelAgent.Capability.MODIFY, WheelAgent.Capability.ORCHESTRATE }, params)
+    if not agent then return nil, auth_err end
+    local branch_name, branch_err = bounded_id_ref(params.branch_name or params.branch, "branch_name")
+    if not branch_name then
+      return nil, dashboard_error("E_DASHBOARD_INVALID", branch_err, "validation")
+    end
+    local created, create_err = agent:create_branch(branch_name, params.start_point)
+    if not created then
+      return nil, dashboard_error("E_DASHBOARD_BRANCH",
+        (type(create_err) == "table" and create_err.message) or tostring(create_err))
+    end
+    if params.checkout ~= false then
+      local checked_out, checkout_err = agent:checkout(branch_name)
+      if not checked_out then
+        return nil, dashboard_error("E_DASHBOARD_BRANCH",
+          (type(checkout_err) == "table" and checkout_err.message) or tostring(checkout_err))
+      end
+    end
+    return {
+      action = action,
+      agent_id = agent.agent_id,
+      branch = branch_name,
+      current_branch = agent:current_branch(),
+      head_commit = self.context and self.context:head_commit_hash() or nil,
+    }, nil
+
+  elseif action == WheelTeam.DashboardAction.FORK then
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, params)
+    if not agent then return nil, auth_err end
+    local child, fork_err = self:fork_agent(agent_name, params)
+    if not child then
+      return nil, fork_err or dashboard_error("E_DASHBOARD_FORK", "fork_agent failed")
+    end
+    return {
+      action = action,
+      parent_agent_id = agent.agent_id,
+      child_agent_id = child.agent_id,
+      child_name = child.name,
+      role_binding = WheelAgent.binding_reference(child.role_binding),
+      lineage = child:lineage_projection(),
+      session_id = child:runtime_session_id(),
+      panel_id = child:runtime_panel_id(),
+    }, nil
+
+  elseif action == WheelTeam.DashboardAction.PAUSE then
+    if not self.lifecycle then
+      return nil, dashboard_error("E_LIFECYCLE_UNAVAILABLE", "pause requires a lifecycle registry")
+    end
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, {
+        agent_id = params.agent_id,
+        session_id = params.session_id,
+        role_binding = params.role_binding,
+        policy_generation = params.policy_generation,
+        require_active_session = true,
+      })
+    if not agent then return nil, auth_err end
+    local paused, pause_err = agent:pause_runtime_session(params.reason or "user_pause")
+    if not paused then return nil, pause_err end
+    return { action = action, agent_id = agent.agent_id, session = paused }, nil
+
+  elseif action == WheelTeam.DashboardAction.RESUME then
+    if not self.lifecycle then
+      return nil, dashboard_error("E_LIFECYCLE_UNAVAILABLE", "resume requires a lifecycle registry")
+    end
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, params)
+    if not agent then return nil, auth_err end
+    local resumed, resume_err = agent:resume_runtime_session()
+    if not resumed then return nil, resume_err end
+    return { action = action, agent_id = agent.agent_id, session = resumed }, nil
+
+  elseif action == WheelTeam.DashboardAction.ATTACH then
+    if not self.lifecycle then
+      return nil, dashboard_error("E_LIFECYCLE_UNAVAILABLE", "attach requires a lifecycle registry")
+    end
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, params)
+    if not agent then return nil, auth_err end
+    local attached, attach_err = agent:attach_runtime_session(params.panel_id, {
+      mode = params.mode,
+    })
+    if not attached then return nil, attach_err end
+    return { action = action, agent_id = agent.agent_id, session = attached }, nil
+
+  elseif action == WheelTeam.DashboardAction.DETACH then
+    if not self.lifecycle then
+      return nil, dashboard_error("E_LIFECYCLE_UNAVAILABLE", "detach requires a lifecycle registry")
+    end
+    local agent, _, auth_err = self:_verify_agent_authority(
+      agent_name, WheelAgent.Capability.INSPECT, params)
+    if not agent then return nil, auth_err end
+    local detached, detach_err = agent:detach_runtime_session({
+      reason = params.reason or "explicit",
+    })
+    if not detached then return nil, detach_err end
+    return { action = action, agent_id = agent.agent_id, session = detached }, nil
+
+  elseif action == WheelTeam.DashboardAction.CANCEL then
+    local reason_text, reason_err = bounded_clean_text(
+      params.reason or "explicit cancellation", "reason", 256, false)
+    if not reason_text then
+      return nil, dashboard_error("E_DASHBOARD_INVALID", reason_err, "validation")
+    end
+    if params.job_id ~= nil then
+      local agent, _, auth_err = self:_verify_agent_authority(
+        agent_name, { WheelAgent.Capability.EXECUTE, WheelAgent.Capability.ORCHESTRATE }, params)
+      if not agent then return nil, auth_err end
+      if type(params.generation) ~= "number" or params.generation < 1 or params.generation % 1 ~= 0 then
+        return nil, dashboard_error("E_DASHBOARD_INVALID", "process cancellation requires integer generation", "validation")
+      end
+      local cancelled, cancel_err = WheelHost.proc.cancel(params.job_id, params.generation, params.grace_ms)
+      if not cancelled then
+        return nil, dashboard_error("E_DASHBOARD_CANCEL", tostring(cancel_err or "process cancel refused"))
+      end
+      return {
+        action = action,
+        agent_id = agent.agent_id,
+        job_id = params.job_id,
+        generation = params.generation,
+        cancelled = true,
+        reason = reason_text,
+      }, nil
+    end
+
+    local task_id, task_err = bounded_id_ref(params.task_id, "task_id")
+    if not task_id then
+      return nil, dashboard_error("E_DASHBOARD_INVALID", task_err, "validation")
+    end
+    local agent, session, auth_err = self:_verify_agent_authority(
+      agent_name, { WheelAgent.Capability.MODIFY, WheelAgent.Capability.EXECUTE, WheelAgent.Capability.ORCHESTRATE }, params)
+    if not agent then return nil, auth_err end
+    local task = self.kernel:get_task(task_id)
+    if not task then
+      return nil, dashboard_error("E_DASHBOARD_NOT_FOUND", "task not found: " .. tostring(task_id))
+    end
+    local owner = self.task_assignments[task_id] or task.assigned_agent or task.worker_id
+    local is_owner = owner == agent.name
+    local is_commander = agent:current_role() == WheelAgent.Role.COMMANDER
+      and agent:has_capability(WheelAgent.Capability.ORCHESTRATE)
+    if not is_owner and not is_commander then
+      return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+        "only the owning worker or a Commander with orchestrate capability may cancel task '" .. task_id .. "'")
+    end
+    local claim = owner and self.agent_tasks[owner] and self.agent_tasks[owner][task_id]
+    local expected_gen = params.expected_generation or (claim and claim.generation) or task.generation
+    if type(expected_gen) ~= "number" or expected_gen ~= task.generation then
+      return nil, dashboard_error("E_DASHBOARD_FENCE", "stale task generation; cancellation refused")
+    end
+    if self.lifecycle and is_owner then
+      local valid_ctrl, ctrl_err = self:_validate_controller_session(
+        agent.name, task_id, (session and session.session_id) or (claim and claim.session_id), "session_id")
+      if not valid_ctrl then
+        return nil, dashboard_error("E_DASHBOARD_AUTHORITY", ctrl_err)
+      end
+    end
+    local ok_cancel, cancelled_task = pcall(
+      self.kernel.cancel_task, self.kernel, task_id, expected_gen, owner)
+    if not ok_cancel or not cancelled_task then
+      return nil, dashboard_error("E_DASHBOARD_CANCEL",
+        "kernel rejected task cancellation: " .. tostring(cancelled_task))
+    end
+    if owner and self.agent_tasks[owner] then
+      self.agent_tasks[owner][task_id] = nil
+      local owner_st = self.agent_states[owner]
+      if owner_st and owner_st.active_task_ids then
+        owner_st.active_task_ids[task_id] = nil
+        owner_st.active_task_id = next(self.agent_tasks[owner])
+        owner_st.state = owner_st.active_task_id and "busy" or "idle"
+      end
+    end
+    self.task_assignments[task_id] = nil
+    local cp = self.context and self.context:commit_checkpoint({
+      author = agent.agent_id,
+      task_id = task_id,
+      message = string.format("Cancelled task %s (generation %d)", task_id, expected_gen),
+      rationale = {
+        why = "Bounded dashboard task cancellation: " .. reason_text,
+        what = string.format("Task %s cancelled by %s at generation %d", task_id, agent.agent_id, expected_gen),
+      },
+    })
+    return {
+      action = action,
+      agent_id = agent.agent_id,
+      task_id = task_id,
+      generation = expected_gen,
+      status = cancelled_task.status,
+      reason = reason_text,
+      checkpoint_hash = cp and cp.hash or nil,
+    }, nil
+  end
+
+  return nil, dashboard_error("E_DASHBOARD_INVALID", "unsupported dashboard action: " .. tostring(action), "validation")
+end
+
+--- Select an Agent in the Dashboard and return its structured inspection view.
+function WheelTeam:select_agent(agent_name, opts)
+  if not self.agents[agent_name] then
+    return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "agent not found: " .. tostring(agent_name))
+  end
+  self.selected_agent = agent_name
+  return self:inspect_agent(agent_name, opts)
+end
+
+--- Build a read-only structured Context projection for a specific Agent across
+--- project, team, task, and session scopes with provenance and omitted references.
+function WheelTeam:project_dashboard_context(agent_name, opts)
+  opts = opts or {}
+  local agent = self.agents[agent_name]
+  if not agent then
+    return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "agent not found: " .. tostring(agent_name))
+  end
+  if not self.context then
+    return nil, dashboard_error("E_NO_CONTEXT", "team has no context engine configured")
+  end
+
+  local st = self.agent_states[agent_name] or {}
+  local task_id = opts.task_id or st.active_task_id
+  local session_id = agent:runtime_session_id()
+  local head_hash = opts.current_commit or self.context:head_commit_hash()
+  if not head_hash then
+    local initial_cp = self.context:commit_checkpoint({
+      author = "wheel:dashboard",
+      task_id = task_id,
+      message = "Initial dashboard projection commit",
+      rationale = { why = "Materialize immutable commit for read-only dashboard projection", what = agent.agent_id },
+    })
+    head_hash = initial_cp and initial_cp.hash or nil
+  end
+
+  local AGENT_TO_PROJECTION_ROLE = {
+    [WheelAgent.Role.COMMANDER] = WheelContext.Role.PLANNER,
+    [WheelAgent.Role.CODING] = WheelContext.Role.CODING,
+    [WheelAgent.Role.DEBUG] = WheelContext.Role.DEBUG,
+    [WheelAgent.Role.RESEARCH] = WheelContext.Role.RESEARCH,
+    [WheelAgent.Role.REVIEWER] = WheelContext.Role.REVIEWER,
+  }
+  local current_role = agent:current_role()
+  local proj_opts = {
+    current_commit = head_hash,
+    base_commit = opts.base_commit or agent.context_refs.base_context_commit or head_hash,
+    role = opts.projection_role or AGENT_TO_PROJECTION_ROLE[current_role] or current_role,
+    task_id = task_id,
+    relevant_scopes = opts.relevant_scopes or opts.scopes,
+    records = opts.records,
+    base_records = opts.base_records,
+    recent_records = opts.recent_records,
+    p0_max_bytes = opts.p0_max_bytes,
+    p1_max_bytes = opts.p1_max_bytes,
+    p2_max_bytes = opts.p2_max_bytes,
+    p3_max_bytes = opts.p3_max_bytes,
+    p4_max_bytes = opts.p4_max_bytes,
+    max_budget_bytes = opts.max_budget_bytes,
+  }
+  local raw_projection, proj_err = agent:context_projection(proj_opts)
+  if not raw_projection then
+    return nil, proj_err
+  end
+
+  local diag = self:bounded_diagnostics({ limit = opts.diagnostic_limit })
+  local omitted = deep_copy_plain(raw_projection.omitted_references or {})
+  for _, item in ipairs(diag.items) do
+    local ref_info = item.raw_output_ref
+    if ref_info and ref_info.omitted_reason then
+      omitted[#omitted + 1] = {
+        layer = "diagnostics",
+        ref = ref_info.slot_ref or ("action:" .. tostring(item.action_id)),
+        blob_hash = ref_info.blob_hash,
+        reason = ref_info.omitted_reason,
+        bytes = ref_info.size_bytes,
+        provenance = {
+          source_commit = head_hash,
+          source_task = task_id,
+          source_session = session_id,
+          agent_id = agent.agent_id,
+          policy_generation = agent.policy_generation,
+        },
+      }
+    end
+  end
+
+  local session_record = (self.lifecycle and session_id) and self.lifecycle:get_session(session_id) or nil
+  local task_record = task_id and self.kernel:get_task(task_id) or nil
+  local context_ref_slot = task_id and self.context:get_slot("tasks/" .. task_id .. "/context_ref") or nil
+
+  local view = {
+    read_only = true,
+    authority_bearing = false,
+    agent_id = agent.agent_id,
+    name = agent.name,
+    role_binding = WheelAgent.binding_reference(agent.role_binding),
+    lineage = agent:lineage_projection(),
+    context_branch = agent:current_branch(),
+    context_head = head_hash,
+    base_commit = raw_projection.base_commit,
+    current_commit = raw_projection.current_commit,
+    project = {
+      scope = "project",
+      layer_id = "P0",
+      records = deep_copy_plain(raw_projection.layers.P0.records),
+      bytes = raw_projection.layers.P0.bytes,
+      budget_bytes = raw_projection.layers.P0.budget_bytes,
+      provenance = deep_copy_plain(raw_projection.layers.P0.provenance),
+    },
+    team = {
+      scope = "team",
+      layer_id = "P1",
+      role_lenses = deep_copy_plain(raw_projection.layers.P1.records),
+      colleagues = self:list_agents(),
+      handoffs = deep_copy_plain(self.handoffs),
+      requests = self:list_requests({ agent_name = agent.name }),
+      provenance = deep_copy_plain(raw_projection.layers.P1.provenance),
+    },
+    task = {
+      scope = "task",
+      layer_id = "P2",
+      task_id = task_id,
+      task = deep_copy_plain(task_record),
+      records = deep_copy_plain(raw_projection.layers.P2.records),
+      context_ref_hash = (context_ref_slot and context_ref_slot.found) and context_ref_slot.hash or nil,
+      bytes = raw_projection.layers.P2.bytes,
+      budget_bytes = raw_projection.layers.P2.budget_bytes,
+      provenance = deep_copy_plain(raw_projection.layers.P2.provenance),
+    },
+    session = {
+      scope = "session",
+      layer_id = "P4",
+      session_id = session_id or raw_projection.session_id,
+      runtime_session = deep_copy_plain(session_record),
+      records = deep_copy_plain(raw_projection.layers.P4.records),
+      bytes = raw_projection.layers.P4.bytes,
+      budget_bytes = raw_projection.layers.P4.budget_bytes,
+      provenance = deep_copy_plain(raw_projection.layers.P4.provenance),
+    },
+    delta = {
+      scope = "delta",
+      layer_id = "P3",
+      records = deep_copy_plain(raw_projection.layers.P3.records),
+      bytes = raw_projection.layers.P3.bytes,
+      budget_bytes = raw_projection.layers.P3.budget_bytes,
+      provenance = deep_copy_plain(raw_projection.layers.P3.provenance),
+    },
+    layers = deep_copy_plain(raw_projection.layers),
+    omitted_references = omitted,
+    provenance = deep_copy_plain(raw_projection.provenance),
+    total_bytes = raw_projection.total_bytes,
+    max_budget_bytes = raw_projection.max_budget_bytes,
+  }
+  return view, nil
+end
+
+--- Inspect a single registered Agent with separate structured fields for
+--- AgentId, RoleBinding, AgentSession, Panel, Task, ContextBranch/Head,
+--- provider status, lifecycle state, collaboration requests, and diagnostics.
+function WheelTeam:inspect_agent(agent_name, opts)
+  opts = opts or {}
+  local agent = self.agents[agent_name]
+  if not agent then
+    return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "agent not found: " .. tostring(agent_name))
+  end
+  local st = self.agent_states[agent_name] or {}
+  local status = agent:status()
+  local session_id = agent:runtime_session_id()
+  local panel_id = agent:runtime_panel_id()
+  local session_rec = (self.lifecycle and session_id) and self.lifecycle:get_session(session_id) or nil
+  local panel_rec = (self.lifecycle and panel_id) and self.lifecycle:get_panel(panel_id) or nil
+
+  local task_id = opts.task_id or st.active_task_id or (session_rec and session_rec.task_id) or nil
+  local task_rec = task_id and self.kernel:get_task(task_id) or nil
+  local claim_rec = (task_id and self.agent_tasks[agent_name]) and self.agent_tasks[agent_name][task_id] or nil
+
+  local prof = status.model_profile or {}
+  local prov_desc = status.provider or {}
+  local provider_status = {
+    provider = WheelAudit.redact_bounded(tostring(prof.provider or prov_desc.provider or "unconfigured"), 64),
+    model = WheelAudit.redact_bounded(tostring(prof.model or prov_desc.model or "unconfigured"), 128),
+    temperature = prof.temperature,
+    thinking_enabled = type(prof.thinking) == "table" and prof.thinking.enabled == true or false,
+    thinking_gear = type(prof.thinking) == "table" and prof.thinking.gear or nil,
+    ready = agent.provider ~= nil,
+    prefix_cache_key = status.prefix_cache_key,
+    cache_share_ratio = status.cache_share_ratio,
+  }
+
+  local agent_session_field = {
+    session_id = session_rec and session_rec.session_id or session_id or (claim_rec and claim_rec.session_id) or nil,
+    state = session_rec and session_rec.state or "unregistered",
+    attachment_mode = session_rec and session_rec.attachment_mode or nil,
+    checkpoint = session_rec and session_rec.checkpoint or nil,
+    worktree_id = session_rec and session_rec.worktree_id or agent.worktree_id,
+    recovered_from = session_rec and session_rec.recovered_from or nil,
+  }
+
+  local panel_field = {
+    panel_id = panel_rec and panel_rec.panel_id or panel_id,
+    kind = panel_rec and panel_rec.kind or "headless",
+    headless = panel_rec ~= nil and panel_rec.headless or (agent.headless ~= false),
+    state = panel_rec and panel_rec.state or "unregistered",
+    attached_session_id = panel_rec and panel_rec.attached_session_id or nil,
+    observer_session_ids = panel_rec and deep_copy_plain(panel_rec.observer_session_ids) or {},
+  }
+
+  local task_field = nil
+  if task_rec or task_id then
+    task_field = {
+      task_id = task_id,
+      title = task_rec and task_rec.title or nil,
+      status = task_rec and task_rec.status or nil,
+      lifecycle_status = task_rec and (task_rec.lifecycle_status or normalize_lifecycle_status(task_rec.status)) or nil,
+      generation = (task_rec and task_rec.generation) or (claim_rec and claim_rec.generation) or 0,
+      assigned_agent = task_rec and task_rec.assigned_agent or nil,
+      worker_id = task_rec and task_rec.worker_id or nil,
+      checkpoint = task_rec and task_rec.checkpoint or nil,
+    }
+  end
+
+  local lifecycle_state = {
+    team_state = st.state or "idle",
+    session_state = agent_session_field.state,
+    panel_state = panel_field.state,
+    task_state = task_field and task_field.lifecycle_status or "none",
+    attachment_mode = agent_session_field.attachment_mode,
+  }
+
+  local context_view, context_err = nil, nil
+  if opts.include_context ~= false then
+    context_view, context_err = self:project_dashboard_context(agent_name, opts)
+    if not context_view and context_err then
+      return nil, context_err
+    end
+  end
+
+  return {
+    schema = WheelTeam.DASHBOARD_PROTOCOL,
+    presentation_only = true,
+    authority_bearing = false,
+    name = agent.name,
+    agent_id = status.agent_id,
+    role_binding = {
+      agent_id = status.agent_id,
+      role = status.role_binding and status.role_binding.role or status.role,
+      binding_id = status.role_binding and status.role_binding.binding_id or nil,
+      policy_generation = status.policy_generation,
+      capabilities = agent:capabilities(),
+    },
+    agent_session = agent_session_field,
+    panel = panel_field,
+    task = task_field,
+    context_branch = status.context_branch,
+    context_head = status.context_head,
+    context_refs = deep_copy_plain(status.context_refs),
+    lineage = deep_copy_plain(status.lineage),
+    provider_status = provider_status,
+    lifecycle_state = lifecycle_state,
+    context_projection = context_view,
+    requests = self:list_requests({ agent_name = agent.name }),
+    diagnostics = self:bounded_diagnostics({ limit = opts.diagnostic_limit }),
+  }, nil
+end
+
+--- Build a complete read-only Dashboard snapshot across the Team.
+-- @param opts table|nil
+-- @return table|nil, table|nil
+function WheelTeam:dashboard_snapshot(opts)
+  opts = opts or {}
+  local names = {}
+  for name in pairs(self.agents) do names[#names + 1] = name end
+  table.sort(names)
+
+  local selected = opts.selected_agent or self.selected_agent or names[1]
+  local agent_cards = {}
+  local selected_view = nil
+  for _, name in ipairs(names) do
+    local is_selected = (name == selected)
+    local card, card_err = self:inspect_agent(name, {
+      include_context = is_selected or opts.include_all_contexts == true,
+      diagnostic_limit = opts.diagnostic_limit,
+      base_commit = opts.base_commit,
+      current_commit = opts.current_commit,
+    })
+    if not card then
+      return nil, card_err
+    end
+    agent_cards[#agent_cards + 1] = card
+    if is_selected then
+      selected_view = card
+    end
+  end
+
+  return {
+    schema = WheelTeam.DASHBOARD_PROTOCOL,
+    presentation_only = true,
+    authority_bearing = false,
+    selected_agent = selected,
+    selected_view = selected_view,
+    agents = agent_cards,
+    handoffs = deep_copy_plain(self.handoffs),
+    requests = self:list_requests(),
+    diagnostics = self:bounded_diagnostics({ limit = opts.diagnostic_limit }),
   }
 end
 

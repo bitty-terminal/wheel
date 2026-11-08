@@ -10892,6 +10892,10 @@ run_context_projection_tests(run_test)
 local run_agent_identity_tests = assert(loadfile("tests/test_agent_identity.lua"))()
 run_agent_identity_tests(run_test)
 
+-- CTX-0050: Agent Dashboard and bidirectional collaboration control plane.
+local run_dashboard_tests = assert(loadfile("tests/test_dashboard.lua"))()
+run_dashboard_tests(run_test)
+
 -- Remove only this run's root; any caller-owned WHEEL_TEST_TMP base remains.
 cleanup_test_run_root()
 
