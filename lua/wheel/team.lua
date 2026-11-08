@@ -1646,6 +1646,11 @@ local COLLABORATION_KINDS = {
   ["context-share"] = true,
 }
 
+--- Construct a typed Dashboard error object.
+-- @param code string
+-- @param message string
+-- @param class string|nil
+-- @return table
 local function dashboard_error(code, message, class)
   return {
     class = class or (WheelErrors and WheelErrors.CLASS_RUNTIME) or "runtime",
@@ -1654,6 +1659,10 @@ local function dashboard_error(code, message, class)
   }
 end
 
+--- Recursively deep-copy a plain Lua value or table.
+-- @param value any
+-- @param seen table|nil
+-- @return any
 local function deep_copy_plain(value, seen)
   if type(value) ~= "table" then return value end
   seen = seen or {}
@@ -1666,6 +1675,12 @@ local function deep_copy_plain(value, seen)
   return copy
 end
 
+--- Validate and redact a bounded control-character-free string.
+-- @param value any
+-- @param label string
+-- @param max_bytes number|nil
+-- @param allow_empty boolean|nil
+-- @return string|nil, string|nil
 local function bounded_clean_text(value, label, max_bytes, allow_empty)
   max_bytes = max_bytes or MAX_REQUEST_MESSAGE_BYTES
   if type(value) ~= "string" or #value > max_bytes or value:find("[%z\1-\31\127]") then
@@ -1677,6 +1692,11 @@ local function bounded_clean_text(value, label, max_bytes, allow_empty)
   return WheelAudit.redact_bounded(value, max_bytes)
 end
 
+--- Validate a bounded ASCII identifier reference.
+-- @param value any
+-- @param label string
+-- @param allow_nil boolean|nil
+-- @return string|nil, string|nil
 local function bounded_id_ref(value, label, allow_nil)
   if value == nil and allow_nil then return nil end
   if type(value) ~= "string" or value == "" or #value > 128
@@ -1686,6 +1706,10 @@ local function bounded_id_ref(value, label, allow_nil)
   return value
 end
 
+--- Verify that a 64-hex hash names an existing immutable ContextCommit.
+-- @param context table|nil
+-- @param hash string|nil
+-- @return table|nil
 local function verify_commit_exists(context, hash)
   if type(hash) ~= "string" or #hash ~= 64 or not hash:match("^[0-9a-f]+$") then
     return nil
@@ -1700,6 +1724,10 @@ local function verify_commit_exists(context, hash)
   return commit
 end
 
+--- Resolve and verify the canonical runtime session for an Agent.
+-- @param agent table
+-- @param explicit_session_id string|nil
+-- @return table|nil, table|nil
 function WheelTeam:_canonical_agent_session(agent, explicit_session_id)
   if not self.lifecycle or type(self.lifecycle.get_session) ~= "function" then
     return nil, nil
@@ -1727,6 +1755,11 @@ function WheelTeam:_canonical_agent_session(agent, explicit_session_id)
   return session, nil
 end
 
+--- Verify an Agent's canonical RoleBinding, capability grant, and runtime session.
+-- @param agent_name string
+-- @param required_capability string|table|nil
+-- @param opts table|nil
+-- @return table|nil, table|nil, table|nil
 function WheelTeam:_verify_agent_authority(agent_name, required_capability, opts)
   opts = opts or {}
   local agent = self.agents[agent_name]
@@ -1801,13 +1834,43 @@ function WheelTeam:_verify_agent_authority(agent_name, required_capability, opts
   return agent, session, nil
 end
 
-function WheelTeam:_persist_collaboration_request(record)
+--- Atomically persist a collaboration request/reply record and anchor it in an
+--- immutable ContextCommit.
+-- @param record table
+-- @param is_new boolean|nil
+-- @return boolean, table|nil
+function WheelTeam:_persist_collaboration_request(record, is_new)
   if not self.context or type(self.context.put_slot) ~= "function"
     or type(self.context.commit_checkpoint) ~= "function" then
     return false, dashboard_error("E_DASHBOARD_PERSIST",
       "collaboration requests require a context persistence store")
   end
   local slot_name = "collaboration/requests/" .. record.request_id
+  if type(self.context._with_handoff_transaction) == "function"
+    and not self.context._handoff_transaction_active then
+    local orig_cp = record.checkpoint_hash
+    local orig_reply_cp = record.reply and record.reply.checkpoint_hash or nil
+    local tx_err = nil
+    local tx_ok, tx_res = self.context:_with_handoff_transaction(slot_name, function()
+      local ok_inner, err_inner = self:_persist_collaboration_request(record, is_new)
+      if not ok_inner then
+        tx_err = err_inner
+        return false, err_inner
+      end
+      return true, nil
+    end, self.kernel)
+    if not tx_ok then
+      record.checkpoint_hash = orig_cp
+      if record.reply then
+        record.reply.checkpoint_hash = orig_reply_cp
+      end
+      return false, tx_err or dashboard_error("E_DASHBOARD_PERSIST",
+        (type(tx_res) == "table" and (tx_res.message or tx_res.error))
+        or "collaboration request transaction failed")
+    end
+    return true, nil
+  end
+
   local copy = deep_copy_plain(record)
   copy.checkpoint_hash = nil
   local ok_enc, encoded = pcall(self.kernel.json.encode, copy)
@@ -1816,8 +1879,21 @@ function WheelTeam:_persist_collaboration_request(record)
       "collaboration request record exceeds size bound")
   end
   local existing = self.context:get_slot(slot_name)
-  local put_res, put_err = self.context:put_slot(slot_name, encoded,
-    existing and existing.found and existing.version or nil)
+  local expected_version
+  if is_new then
+    if existing and existing.found then
+      return false, dashboard_error("E_DASHBOARD_PERSIST",
+        "collaboration request slot already exists: " .. tostring(record.request_id))
+    end
+    expected_version = 0
+  else
+    if not existing or not existing.found then
+      return false, dashboard_error("E_DASHBOARD_PERSIST",
+        "collaboration request slot does not exist: " .. tostring(record.request_id))
+    end
+    expected_version = existing.version
+  end
+  local put_res, put_err = self.context:put_slot(slot_name, encoded, expected_version)
   if not put_res or not put_res.success then
     return false, dashboard_error("E_DASHBOARD_PERSIST",
       (type(put_err) == "table" and put_err.message) or "failed to persist collaboration request")
@@ -1867,6 +1943,9 @@ function WheelTeam:_persist_collaboration_request(record)
   return true, nil
 end
 
+--- Look up and verify a committed collaboration request record by ID.
+-- @param request_id string
+-- @return table|nil
 function WheelTeam:_find_collaboration_request(request_id)
   if type(request_id) ~= "string" or request_id == "" then return nil end
   local slot_name = "collaboration/requests/" .. request_id
@@ -1903,10 +1982,21 @@ function WheelTeam:_find_collaboration_request(request_id)
   return decoded
 end
 
+--- Create and persist a new collaboration request (`ask`, `clarification`, or `context-share`).
+-- @param kind string
+-- @param from_actor string
+-- @param to_actor string
+-- @param message string
+-- @param opts table|nil
+-- @return table|nil, table|nil
 function WheelTeam:_create_collaboration_request(kind, from_actor, to_actor, message, opts)
   opts = opts or {}
   if not COLLABORATION_KINDS[kind] then
     return nil, dashboard_error("E_DASHBOARD_INVALID", "unsupported collaboration request kind", "validation")
+  end
+  if opts.reply ~= nil or opts.reply_fn ~= nil then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY",
+      "replies must be submitted by the recipient through reply_request", "validation")
   end
   local clean_from, from_err = bounded_id_ref(from_actor, "from")
   if not clean_from then return nil, dashboard_error("E_DASHBOARD_INVALID", from_err, "validation") end
@@ -1974,9 +2064,16 @@ function WheelTeam:_create_collaboration_request(kind, from_actor, to_actor, mes
     end
   end
 
-  self.request_counter = (self.request_counter or 0) + 1
   local now_ms = math.floor(WheelHost.time.now() * 1000)
-  local request_id = string.format("req-%d-%s", self.request_counter, kind:gsub("[^a-z]", ""))
+  local clean_kind = kind:gsub("[^a-z]", "")
+  local request_id
+  repeat
+    self.request_counter = (self.request_counter or 0) + 1
+    request_id = string.format("req-%d-%d-%s", now_ms, self.request_counter, clean_kind)
+    local taken = self.context and type(self.context.get_slot) == "function"
+      and self.context:get_slot("collaboration/requests/" .. request_id) or nil
+  until not (taken and taken.found)
+
   local record = {
     request_id = request_id,
     kind = kind,
@@ -1996,7 +2093,7 @@ function WheelTeam:_create_collaboration_request(kind, from_actor, to_actor, mes
     updated_at_ms = now_ms,
   }
 
-  local ok_persist, persist_err = self:_persist_collaboration_request(record)
+  local ok_persist, persist_err = self:_persist_collaboration_request(record, true)
   if not ok_persist then
     return nil, persist_err
   end
@@ -2010,18 +2107,6 @@ function WheelTeam:_create_collaboration_request(kind, from_actor, to_actor, mes
       to = record.to,
       task_id = record.task_id,
       checkpoint_hash = record.checkpoint_hash,
-    })
-  end
-
-  if opts.reply ~= nil or type(opts.reply_fn) == "function" then
-    local reply_text = opts.reply
-    if type(opts.reply_fn) == "function" then
-      reply_text = opts.reply_fn(to_agent, deep_copy_plain(record))
-    end
-    return self:reply_request(record.request_id, reply_text, {
-      responder = clean_to,
-      session_id = opts.target_session_id or (to_agent and to_agent:runtime_session_id()) or nil,
-      context_ref = opts.reply_context_ref,
     })
   end
 
@@ -2714,9 +2799,12 @@ function WheelTeam:inspect_agent(agent_name, opts)
     attachment_mode = agent_session_field.attachment_mode,
   }
 
-  local context_view = nil
+  local context_view, context_err = nil, nil
   if opts.include_context ~= false then
-    context_view = self:project_dashboard_context(agent_name, opts)
+    context_view, context_err = self:project_dashboard_context(agent_name, opts)
+    if not context_view and context_err then
+      return nil, context_err
+    end
   end
 
   return {
@@ -2748,6 +2836,8 @@ function WheelTeam:inspect_agent(agent_name, opts)
 end
 
 --- Build a complete read-only Dashboard snapshot across the Team.
+-- @param opts table|nil
+-- @return table|nil, table|nil
 function WheelTeam:dashboard_snapshot(opts)
   opts = opts or {}
   local names = {}
@@ -2759,10 +2849,15 @@ function WheelTeam:dashboard_snapshot(opts)
   local selected_view = nil
   for _, name in ipairs(names) do
     local is_selected = (name == selected)
-    local card = self:inspect_agent(name, {
+    local card, card_err = self:inspect_agent(name, {
       include_context = is_selected or opts.include_all_contexts == true,
       diagnostic_limit = opts.diagnostic_limit,
+      base_commit = opts.base_commit,
+      current_commit = opts.current_commit,
     })
+    if not card then
+      return nil, card_err
+    end
     agent_cards[#agent_cards + 1] = card
     if is_selected then
       selected_view = card

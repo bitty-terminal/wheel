@@ -260,7 +260,33 @@ return function(run_test)
     assert(shared.slot_refs[1] == "tasks/TASK-117/spec")
     assert(is_hex_hash(shared.checkpoint_hash))
 
-    -- Verify requests are durable in Context slots (`collaboration/requests/<id>`) and filterable.
+    -- Sender-supplied inline reply/reply_fn must be rejected (`E_DASHBOARD_AUTHORITY`).
+    local forged_inline, forged_inline_err = team:ask_agent("coder", "Can sender forge reply?", {
+      from = "commander",
+      reply = "Forged recipient reply",
+    })
+    assert(forged_inline == nil and forged_inline_err and forged_inline_err.code == "E_DASHBOARD_AUTHORITY",
+      "ask_agent must reject sender-supplied inline reply")
+
+    -- Reloaded / shared WheelTeam instance must generate collision-free request IDs and never overwrite existing records.
+    local second_team = WheelTeam.new({
+      kernel = fx.kernel,
+      context = context,
+      lifecycle = fx.lifecycle,
+      audit = fx.audit,
+    })
+    second_team:register_agent(fx.coder)
+    second_team.request_counter = 0
+    local second_ask, second_err = second_team:ask_agent("user", "Question from shared context team", {
+      from = "coder",
+    })
+    assert(second_ask ~= nil, "shared-context ask_agent must succeed: " .. tostring(second_err and second_err.message))
+    assert(second_ask.request_id ~= asked.request_id, "request_id must not collide with existing durable slot")
+    local orig_preserved = team:get_request(asked.request_id)
+    assert(orig_preserved and orig_preserved.status == "replied",
+      "existing replied record must remain intact after second team creates a request")
+
+    -- Verifyrequests are durable in Context slots (`collaboration/requests/<id>`) and filterable.
     local open_for_commander = team:list_requests({ agent_name = "commander", status = "pending" })
     assert(#open_for_commander == 1 and open_for_commander[1].request_id == clar.request_id)
     local slot = context:get_slot("collaboration/requests/" .. asked.request_id)
@@ -470,9 +496,22 @@ return function(run_test)
     assert(formatted:find(huge_output, 1, true) == nil,
       "format_dashboard must never dump unbounded raw logs")
 
+    local formatted_from_view = WheelUI.format_dashboard(view)
+    assert(formatted_from_view:find("Agents: 3 total", 1, true) ~= nil,
+      "format_dashboard(view) must preserve cards and counts")
+    assert(formatted_from_view:find("role=coding@g1", 1, true) ~= nil)
+
     local scene = WheelUI.render_dashboard_scene(team, { selected_agent = "coder" })
     assert(scene.type == "Text")
     assert(scene.metadata.schema == WheelUI.DASHBOARD_SCHEMA)
     assert(scene.metadata.selected_agent == "coder")
+    assert(scene.content:find("Agents: 3 total", 1, true) ~= nil,
+      "render_dashboard_scene must render all agent cards")
+
+    local bad_inspect, bad_inspect_err = team:inspect_agent("coder", {
+      base_commit = string.rep("f", 64),
+    })
+    assert(bad_inspect == nil and bad_inspect_err ~= nil,
+      "inspect_agent must surface projection failure for an unresolved base_commit")
   end)
 end
