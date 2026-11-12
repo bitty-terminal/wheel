@@ -36,6 +36,12 @@
   return later only if a host-brokered execution service is accepted. Sibling
   future repositories (LLM provider/model management, Agent dashboard, and
   others) are separate, not this one.
+- Documentation and ecosystem surface (owner directive 2026-11-12): keep
+  `README.md` concise (the six required SDK H2 sections, command catalog, 8
+  configuration classes, error codes, and quickstart gates). Detailed Wheel
+  configuration, architecture guides, and Wheel-related plugins belong to the
+  dedicated `https://wheel.bitty.run` website, which may live inside this
+  repository.
 - Authority (0.1.0): the harness holds the user's OS authority under
   [`SECURITY-MODEL.md`](SECURITY-MODEL.md). The approved ceiling is workspace
   read, workspace write, arbitrary argv, shell command strings, network egress,

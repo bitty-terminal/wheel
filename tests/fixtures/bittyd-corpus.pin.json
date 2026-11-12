@@ -1,0 +1,15 @@
+{
+  "schema": "bittyd-corpus-pin/1",
+  "core_commit": "e7cad3ec1ccf9e6505d695efee7bb04787f33457",
+  "core_short_sha": "e7cad3ec",
+  "source_path": "crates/bitty-daemon/tests/harness/corpus.json",
+  "corpus_schema": "bittyd-conformance-corpus/1",
+  "contract_ref": "bitty-terminal-docs/specifications/bittyd-session-host-contract.md",
+  "requirements_ref": "bitty-terminal-docs/specifications/bittyd-session-host-requirements-candidate.md",
+  "sha256": "6c3dff3b61ed22dfe62399128958f880f12c17ceb33059644109eb7856bc096d",
+  "vector_counts": {
+    "total": 83,
+    "adapter_executable": 51,
+    "adapter_skipped": 32
+  }
+}

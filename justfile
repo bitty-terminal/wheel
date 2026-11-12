@@ -105,6 +105,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/daemon.lua
     bun run luaparse --quiet --file lua/wheel/session_cli.lua
     bun run luaparse --quiet --file lua/wheel/cache_telemetry.lua
+    bun run luaparse --quiet --file lua/wheel/bittyd_adapter.lua
     bun run luaparse --quiet --file bench/run.lua
     bun run luaparse --quiet --file bench/lib/cli.lua
     bun run luaparse --quiet --file bench/lib/env.lua
@@ -133,6 +134,8 @@ lua: deps
     bun run luaparse --quiet --file tests/test_audit.lua
     bun run luaparse --quiet --file tests/test_cancel.lua
     bun run luaparse --quiet --file tests/test_cache_telemetry.lua
+    bun run luaparse --quiet --file tests/test_bittyd_adapter.lua
+    bun run luaparse --quiet --file tests/bittyd_adapter_bridge.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
@@ -350,8 +353,16 @@ lua-control: deps
         exit 0; \
     fi
 
+# Core shared bittyd conformance corpus (bittyd-conformance-corpus/1) driven
+# unchanged from the SHA-256-pinned Core commit against the transport-injectable
+# Lua WheelBittydAdapter (candidate-not-bittyd). Covers V-29, V-30, and the
+# adapter half of V-33 without claiming real bittyd daemon behavior.
+test-bittyd-conformance: deps
+    @command -v python3 >/dev/null 2>&1 || { echo "test-bittyd-conformance requires python3" >&2; exit 1; }
+    python3 tests/bittyd_conformance_runner.py
+
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-audit test-cancel test test-bench test-session test-lifecycle lua-control
+check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-bittyd-conformance test-audit test-cancel test test-bench test-session test-lifecycle lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

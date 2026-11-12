@@ -117,6 +117,7 @@ local LAZY_FIELDS = {
   provider = "provider",
   runner = "runner",
   host = "host",
+  bittyd_adapter = "bittyd_adapter",
   WheelAgent = "agent",
   WheelConfig = "config",
   WheelTeam = "team",
@@ -125,6 +126,7 @@ local LAZY_FIELDS = {
   WheelProvider = "provider",
   WheelRunner = "runner",
   WheelHost = "host",
+  WheelBittydAdapter = "bittyd_adapter",
   tools = "tools",
 }
 
