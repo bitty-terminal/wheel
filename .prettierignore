@@ -1,0 +1,3 @@
+# Preserve exact upstream Core corpus bytes (verified by SHA-256 in
+# tests/fixtures/bittyd-corpus.pin.json).
+tests/fixtures/bittyd-corpus.json

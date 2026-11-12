@@ -77,6 +77,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Consumer `bittyd` transport adapter and Core shared conformance corpus gate
+  (CTX-0036 / wheel#108): `lua/wheel/bittyd_adapter.lua` adds the
+  transport-injectable `WheelBittydAdapter` separating local in-process
+  execution from `bittyd` client frames, with typed `Unavailable` refusal when
+  no server is bound (`V-29`), pre-connection policy refusal with zero daemon
+  frames (`V-30`), scrubbed correlation-only adapter audit carrying
+  `daemon_instance_id`, `client_id`, and `session_id` (`V-33`), `R-W13`
+  `daemon.stop` refusal, `R-W06` `pid`/`signal` wire-field refusal, `R-W07`
+  `outcome_unknown` tracking on dropped `session.abort`/`session.kill`, and
+  `WheelContext`/task/runner state survival across client detach and reattach.
+  `just test-bittyd-conformance` (`tests/bittyd_conformance_runner.py` +
+  `tests/bittyd_adapter_bridge.lua`) verifies the SHA-256-pinned Core
+  `bittyd-conformance-corpus/1` vector set unchanged (`e7cad3ec`) and runs all
+  51 fake/adapter vectors as `candidate-not-bittyd` while recording typed skip
+  reasons for the 32 real-service/D-01 rows; no real `bittyd` daemon behavior
+  is claimed from adapter evidence.
+
 - Close CTX-0046 PX-0417 authority and identity defects: lifecycle session
   creation rejects caller resolvers and forged references, while transitions
   and fork widening validate private Agent-issued references against a protected
