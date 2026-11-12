@@ -938,6 +938,9 @@ function Adapter:_check_preconditions(action, params)
   -- R-W11: client-side version gate before opening a connection (V-30).
   if self.enforce_version_gate then
     local ver = self.client_version
+    if action == "daemon.negotiate" and type(params) == "table" and params.client_version ~= nil then
+      ver = params.client_version
+    end
     if
       type(ver) ~= "table"
       or ver.major ~= M.SUPPORTED_MAJOR
@@ -947,7 +950,9 @@ function Adapter:_check_preconditions(action, params)
     then
       self.closed = true
       self:_append_audit(action, "refused", { error_code = "VersionMismatch" })
-      return typed_error("Validation", "VersionMismatch", "adapter refuses unsupported protocol version")
+      local err = typed_error("Validation", "VersionMismatch", "adapter refuses unsupported protocol version")
+      err.refused_by_adapter = true
+      return err
     end
   end
   -- R-W10: Wheel role/consent/policy gate runs before reaching transport (V-30).

@@ -374,7 +374,28 @@ do
     override_refusal.ok == false and override_refusal.error.code == "VersionMismatch",
     "per-call negotiate version override refused with VersionMismatch"
   )
-  check(server.connection_count == 0, "per-call version refusal opens 0 connections")
+  check(
+    server.connection_count == 0 and #server:request_log() == 0,
+    "per-call version refusal opens 0 connections and sends 0 requests"
+  )
+
+  -- Generic Adapter:call("daemon.negotiate", ...) wire version is also checked before opening a connection
+  local call_adapter = AdapterMod.new_adapter({
+    mode = AdapterMod.TRANSPORT_BITTYD,
+    transport = server,
+    connection_name = "review-call-client",
+  })
+  local call_refusal = call_adapter:call("daemon.negotiate", {
+    client_version = { major = 2, minor = 0 },
+  })
+  check(
+    call_refusal.ok == false and call_refusal.error.code == "VersionMismatch",
+    "generic call daemon.negotiate wire version refused with VersionMismatch"
+  )
+  check(
+    server.connection_count == 0 and #server:request_log() == 0,
+    "generic call version refusal opens 0 connections and sends 0 requests"
+  )
 
   -- Re-open clean adapter and negotiate
   adapter = AdapterMod.new_adapter({
