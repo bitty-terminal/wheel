@@ -354,4 +354,117 @@ do
   )
 end
 
+-- ---------------------------------------------------------------------------
+-- PR #139 review coverage: observer grant/terminated checks, wire version gate,
+-- non-callable transport Unavailable, and run_id reuse after termination
+-- ---------------------------------------------------------------------------
+do
+  local server = AdapterMod.new_fake_server({ host_grant = true })
+  local adapter = AdapterMod.new_adapter({
+    mode = AdapterMod.TRANSPORT_BITTYD,
+    transport = server,
+    connection_name = "review-client",
+  })
+
+  -- Per-call negotiate version override is checked before opening a connection
+  local override_refusal = adapter:negotiate({
+    client_version = { major = 2, minor = 0 },
+  })
+  check(
+    override_refusal.ok == false and override_refusal.error.code == "VersionMismatch",
+    "per-call negotiate version override refused with VersionMismatch"
+  )
+  check(server.connection_count == 0, "per-call version refusal opens 0 connections")
+
+  -- Re-open clean adapter and negotiate
+  adapter = AdapterMod.new_adapter({
+    mode = AdapterMod.TRANSPORT_BITTYD,
+    transport = server,
+    connection_name = "review-client",
+  })
+  check(adapter:negotiate({ host_grant = server.host_grant }).ok == true, "review client negotiate ok")
+
+  local created = adapter:create_session({
+    kind = "terminal",
+    idempotency_key = "review-create-1",
+    run_id = "run-retry",
+  })
+  check(created.ok == true, "initial run-retry create ok")
+  local sid = created.result.session.session_id
+
+  -- Observer attach without grant is refused
+  local no_grant_obs = adapter:attach_session({
+    session_id = sid,
+    attach_role = "observer",
+  })
+  check(
+    no_grant_obs.ok == false and no_grant_obs.error.code == "ObserverGrantRequired",
+    "observer attach without grant is refused"
+  )
+
+  -- Observer attach with valid unconsumed grant succeeds once, then is consumed
+  local grant = server:mint_observer_grant(sid)
+  local ok_obs = adapter:attach_session({
+    session_id = sid,
+    attach_role = "observer",
+    observer_grant = grant,
+  })
+  check(ok_obs.ok == true and ok_obs.result.role == "observer", "observer attach with grant succeeds")
+  local replay_obs = adapter:attach_session({
+    session_id = sid,
+    attach_role = "observer",
+    observer_grant = grant,
+  })
+  check(
+    replay_obs.ok == false and replay_obs.error.code == "ObserverGrantRequired",
+    "consumed observer grant cannot be reused"
+  )
+
+  -- Abort session so it reaches terminated
+  local ctrl = adapter:attach_session({
+    session_id = sid,
+    attach_role = "controller",
+    expected_generation = 0,
+    control_token = created.result.control_token,
+  })
+  check(ctrl.ok == true, "controller attach before abort ok")
+  local aborted = adapter:abort_session({
+    session_id = sid,
+    reason_class = "cancel",
+    generation = 0,
+  })
+  check(aborted.ok == true, "abort run-retry ok")
+
+  -- Observer attach to terminated session is refused even with a fresh grant
+  local post_term_grant = server:mint_observer_grant(sid)
+  local term_obs = adapter:attach_session({
+    session_id = sid,
+    attach_role = "observer",
+    observer_grant = post_term_grant,
+  })
+  check(
+    term_obs.ok == false and term_obs.error.code == "SessionNotRunning",
+    "observer attach to terminated session is refused"
+  )
+
+  -- Same run_id can be created again after its prior session terminated
+  local recreated = adapter:create_session({
+    kind = "terminal",
+    idempotency_key = "review-create-2",
+    run_id = "run-retry",
+  })
+  check(recreated.ok == true, "terminated run_id can be reused for a new session")
+
+  -- Non-callable transport table returns typed Unavailable instead of raising
+  local bad_transport_adapter = AdapterMod.new_adapter({
+    mode = AdapterMod.TRANSPORT_BITTYD,
+    transport = {},
+  })
+  local unavail = bad_transport_adapter:status_session({ session_id = sid })
+  check(
+    unavail.ok == false and unavail.error.class == "Unavailable" and unavail.error.code == "Unavailable",
+    "non-callable transport returns typed Unavailable"
+  )
+end
+
 print(string.format("[PASS] test_bittyd_adapter: %d assertions passed", checks))

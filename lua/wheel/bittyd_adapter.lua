@@ -205,6 +205,7 @@ function M.new_fake_server(opts)
     needs_host_grant = opts.host_grant == true,
     state = "running",
     sessions = {},
+    observer_grants = {},
     connections = {},
     connection_count = 0,
     create_keys = {},
@@ -226,6 +227,19 @@ end
 function FakeServer:_mint_token()
   self.id_seq = self.id_seq + 1
   return hex_id(self.id_seq, 64)
+end
+
+function FakeServer:mint_observer_grant(session_id, opts)
+  opts = opts or {}
+  local bearer = self:_mint_token()
+  local ttl = tonumber(opts.ttl_ms) or self.limits.observer_grant_ttl_ms
+  self.observer_grants[bearer] = {
+    session_id = session_id,
+    consumed = false,
+    revoked = opts.revoked == true,
+    expires_ms = self.clock_ms + ttl,
+  }
+  return bearer
 end
 
 function FakeServer:advance_clock(delta_ms)
@@ -637,6 +651,23 @@ function FakeServer:_handle_attach(conn, params)
     })
   end
 
+  if sess.state == "terminated" then
+    self:_record_audit("session.attach", "refused", sess, "SessionNotRunning")
+    return typed_error("Conflict", "SessionNotRunning", "cannot attach observer to terminated session")
+  end
+  local bearer = params.observer_grant
+  local grant = type(bearer) == "string" and self.observer_grants[bearer] or nil
+  local grant_valid = grant ~= nil
+    and grant.session_id == sess.session_id
+    and not grant.consumed
+    and not grant.revoked
+    and grant.expires_ms > self.clock_ms
+  if not grant_valid then
+    self:_record_audit("session.attach", "refused", sess, "ObserverGrantRequired")
+    return typed_error("Denied", "ObserverGrantRequired", "unconsumed observer_grant required")
+  end
+  grant.consumed = true
+
   local attach_id = self:_mint_id()
   local expires = self.clock_ms + self.limits.attach_lease_ttl_ms
   sess.state_revision = sess.state_revision + 1
@@ -944,7 +975,9 @@ function Adapter:_check_preconditions(action, params)
   end
   -- R-W04 / V-29: If bittyd transport is selected and no server is available,
   -- return typed Unavailable without spawning a worker or falling back.
-  if self.mode == M.TRANSPORT_BITTYD and self.transport == nil then
+  local callable_transport = type(self.transport) == "function"
+    or (type(self.transport) == "table" and type(self.transport.send_frame) == "function")
+  if self.mode == M.TRANSPORT_BITTYD and not callable_transport then
     self:_append_audit(action, "unavailable", { error_code = "Unavailable" })
     return typed_error("Unavailable", "Unavailable", "bittyd transport is not available")
   end
@@ -958,10 +991,14 @@ function Adapter:_send_raw(method, params, opts)
       params = params,
     }, opts)
   end
-  return self.transport(self.connection_name, {
-    method = method,
-    params = params,
-  }, opts)
+  if type(self.transport) == "function" then
+    return self.transport(self.connection_name, {
+      method = method,
+      params = params,
+    }, opts)
+  end
+  self:_append_audit(method, "unavailable", { error_code = "Unavailable" })
+  return typed_error("Unavailable", "Unavailable", "bittyd transport is not available")
 end
 
 function Adapter:_observe_reply(method, params, reply)
@@ -1066,8 +1103,11 @@ end
 
 function Adapter:negotiate(opts)
   opts = opts or {}
+  if opts.client_version ~= nil then
+    self.client_version = deep_copy(opts.client_version)
+  end
   local params = {
-    client_version = opts.client_version or self.client_version,
+    client_version = self.client_version,
     host_grant = opts.host_grant,
     operator_capability = opts.operator_capability,
     client_correlation = opts.client_correlation,
@@ -1079,7 +1119,11 @@ end
 function Adapter:create_session(params)
   params = params or {}
   -- R-W05: refuse dual-run when a run_id already has a live session.
-  if type(params.run_id) == "string" and self.hosted_runs[params.run_id] ~= nil then
+  local prior_sid = type(params.run_id) == "string" and self.hosted_runs[params.run_id] or nil
+  local prior = prior_sid and self.sessions[prior_sid] or nil
+  local prior_live = prior_sid ~= nil
+    and not (prior and (prior.state == "terminated" or prior.state == "exited" or prior.state == "failed"))
+  if prior_live then
     self:_append_audit("session.create", "refused", { error_code = "DuplicateRunSession" })
     return typed_error("Conflict", "DuplicateRunSession", "run already has a hosted session")
   end
