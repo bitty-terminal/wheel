@@ -480,7 +480,7 @@ local function resolve_verified_http_tmp_dir(host)
     end
   end
   if not runtime_dir or runtime_dir == "" then
-    runtime_dir = read_env_var(host, "XDG_RUNTIME_DIR") or read_env_var(host, "TMPDIR") or "/tmp/bitty"
+    return nil, "private runtime directory is unavailable"
   end
   local tmp_base = runtime_dir:gsub("/+$", "") .. "/wheel-http"
   if not host.fs.mkdir_p(tmp_base) then
@@ -504,13 +504,13 @@ local function resolve_verified_http_tmp_dir(host)
 end
 
 local function scrub_secret_text(text, secrets)
-  local out = tostring(text or ""):sub(1, 512)
+  local out = tostring(text or "")
   for _, secret in ipairs(secrets or {}) do
     if type(secret) == "string" and #secret >= 4 then
       out = out:gsub(secret:gsub("([^%w])", "%%%1"), "***REDACTED***")
     end
   end
-  return out
+  return out:sub(1, 512)
 end
 
 local http_temp_counter = 0
@@ -645,6 +645,7 @@ function WheelProvider.default_http_client(req)
   end
 
   local argv = {
+    "-q",
     "-sS",
     "--max-redirs", "0",
     "--proto", proto_spec,
@@ -659,9 +660,11 @@ function WheelProvider.default_http_client(req)
   if #resp_body > MAX_HTTP_RESPONSE_BYTES then
     return nil, "HTTP response exceeded byte limit"
   end
-  if not res or not res.ok then
-    local detail = scrub_secret_text(res and (res.stderr ~= "" and res.stderr or res.error) or "curl failed", secret_values)
-    return nil, detail
+  local exit_code = res and (res.exit_code ~= nil and res.exit_code or res.code)
+  if not res or not res.ok or (exit_code ~= nil and exit_code ~= 0) then
+    local detail = res and (res.stderr ~= "" and res.stderr or res.error)
+      or (exit_code and ("curl exited with status " .. tostring(exit_code)) or "curl failed")
+    return nil, scrub_secret_text(detail, secret_values)
   end
 
   local status_num = tonumber((res.stdout or ""):match("(%d%d%d)") or "") or 0
@@ -3007,14 +3010,16 @@ local function resolve_provider_api_key(provider_name, env_name, opts)
   if type(opts.api_key) == "string" and #opts.api_key > 0 then
     return opts.api_key
   end
-  local ok_cfg, cfg = pcall(require, "wheel.config")
-  if not ok_cfg then
-    ok_cfg, cfg = pcall(require, "lua.wheel.config")
-  end
-  if ok_cfg and type(cfg) == "table" and type(cfg.resolve_api_key) == "function" then
-    local resolved = cfg.resolve_api_key(provider_name, opts)
-    if type(resolved) == "string" and #resolved > 0 then
-      return resolved
+  if opts.resolve_stored_credentials == true then
+    local ok_cfg, cfg = pcall(require, "wheel.config")
+    if not ok_cfg then
+      ok_cfg, cfg = pcall(require, "lua.wheel.config")
+    end
+    if ok_cfg and type(cfg) == "table" and type(cfg.resolve_api_key) == "function" then
+      local resolved = cfg.resolve_api_key(provider_name, opts)
+      if type(resolved) == "string" and #resolved > 0 then
+        return resolved
+      end
     end
   end
   if type(env_name) == "string" and #env_name > 0 then
@@ -3030,7 +3035,10 @@ local function resolve_default_http_client(opts)
   if opts.http_client ~= nil then
     return opts.http_client
   end
-  return WheelProvider.default_http_client
+  if opts.use_default_http_client == true then
+    return WheelProvider.default_http_client
+  end
+  return nil
 end
 
 function WheelProvider.create(profile, opts)
@@ -3052,7 +3060,7 @@ function WheelProvider.create(profile, opts)
   local is_openai_family = (p_type == "openai" or p_type == "deepseek"
     or p_type == "opencode-go" or p_type == "openrouter"
     or (tmpl and tmpl.type == "openai")
-    or (p_type == "ollama" and profile.transport == "http"))
+    or (p_type == "ollama" and (profile.transport == "http" or opts.transport == "http")))
 
   -- Attribution applies to OpenAI-compatible adapters that accept attribution.
   local attribution = nil
@@ -3083,7 +3091,12 @@ function WheelProvider.create(profile, opts)
     local adapter_name = (tmpl and tmpl.name) or p_type
     local default_base = (tmpl and tmpl.base_url) or OPENAI_BASE_URL
     local default_model = (tmpl and tmpl.default_model) or "gpt-4o"
-    local api_key_env = (tmpl and tmpl.api_key_env) or (p_type == "deepseek" and "DEEPSEEK_API_KEY" or "OPENAI_API_KEY")
+    local api_key_env
+    if tmpl ~= nil then
+      api_key_env = tmpl.api_key_env
+    elseif p_type ~= "ollama" and p_type ~= "local" and p_type ~= "stdio" then
+      api_key_env = (p_type == "deepseek" and "DEEPSEEK_API_KEY" or "OPENAI_API_KEY")
+    end
     local api_key = resolve_provider_api_key(adapter_name, api_key_env, opts)
     local base_url = profile.base_url or opts.base_url or default_base
     local cache_supported = base_url:gsub("/+$", "") == OPENAI_BASE_URL

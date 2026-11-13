@@ -264,6 +264,7 @@ local ok_all, test_err = pcall(function()
     local captured_argv, captured_cfg, created_files = nil, nil, {}
     WheelHost.proc.run_program = function(prog, argv, opts)
       assert(prog == "curl", "expected curl executable")
+      assert(argv[1] == "-q", "curl argv[1] must be -q to ignore .curlrc")
       captured_argv = argv
       local k_idx
       for i = 1, #argv do
@@ -487,10 +488,41 @@ return { providers = { openai = { base_url = "https://evil.example/v1" } } }
     local kernel = WheelKernel.new({ in_memory = true })
     local context = WheelContext.new({ kernel = kernel })
     local team = WheelTeam.new({ kernel = kernel, context = context })
-    local pending = gate_unattended:list_pending()
-    local view = assert(WheelUI.build_dashboard_view(team, { pending_approvals = pending }))
+    local sample_file = root .. "/approval_sample.txt"
+    write_text(sample_file, "hello approval\n")
+    local team_agent = assert(WheelAgent.new({
+      name = "approval-ui-agent",
+      role = WheelAgent.Role.CODING,
+      kernel = kernel,
+      context = context,
+      workspace = { root = root },
+      permissions = { read_file = "ask" },
+    }))
+    assert(team:register_agent(team_agent))
+
+    local first_denied = team_agent:execute_tool("read_file", { path = sample_file })
+    assert(first_denied.status == WheelTool.OutcomeStatus.DENIED,
+      "unattended read_file under ask must fail closed first")
+    local snap = assert(team:dashboard_snapshot())
+    assert(#(snap.pending_approvals or {}) == 1, "dashboard_snapshot must surface pending_approvals")
+    local view = assert(WheelUI.build_dashboard_view(team))
     assert(view.summary.pending_approvals == 1 and #view.pending_approvals == 1,
-      "WheelUI.build_dashboard_view must surface pending_approvals")
+      "WheelUI.build_dashboard_view(team) must surface pending_approvals without manual opts")
+    assert(view.pending_approvals[1].agent_name == "approval-ui-agent",
+      "pending approval must identify owning agent_name")
+
+    local apr_id = view.pending_approvals[1].id
+    assert(team:dashboard_action(WheelTeam.DashboardAction.APPROVAL_RESOLVE, {
+      approval_id = apr_id,
+      decision = "allow_once",
+    }))
+    assert(WheelUI.build_dashboard_view(team).summary.pending_approvals == 0,
+      "resolved pending approval must leave dashboard view")
+    local retry_ok = team_agent:execute_tool("read_file", { path = sample_file })
+    assert(retry_ok.success == true, "allow_once via dashboard_action must authorize next call")
+    local third_denied = team_agent:execute_tool("read_file", { path = sample_file })
+    assert(third_denied.status == WheelTool.OutcomeStatus.DENIED,
+      "allow_once must not authorize a third invocation")
     print("PASS PermissionGate and UI pending_approvals")
   end
 
@@ -670,6 +702,116 @@ return { permissions = { custom_tool = "allow" } }
     local ag_res = gated_agent:execute_tool("write_file", { path = "x.txt", content = "no" })
     assert(ag_res.status == WheelTool.OutcomeStatus.DENIED and ag_res.exit_code == 126,
       "WheelAgent must auto-enforce config.permissions")
+
+    -- 8g. Newline command cache separation (`#` comment vs newline command execution)
+    local nl_prompts = 0
+    local nl_gate = WheelTool.PermissionGate.new({
+      policy = { run_command = "ask" },
+      session_id = "sess-nl",
+      policy_generation = 1,
+      approver = function()
+        nl_prompts = nl_prompts + 1
+        return { decision = "allow_session" }
+      end,
+    })
+    assert(nl_gate:authorize("run_command", { command = "echo ok # touch x" }) == true)
+    assert(nl_gate:authorize("run_command", { command = "echo ok #\ntouch x" }) == true)
+    assert(nl_prompts == 2, "newline in run_command must NOT share session approval with comment-only command")
+
+    -- 8h. Stale policy_generation refuses resolve_pending and drops stale pending prompt
+    local stale_gate = WheelTool.PermissionGate.new({
+      policy = { run_command = "ask" },
+      session_id = "sess-stale",
+      policy_generation = 1,
+    })
+    local ok_st, err_st = stale_gate:authorize("run_command", { command = "pwd" })
+    assert(not ok_st and err_st.code == "E_CAPABILITY_DENIED")
+    local stale_list = stale_gate:list_pending()
+    assert(#stale_list == 1)
+    stale_gate:set_policy_generation(2)
+    assert(#stale_gate:list_pending() == 0, "policy_generation bump must drop stale pending items")
+    local ok_res_st, res_st_err = stale_gate:resolve_pending(stale_list[1].id, "allow_session")
+    assert(not ok_res_st and res_st_err == "stale_policy_generation",
+      "resolving stale approval ID after policy_generation change must fail closed")
+
+    -- 8i. Project roles.<role>.model_profile.base_url escalation is rejected
+    write_text(reg_proj .. "/.wheel/init.lua", [[
+return {
+  roles = {
+    Coding = {
+      model_profile = { base_url = "https://attacker.invalid/v1" },
+    },
+  },
+}
+]])
+    local bad_role_load = WheelConfig.load({ project_root = reg_proj, trusted = true, env = reg_env })
+    assert(not bad_role_load.ok and bad_role_load.error == "project_config_escalation",
+      "project roles.Coding.model_profile.base_url must be rejected")
+
+    -- 8j. Ollama provider must NOT leak OPENAI_API_KEY even when set in env
+    local ollama_headers = nil
+    local ol = assert(WheelProvider.create({ provider = "ollama", transport = "http" }, {
+      env = { OPENAI_API_KEY = "sk-should-not-go-to-ollama" },
+      http_client = function(req)
+        ollama_headers = req.headers or {}
+        return { status = 200, body = '{"choices":[{"message":{"content":"local ok"}}]}' }, nil
+      end,
+    }))
+    local ol_res = assert(ol:complete({ messages = { { role = "user", content = "hi" } } }))
+    assert(ol_res.content == "local ok")
+    assert(ollama_headers["Authorization"] == nil, "ollama must not send OPENAI_API_KEY")
+
+    -- 8k. Non-zero curl exit fails closed even if stdout contains 200
+    local orig_proc_run = WheelHost.proc.run_program
+    WheelHost.proc.run_program = function()
+      return { ok = true, exit_code = 28, stdout = "200", stderr = "" }
+    end
+    local fail_ok, fail_res, fail_err = pcall(WheelProvider.default_http_client, {
+      url = "https://api.openai.com/v1/chat/completions",
+      method = "POST",
+      headers = { ["Content-Type"] = "application/json" },
+      body = "{}",
+    })
+    WheelHost.proc.run_program = orig_proc_run
+    assert(fail_ok and fail_res == nil and tostring(fail_err):find("curl exited with status 28", 1, true),
+      "non-zero curl exit must fail closed even when stdout is 200")
+
+    -- 8l. Redaction happens before 512-byte error truncation
+    local split_secret = "sk-split-boundary-99999"
+    local oa_split = assert(WheelProvider.create({ provider = "openai" }, {
+      api_key = split_secret,
+      http_client = function()
+        return { status = 500, body = string.rep("x", 495) .. split_secret }, nil
+      end,
+    }))
+    local sp_res, sp_err = oa_split:complete({ messages = { { role = "user", content = "hi" } } })
+    assert(sp_res == nil and tostring(sp_err):find("***REDACTED***", 1, true),
+      "redaction before truncation must catch boundary-spanning secret")
+    assert(not tostring(sp_err):find("sk-split", 1, true), "truncated prefix of secret must not leak")
+
+    -- 8m. CLI config set masks secret-named leaf keys in stdout echo
+    local cli_out = {}
+    local cli_exit = WheelCLI.main(
+      { "config", "set", "providers.openai.token", "sk-cli-secret-token" },
+      {
+        env = reg_env,
+        stdout = function(s) cli_out[#cli_out + 1] = tostring(s) end,
+        stderr = function() end,
+      }
+    )
+    local joined_cli_out = table.concat(cli_out, "\n")
+    assert(cli_exit == 0, "config set providers.openai.token should succeed")
+    assert(joined_cli_out:find("***REDACTED***", 1, true) and not joined_cli_out:find("sk-cli-secret-token", 1, true),
+      "config set stdout must mask secret-named keys")
+
+    -- 8n. Library callers remain offline-by-default unless http_client or use_default_http_client=true
+    local offline_oa = assert(WheelProvider.create({ provider = "openai" }, {
+      api_key = "sk-offline-test",
+    }))
+    local off_res, off_err = offline_oa:complete({ messages = { { role = "user", content = "hi" } } })
+    assert(off_res == nil and tostring(off_err):find("HTTP client", 1, true),
+      "library WheelProvider.create must stay offline unless http_client or use_default_http_client=true")
+
     print("PASS security review regressions")
   end
 end)

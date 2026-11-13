@@ -1634,6 +1634,7 @@ WheelTeam.DashboardAction = {
   CLARIFICATION = "clarification",
   CONTEXT_SHARE = "context-share",
   HANDOFF_RESPOND = "handoff_respond",
+  APPROVAL_RESOLVE = "approval_resolve",
 }
 
 local MAX_REQUEST_RECORD_BYTES = 8192
@@ -2334,6 +2335,12 @@ function WheelTeam:dashboard_action(action, params)
       agent_id = params.agent_id,
       session_id = params.session_id,
     })
+  elseif action == WheelTeam.DashboardAction.APPROVAL_RESOLVE then
+    return self:resolve_pending_approval(params.approval_id, params.decision, {
+      agent_name = params.agent_name,
+      agent_id = params.agent_id,
+      session_id = params.session_id,
+    })
   end
 
   local agent_name = params.agent_name
@@ -2835,6 +2842,89 @@ function WheelTeam:inspect_agent(agent_name, opts)
   }, nil
 end
 
+--- List pending tool approval requests across registered agents.
+-- @param opts table|nil optional { agent_name = string }
+-- @return table
+function WheelTeam:list_pending_approvals(opts)
+  opts = opts or {}
+  local names = {}
+  for name in pairs(self.agents) do
+    if not opts.agent_name or opts.agent_name == name then
+      names[#names + 1] = name
+    end
+  end
+  table.sort(names)
+
+  local out = {}
+  for _, name in ipairs(names) do
+    local agent = self.agents[name]
+    if agent and type(agent.list_pending_approvals) == "function" then
+      for _, item in ipairs(agent:list_pending_approvals()) do
+        out[#out + 1] = item
+      end
+    end
+  end
+  return out
+end
+
+--- Resolve a pending tool approval request through the owning agent's PermissionGate.
+-- @param approval_id string
+-- @param decision string ("allow_once" | "allow_session" | "deny")
+-- @param opts table|nil
+-- @return table|nil, table|nil
+function WheelTeam:resolve_pending_approval(approval_id, decision, opts)
+  opts = opts or {}
+  if type(approval_id) ~= "string" or approval_id == "" then
+    return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "approval_id is required", "validation")
+  end
+  if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
+    return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "invalid approval decision: " .. tostring(decision), "validation")
+  end
+
+  local names = {}
+  if opts.agent_name ~= nil then
+    if not self.agents[opts.agent_name] then
+      return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "agent not found: " .. tostring(opts.agent_name))
+    end
+    names[1] = opts.agent_name
+  else
+    for name in pairs(self.agents) do
+      names[#names + 1] = name
+    end
+    table.sort(names)
+  end
+
+  local saw_stale = false
+  for _, name in ipairs(names) do
+    local agent = self.agents[name]
+    if agent and type(agent.resolve_pending_approval) == "function" then
+      if opts.agent_id and opts.agent_id ~= agent.agent_id then
+        if opts.agent_name ~= nil then
+          return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "agent_id mismatch for " .. tostring(name), "validation")
+        end
+      else
+        local ok, res = agent:resolve_pending_approval(approval_id, decision)
+        if ok then
+          return {
+            action = WheelTeam.DashboardAction.APPROVAL_RESOLVE,
+            approval_id = approval_id,
+            decision = res,
+            agent_name = name,
+            agent_id = agent.agent_id,
+          }, nil
+        elseif res == "stale_policy_generation" then
+          saw_stale = true
+        end
+      end
+    end
+  end
+
+  if saw_stale then
+    return nil, dashboard_error("E_TEAM_APPROVAL_STALE", "approval belongs to a stale policy generation")
+  end
+  return nil, dashboard_error("E_TEAM_APPROVAL_NOT_FOUND", "pending approval not found: " .. tostring(approval_id))
+end
+
 --- Build a complete read-only Dashboard snapshot across the Team.
 -- @param opts table|nil
 -- @return table|nil, table|nil
@@ -2873,6 +2963,7 @@ function WheelTeam:dashboard_snapshot(opts)
     agents = agent_cards,
     handoffs = deep_copy_plain(self.handoffs),
     requests = self:list_requests(),
+    pending_approvals = self:list_pending_approvals(),
     diagnostics = self:bounded_diagnostics({ limit = opts.diagnostic_limit }),
   }
 end

@@ -1367,11 +1367,17 @@ local function sanitize_approval_summary(tool_name, args)
     end
   end
   local text = table.concat(parts, ": ")
-  text = text:gsub("[%z\1-\31\127]", " ")
+  text = text:gsub("\r", "\\r"):gsub("\n", "\\n"):gsub("[%z\1-\31\127]", " ")
   if #text > MAX_SUMMARY_BYTES then
     text = text:sub(1, MAX_SUMMARY_BYTES - 3) .. "..."
   end
   return text
+end
+
+local function escape_control_bytes(text)
+  return (text:gsub("\\", "\\\\"):gsub("([%z\1-\31\127])", function(ch)
+    return string.format("\\x%02x", string.byte(ch))
+  end))
 end
 
 local function scope_key_for_tool(tool_name, args)
@@ -1379,8 +1385,9 @@ local function scope_key_for_tool(tool_name, args)
     return tostring(tool_name)
   end
   if tool_name == "run_command" and type(args.command) == "string" then
-    -- Cache exact normalized command (not bare argv[0]) so `ls` approval cannot widen into `ls; rm -rf ...`.
-    local normalized = args.command:gsub("[%z\1-\31\127]", " "):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+    -- Escape control bytes injectively and only normalize horizontal spaces so newlines cannot collide.
+    local escaped = escape_control_bytes(args.command)
+    local normalized = escaped:gsub("^[ \t]+", ""):gsub("[ \t]+$", ""):gsub(" +", " ")
     if normalized == "" then
       return "run_command:*"
     end
@@ -1411,7 +1418,10 @@ function PermissionGate.new(opts)
   self.policy_generation = tonumber(opts.policy_generation) or 1
   self.approver = type(opts.approver) == "function" and opts.approver or nil
   self._session_cache = {}
+  self._once_cache = {}
   self._pending = {}
+  self._stale_pending_ids = {}
+  self._stale_pending_order = {}
   self._seq = 0
   return self
 end
@@ -1421,6 +1431,18 @@ function PermissionGate:set_policy_generation(gen)
   if num and num ~= self.policy_generation then
     self.policy_generation = num
     self._session_cache = {}
+    self._once_cache = {}
+    for _, item in ipairs(self._pending) do
+      if item and item.id and not self._stale_pending_ids[item.id] then
+        self._stale_pending_ids[item.id] = true
+        table.insert(self._stale_pending_order, item.id)
+        if #self._stale_pending_order > MAX_PENDING_APPROVALS then
+          local evict = table.remove(self._stale_pending_order, 1)
+          self._stale_pending_ids[evict] = nil
+        end
+      end
+    end
+    self._pending = {}
   end
 end
 
@@ -1454,11 +1476,23 @@ function PermissionGate:list_pending()
 end
 
 function PermissionGate:resolve_pending(approval_id, decision)
+  if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
+    return false, "invalid_decision"
+  end
+  if self._stale_pending_ids[approval_id] then
+    self._stale_pending_ids[approval_id] = nil
+    return false, "stale_policy_generation"
+  end
   for i, item in ipairs(self._pending) do
     if item.id == approval_id then
       table.remove(self._pending, i)
-      if decision == "allow_session" then
-        local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
+      if item.policy_generation ~= self.policy_generation then
+        return false, "stale_policy_generation"
+      end
+      local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
+      if decision == "allow_once" then
+        self._once_cache[cache_key] = (self._once_cache[cache_key] or 0) + 1
+      elseif decision == "allow_session" then
         self._session_cache[cache_key] = true
       end
       return true, decision
@@ -1484,6 +1518,15 @@ function PermissionGate:authorize(tool_name, args, ctx)
   local cache_key = string.format("%s|%s|%d", self.session_id, skey, self.policy_generation)
   if self._session_cache[cache_key] == true then
     return true, { decision = "allow_session_cached", mode = "ask" }
+  end
+  local once_count = self._once_cache[cache_key] or 0
+  if once_count > 0 then
+    if once_count <= 1 then
+      self._once_cache[cache_key] = nil
+    else
+      self._once_cache[cache_key] = once_count - 1
+    end
+    return true, { decision = "allow_once", mode = "ask" }
   end
 
   local summary = sanitize_approval_summary(tool_name, args)

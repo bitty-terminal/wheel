@@ -1772,6 +1772,40 @@ function WheelAgent:status()
   }
 end
 
+function WheelAgent:list_pending_approvals()
+  local perm_gate = authoritative_permission_gate(self)
+  if not perm_gate or type(perm_gate.list_pending) ~= "function" then
+    return {}
+  end
+  local pg_gen = authoritative_policy_generation(self)
+  if pg_gen and type(perm_gate.set_policy_generation) == "function" then
+    perm_gate:set_policy_generation(pg_gen)
+  end
+  local items = perm_gate:list_pending() or {}
+  local out = {}
+  for _, item in ipairs(items) do
+    local copy = {}
+    for k, v in pairs(item) do
+      copy[k] = v
+    end
+    copy.agent_name = self.name
+    out[#out + 1] = copy
+  end
+  return out
+end
+
+function WheelAgent:resolve_pending_approval(approval_id, decision)
+  local perm_gate = authoritative_permission_gate(self)
+  if not perm_gate or type(perm_gate.resolve_pending) ~= "function" then
+    return false, "permission_gate_unavailable"
+  end
+  local pg_gen = authoritative_policy_generation(self)
+  if pg_gen and type(perm_gate.set_policy_generation) == "function" then
+    perm_gate:set_policy_generation(pg_gen)
+  end
+  return perm_gate:resolve_pending(approval_id, decision)
+end
+
 -- Stable Agent identity, fork lineage, and the current RoleBinding are immutable
 -- after construction. RoleBinding changes flow only through transition_role,
 -- which issues a new binding and policy generation instead of rewriting history.

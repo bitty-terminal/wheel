@@ -333,7 +333,9 @@ local function cmd_config(args, io_ctx)
       io_ctx.errln("wheel config set: " .. tostring(werr and werr.message or "failed to write settings"))
       return 1
     end
-    io_ctx.println(key .. " = " .. tostring(raw_val))
+    local leaf = key:match("([^%.]+)$") or key
+    local shown = (is_secret_key(leaf) or key:match("^credentials%.")) and "***REDACTED***" or tostring(raw_val)
+    io_ctx.println(key .. " = " .. shown)
     return 0
   elseif sub == "export" then
     io_ctx.out(WheelConfig.export_single_file({ env = io_ctx.env }))
@@ -468,7 +470,8 @@ local function build_provider_from_cli(parsed, io_ctx)
     transport = pcfg.transport,
   }, {
     api_key = api_key,
-    http_client = io_ctx.http_client,
+    http_client = io_ctx.http_client or WheelProvider.default_http_client,
+    use_default_http_client = true,
     session_id = parsed.session_id,
   })
   if not adapter then

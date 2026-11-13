@@ -2598,6 +2598,34 @@ local function validate_project_override(base_config, project_tbl)
       end
     end
   end
+  if type(project_tbl.roles) == "table" then
+    for k in pairs(PROJECT_FORBIDDEN_PROVIDER_KEYS) do
+      if project_tbl.roles[k] ~= nil then
+        return false, "project_config_escalation", "project config must not set roles." .. tostring(k)
+      end
+    end
+    for rname, rcfg in pairs(project_tbl.roles) do
+      if type(rcfg) == "table" then
+        for k in pairs(PROJECT_FORBIDDEN_PROVIDER_KEYS) do
+          if rcfg[k] ~= nil then
+            return false, "project_config_escalation",
+              "project config must not override " .. tostring(k) .. " for role '" .. tostring(rname) .. "'"
+          end
+        end
+        for _, sub_field in ipairs({ "model_profile", "model" }) do
+          if type(rcfg[sub_field]) == "table" then
+            for k in pairs(PROJECT_FORBIDDEN_PROVIDER_KEYS) do
+              if rcfg[sub_field][k] ~= nil then
+                return false, "project_config_escalation",
+                  string.format("project config must not override %s.%s.%s for role '%s'",
+                    tostring(rname), sub_field, tostring(k), tostring(rname))
+              end
+            end
+          end
+        end
+      end
+    end
+  end
   if type(project_tbl.permissions) == "table" then
     local base_perms = type(base_config.permissions) == "table" and base_config.permissions or {}
     for tool_name, mode in pairs(project_tbl.permissions) do
@@ -2751,9 +2779,9 @@ function WheelConfig.load(opts)
     if not safe_ok then
       return {
         ok = false,
-        error = esc_err,
+        error = "project_config_escalation",
         code = "E_PROJECT_CONFIG_ESCALATION",
-        message = esc_msg,
+        message = esc_msg or esc_err,
         path = project_path,
         root = entry.root,
         config = active_config,

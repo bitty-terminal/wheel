@@ -116,7 +116,7 @@ Every command crosses the typed failure boundary in `lua/wheel/errors.lua` and s
 
 ### Configuration failures
 
-Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config`, `project_config_rejected`, `project_config_eval_error`, and `data_settings_rejected`.
+Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config`, `project_config_rejected`, `project_config_eval_error`, `project_config_escalation`, and `data_settings_rejected`.
 
 ## Development
 
