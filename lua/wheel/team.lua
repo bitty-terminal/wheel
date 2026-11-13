@@ -2852,11 +2852,34 @@ function WheelTeam:list_pending_approvals(opts)
   table.sort(names)
 
   local out = {}
+  local seen = {}
   for _, name in ipairs(names) do
     local agent = self.agents[name]
     if agent and type(agent.list_pending_approvals) == "function" then
       for _, item in ipairs(agent:list_pending_approvals()) do
+        if type(item) == "table" and item.id then
+          seen[item.id] = true
+        end
         out[#out + 1] = item
+      end
+    end
+  end
+  if opts.include_store == true or opts.data_dir ~= nil or opts.env ~= nil then
+    local ok_cfg, WheelConfig = pcall(require, "wheel.config")
+    if ok_cfg and type(WheelConfig.read_approvals) == "function" then
+      local store = WheelConfig.read_approvals({ data_dir = opts.data_dir, env = opts.env })
+      if store and type(store.entries) == "table" then
+        for _, entry in ipairs(store.entries) do
+          if type(entry) == "table"
+            and entry.status == "pending"
+            and entry.id
+            and not seen[entry.id]
+            and (not opts.agent_name or entry.agent_name == opts.agent_name)
+          then
+            seen[entry.id] = true
+            out[#out + 1] = deep_copy_plain(entry)
+          end
+        end
       end
     end
   end
@@ -2929,6 +2952,28 @@ function WheelTeam:resolve_pending_approval(approval_id, decision, opts)
   elseif res == "stale_policy_generation" then
     return nil, dashboard_error("E_TEAM_APPROVAL_STALE", "approval belongs to a stale policy generation")
   end
+  if opts.include_store == true or opts.data_dir ~= nil or opts.env ~= nil then
+    local ok_cfg, WheelConfig = pcall(require, "wheel.config")
+    if ok_cfg and type(WheelConfig.resolve_approval_store) == "function" then
+      local resolved, serr = WheelConfig.resolve_approval_store(
+        approval_id,
+        decision,
+        { data_dir = opts.data_dir, env = opts.env }
+      )
+      if resolved then
+        return {
+          action = WheelTeam.DashboardAction.APPROVAL_RESOLVE,
+          approval_id = approval_id,
+          decision = resolved.decision,
+          agent_name = agent.name,
+          agent_id = agent.agent_id,
+          session_id = runtime_sid,
+        }, nil
+      elseif serr and serr.code == "E_APPROVAL_EXPIRED" then
+        return nil, dashboard_error("E_TEAM_APPROVAL_STALE", serr.message or "approval expired")
+      end
+    end
+  end
   return nil, dashboard_error("E_TEAM_APPROVAL_NOT_FOUND", "pending approval not found: " .. tostring(approval_id))
 end
 
@@ -2970,7 +3015,11 @@ function WheelTeam:dashboard_snapshot(opts)
     agents = agent_cards,
     handoffs = deep_copy_plain(self.handoffs),
     requests = self:list_requests(),
-    pending_approvals = self:list_pending_approvals(),
+    pending_approvals = self:list_pending_approvals({
+      include_store = opts.include_store,
+      data_dir = opts.data_dir,
+      env = opts.env,
+    }),
     diagnostics = self:bounded_diagnostics({ limit = opts.diagnostic_limit }),
   }
 end

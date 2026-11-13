@@ -169,8 +169,10 @@ local function build_cli_approver(io_ctx, mode_flag, cfg)
           .. tostring(enq_err and enq_err.message or "error"))
         return { decision = "deny" }
       end
-      io_ctx.errln(string.format("[wheel approval] Pending in Dashboard: id=%s tool=%s summary=%s",
-        tostring(entry.id), tostring(req.tool), tostring(req.summary)))
+      io_ctx.errln(string.format(
+        "[wheel approval] Pending in Dashboard: id=%s tool=%s summary=%s"
+          .. " (or run: wheel approvals resolve %s <allow_once|allow_session|deny>)",
+        tostring(entry.id), tostring(req.tool), tostring(req.summary), tostring(entry.id)))
       local timeout_sec = tonumber(io_ctx.approval_timeout_sec) or 120
       if timeout_sec <= 0 then
         timeout_sec = 120
@@ -195,6 +197,9 @@ local function build_cli_approver(io_ctx, mode_flag, cfg)
             return { decision = "deny" }
           end
           if current.decision == "allow_once" or current.decision == "allow_session" then
+            if (WheelHost.time.now() - start_ts) >= timeout_sec then
+              return { decision = "deny" }
+            end
             return { decision = current.decision }
           end
           return { decision = "deny" }

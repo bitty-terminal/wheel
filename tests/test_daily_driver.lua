@@ -33,7 +33,16 @@ local UUID_V4_PATTERN = "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-
 local function make_temp_root(prefix)
   local base = os.getenv("WHEEL_TEST_TMP") or os.getenv("TMPDIR") or "/tmp/bitty"
   WheelHost.fs.mkdir_p(base)
-  local dir = base .. "/" .. prefix .. "-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
+  local pid = (WheelHost.proc and type(WheelHost.proc.pid) == "function" and WheelHost.proc.pid()) or 0
+  local dir = base
+    .. "/"
+    .. prefix
+    .. "-"
+    .. tostring(os.time())
+    .. "-"
+    .. tostring(pid)
+    .. "-"
+    .. tostring(math.random(100000, 999999))
   assert(WheelHost.fs.mkdir_p(dir), "failed to create temp test dir: " .. dir)
   assert(WheelHost.fs.chmod(dir, "700"), "failed to chmod temp dir 0700")
   return dir
@@ -999,6 +1008,23 @@ return {
     assert(strict_res.ok and strict_res.config.approval_mode == "auto-deny",
       "project config may tighten approval_mode to auto-deny")
 
+    -- 9b-2. thinking_enabled=false overrides legacy thinking="high", legacy thinking=false stays disabled,
+    -- and oversized scope_key is bounded.
+    assert(WheelConfig.effective_thinking({ thinking = "high", thinking_enabled = false, thinking_gear = "high" }) == "off",
+      "explicit thinking_enabled=false must return off even when legacy thinking is set")
+    WheelHost.fs.write_file(cfg_root .. "/.config/wheel/init.lua", 'return { thinking = false }\n')
+    local false_think = WheelConfig.resolve_effective_config({ env = cfg_env, project_root = proj_root, trusted = true })
+    assert(false_think.ok and false_think.config.thinking_enabled == false and false_think.config.thinking == "off",
+      "legacy thinking=false must keep thinking_enabled=false")
+    local long_scope = string.rep("x", 400)
+    local bounded_entry = WheelConfig.enqueue_approval({
+      tool = "run_command",
+      scope_key = long_scope,
+      summary = "oversized scope test",
+    }, { env = apr_env, now = 2000 })
+    assert(bounded_entry and bounded_entry.scope_key:match("^bounded:[0-9a-f]+$") and #bounded_entry.scope_key <= 256,
+      "oversized scope_key must be hashed to bounded:<sha256>")
+
     -- 9c. wheel approvals list / resolve + wheel run --approval-mode dashboard
     local dash_root = root .. "/dash-run"
     WheelHost.fs.mkdir_p(dash_root .. "/ws")
@@ -1058,6 +1084,35 @@ return {
       end
     end
 
+    local function count_successful_tool_outputs(raw_body, expected_substr)
+      if type(raw_body) ~= "string" then
+        return 0
+      end
+      local ok_dec, decoded = pcall(WheelProvider.JSON.decode, raw_body)
+      if not ok_dec or type(decoded) ~= "table" or type(decoded.messages) ~= "table" then
+        return 0
+      end
+      local matches = 0
+      local seen_seq = 0
+      local seen_ids = {}
+      for _, msg in ipairs(decoded.messages) do
+        if type(msg) == "table" and msg.role == "tool" and type(msg.content) == "string" then
+          local ok_res, tool_res = pcall(WheelProvider.JSON.decode, msg.content)
+          local is_success = (ok_res and type(tool_res) == "table" and tool_res.ok == true)
+            or (not msg.content:find("denied", 1, true) and not msg.content:find("E_CAPABILITY_DENIED", 1, true))
+          if is_success and msg.content:find(expected_substr, 1, true) then
+            seen_seq = seen_seq + 1
+            local key = tostring(msg.tool_call_id or ("idx-" .. tostring(seen_seq)))
+            if not seen_ids[key] then
+              seen_ids[key] = true
+              matches = matches + 1
+            end
+          end
+        end
+      end
+      return matches
+    end
+
     -- Case 1: allow_once permits execution once
     local run_out, run_err = {}, {}
     local listed_during_wait = nil
@@ -1067,7 +1122,7 @@ return {
     }, {
       env = dash_env,
       http_client = make_tool_loop_http("echo dash-approved", function(body)
-        if type(body) == "string" and body:find("dash%-approved") then
+        if count_successful_tool_outputs(body, "dash-approved") >= 1 then
           saw_tool_output = true
         end
       end),
@@ -1106,8 +1161,11 @@ return {
       env = dash_env,
       http_client = function(req)
         sess_turn = sess_turn + 1
-        if sess_turn >= 2 and type(req.body) == "string" and req.body:find("sess%-approved") then
-          sess_outputs = sess_outputs + 1
+        if sess_turn >= 2 then
+          local c = count_successful_tool_outputs(req.body, "sess-approved")
+          if c > sess_outputs then
+            sess_outputs = c
+          end
         end
         local msg
         if sess_turn <= 2 then
