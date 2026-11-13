@@ -1609,6 +1609,7 @@ function PermissionGate:authorize(tool_name, args, ctx)
   local reply = self.approver({
     tool = tostring(tool_name),
     scope_key = skey,
+    args_key = args_fp,
     summary = summary,
     session_id = self.session_id,
     policy_generation = self.policy_generation,

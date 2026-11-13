@@ -33,7 +33,16 @@ local UUID_V4_PATTERN = "^[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-
 local function make_temp_root(prefix)
   local base = os.getenv("WHEEL_TEST_TMP") or os.getenv("TMPDIR") or "/tmp/bitty"
   WheelHost.fs.mkdir_p(base)
-  local dir = base .. "/" .. prefix .. "-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000, 999999))
+  local pid = (WheelHost.proc and type(WheelHost.proc.pid) == "function" and WheelHost.proc.pid()) or 0
+  local dir = base
+    .. "/"
+    .. prefix
+    .. "-"
+    .. tostring(os.time())
+    .. "-"
+    .. tostring(pid)
+    .. "-"
+    .. tostring(math.random(100000, 999999))
   assert(WheelHost.fs.mkdir_p(dir), "failed to create temp test dir: " .. dir)
   assert(WheelHost.fs.chmod(dir, "700"), "failed to chmod temp dir 0700")
   return dir
@@ -886,6 +895,466 @@ return {
       "allow_once must still authorize the original exact arguments once")
 
     print("PASS security review regressions")
+  end
+
+  -- 9. Dashboard approvals store, thinking toggles, and CLI runtime wiring (CTX-0054)
+  do
+    local apr_root = root .. "/approvals-xdg"
+    local apr_data = apr_root .. "/.local/share/wheel"
+    local apr_env = {
+      HOME = apr_root,
+      XDG_CONFIG_HOME = apr_root .. "/.config",
+      XDG_DATA_HOME = apr_root .. "/.local/share",
+      XDG_STATE_HOME = apr_root .. "/.local/state",
+    }
+
+    -- 9a. 0700/0600 permissions, <= 32 cap pruning oldest resolved first, and symlink refusal
+    local first_id = nil
+    local pending_ids = {}
+    for idx = 1, 35 do
+      local enq, eerr = WheelConfig.enqueue_approval({
+        tool = "run_command",
+        scope_key = "run_command:echo " .. tostring(idx),
+        args_key = "cmd:" .. tostring(idx),
+        summary = "echo " .. tostring(idx),
+        session_id = "sess-cap",
+        policy_generation = 1,
+      }, { env = apr_env, now = 1000 + idx })
+      assert(enq ~= nil, "enqueue_approval failed: " .. tostring(eerr and eerr.message))
+      if idx == 1 then first_id = enq.id end
+      if idx <= 5 then
+        local res_ok, rerr = WheelConfig.resolve_approval_store(enq.id, "deny", { env = apr_env, now = 1000 + idx })
+        assert(res_ok ~= nil, "resolve_approval_store failed: " .. tostring(rerr and rerr.message))
+      else
+        table.insert(pending_ids, enq.id)
+      end
+    end
+    assert(WheelHost.fs.stat(apr_data).mode == 448, "approvals data dir must be 0700")
+    assert(WheelHost.fs.stat(apr_data .. "/approvals.json").mode == 384, "approvals.json must be 0600")
+    local store = assert(WheelConfig.read_approvals({ env = apr_env }))
+    assert(#store.entries == 32, "approvals store must be capped at 32 entries, got " .. tostring(#store.entries))
+    assert(WheelConfig.get_approval(first_id, { env = apr_env }) == nil,
+      "oldest resolved entry must be pruned first when capping at 32 entries")
+    assert(WheelConfig.get_approval(pending_ids[1], { env = apr_env }) ~= nil,
+      "pending entries must survive pruning while older resolved entries exist")
+
+    -- Symlink refusal on approvals.json
+    local sym_root = root .. "/approvals-symlink"
+    WheelHost.fs.mkdir_p(sym_root .. "/share/wheel")
+    WheelHost.fs.chmod(sym_root .. "/share/wheel", "700")
+    WheelHost.fs.write_file(sym_root .. "/real.json", '{"version":1,"entries":[]}\n')
+    WheelHost.proc.run_program("ln", { "-s", sym_root .. "/real.json", sym_root .. "/share/wheel/approvals.json" })
+    local sym_read, sym_err = WheelConfig.read_approvals({ data_dir = sym_root .. "/share/wheel" })
+    assert(sym_read == nil and sym_err and sym_err.code == "E_DATA_STORE_SYMLINK",
+      "read_approvals must refuse symlinked approvals.json")
+    local sym_enq, sym_enq_err = WheelConfig.enqueue_approval({ tool = "run_command" }, { data_dir = sym_root .. "/share/wheel" })
+    assert(sym_enq == nil and sym_enq_err and sym_enq_err.code == "E_DATA_STORE_SYMLINK",
+      "enqueue_approval must refuse symlinked approvals.json")
+
+    -- 9b. wheel init non-shadowing + thinking_enabled/gear CLI + layer override + project non-escalation
+    local cfg_root = root .. "/thinking-xdg"
+    local cfg_env = {
+      HOME = cfg_root,
+      XDG_CONFIG_HOME = cfg_root .. "/.config",
+      XDG_DATA_HOME = cfg_root .. "/.local/share",
+      XDG_STATE_HOME = cfg_root .. "/.local/state",
+    }
+    assert(WheelCLI.main({ "init" }, { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    assert(WheelCLI.main({ "config", "set", "providers.opencode-go.model", "custom-go-model" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    assert(WheelCLI.main({ "config", "set", "thinking_enabled", "true" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    assert(WheelCLI.main({ "config", "set", "thinking_gear", "high" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    local eff1 = assert(WheelConfig.resolve_effective_config({ env = cfg_env, project_root = cfg_root }))
+    assert(eff1.ok, "init + settings config load must succeed")
+    assert(eff1.config.providers["opencode-go"].model == "custom-go-model",
+      "starter providers/opencode-go.lua must not shadow Layer 0.5 settings.json model")
+    assert(WheelConfig.effective_thinking(eff1.config) == "high",
+      "thinking_enabled=true + thinking_gear=high must resolve effective_thinking=high")
+
+    -- Disabling thinking_enabled keeps thinking_gear preserved while effective_thinking is off
+    assert(WheelCLI.main({ "config", "set", "thinking_enabled", "false" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    local eff2 = assert(WheelConfig.resolve_effective_config({ env = cfg_env, project_root = cfg_root }))
+    assert(eff2.config.thinking_gear == "high", "thinking_gear must stay preserved when disabled")
+    assert(WheelConfig.effective_thinking(eff2.config) == "off", "effective_thinking must be off when disabled")
+
+    -- Layer 1 legacy `thinking = "low"` overrides Layer 0.5 toggle
+    WheelHost.fs.write_file(cfg_root .. "/.config/wheel/init.lua", 'return { thinking = "low" }\n')
+    assert(WheelCLI.main({ "config", "set", "thinking_enabled", "true" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 0)
+    local eff3 = assert(WheelConfig.resolve_effective_config({ env = cfg_env, project_root = cfg_root }))
+    assert(WheelConfig.effective_thinking(eff3.config) == "low",
+      "Layer 1 legacy thinking=low must override Layer 0.5 thinking_enabled=true")
+
+    -- Invalid CLI settings values fail with exit code 2
+    assert(WheelCLI.main({ "config", "set", "thinking_enabled", "maybe" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 2)
+    assert(WheelCLI.main({ "config", "set", "thinking_gear", "ultra" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 2)
+    assert(WheelCLI.main({ "config", "set", "approval_mode", "yolo" },
+      { env = cfg_env, stdout = function() end, stderr = function() end }) == 2)
+
+    -- Project config cannot weaken approval_mode to prompt or dashboard; auto-deny is allowed
+    local proj_root = root .. "/proj-approval-escalation"
+    WheelHost.fs.mkdir_p(proj_root .. "/.wheel")
+    WheelHost.fs.write_file(proj_root .. "/.wheel/init.lua", 'return { approval_mode = "dashboard" }\n')
+    local esc_res = WheelConfig.resolve_effective_config({ env = cfg_env, project_root = proj_root, trusted = true })
+    assert(not esc_res.ok and esc_res.error == "project_config_escalation",
+      "project config setting approval_mode=dashboard must fail with project_config_escalation")
+    WheelHost.fs.write_file(proj_root .. "/.wheel/init.lua", 'return { approval_mode = "auto-deny" }\n')
+    local strict_res = WheelConfig.resolve_effective_config({ env = cfg_env, project_root = proj_root, trusted = true })
+    assert(strict_res.ok and strict_res.config.approval_mode == "auto-deny",
+      "project config may tighten approval_mode to auto-deny")
+
+    -- 9b-2. thinking_enabled=false overrides legacy thinking="high", legacy thinking=false stays disabled,
+    -- and oversized scope_key is bounded.
+    assert(WheelConfig.effective_thinking({ thinking = "high", thinking_enabled = false, thinking_gear = "high" }) == "off",
+      "explicit thinking_enabled=false must return off even when legacy thinking is set")
+    WheelHost.fs.write_file(cfg_root .. "/.config/wheel/init.lua", 'return { thinking = false }\n')
+    local false_think = WheelConfig.resolve_effective_config({ env = cfg_env, project_root = proj_root, trusted = true })
+    assert(false_think.ok and false_think.config.thinking_enabled == false and false_think.config.thinking == "off",
+      "legacy thinking=false must keep thinking_enabled=false")
+    local long_scope = string.rep("x", 400)
+    local bounded_entry = WheelConfig.enqueue_approval({
+      tool = "run_command",
+      scope_key = long_scope,
+      summary = "oversized scope test",
+    }, { env = apr_env, now = 2000 })
+    assert(bounded_entry and bounded_entry.scope_key:match("^bounded:[0-9a-f]+$") and #bounded_entry.scope_key <= 256,
+      "oversized scope_key must be hashed to bounded:<sha256>")
+
+    -- 9c. wheel approvals list / resolve + wheel run --approval-mode dashboard
+    local dash_root = root .. "/dash-run"
+    WheelHost.fs.mkdir_p(dash_root .. "/ws")
+    local dash_env = {
+      HOME = dash_root,
+      XDG_CONFIG_HOME = dash_root .. "/.config",
+      XDG_DATA_HOME = dash_root .. "/.local/share",
+      XDG_STATE_HOME = dash_root .. "/.local/state",
+    }
+    assert(WheelCLI.main({ "init" }, { env = dash_env, stdout = function() end, stderr = function() end }) == 0)
+    assert(WheelCLI.main({ "auth", "set", "opencode-go", "--stdin" }, {
+      env = dash_env,
+      stdin = "og-dash-secret\n",
+      stdout = function() end,
+      stderr = function() end,
+    }) == 0)
+
+    local function make_tool_loop_http(cmd_str, check_tool_body)
+      local turn = 0
+      return function(req)
+        turn = turn + 1
+        if turn == 2 and type(check_tool_body) == "function" then
+          check_tool_body(req.body)
+        end
+        local body_obj = {
+          choices = {
+            {
+              message = (turn == 1) and {
+                content = "",
+                tool_calls = {
+                  {
+                    index = 0,
+                    id = "call_dash_" .. tostring(turn),
+                    type = "function",
+                    ["function"] = {
+                      name = "run_command",
+                      arguments = WheelProvider.JSON.encode({ command = cmd_str or "echo dash-approved" }),
+                    },
+                  },
+                },
+              } or {
+                content = "tool step complete",
+              },
+              finish_reason = (turn == 1) and "tool_calls" or "stop",
+            },
+          },
+        }
+        if req.stream and type(req.on_stream_chunk) == "function" then
+          local delta = body_obj.choices[1].message
+          local chunk = WheelProvider.JSON.encode({
+            choices = { { delta = delta, finish_reason = body_obj.choices[1].finish_reason } },
+          })
+          req.on_stream_chunk("data: " .. chunk .. "\n\ndata: [DONE]\n\n")
+          return { status = 200, body = "" }
+        end
+        return { status = 200, body = WheelProvider.JSON.encode(body_obj) }
+      end
+    end
+
+    local function count_successful_tool_outputs(raw_body, expected_substr)
+      if type(raw_body) ~= "string" then
+        return 0
+      end
+      local ok_dec, decoded = pcall(WheelProvider.JSON.decode, raw_body)
+      if not ok_dec or type(decoded) ~= "table" or type(decoded.messages) ~= "table" then
+        return 0
+      end
+      local matches = 0
+      local seen_seq = 0
+      local seen_ids = {}
+      for _, msg in ipairs(decoded.messages) do
+        if type(msg) == "table" and msg.role == "tool" and type(msg.content) == "string" then
+          local ok_res, tool_res = pcall(WheelProvider.JSON.decode, msg.content)
+          local is_success = (ok_res and type(tool_res) == "table" and tool_res.ok == true)
+            or (not msg.content:find("denied", 1, true) and not msg.content:find("E_CAPABILITY_DENIED", 1, true))
+          if is_success and msg.content:find(expected_substr, 1, true) then
+            seen_seq = seen_seq + 1
+            local key = tostring(msg.tool_call_id or ("idx-" .. tostring(seen_seq)))
+            if not seen_ids[key] then
+              seen_ids[key] = true
+              matches = matches + 1
+            end
+          end
+        end
+      end
+      return matches
+    end
+
+    -- Case 1: allow_once permits execution once
+    local run_out, run_err = {}, {}
+    local listed_during_wait = nil
+    local saw_tool_output = false
+    local rc_once = WheelCLI.main({
+      "run", "--approval-mode", "dashboard", "--workspace", dash_root .. "/ws", "run echo",
+    }, {
+      env = dash_env,
+      http_client = make_tool_loop_http("echo dash-approved", function(body)
+        if count_successful_tool_outputs(body, "dash-approved") >= 1 then
+          saw_tool_output = true
+        end
+      end),
+      approval_timeout_sec = 30,
+      poll_wait = function(approval_id)
+        local l_out = {}
+        assert(WheelCLI.main({ "approvals", "list" }, {
+          env = dash_env,
+          stdout = function(s) table.insert(l_out, s) end,
+          stderr = function() end,
+        }) == 0)
+        listed_during_wait = table.concat(l_out, "")
+        assert(WheelCLI.main({ "approvals", "resolve", approval_id, "allow_once" }, {
+          env = dash_env,
+          stdout = function() end,
+          stderr = function() end,
+        }) == 0)
+      end,
+      stdout = function(s) table.insert(run_out, s) end,
+      stderr = function(s) table.insert(run_err, s) end,
+    })
+    assert(rc_once == 0, "dashboard allow_once run failed: " .. table.concat(run_err, ""))
+    assert(listed_during_wait and listed_during_wait:find("pending", 1, true),
+      "approvals list must show pending entry during dashboard wait")
+    assert(saw_tool_output, "allow_once must execute run_command and pass output to turn 2")
+    assert(table.concat(run_err, ""):find("Pending in Dashboard:", 1, true),
+      "dashboard approver must log pending id to stderr")
+
+    -- Case 1b: allow_session caches for repeated identical invocation without second poll
+    local sess_polls = 0
+    local sess_turn = 0
+    local sess_outputs = 0
+    local rc_sess = WheelCLI.main({
+      "run", "--approval-mode", "dashboard", "--workspace", dash_root .. "/ws", "run echo twice",
+    }, {
+      env = dash_env,
+      http_client = function(req)
+        sess_turn = sess_turn + 1
+        if sess_turn >= 2 then
+          local c = count_successful_tool_outputs(req.body, "sess-approved")
+          if c > sess_outputs then
+            sess_outputs = c
+          end
+        end
+        local msg
+        if sess_turn <= 2 then
+          msg = {
+            content = "",
+            tool_calls = {
+              {
+                index = 0,
+                id = "call_sess_" .. tostring(sess_turn),
+                type = "function",
+                ["function"] = { name = "run_command", arguments = '{"command":"echo sess-approved"}' },
+              },
+            },
+          }
+        else
+          msg = { content = "session cached complete" }
+        end
+        local chunk = WheelProvider.JSON.encode({
+          choices = { { delta = msg, finish_reason = (sess_turn <= 2) and "tool_calls" or "stop" } },
+        })
+        if req.stream and type(req.on_stream_chunk) == "function" then
+          req.on_stream_chunk("data: " .. chunk .. "\n\ndata: [DONE]\n\n")
+          return { status = 200, body = "" }
+        end
+        return { status = 200, body = chunk }
+      end,
+      approval_timeout_sec = 30,
+      poll_wait = function(approval_id)
+        sess_polls = sess_polls + 1
+        assert(WheelCLI.main({ "approvals", "resolve", approval_id, "allow_session" }, {
+          env = dash_env,
+          stdout = function() end,
+          stderr = function() end,
+        }) == 0)
+      end,
+      stdout = function() end,
+      stderr = function() end,
+    })
+    assert(rc_sess == 0, "dashboard allow_session run failed")
+    assert(sess_polls == 1, "allow_session must cache approval and prompt only once, polled=" .. tostring(sess_polls))
+    assert(sess_outputs >= 2, "allow_session must permit both matching run_command calls")
+
+    -- Case 1c: deny blocks tool execution
+    local deny_blocked = false
+    local rc_deny = WheelCLI.main({
+      "run", "--approval-mode", "dashboard", "--workspace", dash_root .. "/ws", "run deny",
+    }, {
+      env = dash_env,
+      http_client = make_tool_loop_http("echo should-not-run", function(body)
+        if type(body) == "string" and (body:find("denied", 1, true) or body:find("blocked", 1, true) or body:find("rejected", 1, true) or body:find("E_CAPABILITY_DENIED", 1, true)) then
+          deny_blocked = true
+        end
+      end),
+      approval_timeout_sec = 30,
+      poll_wait = function(approval_id)
+        assert(WheelCLI.main({ "approvals", "resolve", approval_id, "deny" }, {
+          env = dash_env,
+          stdout = function() end,
+          stderr = function() end,
+        }) == 0)
+      end,
+      stdout = function() end,
+      stderr = function() end,
+    })
+    assert(rc_deny == 0 and deny_blocked, "explicit deny must block run_command execution")
+
+    -- Case 2: bad approvals resolve usage fails with exit 2; missing/already resolved fails with exit 1
+    assert(WheelCLI.main({ "approvals", "resolve", "apr-missing", "bogus" }, {
+      env = dash_env,
+      stdout = function() end,
+      stderr = function() end,
+    }) == 2)
+    assert(WheelCLI.main({ "approvals", "resolve", "apr-missing", "deny" }, {
+      env = dash_env,
+      stdout = function() end,
+      stderr = function() end,
+    }) == 1)
+
+    -- Case 3: tampered args_sha256 fails closed to deny even if status=resolved decision=allow_once
+    local tamper_calls = 0
+    local tamper_blocked = false
+    local rc_tamper = WheelCLI.main({
+      "run", "--approval-mode", "dashboard", "--workspace", dash_root .. "/ws", "run echo tamper",
+    }, {
+      env = dash_env,
+      http_client = function(req)
+        tamper_calls = tamper_calls + 1
+        local msg
+        if tamper_calls == 1 then
+          msg = {
+            content = "",
+            tool_calls = {
+              {
+                index = 0,
+                id = "call_tamper",
+                type = "function",
+                ["function"] = { name = "run_command", arguments = '{"command":"echo tamper"}' },
+              },
+            },
+          }
+        else
+          -- Ensure tool result reports Permission denied (failed closed)
+          if type(req.body) == "string" and (req.body:find("denied", 1, true) or req.body:find("blocked", 1, true) or req.body:find("rejected", 1, true) or req.body:find("E_CAPABILITY_DENIED", 1, true)) then
+            tamper_blocked = true
+          end
+          msg = { content = "blocked cleanly" }
+        end
+        local chunk = WheelProvider.JSON.encode({
+          choices = { { delta = msg, finish_reason = (tamper_calls == 1) and "tool_calls" or "stop" } },
+        })
+        if req.stream and type(req.on_stream_chunk) == "function" then
+          req.on_stream_chunk("data: " .. chunk .. "\n\ndata: [DONE]\n\n")
+          return { status = 200, body = "" }
+        end
+        return { status = 200, body = chunk }
+      end,
+      approval_timeout_sec = 30,
+      poll_wait = function(approval_id)
+        local path = dash_root .. "/.local/share/wheel/approvals.json"
+        local raw = assert(WheelHost.fs.read_file(path))
+        local doc = WheelKernel.JSON.decode(raw)
+        for _, e in ipairs(doc.entries) do
+          if e.id == approval_id then
+            e.status = "resolved"
+            e.decision = "allow_once"
+            e.args_sha256 = string.rep("0", 64)
+          end
+        end
+        WheelHost.fs.write_file(path, WheelKernel.JSON.encode(doc))
+      end,
+      stdout = function() end,
+      stderr = function() end,
+    })
+    assert(rc_tamper == 0 and tamper_blocked, "tampered approval args_sha256 must fail closed to deny")
+
+    -- Case 4: timeout fail closed (deterministic mocked clock)
+    local fake_clock = 5000
+    local orig_time_now = WheelHost.time.now
+    WheelHost.time.now = function() return fake_clock end
+    local to_ok, to_err = pcall(function()
+      local out_t, err_t = {}, {}
+      local to_turns = 0
+      local timeout_blocked = false
+      local rc_t = WheelCLI.main({
+        "run", "--approval-mode", "dashboard", "--workspace", dash_root .. "/ws", "run timeout",
+      }, {
+        env = dash_env,
+        approval_timeout_sec = 2,
+        poll_wait = function() fake_clock = fake_clock + 3 end,
+        http_client = function(req)
+          to_turns = to_turns + 1
+          local msg
+          if to_turns == 1 then
+            msg = {
+              content = "",
+              tool_calls = {
+                {
+                  index = 0,
+                  id = "call_to",
+                  type = "function",
+                  ["function"] = { name = "run_command", arguments = '{"command":"echo timeout"}' },
+                },
+              },
+            }
+          else
+            if type(req.body) == "string" and (req.body:find("denied", 1, true) or req.body:find("blocked", 1, true) or req.body:find("E_CAPABILITY_DENIED", 1, true)) then
+              timeout_blocked = true
+            end
+            msg = { content = "timed out" }
+          end
+          local chunk = WheelProvider.JSON.encode({
+            choices = { { delta = msg, finish_reason = (to_turns == 1) and "tool_calls" or "stop" } },
+          })
+          if req.stream and type(req.on_stream_chunk) == "function" then
+            req.on_stream_chunk("data: " .. chunk .. "\n\ndata: [DONE]\n\n")
+            return { status = 200, body = "" }
+          end
+          return { status = 200, body = chunk }
+        end,
+        stdout = function(s) table.insert(out_t, s) end,
+        stderr = function(s) table.insert(err_t, s) end,
+      })
+      assert(rc_t == 0 and timeout_blocked and table.concat(err_t, ""):find("timed out waiting for Dashboard decision", 1, true),
+        "dashboard wait must time out and deny")
+    end)
+    WheelHost.time.now = orig_time_now
+    assert(to_ok, to_err)
+
+    print("PASS dashboard approvals and thinking controls")
   end
 end)
 

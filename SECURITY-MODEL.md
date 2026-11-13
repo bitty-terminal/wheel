@@ -606,12 +606,19 @@ security principals. The following matrix is mandatory and fail-closed:
   (`session_override > trusted_project > global_config > data_settings > RUNTIME_DEFAULTS`).
   `WheelConfig` enforces project non-escalation (`project_config_escalation`):
   `.wheel/` configuration is rejected if it sets `api_key`, `credentials`, or
-  provider `base_url`, or weakens any tool permission mode (`deny > ask > allow`).
+  provider `base_url`, weakens any tool permission mode (`deny > ask > allow`),
+  or sets `approval_mode` to anything less strict than `auto-deny`.
 - Interactive tool execution passes through `WheelTool.PermissionGate`:
   unattended `ask` fails closed with `E_CAPABILITY_DENIED` while queueing an
   entry in `pending_approvals`; `allow_once` permits one invocation only;
   `allow_session` caches approval strictly within `(session_id, scope_key, policy_generation)`
   and invalidates automatically when `policy_generation` advances.
+- Cross-process Dashboard approvals (`--approval-mode dashboard` or
+  `approval_mode = "dashboard"`) persist queue records under owner-only
+  `0700`/`0600` `$XDG_DATA_HOME/wheel/approvals.json` (symlinks refused, bounded
+  to 32 entries). Polling fails closed to `deny` on timeout, expiry, store
+  corruption, or any mismatch in `session_id`, `policy_generation`, or
+  canonical `args_sha256`.
 
 ## Command deny-list
 

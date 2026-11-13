@@ -153,6 +153,9 @@ WheelConfig.DEFAULTS = {
 WheelConfig.RUNTIME_DEFAULTS = {
   default_provider = "opencode-go",
   thinking = "off",
+  thinking_enabled = false,
+  thinking_gear = "medium",
+  approval_mode = "prompt",
   providers = {},
   commands = {},
   custom_tools = {},
@@ -896,6 +899,365 @@ function WheelConfig.write_data_settings(settings, opts)
     return false, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
   end
   return write_private_json_store(data_dir, data_dir .. "/settings.json", settings, "wheel settings store")
+end
+
+local APPROVALS_MAX_ENTRIES = 32
+local APPROVAL_DEFAULT_TTL_SEC = 600
+local APPROVAL_SCOPE_KEY_MAX_BYTES = 256
+local APPROVAL_LOCK_MAX_ATTEMPTS = 40
+local APPROVAL_LOCK_RECLAIM_ATTEMPT = 10
+local APPROVAL_LOCK_SLEEP_MS = 25
+local VALID_THINKING_GEARS = { low = true, medium = true, high = true, max = true }
+local VALID_APPROVAL_DECISIONS = { allow_once = true, allow_session = true, deny = true }
+local approval_nonce = 0
+local cached_lock_pid = nil
+
+local function current_lock_pid(host)
+  if cached_lock_pid ~= nil then
+    return cached_lock_pid
+  end
+  local p = (host.proc and type(host.proc.pid) == "function" and host.proc.pid()) or 0
+  cached_lock_pid = p
+  return p
+end
+
+local function current_unix_time()
+  return require_host("time.now").time.now()
+end
+
+local function bound_approval_scope_key(key)
+  local s = tostring(key or "")
+  if #s <= APPROVAL_SCOPE_KEY_MAX_BYTES then
+    return s
+  end
+  return "bounded:" .. WheelConfig.compute_hash(s)
+end
+
+local function read_approvals_lock_owner(host, owner_file)
+  if type(host.fs.read_file) ~= "function" then
+    return nil
+  end
+  local raw = host.fs.read_file(owner_file)
+  if type(raw) ~= "string" then
+    return nil
+  end
+  local parsed = tonumber(raw:match("^%s*(%d+)%s*$"))
+  if parsed ~= nil and parsed > 1 then
+    return parsed
+  end
+  return nil
+end
+
+local function release_approvals_lock(host, lock_dir, owner_file, expected_pid)
+  local recorded_pid = read_approvals_lock_owner(host, owner_file)
+  if expected_pid > 1 and recorded_pid ~= nil and recorded_pid ~= expected_pid then
+    return
+  end
+  pcall(host.fs.remove_file, owner_file)
+  pcall(host.fs.remove_dir, lock_dir)
+end
+
+local function with_approvals_lock(data_dir, fn)
+  local host = require_host("fs.write")
+  local ok_dir, dir_err = ensure_private_data_dir(host, data_dir)
+  if not ok_dir then
+    return nil, dir_err
+  end
+  local lock_dir = data_dir .. "/.approvals.lock"
+  local owner_file = lock_dir .. "/owner"
+  local pid = current_lock_pid(host)
+  local acquired = false
+  for attempt = 1, APPROVAL_LOCK_MAX_ATTEMPTS do
+    if host.fs.mkdir(lock_dir) then
+      host.fs.write_file(owner_file, tostring(pid) .. "\n")
+      acquired = true
+      break
+    end
+    local reclaimed = false
+    if attempt >= APPROVAL_LOCK_RECLAIM_ATTEMPT then
+      local owner_pid = read_approvals_lock_owner(host, owner_file)
+      if owner_pid ~= nil and host.proc and type(host.proc.is_alive) == "function" then
+        local alive, alive_err = host.proc.is_alive(owner_pid)
+        if alive == false and alive_err == nil then
+          local now = (host.time and type(host.time.now) == "function" and host.time.now()) or 0
+          local stale_dir = lock_dir .. ".stale." .. tostring(pid) .. "." .. tostring(now)
+          if host.fs.rename(lock_dir, stale_dir) then
+            local stale_owner_file = stale_dir .. "/owner"
+            local stale_owner = read_approvals_lock_owner(host, stale_owner_file)
+            if stale_owner == nil or stale_owner == owner_pid then
+              pcall(host.fs.remove_file, stale_owner_file)
+              pcall(host.fs.remove_dir, stale_dir)
+              reclaimed = true
+            else
+              pcall(host.fs.rename, stale_dir, lock_dir)
+            end
+          end
+        end
+      end
+    end
+    if not reclaimed and host.time and type(host.time.sleep_ms) == "function" then
+      host.time.sleep_ms(APPROVAL_LOCK_SLEEP_MS)
+    end
+  end
+  if not acquired then
+    return nil, store_error("E_DATA_STORE_BUSY", "timed out acquiring approvals store lock")
+  end
+  local ok_call, res, err = pcall(fn)
+  release_approvals_lock(host, lock_dir, owner_file, pid)
+  if not ok_call then
+    error(res, 0)
+  end
+  return res, err
+end
+
+local function sanitize_approval_summary(summary)
+  local s = tostring(summary or "")
+  s = string.gsub(s, "[\r\n\t]+", " ")
+  if #s > 240 then
+    s = string.sub(s, 1, 240)
+  end
+  return s
+end
+
+local function normalize_approvals_store(raw)
+  if type(raw) ~= "table" then
+    return nil, store_error("E_DATA_STORE_CORRUPT", "approvals store root must be a JSON object")
+  end
+  local entries = raw.entries
+  if entries == nil then
+    entries = {}
+  elseif type(entries) ~= "table" then
+    return nil, store_error("E_DATA_STORE_CORRUPT", "approvals store entries must be an array")
+  end
+  return {
+    version = type(raw.version) == "number" and raw.version or 1,
+    entries = entries,
+  }, nil
+end
+
+local function prune_approvals_entries(entries, max_entries)
+  while #entries > max_entries do
+    local victim_idx = nil
+    local victim_ts = nil
+    for i = 1, #entries do
+      local e = entries[i]
+      if type(e) == "table" and e.status == "resolved" then
+        local ts = tonumber(e.updated_at or e.created_at) or 0
+        if not victim_idx or ts < victim_ts then
+          victim_idx = i
+          victim_ts = ts
+        end
+      end
+    end
+    if not victim_idx then
+      for i = 1, #entries do
+        local e = entries[i]
+        local ts = type(e) == "table" and (tonumber(e.created_at or e.updated_at) or 0) or 0
+        if not victim_idx or ts < victim_ts then
+          victim_idx = i
+          victim_ts = ts
+        end
+      end
+    end
+    if not victim_idx then
+      break
+    end
+    table.remove(entries, victim_idx)
+  end
+end
+
+--- Compute the effective thinking level from new toggles or legacy `thinking`.
+function WheelConfig.effective_thinking(cfg)
+  if type(cfg) ~= "table" then
+    return "off"
+  end
+  local gear = cfg.thinking_gear
+  if not VALID_THINKING_GEARS[gear] then
+    gear = "medium"
+  end
+  if cfg.thinking_enabled == true then
+    return gear
+  end
+  if cfg.thinking_enabled == false then
+    return "off"
+  end
+  if VALID_THINKING_GEARS[cfg.thinking] then
+    return cfg.thinking
+  end
+  return "off"
+end
+
+--- Read cross-process pending/resolved approvals from 0700/0600 $XDG_DATA_HOME/wheel/approvals.json.
+function WheelConfig.read_approvals(opts)
+  opts = opts or {}
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return nil, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  local raw, err = read_private_json_store(data_dir .. "/approvals.json", "wheel approvals store")
+  if not raw then
+    return nil, err
+  end
+  return normalize_approvals_store(raw)
+end
+
+--- Enqueue a pending tool approval request into $XDG_DATA_HOME/wheel/approvals.json (max 32 entries).
+function WheelConfig.enqueue_approval(req, opts)
+  opts = opts or {}
+  if type(req) ~= "table" or type(req.tool) ~= "string" or req.tool == "" then
+    return nil, store_error("E_INVALID_APPROVAL", "approval request requires a non-empty tool name")
+  end
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return nil, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  return with_approvals_lock(data_dir, function()
+    local filepath = data_dir .. "/approvals.json"
+    local raw, err = read_private_json_store(filepath, "wheel approvals store")
+    if not raw then
+      return nil, err
+    end
+    local store, nerr = normalize_approvals_store(raw)
+    if not store then
+      return nil, nerr
+    end
+    local now = type(opts.now) == "number" and opts.now or current_unix_time()
+    local ttl = tonumber(req.ttl_sec or opts.ttl_sec) or APPROVAL_DEFAULT_TTL_SEC
+    if ttl <= 0 then
+      ttl = APPROVAL_DEFAULT_TTL_SEC
+    end
+    local entries = store.entries
+    for i = 1, #entries do
+      local e = entries[i]
+      if type(e) == "table" and e.status == "pending" and type(e.expires_at) == "number" and now > e.expires_at then
+        e.status = "resolved"
+        e.decision = "deny"
+        e.updated_at = now
+      end
+    end
+    local existing_ids = {}
+    for i = 1, #entries do
+      if type(entries[i]) == "table" and type(entries[i].id) == "string" then
+        existing_ids[entries[i].id] = true
+      end
+    end
+    local args_sha256 = req.args_sha256
+    if not is_sha256_hex(args_sha256) then
+      args_sha256 = WheelConfig.compute_hash(tostring(req.args_key or ""))
+    end
+    local entry_id = nil
+    repeat
+      approval_nonce = approval_nonce + 1
+      local seed = tostring(now)
+        .. ":" .. tostring(approval_nonce)
+        .. ":" .. tostring(req.session_id or "")
+        .. ":" .. tostring(req.scope_key or req.tool)
+        .. ":" .. args_sha256
+      entry_id = "apr-" .. string.sub(WheelConfig.compute_hash(seed), 1, 16)
+    until not existing_ids[entry_id]
+
+    local entry = {
+      id = entry_id,
+      status = "pending",
+      tool = req.tool,
+      scope_key = bound_approval_scope_key(req.scope_key or req.tool),
+      args_sha256 = args_sha256,
+      summary = sanitize_approval_summary(req.summary),
+      session_id = req.session_id ~= nil and tostring(req.session_id) or nil,
+      policy_generation = tonumber(req.policy_generation) or 1,
+      agent_name = req.agent_name ~= nil and tostring(req.agent_name) or nil,
+      created_at = now,
+      expires_at = now + ttl,
+      updated_at = now,
+    }
+    entries[#entries + 1] = entry
+    prune_approvals_entries(entries, APPROVALS_MAX_ENTRIES)
+    local ok_w, werr = write_private_json_store(data_dir, filepath, store, "wheel approvals store")
+    if not ok_w then
+      return nil, werr
+    end
+    return entry, nil
+  end)
+end
+
+--- Fetch a single approval entry by ID from $XDG_DATA_HOME/wheel/approvals.json.
+function WheelConfig.get_approval(id, opts)
+  if type(id) ~= "string" or id == "" then
+    return nil, store_error("E_INVALID_APPROVAL", "approval id must be a non-empty string")
+  end
+  local store, err = WheelConfig.read_approvals(opts)
+  if not store then
+    return nil, err
+  end
+  for i = 1, #store.entries do
+    local e = store.entries[i]
+    if type(e) == "table" and e.id == id then
+      return e, nil
+    end
+  end
+  return nil, nil
+end
+
+--- Resolve a pending approval entry in $XDG_DATA_HOME/wheel/approvals.json.
+function WheelConfig.resolve_approval_store(id, decision, opts)
+  opts = opts or {}
+  if type(id) ~= "string" or id == "" then
+    return nil, store_error("E_INVALID_APPROVAL", "approval id must be a non-empty string")
+  end
+  if not VALID_APPROVAL_DECISIONS[decision] then
+    return nil, store_error("E_INVALID_DECISION", "decision must be allow_once, allow_session, or deny")
+  end
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return nil, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  return with_approvals_lock(data_dir, function()
+    local filepath = data_dir .. "/approvals.json"
+    local raw, err = read_private_json_store(filepath, "wheel approvals store")
+    if not raw then
+      return nil, err
+    end
+    local store, nerr = normalize_approvals_store(raw)
+    if not store then
+      return nil, nerr
+    end
+    local target = nil
+    for i = 1, #store.entries do
+      local e = store.entries[i]
+      if type(e) == "table" and e.id == id then
+        target = e
+        break
+      end
+    end
+    if not target then
+      return nil, store_error("E_APPROVAL_NOT_FOUND", "approval id not found: " .. id)
+    end
+    if opts.agent_name ~= nil and target.agent_name ~= opts.agent_name then
+      return nil, store_error("E_APPROVAL_OWNER_MISMATCH", "approval agent owner does not match: " .. id)
+    end
+    if opts.session_id ~= nil and target.session_id ~= opts.session_id then
+      return nil, store_error("E_APPROVAL_OWNER_MISMATCH", "approval session owner does not match: " .. id)
+    end
+    if target.status ~= "pending" then
+      return nil, store_error("E_APPROVAL_NOT_PENDING", "approval is already resolved: " .. id)
+    end
+    local now = type(opts.now) == "number" and opts.now or current_unix_time()
+    if type(target.expires_at) == "number" and now > target.expires_at then
+      target.status = "resolved"
+      target.decision = "deny"
+      target.updated_at = now
+      write_private_json_store(data_dir, filepath, store, "wheel approvals store")
+      return nil, store_error("E_APPROVAL_EXPIRED", "approval request has expired: " .. id)
+    end
+    target.status = "resolved"
+    target.decision = decision
+    target.updated_at = now
+    local ok_w, werr = write_private_json_store(data_dir, filepath, store, "wheel approvals store")
+    if not ok_w then
+      return nil, werr
+    end
+    return target, nil
+  end)
 end
 
 --- Read private provider credentials from $XDG_DATA_HOME/wheel/credentials.json (0600 enforced).
@@ -2576,6 +2938,9 @@ local function validate_project_override(base_config, project_tbl)
   if type(project_tbl) ~= "table" then
     return false, "project_config_escalation", "project config must return a table"
   end
+  if project_tbl.approval_mode ~= nil and project_tbl.approval_mode ~= "auto-deny" then
+    return false, "project_config_escalation", "project config may only tighten approval_mode to auto-deny"
+  end
   if project_tbl.api_key ~= nil or project_tbl.credentials ~= nil
     or project_tbl.api_key_env ~= nil or project_tbl.base_url ~= nil
     or project_tbl.transport ~= nil then
@@ -2645,6 +3010,21 @@ local function validate_project_override(base_config, project_tbl)
   return true, nil, nil
 end
 
+local function sync_thinking_layer(target, overlay)
+  if type(target) ~= "table" or type(overlay) ~= "table" then
+    return
+  end
+  if overlay.thinking ~= nil and overlay.thinking_enabled == nil then
+    target.thinking_enabled = (overlay.thinking ~= false and overlay.thinking ~= "off")
+    if VALID_THINKING_GEARS[overlay.thinking] then
+      target.thinking_gear = overlay.thinking
+    end
+    target.thinking = WheelConfig.effective_thinking(target)
+  elseif overlay.thinking_enabled ~= nil or overlay.thinking_gear ~= nil then
+    target.thinking = WheelConfig.effective_thinking(target)
+  end
+end
+
 --- Load and resolve configuration with hierarchical layering:
 --- Defaults (Layer 0) < Data Settings < Global (Layer 1) < Project (Layer 2) < Session overrides.
 --- Enforces security trust gate and project non-escalation invariants.
@@ -2679,6 +3059,7 @@ function WheelConfig.load(opts)
         table.insert(permission_layers, deep_copy(data_settings.permissions))
       end
       active_config = deep_merge(active_config, data_settings)
+      sync_thinking_layer(active_config, data_settings)
       layers_loaded.data_settings = true
     end
   end
@@ -2694,6 +3075,7 @@ function WheelConfig.load(opts)
       table.insert(permission_layers, deep_copy(global_tbl.permissions))
     end
     active_config = deep_merge(active_config, global_tbl)
+    sync_thinking_layer(active_config, global_tbl)
     layers_loaded.global = true
   end
 
@@ -2795,6 +3177,7 @@ function WheelConfig.load(opts)
       table.insert(permission_layers, deep_copy(project_tbl.permissions))
     end
     active_config = deep_merge(active_config, project_tbl)
+    sync_thinking_layer(active_config, project_tbl)
     layers_loaded.project = true
   end
 
@@ -2827,6 +3210,7 @@ function WheelConfig.resolve_effective_config(opts)
       table.insert(res.permission_layers, deep_copy(opts.session_override.permissions))
     end
     res.config = deep_merge(res.config, opts.session_override)
+    sync_thinking_layer(res.config, opts.session_override)
     res.layers.session = true
   end
   return res

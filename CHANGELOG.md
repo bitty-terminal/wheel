@@ -77,6 +77,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Cross-process Dashboard approval queue in `$XDG_DATA_HOME/wheel/approvals.json`
+  (`0700`/`0600`, 32-entry cap, symlink refusal, fail-closed timeout and
+  `session_id`/`policy_generation`/`args_sha256` verification),
+  `--approval-mode dashboard` / `approval_mode`, `thinking_enabled` +
+  `thinking_gear` runtime controls, and `wheel approvals [list|resolve]`.
+- Commented `model` in the `wheel init` starter `providers/opencode-go.lua` so
+  Layer 0.5 `$XDG_DATA_HOME/wheel/settings.json` overrides apply without being
+  shadowed.
 - Consumer `bittyd` transport adapter and Core shared conformance corpus gate
   (CTX-0036 / wheel#108): `lua/wheel/bittyd_adapter.lua` adds the
   transport-injectable `WheelBittydAdapter` separating local in-process

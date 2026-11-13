@@ -48,6 +48,8 @@ local function make_io(harness)
     env = harness.env,
     http_client = harness.http_client,
     approver = harness.approver,
+    poll_wait = harness.poll_wait,
+    approval_timeout_sec = harness.approval_timeout_sec,
     out = out_fn,
     err = err_fn,
     read_line = read_line_fn,
@@ -141,12 +143,83 @@ local function parse_scalar(raw)
   return raw
 end
 
-local function build_cli_approver(io_ctx, mode_flag)
+local function build_cli_approver(io_ctx, mode_flag, cfg)
   if type(io_ctx.approver) == "function" then
     return io_ctx.approver
   end
-  if mode_flag == "auto-deny" then
+  local effective_mode = mode_flag or (type(cfg) == "table" and cfg.approval_mode) or "prompt"
+  if effective_mode == "auto-deny" then
     return function() return { decision = "deny" } end
+  end
+  if effective_mode == "dashboard" then
+    return function(req)
+      local args_sha256 = WheelConfig.compute_hash(tostring(req.args_key or ""))
+      local entry, enq_err = WheelConfig.enqueue_approval({
+        tool = req.tool,
+        scope_key = req.scope_key,
+        args_sha256 = args_sha256,
+        summary = req.summary,
+        session_id = req.session_id,
+        policy_generation = req.policy_generation,
+        agent_name = req.agent_name,
+        ttl_sec = io_ctx.approval_timeout_sec,
+      }, { env = io_ctx.env })
+      if not entry then
+        io_ctx.errln("wheel approval: failed to enqueue dashboard request: "
+          .. tostring(enq_err and enq_err.message or "error"))
+        return { decision = "deny" }
+      end
+      io_ctx.errln(string.format(
+        "[wheel approval] Pending in Dashboard: id=%s tool=%s summary=%s"
+          .. " (or run: wheel approvals resolve %s <allow_once|allow_session|deny>)",
+        tostring(entry.id), tostring(req.tool), tostring(req.summary), tostring(entry.id)))
+      local timeout_sec = tonumber(io_ctx.approval_timeout_sec) or 120
+      if timeout_sec <= 0 then
+        timeout_sec = 120
+      end
+      local start_ts = WheelHost.time.now()
+      while true do
+        local current, gerr = WheelConfig.get_approval(entry.id, { env = io_ctx.env })
+        if not current then
+          if gerr then
+            io_ctx.errln("wheel approval: failed to read approval state: " .. tostring(gerr.message or "error"))
+          end
+          return { decision = "deny" }
+        end
+        if current.status == "resolved" then
+          local expected_gen = tonumber(req.policy_generation) or 1
+          local expected_sid = req.session_id ~= nil and tostring(req.session_id) or nil
+          if current.session_id ~= expected_sid
+            or tonumber(current.policy_generation) ~= expected_gen
+            or current.args_sha256 ~= args_sha256
+          then
+            io_ctx.errln("wheel approval: rejected mismatched approval response for " .. tostring(entry.id))
+            return { decision = "deny" }
+          end
+          if current.decision == "allow_once" or current.decision == "allow_session" then
+            if (WheelHost.time.now() - start_ts) >= timeout_sec then
+              return { decision = "deny" }
+            end
+            return { decision = current.decision }
+          end
+          return { decision = "deny" }
+        end
+        local now_ts = WheelHost.time.now()
+        if (now_ts - start_ts) >= timeout_sec then
+          pcall(WheelConfig.resolve_approval_store, entry.id, "deny", { env = io_ctx.env, now = now_ts })
+          io_ctx.errln("wheel approval: timed out waiting for Dashboard decision on " .. tostring(entry.id))
+          return { decision = "deny" }
+        end
+        if type(io_ctx.poll_wait) == "function" then
+          io_ctx.poll_wait(entry.id, 250)
+        elseif type(WheelHost.time.sleep_ms) == "function" then
+          WheelHost.time.sleep_ms(250)
+        else
+          pcall(WheelConfig.resolve_approval_store, entry.id, "deny", { env = io_ctx.env, now = now_ts })
+          return { decision = "deny" }
+        end
+      end
+    end
   end
   return function(req)
     io_ctx.errln(string.format("[wheel approval] tool=%s summary=%s",
@@ -202,9 +275,10 @@ return {
   local og_path = cfg_dir .. "/providers/opencode-go.lua"
   if force or not WheelHost.fs.exists(og_path) then
     local starter_og = [[-- Built-in template defaults for OpenCode Go (deepseek-v4.1-flash).
+-- Uncomment model below only if you want Layer 1 config.lua to override $XDG_DATA_HOME/wheel/settings.json.
 return {
   name = "opencode-go",
-  model = "deepseek-v4.1-flash",
+  -- model = "deepseek-v4.1-flash",
 }
 ]]
     if not WheelHost.fs.write_file(og_path, starter_og) then
@@ -222,6 +296,9 @@ return {
     local ok_ws, ws_err = WheelConfig.write_data_settings({
       default_provider = "opencode-go",
       thinking = "off",
+      thinking_enabled = false,
+      thinking_gear = "medium",
+      approval_mode = "prompt",
       permissions = {
         read_file = "allow",
         list_directory = "allow",
@@ -316,6 +393,24 @@ local function cmd_config(args, io_ctx)
         return 2
       end
     end
+    if key == "thinking_enabled" then
+      if raw_val ~= "true" and raw_val ~= "false" then
+        io_ctx.errln("wheel config set: thinking_enabled must be true or false")
+        return 2
+      end
+    end
+    if key == "thinking_gear" then
+      if raw_val ~= "low" and raw_val ~= "medium" and raw_val ~= "high" and raw_val ~= "max" then
+        io_ctx.errln("wheel config set: thinking_gear must be low, medium, high, or max")
+        return 2
+      end
+    end
+    if key == "approval_mode" then
+      if raw_val ~= "prompt" and raw_val ~= "dashboard" and raw_val ~= "auto-deny" then
+        io_ctx.errln("wheel config set: approval_mode must be prompt, dashboard, or auto-deny")
+        return 2
+      end
+    end
     if key:match("^permissions%.") then
       if raw_val ~= "allow" and raw_val ~= "ask" and raw_val ~= "deny" then
         io_ctx.errln("wheel config set: permission must be allow, ask, or deny")
@@ -328,6 +423,16 @@ local function cmd_config(args, io_ctx)
       return 1
     end
     dotted_set(settings, key, parse_scalar(raw_val))
+    if key == "thinking" then
+      settings.thinking_enabled = (raw_val ~= "off")
+      if raw_val ~= "off" then
+        settings.thinking_gear = raw_val
+      end
+    elseif key == "thinking_enabled" or key == "thinking_gear" then
+      local enabled = settings.thinking_enabled == true
+      local gear = settings.thinking_gear or "medium"
+      settings.thinking = enabled and gear or "off"
+    end
     local ok_w, werr = WheelConfig.write_data_settings(settings, { env = io_ctx.env })
     if not ok_w then
       io_ctx.errln("wheel config set: " .. tostring(werr and werr.message or "failed to write settings"))
@@ -430,6 +535,9 @@ local function parse_runtime_flags(args)
     elseif a == "--auto-deny" then
       opts.approval_mode = "auto-deny"
       i = i + 1
+    elseif a == "--approval-mode" and args[i + 1] then
+      opts.approval_mode = args[i + 1]
+      i = i + 2
     else
       table.insert(opts.positional, a)
       i = i + 1
@@ -439,6 +547,13 @@ local function parse_runtime_flags(args)
 end
 
 local function build_provider_from_cli(parsed, io_ctx)
+  if parsed.approval_mode ~= nil
+    and parsed.approval_mode ~= "prompt"
+    and parsed.approval_mode ~= "dashboard"
+    and parsed.approval_mode ~= "auto-deny"
+  then
+    return nil, nil, "invalid approval_mode: expected prompt, dashboard, or auto-deny"
+  end
   local eff = WheelConfig.resolve_effective_config({
     env = io_ctx.env,
     project_root = parsed.workspace or ".",
@@ -451,7 +566,7 @@ local function build_provider_from_cli(parsed, io_ctx)
   local pcfg = (type(cfg.providers) == "table" and cfg.providers[pname]) or {}
   local tmpl = WheelProvider.get_template(pname)
   local model = parsed.model or pcfg.model or cfg.default_model or (tmpl and tmpl.default_model)
-  local thinking = parsed.thinking or pcfg.thinking or cfg.thinking
+  local thinking = parsed.thinking or pcfg.thinking or WheelConfig.effective_thinking(cfg)
   local api_key = WheelConfig.resolve_api_key(pname, {
     env = io_ctx.env,
     global_config = cfg,
@@ -541,7 +656,7 @@ local function cmd_run(args, io_ctx)
   local parsed = parse_runtime_flags(args)
   local task_desc = trim(table.concat(parsed.positional, " "))
   if task_desc == "" then
-    io_ctx.errln("Usage: wheel run [--provider P] [--model M] [--thinking G] [--workspace DIR] <task>")
+    io_ctx.errln("Usage: wheel run [--provider P] [--model M] [--thinking G] [--workspace DIR] [--approval-mode prompt|dashboard|auto-deny] <task>")
     return 2
   end
   local adapter, meta, err = build_provider_from_cli(parsed, io_ctx)
@@ -553,7 +668,7 @@ local function cmd_run(args, io_ctx)
   local kernel = WheelKernel.new({ in_memory = true })
   local context = WheelContext.new({ kernel = kernel })
   local registry = WheelTool.Registry.new()
-  local approver = build_cli_approver(io_ctx, parsed.approval_mode)
+  local approver = build_cli_approver(io_ctx, parsed.approval_mode, meta.config)
   local gate = WheelTool.PermissionGate.new({
     policy = meta.config.permissions or { run_command = "ask" },
     layers = meta.permission_layers,
@@ -641,6 +756,51 @@ local function cmd_chat(args, io_ctx)
   return 0
 end
 
+local function cmd_approvals(args, io_ctx)
+  local sub = args[1] or "list"
+  if sub == "list" then
+    local store, err = WheelConfig.read_approvals({ env = io_ctx.env })
+    if not store then
+      io_ctx.errln("wheel approvals list: " .. tostring(err and err.message or "failed to read approvals"))
+      return 1
+    end
+    if #store.entries == 0 then
+      io_ctx.println("No pending or recent approvals.")
+      return 0
+    end
+    for _, e in ipairs(store.entries) do
+      if type(e) == "table" then
+        io_ctx.println(string.format("%-20s status=%-8s decision=%-13s tool=%-12s %s",
+          tostring(e.id or "-"),
+          tostring(e.status or "-"),
+          tostring(e.decision or "-"),
+          tostring(e.tool or "-"),
+          tostring(e.summary or "")))
+      end
+    end
+    return 0
+  elseif sub == "resolve" then
+    local id, decision = args[2], args[3]
+    if not id or id == "" or not decision or decision == "" then
+      io_ctx.errln("Usage: wheel approvals resolve <id> <allow_once|allow_session|deny>")
+      return 2
+    end
+    if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
+      io_ctx.errln("wheel approvals resolve: decision must be allow_once, allow_session, or deny")
+      return 2
+    end
+    local updated, rerr = WheelConfig.resolve_approval_store(id, decision, { env = io_ctx.env })
+    if not updated then
+      io_ctx.errln("wheel approvals resolve: " .. tostring(rerr and rerr.message or "failed to resolve approval"))
+      return 1
+    end
+    io_ctx.println(string.format("Resolved %s -> %s", tostring(updated.id), tostring(updated.decision)))
+    return 0
+  end
+  io_ctx.errln("Usage: wheel approvals [list | resolve <id> <allow_once|allow_session|deny>]")
+  return 2
+end
+
 local function print_usage(io_ctx)
   io_ctx.println([[Usage: wheel <command> [options]
 
@@ -649,6 +809,7 @@ Commands:
   providers   List built-in provider templates and credential status
   config      Inspect or update configuration (show | get | set | export)
   auth        Manage credentials securely (status | set <provider> --stdin | remove)
+  approvals   Inspect or resolve pending Dashboard approvals (list | resolve)
   ask         Send a prompt using resolved provider and thinking settings
   run         Run an agent task with tool approval gating
   chat        Start a multi-turn interactive chat session]])
@@ -671,6 +832,7 @@ function WheelCLI.main(argv, harness)
   if cmd == "providers" then return cmd_providers(rest, io_ctx) end
   if cmd == "config" then return cmd_config(rest, io_ctx) end
   if cmd == "auth" then return cmd_auth(rest, io_ctx) end
+  if cmd == "approvals" then return cmd_approvals(rest, io_ctx) end
   if cmd == "ask" then return cmd_ask(rest, io_ctx) end
   if cmd == "run" then return cmd_run(rest, io_ctx) end
   if cmd == "chat" then return cmd_chat(rest, io_ctx) end
