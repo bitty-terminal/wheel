@@ -1380,18 +1380,48 @@ local function escape_control_bytes(text)
   end))
 end
 
+local function canonicalize_tool_args(val, depth)
+  depth = depth or 0
+  if depth > 16 then
+    return "<max_depth>"
+  end
+  local t = type(val)
+  if val == nil then
+    return "n"
+  elseif t == "boolean" then
+    return val and "b:1" or "b:0"
+  elseif t == "number" then
+    return string.format("d:%.17g", val)
+  elseif t == "string" then
+    return string.format("s:%d:%s", #val, escape_control_bytes(val))
+  elseif t == "table" then
+    local keyed = {}
+    for k, v in pairs(val) do
+      local ck = canonicalize_tool_args(k, depth + 1)
+      keyed[#keyed + 1] = { ck = ck, v = v }
+    end
+    table.sort(keyed, function(a, b)
+      return a.ck < b.ck
+    end)
+    local entries = {}
+    for _, item in ipairs(keyed) do
+      entries[#entries + 1] = item.ck .. "=" .. canonicalize_tool_args(item.v, depth + 1)
+    end
+    return "t:{" .. table.concat(entries, ",") .. "}"
+  end
+  return "u:" .. escape_control_bytes(tostring(val))
+end
+
 local function scope_key_for_tool(tool_name, args)
   if type(args) ~= "table" then
     return tostring(tool_name)
   end
   if tool_name == "run_command" and type(args.command) == "string" then
-    -- Escape control bytes injectively and only normalize horizontal spaces so newlines cannot collide.
-    local escaped = escape_control_bytes(args.command)
-    local normalized = escaped:gsub("^[ \t]+", ""):gsub("[ \t]+$", ""):gsub(" +", " ")
-    if normalized == "" then
+    -- Preserve exact command bytes after injective escaping so quoted spacing cannot collide.
+    if args.command == "" then
       return "run_command:*"
     end
-    return "run_command:" .. normalized
+    return "run_command:" .. escape_control_bytes(args.command)
   end
   return tostring(tool_name)
 end
@@ -1400,6 +1430,22 @@ local function strictest_mode(a, b)
   if not a then return b end
   if not b then return a end
   return (PERM_LEVEL[a] or 0) >= (PERM_LEVEL[b] or 0) and a or b
+end
+
+local function retire_pending_to_stale(gate)
+  gate._session_cache = {}
+  gate._once_cache = {}
+  for _, item in ipairs(gate._pending) do
+    if item and item.id and not gate._stale_pending_ids[item.id] then
+      gate._stale_pending_ids[item.id] = true
+      table.insert(gate._stale_pending_order, item.id)
+      if #gate._stale_pending_order > MAX_PENDING_APPROVALS then
+        local evict = table.remove(gate._stale_pending_order, 1)
+        gate._stale_pending_ids[evict] = nil
+      end
+    end
+  end
+  gate._pending = {}
 end
 
 --- Create a PermissionGate implementing allow / ask / deny and session caching
@@ -1430,19 +1476,14 @@ function PermissionGate:set_policy_generation(gen)
   local num = tonumber(gen)
   if num and num ~= self.policy_generation then
     self.policy_generation = num
-    self._session_cache = {}
-    self._once_cache = {}
-    for _, item in ipairs(self._pending) do
-      if item and item.id and not self._stale_pending_ids[item.id] then
-        self._stale_pending_ids[item.id] = true
-        table.insert(self._stale_pending_order, item.id)
-        if #self._stale_pending_order > MAX_PENDING_APPROVALS then
-          local evict = table.remove(self._stale_pending_order, 1)
-          self._stale_pending_ids[evict] = nil
-        end
-      end
-    end
-    self._pending = {}
+    retire_pending_to_stale(self)
+  end
+end
+
+function PermissionGate:set_session_id(sid)
+  if type(sid) == "string" and sid ~= "" and sid ~= self.session_id then
+    self.session_id = sid
+    retire_pending_to_stale(self)
   end
 end
 
@@ -1469,7 +1510,11 @@ function PermissionGate:list_pending()
   local out = {}
   for i, item in ipairs(self._pending) do
     local copy = {}
-    for k, v in pairs(item) do copy[k] = v end
+    for k, v in pairs(item) do
+      if k ~= "_args_key" then
+        copy[k] = v
+      end
+    end
     out[i] = copy
   end
   return out
@@ -1489,10 +1534,17 @@ function PermissionGate:resolve_pending(approval_id, decision)
       if item.policy_generation ~= self.policy_generation then
         return false, "stale_policy_generation"
       end
-      local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
       if decision == "allow_once" then
-        self._once_cache[cache_key] = (self._once_cache[cache_key] or 0) + 1
+        local once_key = string.format(
+          "%s|%s|%d|%s",
+          self.session_id,
+          item.scope_key,
+          self.policy_generation,
+          tostring(item._args_key or "")
+        )
+        self._once_cache[once_key] = (self._once_cache[once_key] or 0) + 1
       elseif decision == "allow_session" then
+        local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
         self._session_cache[cache_key] = true
       end
       return true, decision
@@ -1519,12 +1571,14 @@ function PermissionGate:authorize(tool_name, args, ctx)
   if self._session_cache[cache_key] == true then
     return true, { decision = "allow_session_cached", mode = "ask" }
   end
-  local once_count = self._once_cache[cache_key] or 0
+  local args_fp = canonicalize_tool_args(args)
+  local once_key = string.format("%s|%s|%d|%s", self.session_id, skey, self.policy_generation, args_fp)
+  local once_count = self._once_cache[once_key] or 0
   if once_count > 0 then
     if once_count <= 1 then
-      self._once_cache[cache_key] = nil
+      self._once_cache[once_key] = nil
     else
-      self._once_cache[cache_key] = once_count - 1
+      self._once_cache[once_key] = once_count - 1
     end
     return true, { decision = "allow_once", mode = "ask" }
   end
@@ -1543,6 +1597,7 @@ function PermissionGate:authorize(tool_name, args, ctx)
       session_id = self.session_id,
       policy_generation = self.policy_generation,
       status = "pending",
+      _args_key = args_fp,
     }
     table.insert(self._pending, rec)
     return false, WheelErrors.capability_denied(

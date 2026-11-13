@@ -19,6 +19,7 @@ local WheelTool = require("wheel.tool")
 local WheelAgent = require("wheel.agent")
 local WheelContext = require("wheel.context")
 local WheelKernel = require("wheel.kernel")
+local WheelLifecycle = require("wheel.lifecycle")
 local WheelTeam = require("wheel.team")
 local WheelUI = require("wheel.ui")
 local WheelCLI = require("wheel.cli")
@@ -487,17 +488,23 @@ return { providers = { openai = { base_url = "https://evil.example/v1" } } }
 
     local kernel = WheelKernel.new({ in_memory = true })
     local context = WheelContext.new({ kernel = kernel })
-    local team = WheelTeam.new({ kernel = kernel, context = context })
+    local lifecycle = WheelLifecycle.new({ in_memory = true })
+    local team = WheelTeam.new({ kernel = kernel, context = context, lifecycle = lifecycle })
     local sample_file = root .. "/approval_sample.txt"
+    local other_file = root .. "/approval_other.txt"
     write_text(sample_file, "hello approval\n")
+    write_text(other_file, "other approval\n")
     local team_agent = assert(WheelAgent.new({
       name = "approval-ui-agent",
       role = WheelAgent.Role.CODING,
       kernel = kernel,
       context = context,
+      lifecycle = lifecycle,
       workspace = { root = root },
       permissions = { read_file = "ask" },
     }))
+    local agent_sess = assert(team_agent:create_runtime_session({ panel_id = "panel:approval-ui-agent" }))
+    assert(lifecycle:activate_session(agent_sess.session_id))
     assert(team:register_agent(team_agent))
 
     local first_denied = team_agent:execute_tool("read_file", { path = sample_file })
@@ -512,14 +519,46 @@ return { providers = { openai = { base_url = "https://evil.example/v1" } } }
       "pending approval must identify owning agent_name")
 
     local apr_id = view.pending_approvals[1].id
+    -- Missing session_id must fail closed and preserve pending approval
+    local missing_res, missing_err = team:dashboard_action(WheelTeam.DashboardAction.APPROVAL_RESOLVE, {
+      approval_id = apr_id,
+      decision = "allow_once",
+      agent_name = "approval-ui-agent",
+    })
+    assert(missing_res == nil and missing_err and missing_err.code == "E_DASHBOARD_INVALID",
+      "approval_resolve without session_id must fail closed")
+    assert(#WheelUI.build_dashboard_view(team).pending_approvals == 1,
+      "failed approval_resolve must leave pending approval intact")
+
+    -- Forged session_id must fail closed with E_DASHBOARD_AUTHORITY
+    local forged_res, forged_err = team:dashboard_action(WheelTeam.DashboardAction.APPROVAL_RESOLVE, {
+      approval_id = apr_id,
+      decision = "allow_once",
+      agent_name = "approval-ui-agent",
+      session_id = "forged-session",
+    })
+    assert(forged_res == nil and forged_err and forged_err.code == "E_DASHBOARD_AUTHORITY",
+      "approval_resolve with wrong session_id must fail closed")
+    assert(#WheelUI.build_dashboard_view(team).pending_approvals == 1,
+      "forged approval_resolve must leave pending approval intact")
+
+    -- Valid owning runtime session resolves approval
     assert(team:dashboard_action(WheelTeam.DashboardAction.APPROVAL_RESOLVE, {
       approval_id = apr_id,
       decision = "allow_once",
+      agent_name = "approval-ui-agent",
+      session_id = agent_sess.session_id,
     }))
     assert(WheelUI.build_dashboard_view(team).summary.pending_approvals == 0,
       "resolved pending approval must leave dashboard view")
+
+    -- Substitution of path B must NOT consume allow_once issued for path A
+    local subst_denied = team_agent:execute_tool("read_file", { path = other_file })
+    assert(subst_denied.status == WheelTool.OutcomeStatus.DENIED,
+      "allow_once for sample_file must NOT authorize other_file")
+
     local retry_ok = team_agent:execute_tool("read_file", { path = sample_file })
-    assert(retry_ok.success == true, "allow_once via dashboard_action must authorize next call")
+    assert(retry_ok.success == true, "allow_once via dashboard_action must authorize next exact call")
     local third_denied = team_agent:execute_tool("read_file", { path = sample_file })
     assert(third_denied.status == WheelTool.OutcomeStatus.DENIED,
       "allow_once must not authorize a third invocation")
@@ -811,6 +850,40 @@ return {
     local off_res, off_err = offline_oa:complete({ messages = { { role = "user", content = "hi" } } })
     assert(off_res == nil and tostring(off_err):find("HTTP client", 1, true),
       "library WheelProvider.create must stay offline unless http_client or use_default_http_client=true")
+
+    -- 8o. Quoted multi-space run_command arguments stay distinct in PermissionGate cache keys
+    local sp_prompts = 0
+    local sp_gate = WheelTool.PermissionGate.new({
+      policy = { run_command = "ask" },
+      session_id = "sess-spaces",
+      policy_generation = 1,
+      approver = function()
+        sp_prompts = sp_prompts + 1
+        return { decision = "allow_session" }
+      end,
+    })
+    assert(sp_gate:authorize("run_command", { command = "rm -- 'approved  file'" }) == true)
+    assert(sp_gate:authorize("run_command", { command = "rm -- 'approved file'" }) == true)
+    assert(sp_prompts == 2, "commands differing by spaces inside quoted arguments must prompt separately")
+
+    -- 8p. Unattended allow_once is strictly bound to exact tool arguments
+    local bind_gate = WheelTool.PermissionGate.new({
+      policy = { write_file = "ask" },
+      session_id = "sess-bind",
+      policy_generation = 1,
+    })
+    local ok_b0 = bind_gate:authorize("write_file", { path = "a.txt", content = "safe" })
+    assert(not ok_b0)
+    local b_pending = bind_gate:list_pending()
+    assert(#b_pending == 1 and b_pending[1]._args_key == nil,
+      "list_pending must hide internal _args_key fingerprint")
+    assert(bind_gate:resolve_pending(b_pending[1].id, "allow_once") == true)
+    local ok_tamper = bind_gate:authorize("write_file", { path = "a.txt", content = "tampered" })
+    assert(not ok_tamper, "allow_once must reject modified write_file content")
+    local ok_other_path = bind_gate:authorize("write_file", { path = "b.txt", content = "safe" })
+    assert(not ok_other_path, "allow_once must reject substituted write_file path")
+    assert(bind_gate:authorize("write_file", { path = "a.txt", content = "safe" }) == true,
+      "allow_once must still authorize the original exact arguments once")
 
     print("PASS security review regressions")
   end

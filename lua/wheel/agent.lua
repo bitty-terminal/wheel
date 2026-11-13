@@ -718,6 +718,9 @@ function WheelAgent:create_runtime_session(opts)
   end
   runtime.session_id = session.session_id
   runtime.panel_id = panel.panel_id
+  if runtime.permission_gate and type(runtime.permission_gate.set_session_id) == "function" then
+    runtime.permission_gate:set_session_id(session.session_id)
+  end
   return session, panel
 end
 
@@ -930,6 +933,10 @@ function WheelAgent:execute_tool(tool_name, args)
 
   local perm_gate = authoritative_permission_gate(self)
   if perm_gate then
+    local auth_sid = authoritative_session_id(self)
+    if auth_sid and type(perm_gate.set_session_id) == "function" then
+      perm_gate:set_session_id(auth_sid)
+    end
     local pg_gen = authoritative_policy_generation(self)
     if pg_gen and type(perm_gate.set_policy_generation) == "function" then
       perm_gate:set_policy_generation(pg_gen)
@@ -937,7 +944,7 @@ function WheelAgent:execute_tool(tool_name, args)
     local pg_ok, pg_err = perm_gate:authorize(tool_name, args, {
       agent_name = self.name,
       role = authoritative_binding(self).role,
-      session_id = authoritative_session_id(self),
+      session_id = auth_sid,
     })
     if not pg_ok then
       local msg = type(pg_err) == "table" and pg_err.message or tostring(pg_err or "permission denied")
@@ -1777,6 +1784,10 @@ function WheelAgent:list_pending_approvals()
   if not perm_gate or type(perm_gate.list_pending) ~= "function" then
     return {}
   end
+  local auth_sid = authoritative_session_id(self)
+  if auth_sid and type(perm_gate.set_session_id) == "function" then
+    perm_gate:set_session_id(auth_sid)
+  end
   local pg_gen = authoritative_policy_generation(self)
   if pg_gen and type(perm_gate.set_policy_generation) == "function" then
     perm_gate:set_policy_generation(pg_gen)
@@ -1798,6 +1809,10 @@ function WheelAgent:resolve_pending_approval(approval_id, decision)
   local perm_gate = authoritative_permission_gate(self)
   if not perm_gate or type(perm_gate.resolve_pending) ~= "function" then
     return false, "permission_gate_unavailable"
+  end
+  local auth_sid = authoritative_session_id(self)
+  if auth_sid and type(perm_gate.set_session_id) == "function" then
+    perm_gate:set_session_id(auth_sid)
   end
   local pg_gen = authoritative_policy_generation(self)
   if pg_gen and type(perm_gate.set_policy_generation) == "function" then

@@ -2335,12 +2335,6 @@ function WheelTeam:dashboard_action(action, params)
       agent_id = params.agent_id,
       session_id = params.session_id,
     })
-  elseif action == WheelTeam.DashboardAction.APPROVAL_RESOLVE then
-    return self:resolve_pending_approval(params.approval_id, params.decision, {
-      agent_name = params.agent_name,
-      agent_id = params.agent_id,
-      session_id = params.session_id,
-    })
   end
 
   local agent_name = params.agent_name
@@ -2572,6 +2566,8 @@ function WheelTeam:dashboard_action(action, params)
       reason = reason_text,
       checkpoint_hash = cp and cp.hash or nil,
     }, nil
+  elseif action == WheelTeam.DashboardAction.APPROVAL_RESOLVE then
+    return self:resolve_pending_approval(params.approval_id, params.decision, params)
   end
 
   return nil, dashboard_error("E_DASHBOARD_INVALID", "unsupported dashboard action: " .. tostring(action), "validation")
@@ -2870,56 +2866,67 @@ end
 --- Resolve a pending tool approval request through the owning agent's PermissionGate.
 -- @param approval_id string
 -- @param decision string ("allow_once" | "allow_session" | "deny")
--- @param opts table|nil
+-- @param opts table { agent_name = string, session_id = string, ... }
 -- @return table|nil, table|nil
 function WheelTeam:resolve_pending_approval(approval_id, decision, opts)
-  opts = opts or {}
   if type(approval_id) ~= "string" or approval_id == "" then
-    return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "approval_id is required", "validation")
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "approval_id is required", "validation")
   end
   if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
-    return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "invalid approval decision: " .. tostring(decision), "validation")
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "invalid approval decision: " .. tostring(decision), "validation")
+  end
+  if type(opts) ~= "table" or type(opts.agent_name) ~= "string" or opts.agent_name == "" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "agent_name is required for approval_resolve", "validation")
+  end
+  if type(opts.session_id) ~= "string" or opts.session_id == "" then
+    return nil, dashboard_error("E_DASHBOARD_INVALID", "session_id is required for approval_resolve", "validation")
   end
 
-  local names = {}
-  if opts.agent_name ~= nil then
-    if not self.agents[opts.agent_name] then
-      return nil, dashboard_error("E_TEAM_AGENT_NOT_FOUND", "agent not found: " .. tostring(opts.agent_name))
-    end
-    names[1] = opts.agent_name
-  else
-    for name in pairs(self.agents) do
-      names[#names + 1] = name
-    end
-    table.sort(names)
+  local agent, session, auth_err = self:_verify_agent_authority(
+    opts.agent_name, WheelAgent.Capability.INSPECT, {
+      agent_id = opts.agent_id,
+      session_id = opts.session_id,
+      role_binding = opts.role_binding,
+      policy_generation = opts.policy_generation,
+      authority_reference = opts.authority_reference,
+      require_active_session = true,
+    })
+  if not agent then
+    return nil, auth_err
   end
 
-  local saw_stale = false
-  for _, name in ipairs(names) do
-    local agent = self.agents[name]
-    if agent and type(agent.resolve_pending_approval) == "function" then
-      if opts.agent_id and opts.agent_id ~= agent.agent_id then
-        if opts.agent_name ~= nil then
-          return nil, dashboard_error("E_TEAM_APPROVAL_INVALID", "agent_id mismatch for " .. tostring(name), "validation")
-        end
-      else
-        local ok, res = agent:resolve_pending_approval(approval_id, decision)
-        if ok then
-          return {
-            action = WheelTeam.DashboardAction.APPROVAL_RESOLVE,
-            approval_id = approval_id,
-            decision = res,
-            agent_name = name,
-            agent_id = agent.agent_id,
-          }, nil
-        elseif res == "stale_policy_generation" then
-          saw_stale = true
-        end
+  local runtime_sid = agent:runtime_session_id()
+  if not runtime_sid or opts.session_id ~= runtime_sid then
+    return nil, dashboard_error("E_DASHBOARD_AUTHORITY", "session_id does not match the agent's canonical runtime session")
+  end
+
+  if self.lifecycle ~= nil then
+    if not session or session.attachment_mode == "observer" then
+      return nil, dashboard_error("E_DASHBOARD_AUTHORITY", "observer session cannot resolve tool approvals")
+    end
+    if session.panel_id and type(self.lifecycle.get_panel) == "function" then
+      local panel = self.lifecycle:get_panel(session.panel_id)
+      if panel and panel.attached_session_id ~= nil and panel.attached_session_id ~= opts.session_id then
+        return nil, dashboard_error("E_DASHBOARD_AUTHORITY", "panel is not attached to the presenting runtime session")
       end
     end
   end
 
-  if saw_stale then
+  if type(agent.resolve_pending_approval) ~= "function" then
+    return nil, dashboard_error("E_TEAM_APPROVAL_NOT_FOUND", "agent does not expose pending approval resolution")
+  end
+
+  local ok, res = agent:resolve_pending_approval(approval_id, decision)
+  if ok then
+    return {
+      action = WheelTeam.DashboardAction.APPROVAL_RESOLVE,
+      approval_id = approval_id,
+      decision = res,
+      agent_name = agent.name,
+      agent_id = agent.agent_id,
+      session_id = runtime_sid,
+    }, nil
+  elseif res == "stale_policy_generation" then
     return nil, dashboard_error("E_TEAM_APPROVAL_STALE", "approval belongs to a stale policy generation")
   end
   return nil, dashboard_error("E_TEAM_APPROVAL_NOT_FOUND", "pending approval not found: " .. tostring(approval_id))
