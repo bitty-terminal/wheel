@@ -162,4 +162,7 @@ fi
 if [ "$status" -eq 0 ]; then
   "$interpreter" "$REPO_ROOT/tests/test_bittyd_adapter.lua" || status=$?
 fi
+if [ "$status" -eq 0 ]; then
+  "$interpreter" "$REPO_ROOT/tests/test_daily_driver.lua" || status=$?
+fi
 exit "$status"

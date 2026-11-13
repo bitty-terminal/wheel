@@ -3,7 +3,7 @@
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local provider_name = assert(arg[1])
-assert(provider_name == "openrouter" or provider_name == "commandcode" or provider_name == "openai-cache")
+assert(provider_name == "openrouter" or provider_name == "commandcode" or provider_name == "openai-cache" or provider_name == "opencode-go")
 local MAX_HELPER_REQUEST_BYTES = 1024 * 1024
 local MIN_CACHE_PROMPT_TOKENS = 1024
 local SYNTHETIC_PROMPT_TOKENS = 2048
@@ -66,6 +66,11 @@ io.popen = function(command, mode)
     for name in pairs(spec.headers) do
       assert(name:lower() ~= "authorization" and name:lower() ~= "x-api-key",
         "synthetic helper specification must have no credential headers")
+    end
+    if provider_name == "opencode-go" then
+      assert(spec.url == "https://opencode.ai/inference/go/openai/v1/chat/completions")
+      assert(type(spec.headers["x-opencode-session"]) == "string" and #spec.headers["x-opencode-session"] == 36,
+        "opencode-go requests must carry a stable UUIDv4 x-opencode-session header")
     end
     local payload = assert(WheelProvider.JSON.decode(spec.body))
     if provider_name == "openai-cache" then

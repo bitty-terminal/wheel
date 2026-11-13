@@ -148,6 +148,26 @@ WheelConfig.DEFAULTS = {
   hooks = {},
 }
 
+--- Extended daily-driver runtime defaults merged by load/resolve_effective_config
+-- without modifying the 8 canonical function classes in DEFAULTS.
+WheelConfig.RUNTIME_DEFAULTS = {
+  default_provider = "opencode-go",
+  thinking = "off",
+  providers = {},
+  commands = {},
+  custom_tools = {},
+  global_skills = {},
+  permissions = {
+    read_file = "allow",
+    list_directory = "allow",
+    search_code = "allow",
+    read_blob = "allow",
+    write_file = "allow",
+    edit_file = "allow",
+    run_command = "ask",
+  },
+}
+
 --- Check if a table is an array-like sequence.
 local function is_array(tbl)
   if type(tbl) ~= "table" then return false end
@@ -651,17 +671,322 @@ local function normalize_trust_store(data)
   return store, nil
 end
 
---- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
-function WheelConfig.get_global_config_path()
-  local xdg_config = getenv("XDG_CONFIG_HOME")
-  if xdg_config and xdg_config ~= "" then
-    return xdg_config .. "/wheel/init.lua"
+local PROVIDER_API_KEY_ENV = {
+  ["opencode-go"] = "OPENCODE_GO_API_KEY",
+  openai = "OPENAI_API_KEY",
+  anthropic = "ANTHROPIC_API_KEY",
+  deepseek = "DEEPSEEK_API_KEY",
+  openrouter = "OPENROUTER_API_KEY",
+}
+
+local PERMISSION_SEVERITY = {
+  allow = 1,
+  ask = 2,
+  deny = 3,
+}
+
+local function lookup_env(name, env)
+  if type(env) == "table" and env[name] ~= nil then
+    return env[name]
   end
-  local home = getenv("HOME") or ""
+  if type(env) == "table" then
+    return nil
+  end
+  return getenv(name)
+end
+
+--- Resolve global configuration directory (~/.config/wheel or $XDG_CONFIG_HOME/wheel).
+function WheelConfig.get_global_config_dir(env)
+  local xdg_config = lookup_env("XDG_CONFIG_HOME", env)
+  if xdg_config and xdg_config ~= "" then
+    return string.gsub(xdg_config, "/+$", "") .. "/wheel"
+  end
+  local home = lookup_env("HOME", env) or ""
   if home ~= "" then
-    return home .. "/.config/wheel/init.lua"
+    return string.gsub(home, "/+$", "") .. "/.config/wheel"
   end
   return nil
+end
+
+--- Resolve global configuration path (~/.config/wheel/init.lua or $XDG_CONFIG_HOME/wheel/init.lua).
+function WheelConfig.get_global_config_path(env)
+  local dir = WheelConfig.get_global_config_dir(env)
+  if not dir then return nil end
+  return dir .. "/init.lua"
+end
+
+--- Resolve private Wheel data directory (~/.local/share/wheel or $XDG_DATA_HOME/wheel).
+function WheelConfig.get_data_dir(env)
+  local xdg_data = lookup_env("XDG_DATA_HOME", env)
+  if xdg_data and xdg_data ~= "" then
+    return string.gsub(xdg_data, "/+$", "") .. "/wheel"
+  end
+  local home = lookup_env("HOME", env) or ""
+  if home ~= "" then
+    return string.gsub(home, "/+$", "") .. "/.local/share/wheel"
+  end
+  return nil
+end
+
+local function store_error(code, message)
+  return trust_error(code, message)
+end
+
+local function ensure_private_data_dir(host, dir_path)
+  if not dir_path or dir_path == "" or has_control_chars(dir_path) then
+    return false, store_error("E_DATA_STORE_UNAVAILABLE", "data directory path is unavailable")
+  end
+  if not host.fs.mkdir_p(dir_path) then
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "cannot create data directory")
+  end
+  local info = host.fs.stat(dir_path)
+  if not info or not info.exists then
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "data directory unavailable after creation")
+  end
+  if info.symlink then
+    return false, store_error("E_DATA_STORE_SYMLINK", "data directory is a symbolic link")
+  end
+  if not info.directory then
+    return false, store_error("E_DATA_STORE_NOT_DIR", "data path is not a directory")
+  end
+  local ok_owner, owner_err = check_store_owner(info, "wheel data directory", true)
+  if not ok_owner then
+    return false, owner_err
+  end
+  if host.fs.chmod(dir_path, "700") ~= true then
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "cannot set wheel data directory to 0700")
+  end
+  local after = host.fs.stat(dir_path)
+  local ok_after, after_err = check_store_owner(after, "wheel data directory")
+  if not ok_after then
+    return false, after_err
+  end
+  return true, nil
+end
+
+local function read_private_json_store(filepath, label)
+  if not filepath then
+    return {}, nil
+  end
+  local host = require_host("fs.read")
+  local info = host.fs.stat(filepath)
+  if not info or not info.exists then
+    return {}, nil
+  end
+  if info.symlink then
+    return nil, store_error("E_DATA_STORE_SYMLINK", label .. " is a symbolic link")
+  end
+  if not info.regular then
+    return nil, store_error("E_DATA_STORE_NOT_REGULAR", label .. " is not a regular file")
+  end
+  if info.mode ~= 384 then
+    return nil, store_error("E_DATA_STORE_MODE", label .. " must have mode 0600")
+  end
+  local ok_owner, owner_err = check_store_owner(info, label)
+  if not ok_owner then
+    return nil, owner_err
+  end
+  local content, rerr = host.fs.read_file_bounded(filepath, 1024 * 1024 + 1)
+  if not content then
+    return nil, store_error("E_DATA_STORE_UNREADABLE", label .. " could not be read: " .. tostring(rerr))
+  end
+  if #content > 1024 * 1024 then
+    return nil, store_error("E_DATA_STORE_TOO_LARGE", label .. " exceeds 1 MiB cap")
+  end
+  if content:match("^%s*$") then
+    return {}, nil
+  end
+  local K = get_kernel()
+  local ok_dec, decoded = pcall(K.JSON.decode, content)
+  if not ok_dec or type(decoded) ~= "table" then
+    return nil, store_error("E_DATA_STORE_CORRUPT", label .. " contains invalid JSON")
+  end
+  return decoded, nil
+end
+
+local function write_private_json_store(dir_path, filepath, data, label)
+  if type(data) ~= "table" then
+    return false, store_error("E_DATA_STORE_INVALID", label .. " data must be a table")
+  end
+  local host = require_host("fs.write")
+  local ok_dir, dir_err = ensure_private_data_dir(host, dir_path)
+  if not ok_dir then
+    return false, dir_err
+  end
+  local info = host.fs.stat(filepath)
+  if info and info.exists then
+    if info.symlink then
+      return false, store_error("E_DATA_STORE_SYMLINK", "refusing to replace symlinked " .. label)
+    end
+    if not info.regular then
+      return false, store_error("E_DATA_STORE_NOT_REGULAR", "refusing to replace non-regular " .. label)
+    end
+    local ok_owner, owner_err = check_store_owner(info, label, true)
+    if not ok_owner then
+      return false, owner_err
+    end
+  end
+  local K = get_kernel()
+  local encoded = K.JSON.encode(data) .. "\n"
+  local now_s = (host.time and host.time.now and host.time.now()) or 0
+  local tmp_suffix = tostring(now_s) .. "-" .. tostring(math.random(100000, 999999))
+  if type(host.fs.random_bytes) == "function" then
+    local ok_rb, rb = pcall(host.fs.random_bytes, 6)
+    if ok_rb and type(rb) == "string" and #rb >= 6 then
+      local hx = {}
+      for i = 1, 6 do hx[i] = string.format("%02x", string.byte(rb, i)) end
+      tmp_suffix = table.concat(hx, "")
+    end
+  end
+  local tmp_path = filepath .. ".tmp." .. tmp_suffix
+  if not host.fs.create_private_file(tmp_path, encoded) then
+    pcall(host.fs.remove_file, tmp_path)
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "failed to create private temp file for " .. label)
+  end
+  if not host.fs.rename(tmp_path, filepath) then
+    pcall(host.fs.remove_file, tmp_path)
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "failed to finalize private " .. label)
+  end
+  if host.fs.chmod(filepath, "600") ~= true then
+    return false, store_error("E_DATA_STORE_WRITE_FAILED", "failed to chmod 0600 on " .. label)
+  end
+  local after = host.fs.stat(filepath)
+  if not after or after.symlink or not after.regular or after.mode ~= 384 then
+    return false, store_error("E_DATA_STORE_MODE", label .. " failed post-write 0600 verification")
+  end
+  return true, nil
+end
+
+--- Read private runtime settings from $XDG_DATA_HOME/wheel/settings.json.
+function WheelConfig.read_data_settings(opts)
+  opts = opts or {}
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then return {}, nil end
+  return read_private_json_store(data_dir .. "/settings.json", "wheel settings store")
+end
+
+--- Persist private runtime settings to 0700/0600 $XDG_DATA_HOME/wheel/settings.json.
+function WheelConfig.write_data_settings(settings, opts)
+  opts = opts or {}
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return false, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  return write_private_json_store(data_dir, data_dir .. "/settings.json", settings, "wheel settings store")
+end
+
+--- Read private provider credentials from $XDG_DATA_HOME/wheel/credentials.json (0600 enforced).
+function WheelConfig.read_credentials(opts)
+  opts = opts or {}
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then return {}, nil end
+  local raw, err = read_private_json_store(data_dir .. "/credentials.json", "wheel credentials store")
+  if not raw then return nil, err end
+  local creds = type(raw.providers) == "table" and raw.providers or raw
+  return creds, nil
+end
+
+--- Store or update a provider credential in 0700/0600 $XDG_DATA_HOME/wheel/credentials.json.
+function WheelConfig.write_credential(provider_name, api_key, opts)
+  opts = opts or {}
+  if type(provider_name) ~= "string" or not provider_name:match("^[A-Za-z0-9_%-]+$") then
+    return false, store_error("E_ARGS_INVALID", "invalid provider name")
+  end
+  if type(api_key) ~= "string" or api_key == "" or has_control_chars(api_key) then
+    return false, store_error("E_ARGS_INVALID", "API key must be a non-empty single-line string")
+  end
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return false, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  local file_path = data_dir .. "/credentials.json"
+  local existing, err = read_private_json_store(file_path, "wheel credentials store")
+  if not existing then return false, err end
+  local doc = { version = 1, providers = {} }
+  local src = type(existing.providers) == "table" and existing.providers or existing
+  for k, v in pairs(src) do
+    if k ~= "version" and type(v) == "string" then
+      doc.providers[string.lower(k)] = v
+    end
+  end
+  doc.providers[string.lower(provider_name)] = api_key
+  return write_private_json_store(data_dir, file_path, doc, "wheel credentials store")
+end
+
+--- Delete a provider credential from $XDG_DATA_HOME/wheel/credentials.json.
+function WheelConfig.delete_credential(provider_name, opts)
+  opts = opts or {}
+  if type(provider_name) ~= "string" or provider_name == "" then
+    return false, store_error("E_ARGS_INVALID", "invalid provider name")
+  end
+  local data_dir = opts.data_dir or WheelConfig.get_data_dir(opts.env)
+  if not data_dir then
+    return false, store_error("E_DATA_STORE_UNAVAILABLE", "XDG_DATA_HOME and HOME are unset")
+  end
+  local file_path = data_dir .. "/credentials.json"
+  local existing, err = read_private_json_store(file_path, "wheel credentials store")
+  if not existing then return false, err end
+  local doc = { version = 1, providers = {} }
+  local src = type(existing.providers) == "table" and existing.providers or existing
+  for k, v in pairs(src) do
+    if k ~= "version" and type(v) == "string" then
+      doc.providers[string.lower(k)] = v
+    end
+  end
+  doc.providers[string.lower(provider_name)] = nil
+  return write_private_json_store(data_dir, file_path, doc, "wheel credentials store")
+end
+
+--- Resolve API key using precedence:
+--   session_override > env_var > global_config > data_credentials > "".
+function WheelConfig.resolve_api_key(provider_name, opts, env_override)
+  opts = opts or {}
+  local pname = string.lower(tostring(provider_name or ""))
+  local sess = opts.session_override
+  if type(sess) == "table" then
+    if type(sess.api_key) == "string" and #sess.api_key > 0 then
+      return sess.api_key, "session_override"
+    end
+    if type(sess.providers) == "table" and type(sess.providers[pname]) == "table"
+      and type(sess.providers[pname].api_key) == "string" and #sess.providers[pname].api_key > 0 then
+      return sess.providers[pname].api_key, "session_override"
+    end
+  end
+
+  local active_env = opts.env or env_override
+  local env_var = opts.api_key_env or PROVIDER_API_KEY_ENV[pname]
+  if type(env_var) == "string" and #env_var > 0 then
+    local val = lookup_env(env_var, active_env)
+    if type(val) == "string" and #val > 0 then
+      return val, "env"
+    end
+  end
+
+  local global_cfg = opts.global_config
+  if type(global_cfg) ~= "table" and opts.skip_global_lookup ~= true then
+    local loaded_global = WheelConfig.load_global_only({
+      env = active_env,
+      global_path = opts.global_path,
+      global_dir = opts.global_dir,
+    })
+    global_cfg = loaded_global
+  end
+  if type(global_cfg) == "table" and type(global_cfg.providers) == "table"
+    and type(global_cfg.providers[pname]) == "table"
+    and type(global_cfg.providers[pname].api_key) == "string"
+    and #global_cfg.providers[pname].api_key > 0 then
+    return global_cfg.providers[pname].api_key, "global_config"
+  end
+
+  local creds = opts.data_credentials
+  if type(creds) ~= "table" then
+    local read_creds = WheelConfig.read_credentials({ env = active_env, data_dir = opts.data_dir })
+    creds = read_creds or {}
+  end
+  if type(creds[pname]) == "string" and #creds[pname] > 0 then
+    return creds[pname], "data_credentials"
+  end
+  return "", "none"
 end
 
 --- Resolve project configuration path (<project_root>/.wheel/init.lua).
@@ -2027,24 +2352,272 @@ end
 ---   opts.trust_mode string?: "strict" (default) or "permissive"
 ---   opts.trusted boolean?: If true, bypasses trust store check (e.g. CLI explicit approval)
 --- @return table { ok = boolean, config = table, layers = table, error = string?, trusted = boolean? }
-function WheelConfig.load(opts)
-  opts = opts or {}
-  local project_root = opts.project_root or "."
-  local trust_mode = opts.trust_mode or "strict"
-  local layers_loaded = { defaults = true, global = false, project = false }
-  local active_config = deep_copy(WheelConfig.DEFAULTS)
+local LUA_RESERVED_WORDS = {
+  ["and"] = true, ["break"] = true, ["do"] = true, ["else"] = true, ["elseif"] = true,
+  ["end"] = true, ["false"] = true, ["for"] = true, ["function"] = true, ["if"] = true,
+  ["in"] = true, ["local"] = true, ["nil"] = true, ["not"] = true, ["or"] = true,
+  ["repeat"] = true, ["return"] = true, ["then"] = true, ["true"] = true, ["until"] = true,
+  ["while"] = true,
+}
 
-  -- 1. Layer 1: Global configuration (~/.config/wheel/init.lua)
-  local global_path = opts.global_path or WheelConfig.get_global_config_path()
+local function serialize_lua_value(val, indent, depth)
+  depth = depth or 0
+  if depth > 16 then return "nil" end
+  local t = type(val)
+  if t == "string" then
+    return string.format("%q", val)
+  elseif t == "number" or t == "boolean" then
+    return tostring(val)
+  elseif t ~= "table" then
+    return "nil"
+  end
+  if next(val) == nil then
+    return "{}"
+  end
+  local pad = string.rep("  ", indent)
+  local inner_pad = string.rep("  ", indent + 1)
+  if is_array(val) then
+    local parts = {}
+    for _, item in ipairs(val) do
+      table.insert(parts, inner_pad .. serialize_lua_value(item, indent + 1, depth + 1))
+    end
+    return "{\n" .. table.concat(parts, ",\n") .. ",\n" .. pad .. "}"
+  end
+  local keys = {}
+  for k in pairs(val) do
+    if type(k) == "string" or type(k) == "number" then
+      table.insert(keys, k)
+    end
+  end
+  table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+  local parts = {}
+  for _, k in ipairs(keys) do
+    local key_expr
+    if type(k) == "string" and k:match("^[A-Za-z_][A-Za-z0-9_]*$") and not LUA_RESERVED_WORDS[k] then
+      key_expr = k
+    elseif type(k) == "string" then
+      key_expr = "[" .. string.format("%q", k) .. "]"
+    else
+      key_expr = "[" .. tostring(k) .. "]"
+    end
+    local encoded_v = serialize_lua_value(val[k], indent + 1, depth + 1)
+    if encoded_v ~= "nil" then
+      table.insert(parts, inner_pad .. key_expr .. " = " .. encoded_v)
+    end
+  end
+  if #parts == 0 then return "{}" end
+  return "{\n" .. table.concat(parts, ",\n") .. ",\n" .. pad .. "}"
+end
+
+local function load_lua_subdir(subdir, target_tbl)
+  local host = require_host("fs.read")
+  local st = host.fs.stat(subdir)
+  if not st or not st.exists or not st.directory or st.symlink then
+    return false
+  end
+  local list_res = host.proc.run_program("ls", { "-1", "--", subdir }, { discard_stderr = true })
+  if not list_res or list_res.exit_code ~= 0 then
+    return false
+  end
+  local lua_files = {}
+  for name in (list_res.stdout or ""):gmatch("[^\n]+") do
+    if name:sub(-4) == ".lua" and name:sub(1, 1) ~= "." then
+      table.insert(lua_files, name)
+    end
+  end
+  table.sort(lua_files)
+  local any_loaded = false
+  for _, fname in ipairs(lua_files) do
+    local full = subdir .. "/" .. fname
+    local fstat = host.fs.stat(full)
+    if fstat and fstat.exists and fstat.regular and not fstat.symlink then
+      local content = read_file(full)
+      if content and content ~= "" then
+        local ok_eval, tbl = eval_config_chunk(content, full)
+        if ok_eval and type(tbl) == "table" then
+          local key = (type(tbl.name) == "string" and tbl.name ~= "" and tbl.name) or fname:gsub("%.lua$", "")
+          target_tbl[key] = deep_merge(target_tbl[key] or {}, tbl)
+          any_loaded = true
+        end
+      end
+    end
+  end
+  return any_loaded
+end
+
+local function load_global_skills_dir(skills_dir, target_skills)
+  local host = require_host("fs.read")
+  local st = host.fs.stat(skills_dir)
+  if not st or not st.exists or not st.directory or st.symlink then
+    return false
+  end
+  local list_res = host.proc.run_program("ls", { "-1", "--", skills_dir }, { discard_stderr = true })
+  if not list_res or list_res.exit_code ~= 0 then
+    return false
+  end
+  local names = {}
+  for entry in (list_res.stdout or ""):gmatch("[^\n]+") do
+    if entry ~= "" and entry:sub(1, 1) ~= "." then
+      table.insert(names, entry)
+    end
+  end
+  table.sort(names)
+  local loaded = false
+  for _, entry in ipairs(names) do
+    local skill_path = skills_dir .. "/" .. entry .. "/SKILL.md"
+    local skill_st = host.fs.stat(skill_path)
+    if skill_st and skill_st.exists and skill_st.regular and not skill_st.symlink then
+      target_skills[entry] = {
+        name = entry,
+        path = skill_path,
+        origin = "global",
+      }
+      loaded = true
+    end
+  end
+  return loaded
+end
+
+--- Load global configuration only (init.lua + optional modular subdirectories).
+function WheelConfig.load_global_only(opts)
+  opts = opts or {}
+  local result = {}
+  local any_loaded = false
+  local global_path = opts.global_path or WheelConfig.get_global_config_path(opts.env)
   if global_path then
     local global_content = read_file(global_path)
     if global_content and global_content ~= "" then
       local ok, global_tbl = eval_config_chunk(global_content, global_path)
       if ok and type(global_tbl) == "table" then
-        active_config = deep_merge(active_config, global_tbl)
-        layers_loaded.global = true
+        result = deep_merge(result, global_tbl)
+        any_loaded = true
       end
     end
+  end
+
+  if opts.global_path == nil or opts.global_dir ~= nil then
+    local global_dir = opts.global_dir or WheelConfig.get_global_config_dir(opts.env)
+    if global_dir then
+      result.providers = type(result.providers) == "table" and result.providers or {}
+      result.roles = type(result.roles) == "table" and result.roles or {}
+      result.commands = type(result.commands) == "table" and result.commands or {}
+      result.custom_tools = type(result.custom_tools) == "table" and result.custom_tools or {}
+      result.global_skills = type(result.global_skills) == "table" and result.global_skills or {}
+
+      if load_lua_subdir(global_dir .. "/providers", result.providers) then any_loaded = true end
+      if load_lua_subdir(global_dir .. "/agents", result.roles) then any_loaded = true end
+      if load_lua_subdir(global_dir .. "/commands", result.commands) then any_loaded = true end
+      if load_lua_subdir(global_dir .. "/tools", result.custom_tools) then
+        result.tools = type(result.tools) == "table" and result.tools or {}
+        result.tools.custom = deep_merge(result.tools.custom or {}, result.custom_tools)
+        any_loaded = true
+      end
+      if load_global_skills_dir(global_dir .. "/skills", result.global_skills) then any_loaded = true end
+    end
+  end
+  return result, any_loaded
+end
+
+--- Recursively strip secret fields before exporting merged global configuration.
+local function scrub_export_secrets(val, depth)
+  depth = depth or 0
+  if depth > 16 or type(val) ~= "table" then
+    return val
+  end
+  local out = {}
+  for k, v in pairs(val) do
+    if k ~= "api_key" and k ~= "credentials" then
+      out[k] = scrub_export_secrets(v, depth + 1)
+    end
+  end
+  return out
+end
+
+--- Export the merged global modular directory as a single sandbox-eval Lua chunk.
+function WheelConfig.export_single_file(opts)
+  local global_tbl = scrub_export_secrets(WheelConfig.load_global_only(opts or {}), 0)
+  return "-- Generated by WheelConfig.export_single_file\nreturn " .. serialize_lua_value(global_tbl, 0, 0) .. "\n"
+end
+
+local function validate_project_override(base_config, project_tbl)
+  if type(project_tbl) ~= "table" then
+    return false, "project_config_escalation", "project config must return a table"
+  end
+  if project_tbl.api_key ~= nil or project_tbl.credentials ~= nil then
+    return false, "project_config_escalation", "project config must not define api_key or credentials"
+  end
+  if type(project_tbl.providers) == "table" then
+    if project_tbl.providers.api_key ~= nil or project_tbl.providers.base_url ~= nil then
+      return false, "project_config_escalation", "project config must not set provider api_key or base_url"
+    end
+    for pname, pcfg in pairs(project_tbl.providers) do
+      if type(pcfg) == "table" and (pcfg.api_key ~= nil or pcfg.base_url ~= nil) then
+        return false, "project_config_escalation",
+          "project config must not override api_key or base_url for provider '" .. tostring(pname) .. "'"
+      end
+    end
+  end
+  if type(project_tbl.permissions) == "table" then
+    local base_perms = type(base_config.permissions) == "table" and base_config.permissions or {}
+    for tool_name, mode in pairs(project_tbl.permissions) do
+      if type(mode) ~= "string" or not PERMISSION_SEVERITY[mode] then
+        return false, "project_config_escalation",
+          "project config contains invalid permission mode for '" .. tostring(tool_name) .. "'"
+      end
+      local base_mode = base_perms[tool_name]
+      if base_mode and PERMISSION_SEVERITY[base_mode]
+        and PERMISSION_SEVERITY[mode] < PERMISSION_SEVERITY[base_mode] then
+        return false, "project_config_escalation",
+          string.format("project config cannot weaken permission for '%s' from '%s' to '%s'",
+            tostring(tool_name), tostring(base_mode), tostring(mode))
+      end
+    end
+  end
+  return true, nil, nil
+end
+
+--- Load and resolve configuration with hierarchical layering:
+--- Defaults (Layer 0) < Data Settings < Global (Layer 1) < Project (Layer 2) < Session overrides.
+--- Enforces security trust gate and project non-escalation invariants.
+function WheelConfig.load(opts)
+  opts = opts or {}
+  local project_root = opts.project_root or "."
+  local trust_mode = opts.trust_mode or "strict"
+  local layers_loaded = { defaults = true, data_settings = false, global = false, project = false }
+  local active_config = deep_merge(deep_copy(WheelConfig.DEFAULTS), deep_copy(WheelConfig.RUNTIME_DEFAULTS))
+
+  -- 0.5 Layer: Private XDG data settings ($XDG_DATA_HOME/wheel/settings.json)
+  if opts.data_dir ~= false then
+    local data_settings, ds_err = WheelConfig.read_data_settings({
+      env = opts.env,
+      data_dir = opts.data_dir,
+    })
+    if not data_settings then
+      return {
+        ok = false,
+        error = "data_settings_rejected",
+        code = ds_err and ds_err.code or "E_DATA_STORE_CORRUPT",
+        message = ds_err and ds_err.message or "invalid wheel data settings store",
+        config = active_config,
+        layers = layers_loaded,
+        trusted = false,
+      }
+    end
+    if next(data_settings) ~= nil then
+      active_config = deep_merge(active_config, data_settings)
+      layers_loaded.data_settings = true
+    end
+  end
+
+  -- 1. Layer 1: Global configuration (~/.config/wheel/init.lua + modular subdirs)
+  local global_tbl, global_loaded = WheelConfig.load_global_only({
+    env = opts.env,
+    global_path = opts.global_path,
+    global_dir = opts.global_dir,
+  })
+  if global_loaded then
+    active_config = deep_merge(active_config, global_tbl)
+    layers_loaded.global = true
   end
 
   -- 2. Layer 2: Project configuration (<project_root>/.wheel/init.lua)
@@ -2110,7 +2683,7 @@ function WheelConfig.load(opts)
       }
     end
 
-    -- Project config is trusted: execute safely
+    -- Project config is trusted: execute safely and enforce non-escalation.
     local ok, project_tbl = eval_config_chunk(project_content, project_path)
     if not ok then
       return {
@@ -2125,7 +2698,22 @@ function WheelConfig.load(opts)
       }
     end
 
-    -- Project config takes precedence over Global and Defaults!
+    local safe_ok, esc_err, esc_msg = validate_project_override(active_config, project_tbl)
+    if not safe_ok then
+      return {
+        ok = false,
+        error = esc_err,
+        code = "E_PROJECT_CONFIG_ESCALATION",
+        message = esc_msg,
+        path = project_path,
+        root = entry.root,
+        config = active_config,
+        layers = layers_loaded,
+        trusted = true,
+      }
+    end
+
+    -- Project config takes precedence over Global and Defaults within non-escalation bounds.
     active_config = deep_merge(active_config, project_tbl)
     layers_loaded.project = true
   end
@@ -2142,6 +2730,21 @@ function WheelConfig.load(opts)
     project_path = project_content and project_path or nil,
     root = entry.root,
   }
+end
+
+--- Resolve effective configuration with full runtime precedence:
+--- session_override > trusted_project > global_config > data_settings > DEFAULTS.
+function WheelConfig.resolve_effective_config(opts)
+  opts = opts or {}
+  local res = WheelConfig.load(opts)
+  if not res.ok then
+    return res
+  end
+  if type(opts.session_override) == "table" then
+    res.config = deep_merge(res.config, opts.session_override)
+    res.layers.session = true
+  end
+  return res
 end
 
 return WheelConfig

@@ -3,7 +3,7 @@
 --
 -- Manual only: run with `just test-live`. The recipe is deliberately absent
 -- from `just check` and CI. WHEEL_LIVE_PROVIDER selects `openrouter` (default),
--- `commandcode`, or `openai-cache`, case-insensitively. The test skips with exit 0 when the
+-- `commandcode`, `openai-cache`, or `opencode-go`, case-insensitively. The test skips with exit 0 when the
 -- selected provider's key environment variable is absent, and fails closed on
 -- an unknown selector. The key is read from the inherited environment by the
 -- test-only Python transport (tests/live_http_client.py); it is never passed
@@ -42,6 +42,14 @@ local PROVIDERS = {
     smoke_max_completion_tokens = 64,
     runner_max_completion_tokens = 64,
   },
+  ["opencode-go"] = {
+    name = "opencode-go",
+    api_key_env = "OPENCODE_GO_API_KEY",
+    base_url = "https://opencode.ai/inference/go/openai/v1",
+    model = "deepseek-v4.1-flash",
+    smoke_max_completion_tokens = 1024,
+    runner_max_completion_tokens = 1024,
+  },
 }
 
 local function trim(value)
@@ -61,7 +69,7 @@ local function select_provider()
   local config = PROVIDERS[name]
   if not config then
     io.stderr:write(string.format(
-      "test-live: unsupported %s value; expected openrouter, commandcode, or openai-cache\n",
+      "test-live: unsupported %s value; expected openrouter, commandcode, openai-cache, or opencode-go\n",
       PROVIDER_SELECTOR_ENV
     ))
     os.exit(2)
@@ -200,10 +208,12 @@ local function http_client(req)
 end
 
 local adapter = WheelProvider.OpenAIAdapter.new({
+  name = provider.name == "openai-cache" and "openai" or provider.name,
   base_url = BASE_URL,
   model = MODEL,
   temperature = 0.0,
   http_client = http_client,
+  requires_session_header = provider.name == "opencode-go",
   prompt_cache_supported = provider.name == "openai-cache",
   prompt_cache_policy = provider.name == "openai-cache" and "prefer" or nil,
 })
@@ -416,9 +426,9 @@ do
   print("LIVE " .. provider.name .. " runner OK (" .. tostring(report.iterations) .. " iterations)")
 end
 
-if provider.name == "commandcode" then
+if provider.name == "commandcode" or provider.name == "opencode-go" then
   assert(SMOKE_MAX_COMPLETION_TOKENS >= 512 and RUNNER_MAX_COMPLETION_TOKENS >= 512,
-    "Command Code reasoning checks require at least 512 completion tokens")
+    "Command Code / OpenCode Go reasoning checks require at least 512 completion tokens")
 end
 assert(#observed_budgets >= 4, "every live request path must carry a bounded max_tokens")
 for _, budget in ipairs(observed_budgets) do

@@ -60,6 +60,11 @@ local function authoritative_role_checkpoint(agent)
   return runtime and runtime.last_role_checkpoint or nil
 end
 
+local function authoritative_permission_gate(agent)
+  local runtime = AGENT_RUNTIME[agent]
+  return runtime and runtime.permission_gate or nil
+end
+
 local ok_tool, WheelTool = pcall(require, "wheel.tool")
 if not ok_tool then
   local ok_tool2, WheelTool2 = pcall(require, "lua.wheel.tool")
@@ -604,6 +609,17 @@ local function new_agent(opts, issued_binding)
   -- Bitty Core Rule R1: ExecutionContext is primary; panels describe presentation, not execution authority.
   -- Every agent defaults to running inside a Headless Panel working container.
   -- Presentation UI panels are optional observation projections.
+  local perm_gate = opts.permission_gate
+  if not perm_gate and WheelTool and type(WheelTool.PermissionGate) == "table"
+    and (opts.permissions ~= nil or opts.approver ~= nil) then
+    perm_gate = WheelTool.PermissionGate.new({
+      policy = opts.permissions or (opts.config and opts.config.permissions) or {},
+      session_id = opts.name or "default",
+      policy_generation = role_binding.policy_generation,
+      approver = opts.approver,
+    })
+  end
+
   local cfg_panel = (opts.config and opts.config.panel) or {}
   AGENT_RUNTIME[self] = {
     -- Runtime sessions are issued only by create_runtime_session. Constructor
@@ -617,6 +633,7 @@ local function new_agent(opts, issued_binding)
       branch = opts.context_refs and opts.context_refs.branch,
     },
     last_role_checkpoint = opts.last_role_checkpoint,
+    permission_gate = perm_gate,
   }
   if opts.headless ~= nil then
     self.headless = opts.headless
@@ -907,6 +924,32 @@ function WheelAgent:execute_tool(tool_name, args)
       })
     end
     error(reason)
+  end
+
+  local perm_gate = authoritative_permission_gate(self)
+  if perm_gate then
+    local pg_gen = authoritative_policy_generation(self)
+    if pg_gen and type(perm_gate.set_policy_generation) == "function" then
+      perm_gate:set_policy_generation(pg_gen)
+    end
+    local pg_ok, pg_err = perm_gate:authorize(tool_name, args, {
+      agent_name = self.name,
+      role = authoritative_binding(self).role,
+      session_id = authoritative_session_id(self),
+    })
+    if not pg_ok then
+      local msg = type(pg_err) == "table" and pg_err.message or tostring(pg_err or "permission denied")
+      if WheelTool and type(WheelTool.process_spillover) == "function" then
+        return WheelTool.process_spillover({
+          tool = tool_name,
+          success = false,
+          status = WheelTool.OutcomeStatus.DENIED,
+          exit_code = 126,
+          stderr = msg,
+        })
+      end
+      error(msg)
+    end
   end
 
   if not self.tool_registry then

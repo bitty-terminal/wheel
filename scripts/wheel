@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Standalone daily-driver launcher for Bitty Wheel.
+set -euo pipefail
+
+resolve_script() {
+  local src=$1
+  if command -v readlink >/dev/null 2>&1; then
+    readlink -f -- "$src"
+  else
+    printf '%s\n' "$src"
+  fi
+}
+
+SCRIPT_PATH="$(resolve_script "${BASH_SOURCE[0]}")"
+readonly SCRIPT_PATH
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+readonly REPO_ROOT
+
+select_interpreter() {
+  local candidate
+  for candidate in lua5.1 luajit lua; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  printf 'wheel: requires lua5.1, luajit, or lua on PATH\n' >&2
+  return 1
+}
+
+INTERPRETER="$(select_interpreter)"
+readonly INTERPRETER
+
+export LUA_PATH="$REPO_ROOT/lua/?.lua;$REPO_ROOT/lua/?/init.lua;;"
+exec "$INTERPRETER" "$REPO_ROOT/lua/wheel/cli.lua" "$@"

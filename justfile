@@ -106,6 +106,7 @@ lua: deps
     bun run luaparse --quiet --file lua/wheel/session_cli.lua
     bun run luaparse --quiet --file lua/wheel/cache_telemetry.lua
     bun run luaparse --quiet --file lua/wheel/bittyd_adapter.lua
+    bun run luaparse --quiet --file lua/wheel/cli.lua
     bun run luaparse --quiet --file bench/run.lua
     bun run luaparse --quiet --file bench/lib/cli.lua
     bun run luaparse --quiet --file bench/lib/env.lua
@@ -135,6 +136,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_cancel.lua
     bun run luaparse --quiet --file tests/test_cache_telemetry.lua
     bun run luaparse --quiet --file tests/test_bittyd_adapter.lua
+    bun run luaparse --quiet --file tests/test_daily_driver.lua
     bun run luaparse --quiet --file tests/bittyd_adapter_bridge.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
@@ -284,8 +286,8 @@ verify-package:
 # workflow-*.sh scripts are outside this gate; reformatting them is a separate
 # change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session scripts/wheel-proc
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel-session scripts/wheel-proc
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and

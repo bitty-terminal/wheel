@@ -1341,6 +1341,189 @@ end
 
 WheelTool.Registry = WheelToolRegistry
 
+-- ---------------------------------------------------------------------------
+-- Permission Gate (CONTEXT-ARCHITECTURE.md §10.3)
+-- ---------------------------------------------------------------------------
+
+local PermissionGate = {}
+PermissionGate.__index = PermissionGate
+
+local PERM_LEVEL = {
+  allow = 1,
+  ask = 2,
+  deny = 3,
+}
+
+local MAX_PENDING_APPROVALS = 64
+local MAX_SUMMARY_BYTES = 256
+
+local function sanitize_approval_summary(tool_name, args)
+  local parts = { tostring(tool_name) }
+  if type(args) == "table" then
+    if type(args.command) == "string" and #args.command > 0 then
+      table.insert(parts, args.command)
+    elseif type(args.path) == "string" and #args.path > 0 then
+      table.insert(parts, args.path)
+    end
+  end
+  local text = table.concat(parts, ": ")
+  text = text:gsub("[%z\1-\31\127]", " ")
+  if #text > MAX_SUMMARY_BYTES then
+    text = text:sub(1, MAX_SUMMARY_BYTES - 3) .. "..."
+  end
+  return text
+end
+
+local function scope_key_for_tool(tool_name, args)
+  if type(args) ~= "table" then
+    return tostring(tool_name)
+  end
+  if tool_name == "run_command" and type(args.command) == "string" then
+    local prog = args.command:match("^%s*([%w%._/%-]+)")
+    return tool_name .. ":" .. tostring(prog or "*")
+  end
+  return tostring(tool_name)
+end
+
+local function strictest_mode(a, b)
+  if not a then return b end
+  if not b then return a end
+  return (PERM_LEVEL[a] or 0) >= (PERM_LEVEL[b] or 0) and a or b
+end
+
+--- Create a PermissionGate implementing allow / ask / deny and session caching
+-- fenced by monotonic `policy_generation` (CONTEXT-ARCHITECTURE.md §10.3).
+function PermissionGate.new(opts)
+  opts = opts or {}
+  local self = setmetatable({}, PermissionGate)
+  self.policy = {}
+  for k, v in pairs(opts.policy or {}) do
+    if PERM_LEVEL[v] then
+      self.policy[k] = v
+    end
+  end
+  self.layers = opts.layers
+  self.session_id = tostring(opts.session_id or "default")
+  self.policy_generation = tonumber(opts.policy_generation) or 1
+  self.approver = type(opts.approver) == "function" and opts.approver or nil
+  self._session_cache = {}
+  self._pending = {}
+  self._seq = 0
+  return self
+end
+
+function PermissionGate:set_policy_generation(gen)
+  local num = tonumber(gen)
+  if num and num ~= self.policy_generation then
+    self.policy_generation = num
+    self._session_cache = {}
+  end
+end
+
+function PermissionGate:effective_mode(tool_name)
+  local resolved = nil
+  if type(self.layers) == "table" then
+    for _, layer in ipairs(self.layers) do
+      if type(layer) == "table" and layer[tool_name] and PERM_LEVEL[layer[tool_name]] then
+        resolved = strictest_mode(resolved, layer[tool_name])
+      end
+    end
+  end
+  local direct = self.policy[tool_name] or self.policy["*"]
+  if direct and PERM_LEVEL[direct] then
+    resolved = strictest_mode(resolved, direct)
+  end
+  return resolved or "allow"
+end
+
+function PermissionGate:list_pending()
+  local out = {}
+  for i, item in ipairs(self._pending) do
+    local copy = {}
+    for k, v in pairs(item) do copy[k] = v end
+    out[i] = copy
+  end
+  return out
+end
+
+function PermissionGate:resolve_pending(approval_id, decision)
+  for i, item in ipairs(self._pending) do
+    if item.id == approval_id then
+      table.remove(self._pending, i)
+      if decision == "allow_session" then
+        local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
+        self._session_cache[cache_key] = true
+      end
+      return true, decision
+    end
+  end
+  return false, "approval_not_found"
+end
+
+function PermissionGate:authorize(tool_name, args, ctx)
+  local mode = self:effective_mode(tool_name)
+  if mode == "allow" then
+    return true, { decision = "allow", mode = "allow" }
+  end
+  if mode == "deny" then
+    return false, WheelErrors.capability_denied(
+      "permission_denied:" .. tostring(tool_name),
+      string.format("tool '%s' is denied by permission policy", tostring(tool_name))
+    )
+  end
+
+  -- mode == "ask"
+  local skey = scope_key_for_tool(tool_name, args)
+  local cache_key = string.format("%s|%s|%d", self.session_id, skey, self.policy_generation)
+  if self._session_cache[cache_key] == true then
+    return true, { decision = "allow_session_cached", mode = "ask" }
+  end
+
+  local summary = sanitize_approval_summary(tool_name, args)
+  if not self.approver then
+    self._seq = self._seq + 1
+    if #self._pending >= MAX_PENDING_APPROVALS then
+      table.remove(self._pending, 1)
+    end
+    local rec = {
+      id = string.format("apr-%s-%d", self.session_id, self._seq),
+      tool = tostring(tool_name),
+      scope_key = skey,
+      summary = summary,
+      session_id = self.session_id,
+      policy_generation = self.policy_generation,
+      status = "pending",
+    }
+    table.insert(self._pending, rec)
+    return false, WheelErrors.capability_denied(
+      "approval_required_unattended:" .. tostring(tool_name),
+      string.format("tool '%s' requires interactive approval (unattended mode fails closed)", tostring(tool_name))
+    )
+  end
+
+  local reply = self.approver({
+    tool = tostring(tool_name),
+    scope_key = skey,
+    summary = summary,
+    session_id = self.session_id,
+    policy_generation = self.policy_generation,
+    agent_name = ctx and ctx.agent_name or nil,
+  })
+  local decision = type(reply) == "table" and reply.decision or reply
+  if decision == "allow_once" then
+    return true, { decision = "allow_once", mode = "ask" }
+  elseif decision == "allow_session" then
+    self._session_cache[cache_key] = true
+    return true, { decision = "allow_session", mode = "ask" }
+  end
+  return false, WheelErrors.capability_denied(
+    "approval_denied:" .. tostring(tool_name),
+    string.format("interactive approval denied for tool '%s'", tostring(tool_name))
+  )
+end
+
+WheelTool.PermissionGate = PermissionGate
+
 -- Global default registry singleton
 local _default_registry = nil
 function WheelTool.get_default_registry()
