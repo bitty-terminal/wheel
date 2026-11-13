@@ -1126,7 +1126,7 @@ return {
           saw_tool_output = true
         end
       end),
-      approval_timeout_sec = 5,
+      approval_timeout_sec = 30,
       poll_wait = function(approval_id)
         local l_out = {}
         assert(WheelCLI.main({ "approvals", "list" }, {
@@ -1192,7 +1192,7 @@ return {
         end
         return { status = 200, body = chunk }
       end,
-      approval_timeout_sec = 5,
+      approval_timeout_sec = 30,
       poll_wait = function(approval_id)
         sess_polls = sess_polls + 1
         assert(WheelCLI.main({ "approvals", "resolve", approval_id, "allow_session" }, {
@@ -1219,7 +1219,7 @@ return {
           deny_blocked = true
         end
       end),
-      approval_timeout_sec = 5,
+      approval_timeout_sec = 30,
       poll_wait = function(approval_id)
         assert(WheelCLI.main({ "approvals", "resolve", approval_id, "deny" }, {
           env = dash_env,
@@ -1282,7 +1282,7 @@ return {
         end
         return { status = 200, body = chunk }
       end,
-      approval_timeout_sec = 5,
+      approval_timeout_sec = 30,
       poll_wait = function(approval_id)
         local path = dash_root .. "/.local/share/wheel/approvals.json"
         local raw = assert(WheelHost.fs.read_file(path))

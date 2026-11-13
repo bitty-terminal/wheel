@@ -904,11 +904,22 @@ end
 local APPROVALS_MAX_ENTRIES = 32
 local APPROVAL_DEFAULT_TTL_SEC = 600
 local APPROVAL_SCOPE_KEY_MAX_BYTES = 256
-local APPROVAL_LOCK_STALE_SEC = 15
 local APPROVAL_LOCK_MAX_ATTEMPTS = 40
+local APPROVAL_LOCK_RECLAIM_ATTEMPT = 10
+local APPROVAL_LOCK_SLEEP_MS = 25
 local VALID_THINKING_GEARS = { low = true, medium = true, high = true, max = true }
 local VALID_APPROVAL_DECISIONS = { allow_once = true, allow_session = true, deny = true }
 local approval_nonce = 0
+local cached_lock_pid = nil
+
+local function current_lock_pid(host)
+  if cached_lock_pid ~= nil then
+    return cached_lock_pid
+  end
+  local p = (host.proc and type(host.proc.pid) == "function" and host.proc.pid()) or 0
+  cached_lock_pid = p
+  return p
+end
 
 local function current_unix_time()
   return require_host("time.now").time.now()
@@ -922,6 +933,30 @@ local function bound_approval_scope_key(key)
   return "bounded:" .. WheelConfig.compute_hash(s)
 end
 
+local function read_approvals_lock_owner(host, owner_file)
+  if type(host.fs.read_file) ~= "function" then
+    return nil
+  end
+  local raw = host.fs.read_file(owner_file)
+  if type(raw) ~= "string" then
+    return nil
+  end
+  local parsed = tonumber(raw:match("^%s*(%d+)%s*$"))
+  if parsed ~= nil and parsed > 1 then
+    return parsed
+  end
+  return nil
+end
+
+local function release_approvals_lock(host, lock_dir, owner_file, expected_pid)
+  local recorded_pid = read_approvals_lock_owner(host, owner_file)
+  if expected_pid > 1 and recorded_pid ~= nil and recorded_pid ~= expected_pid then
+    return
+  end
+  pcall(host.fs.remove_file, owner_file)
+  pcall(host.fs.remove_dir, lock_dir)
+end
+
 local function with_approvals_lock(data_dir, fn)
   local host = require_host("fs.write")
   local ok_dir, dir_err = ensure_private_data_dir(host, data_dir)
@@ -929,28 +964,46 @@ local function with_approvals_lock(data_dir, fn)
     return nil, dir_err
   end
   local lock_dir = data_dir .. "/.approvals.lock"
-  local pid = (host.proc and type(host.proc.pid) == "function" and host.proc.pid()) or 0
+  local owner_file = lock_dir .. "/owner"
+  local pid = current_lock_pid(host)
   local acquired = false
   for attempt = 1, APPROVAL_LOCK_MAX_ATTEMPTS do
     if host.fs.mkdir(lock_dir) then
+      host.fs.write_file(owner_file, tostring(pid) .. "\n")
       acquired = true
       break
     end
-    if attempt >= 10 then
-      local now = (host.time and type(host.time.now) == "function" and host.time.now()) or 0
-      local stale_dir = lock_dir .. ".stale." .. tostring(pid) .. "." .. tostring(now)
-      if host.fs.rename(lock_dir, stale_dir) then
-        host.fs.remove_dir(stale_dir)
+    local reclaimed = false
+    if attempt >= APPROVAL_LOCK_RECLAIM_ATTEMPT then
+      local owner_pid = read_approvals_lock_owner(host, owner_file)
+      if owner_pid ~= nil and host.proc and type(host.proc.is_alive) == "function" then
+        local alive, alive_err = host.proc.is_alive(owner_pid)
+        if alive == false and alive_err == nil then
+          local now = (host.time and type(host.time.now) == "function" and host.time.now()) or 0
+          local stale_dir = lock_dir .. ".stale." .. tostring(pid) .. "." .. tostring(now)
+          if host.fs.rename(lock_dir, stale_dir) then
+            local stale_owner_file = stale_dir .. "/owner"
+            local stale_owner = read_approvals_lock_owner(host, stale_owner_file)
+            if stale_owner == nil or stale_owner == owner_pid then
+              pcall(host.fs.remove_file, stale_owner_file)
+              pcall(host.fs.remove_dir, stale_dir)
+              reclaimed = true
+            else
+              pcall(host.fs.rename, stale_dir, lock_dir)
+            end
+          end
+        end
       end
-    elseif host.time and type(host.time.sleep_ms) == "function" then
-      host.time.sleep_ms(25)
+    end
+    if not reclaimed and host.time and type(host.time.sleep_ms) == "function" then
+      host.time.sleep_ms(APPROVAL_LOCK_SLEEP_MS)
     end
   end
   if not acquired then
     return nil, store_error("E_DATA_STORE_BUSY", "timed out acquiring approvals store lock")
   end
   local ok_call, res, err = pcall(fn)
-  host.fs.remove_dir(lock_dir)
+  release_approvals_lock(host, lock_dir, owner_file, pid)
   if not ok_call then
     error(res, 0)
   end
@@ -1178,6 +1231,12 @@ function WheelConfig.resolve_approval_store(id, decision, opts)
     end
     if not target then
       return nil, store_error("E_APPROVAL_NOT_FOUND", "approval id not found: " .. id)
+    end
+    if opts.agent_name ~= nil and target.agent_name ~= opts.agent_name then
+      return nil, store_error("E_APPROVAL_OWNER_MISMATCH", "approval agent owner does not match: " .. id)
+    end
+    if opts.session_id ~= nil and target.session_id ~= opts.session_id then
+      return nil, store_error("E_APPROVAL_OWNER_MISMATCH", "approval session owner does not match: " .. id)
     end
     if target.status ~= "pending" then
       return nil, store_error("E_APPROVAL_NOT_PENDING", "approval is already resolved: " .. id)

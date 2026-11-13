@@ -2866,6 +2866,9 @@ function WheelTeam:list_pending_approvals(opts)
   end
   if opts.include_store == true or opts.data_dir ~= nil or opts.env ~= nil then
     local ok_cfg, WheelConfig = pcall(require, "wheel.config")
+    if not ok_cfg then
+      ok_cfg, WheelConfig = pcall(require, "lua.wheel.config")
+    end
     if ok_cfg and type(WheelConfig.read_approvals) == "function" then
       local store = WheelConfig.read_approvals({ data_dir = opts.data_dir, env = opts.env })
       if store and type(store.entries) == "table" then
@@ -2954,11 +2957,19 @@ function WheelTeam:resolve_pending_approval(approval_id, decision, opts)
   end
   if opts.include_store == true or opts.data_dir ~= nil or opts.env ~= nil then
     local ok_cfg, WheelConfig = pcall(require, "wheel.config")
+    if not ok_cfg then
+      ok_cfg, WheelConfig = pcall(require, "lua.wheel.config")
+    end
     if ok_cfg and type(WheelConfig.resolve_approval_store) == "function" then
       local resolved, serr = WheelConfig.resolve_approval_store(
         approval_id,
         decision,
-        { data_dir = opts.data_dir, env = opts.env }
+        {
+          data_dir = opts.data_dir,
+          env = opts.env,
+          agent_name = agent.name,
+          session_id = runtime_sid,
+        }
       )
       if resolved then
         return {
@@ -2969,6 +2980,8 @@ function WheelTeam:resolve_pending_approval(approval_id, decision, opts)
           agent_id = agent.agent_id,
           session_id = runtime_sid,
         }, nil
+      elseif serr and serr.code == "E_APPROVAL_OWNER_MISMATCH" then
+        return nil, dashboard_error("E_DASHBOARD_AUTHORITY", serr.message or "approval belongs to a different agent or session")
       elseif serr and serr.code == "E_APPROVAL_EXPIRED" then
         return nil, dashboard_error("E_TEAM_APPROVAL_STALE", serr.message or "approval expired")
       end
