@@ -67,16 +67,39 @@ local function collect_args_list(argv)
   return list
 end
 
-local function clone_masked_config(value, parent_key)
+local SECRET_FIELD_NAMES = {
+  api_key = true,
+  credentials = true,
+  token = true,
+  secret = true,
+  password = true,
+  access_token = true,
+  refresh_token = true,
+}
+
+local function is_secret_key(k)
+  if type(k) ~= "string" then return false end
+  local lower = string.lower(k)
+  if SECRET_FIELD_NAMES[lower] then return true end
+  return lower:match("_key$") ~= nil or lower:match("_token$") ~= nil
+    or lower:match("_secret$") ~= nil or lower:match("_password$") ~= nil
+end
+
+local function clone_masked_config(value, in_secret)
   if type(value) ~= "table" then
-    if parent_key == "api_key" and type(value) == "string" and #value > 0 then
+    if in_secret and type(value) == "string" and #value > 0 then
       return "***REDACTED***"
     end
     return value
   end
   local out = {}
   for k, v in pairs(value) do
-    out[k] = clone_masked_config(v, k)
+    local child_secret = in_secret or is_secret_key(k)
+    if child_secret and type(v) ~= "table" then
+      out[k] = (type(v) == "string" and #v > 0) and "***REDACTED***" or v
+    else
+      out[k] = clone_masked_config(v, child_secret)
+    end
   end
   return out
 end
@@ -451,7 +474,13 @@ local function build_provider_from_cli(parsed, io_ctx)
   if not adapter then
     return nil, nil, perr
   end
-  return adapter, { config = cfg, provider_name = pname, model = model, thinking = thinking }, nil
+  return adapter, {
+    config = cfg,
+    permission_layers = eff.permission_layers,
+    provider_name = pname,
+    model = model,
+    thinking = thinking,
+  }, nil
 end
 
 local function cmd_ask(args, io_ctx)
@@ -524,6 +553,7 @@ local function cmd_run(args, io_ctx)
   local approver = build_cli_approver(io_ctx, parsed.approval_mode)
   local gate = WheelTool.PermissionGate.new({
     policy = meta.config.permissions or { run_command = "ask" },
+    layers = meta.permission_layers,
     session_id = "cli-run",
     policy_generation = 1,
     approver = approver,

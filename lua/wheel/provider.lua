@@ -449,10 +449,58 @@ local function has_ctl_or_crlf(value)
 end
 
 local function is_loopback_host(authority)
-  local host = authority:match("^%[([^%]]+)%]") or authority:match("^([^:]+)")
+  if type(authority) ~= "string" then return false end
+  local host = authority:match("^%[([^%]]+)%]$")
+    or authority:match("^%[([^%]]+)%]:%d+$")
+    or authority:match("^([^:%[%]]+):%d+$")
+    or authority:match("^([^:%[%]]+)$")
   if not host then return false end
   host = string.lower(host)
   return host == "127.0.0.1" or host == "::1" or host == "localhost"
+end
+
+local function read_env_var(host, name)
+  if host and host.env and type(host.env.read) == "function" then
+    local v = host.env.read(name)
+    if v ~= nil and v ~= "" then return v end
+  end
+  if type(os) == "table" and type(os.getenv) == "function" then
+    local v = os.getenv(name)
+    if v ~= nil and v ~= "" then return v end
+  end
+  return nil
+end
+
+local function resolve_verified_http_tmp_dir(host)
+  local runtime_dir = nil
+  if host.tmp and type(host.tmp.dir) == "function" then
+    local ok_td, td = pcall(host.tmp.dir)
+    if ok_td and type(td) == "string" and td ~= "" then
+      runtime_dir = td
+    end
+  end
+  if not runtime_dir or runtime_dir == "" then
+    runtime_dir = read_env_var(host, "XDG_RUNTIME_DIR") or read_env_var(host, "TMPDIR") or "/tmp/bitty"
+  end
+  local tmp_base = runtime_dir:gsub("/+$", "") .. "/wheel-http"
+  if not host.fs.mkdir_p(tmp_base) then
+    return nil, "failed to create private HTTP temp directory"
+  end
+  local info = host.fs.stat(tmp_base)
+  if not info or not info.exists or info.symlink or not info.directory then
+    return nil, "HTTP temp directory is missing or unsafe (symlink/non-directory)"
+  end
+  if host.fs.chmod(tmp_base, "700") ~= true then
+    return nil, "failed to enforce 0700 mode on HTTP temp directory"
+  end
+  local verified = host.fs.stat(tmp_base)
+  if not verified or verified.symlink or not verified.directory or verified.mode ~= 448 then
+    return nil, "HTTP temp directory failed 0700 safety verification"
+  end
+  if info.uid ~= nil and verified.uid ~= nil and info.uid ~= verified.uid then
+    return nil, "HTTP temp directory ownership mismatch"
+  end
+  return tmp_base, nil
 end
 
 local function scrub_secret_text(text, secrets)
@@ -533,19 +581,10 @@ function WheelProvider.default_http_client(req)
     return nil, "WheelHost filesystem and process capabilities are unavailable"
   end
 
-  local runtime_dir = nil
-  if host.env and type(host.env.read) == "function" then
-    runtime_dir = host.env.read("XDG_RUNTIME_DIR") or host.env.read("TMPDIR")
+  local tmp_base, tmp_err = resolve_verified_http_tmp_dir(host)
+  if not tmp_base then
+    return nil, tmp_err
   end
-  if (not runtime_dir or runtime_dir == "") and type(os) == "table" and type(os.getenv) == "function" then
-    runtime_dir = os.getenv("XDG_RUNTIME_DIR") or os.getenv("TMPDIR")
-  end
-  if not runtime_dir or runtime_dir == "" then
-    runtime_dir = "/tmp/bitty"
-  end
-  local tmp_base = runtime_dir:gsub("/+$", "") .. "/wheel-http"
-  host.fs.mkdir_p(tmp_base)
-  pcall(host.fs.chmod, tmp_base, "700")
 
   http_temp_counter = http_temp_counter + 1
   local now_s = (host.time and host.time.now and host.time.now()) or 0
@@ -573,6 +612,10 @@ function WheelProvider.default_http_client(req)
     cleanup()
     return nil, "failed to create private HTTP body file"
   end
+  if not host.fs.create_private_file(resp_path, "") then
+    cleanup()
+    return nil, "failed to create private HTTP response file"
+  end
 
   local proto_spec = allow_loopback and "=http,https" or "=https"
   local cfg_lines = {
@@ -584,9 +627,9 @@ function WheelProvider.default_http_client(req)
     'max-time = "180"',
     "data-binary = " .. curl_quote("@" .. body_path),
   }
-  if not allow_loopback and type(os) == "table" and type(os.getenv) == "function" then
-    local proxy_url = os.getenv("HTTPS_PROXY") or os.getenv("https_proxy")
-      or os.getenv("ALL_PROXY") or os.getenv("NETWORK_PROXY")
+  if not allow_loopback then
+    local proxy_url = read_env_var(host, "HTTPS_PROXY") or read_env_var(host, "https_proxy")
+      or read_env_var(host, "ALL_PROXY") or read_env_var(host, "NETWORK_PROXY")
     if type(proxy_url) == "string" and #proxy_url > 0 and not has_ctl_or_crlf(proxy_url) then
       table.insert(secret_values, proxy_url)
       table.insert(cfg_lines, "proxy = " .. curl_quote(proxy_url))
@@ -622,6 +665,9 @@ function WheelProvider.default_http_client(req)
   end
 
   local status_num = tonumber((res.stdout or ""):match("(%d%d%d)") or "") or 0
+  if (status_num < 200 or status_num >= 300) and #resp_body > 0 then
+    resp_body = scrub_secret_text(resp_body, secret_values)
+  end
   if req.stream and type(req.on_stream_chunk) == "function" and #resp_body > 0 then
     local chunk_size = 4096
     for i = 1, #resp_body, chunk_size do
@@ -2134,10 +2180,10 @@ function OpenAIAdapter:complete(request, opts)
   })
 
   if not res then
-    return nil, "HTTP request failed: " .. tostring(err)
+    return nil, "HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status ~= 200 then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
@@ -2296,10 +2342,10 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   })
 
   if not res then
-    return nil, "Streaming HTTP request failed: " .. tostring(err)
+    return nil, "Streaming HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status and (res.status < 200 or res.status >= 300) then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
   end
   if stream_err then
@@ -2538,10 +2584,10 @@ function AnthropicAdapter:complete(request, opts)
   })
 
   if not res then
-    return nil, "HTTP request failed: " .. tostring(err)
+    return nil, "HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status ~= 200 then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
@@ -2690,10 +2736,10 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
   })
 
   if not res then
-    return nil, "Streaming HTTP request failed: " .. tostring(err)
+    return nil, "Streaming HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status and (res.status < 200 or res.status >= 300) then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
   end
   if stream_err then

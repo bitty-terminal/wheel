@@ -1379,8 +1379,12 @@ local function scope_key_for_tool(tool_name, args)
     return tostring(tool_name)
   end
   if tool_name == "run_command" and type(args.command) == "string" then
-    local prog = args.command:match("^%s*([%w%._/%-]+)")
-    return tool_name .. ":" .. tostring(prog or "*")
+    -- Cache exact normalized command (not bare argv[0]) so `ls` approval cannot widen into `ls; rm -rf ...`.
+    local normalized = args.command:gsub("[%z\1-\31\127]", " "):gsub("^%s+", ""):gsub("%s+$", ""):gsub("%s+", " ")
+    if normalized == "" then
+      return "run_command:*"
+    end
+    return "run_command:" .. normalized
   end
   return tostring(tool_name)
 end
@@ -1424,8 +1428,11 @@ function PermissionGate:effective_mode(tool_name)
   local resolved = nil
   if type(self.layers) == "table" then
     for _, layer in ipairs(self.layers) do
-      if type(layer) == "table" and layer[tool_name] and PERM_LEVEL[layer[tool_name]] then
-        resolved = strictest_mode(resolved, layer[tool_name])
+      if type(layer) == "table" then
+        local m = layer[tool_name] or layer["*"]
+        if m and PERM_LEVEL[m] then
+          resolved = strictest_mode(resolved, m)
+        end
       end
     end
   end

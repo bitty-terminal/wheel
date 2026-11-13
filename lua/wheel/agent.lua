@@ -610,10 +610,12 @@ local function new_agent(opts, issued_binding)
   -- Every agent defaults to running inside a Headless Panel working container.
   -- Presentation UI panels are optional observation projections.
   local perm_gate = opts.permission_gate
+  local has_config_perms = type(opts.config) == "table" and type(opts.config.permissions) == "table"
   if not perm_gate and WheelTool and type(WheelTool.PermissionGate) == "table"
-    and (opts.permissions ~= nil or opts.approver ~= nil) then
+    and (opts.permissions ~= nil or opts.approver ~= nil or has_config_perms) then
     perm_gate = WheelTool.PermissionGate.new({
-      policy = opts.permissions or (opts.config and opts.config.permissions) or {},
+      policy = opts.permissions or (has_config_perms and opts.config.permissions) or {},
+      layers = opts.permission_layers,
       session_id = opts.name or "default",
       policy_generation = role_binding.policy_generation,
       approver = opts.approver,
