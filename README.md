@@ -29,6 +29,18 @@ LUA_PATH="$HOME/.local/wheel/current/lua/?.lua;$HOME/.local/wheel/current/lua/?/
   lua5.1 -e 'local wheel = require("wheel"); print(wheel.command_catalog[1].id)'
 ```
 
+Or run the standalone daily-driver CLI (`scripts/wheel`):
+
+```sh
+./scripts/wheel init                      # scaffold XDG config/data stores (0700/0600)
+./scripts/wheel providers                 # list built-in templates (opencode-go, openai, anthropic, deepseek, openrouter, ollama)
+./scripts/wheel config show               # show effective config with precedence metadata
+./scripts/wheel auth set opencode-go      # store credential via stdin/tty into $XDG_DATA_HOME/wheel/credentials.json (0600)
+./scripts/wheel ask "Summarize this repo" # single-turn completion
+./scripts/wheel run "Fix failing tests"   # ReAct tool-loop run with interactive allow/ask/deny gate
+./scripts/wheel chat                      # interactive REPL (/model, /think, /provider, /exit)
+```
+
 - **Gate interpreter:** Lua 5.1 (`lua5.1` primary release gate; `luajit` and `lua` development fallbacks with JIT disabled for evaluated project-config chunks).
 - **Platform:** POSIX hosts with GNU coreutils, `util-linux` (`setsid`), `tar`, and `gzip`.
 
@@ -59,7 +71,7 @@ This plugin declares no settings.
 
 ### Wheel harness configuration
 
-Configuration is resolved by `lua/wheel/config.lua` across three layers (`WheelConfig.DEFAULTS`, `$XDG_CONFIG_HOME/wheel/init.lua`, and `.wheel/init.lua`) and gated by the executable project-config trust gate pinned in `$XDG_STATE_HOME/wheel/trusted_projects.json` (see [SECURITY-MODEL.md](SECURITY-MODEL.md#executable-project-configuration-trust-gate)). Comprehensive configuration examples and plugin docs will be published at `https://wheel.bitty.run`.
+Configuration is resolved by `lua/wheel/config.lua` across deterministic precedence (`session_override > trusted_project > global_config > $XDG_DATA_HOME/wheel/settings.json > WheelConfig.RUNTIME_DEFAULTS`) alongside `$XDG_CONFIG_HOME/wheel/init.lua` (plus modular `providers/*.lua`, `agents/*.lua`, `commands/*.lua`, `tools/*.lua`, and `skills/*/SKILL.md` under `$XDG_CONFIG_HOME/wheel/`) and `.wheel/init.lua` gated by the executable project-config trust gate pinned in `$XDG_STATE_HOME/wheel/trusted_projects.json` (see [SECURITY-MODEL.md](SECURITY-MODEL.md#executable-project-configuration-trust-gate)). Project `.wheel/` overrides reject `api_key`, `credentials`, `base_url`, and permission weakening (`project_config_escalation`). Credentials resolve by `session_override > env_var > global_config_provider_key > $XDG_DATA_HOME/wheel/credentials.json > ""`. Built-in provider templates (`WheelProvider.TEMPLATES`), unified thinking gears (`off|low|medium|high|max`), and interactive `PermissionGate` approvals (`allow|ask|deny`) govern daily execution. Comprehensive configuration examples and plugin docs will be published at `https://wheel.bitty.run`.
 
 - **Function classes** (`lua/wheel/config.lua` schema):
   - `roles` — role definitions, capability narrowing, and model profile references.
@@ -104,7 +116,7 @@ Every command crosses the typed failure boundary in `lua/wheel/errors.lua` and s
 
 ### Configuration failures
 
-Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config`, `project_config_rejected`, and `project_config_eval_error`.
+Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_project_config`, `project_config_rejected`, `project_config_eval_error`, `project_config_escalation`, and `data_settings_rejected`.
 
 ## Development
 

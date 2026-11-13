@@ -1341,6 +1341,294 @@ end
 
 WheelTool.Registry = WheelToolRegistry
 
+-- ---------------------------------------------------------------------------
+-- Permission Gate (CONTEXT-ARCHITECTURE.md §10.3)
+-- ---------------------------------------------------------------------------
+
+local PermissionGate = {}
+PermissionGate.__index = PermissionGate
+
+local PERM_LEVEL = {
+  allow = 1,
+  ask = 2,
+  deny = 3,
+}
+
+local MAX_PENDING_APPROVALS = 64
+local MAX_SUMMARY_BYTES = 256
+
+local function sanitize_approval_summary(tool_name, args)
+  local parts = { tostring(tool_name) }
+  if type(args) == "table" then
+    if type(args.command) == "string" and #args.command > 0 then
+      table.insert(parts, args.command)
+    elseif type(args.path) == "string" and #args.path > 0 then
+      table.insert(parts, args.path)
+    end
+  end
+  local text = table.concat(parts, ": ")
+  text = text:gsub("\r", "\\r"):gsub("\n", "\\n"):gsub("[%z\1-\31\127]", " ")
+  if #text > MAX_SUMMARY_BYTES then
+    text = text:sub(1, MAX_SUMMARY_BYTES - 3) .. "..."
+  end
+  return text
+end
+
+local function escape_control_bytes(text)
+  return (text:gsub("\\", "\\\\"):gsub("([%z\1-\31\127])", function(ch)
+    return string.format("\\x%02x", string.byte(ch))
+  end))
+end
+
+local function canonicalize_tool_args(val, depth)
+  depth = depth or 0
+  if depth > 16 then
+    return "<max_depth>"
+  end
+  local t = type(val)
+  if val == nil then
+    return "n"
+  elseif t == "boolean" then
+    return val and "b:1" or "b:0"
+  elseif t == "number" then
+    return string.format("d:%.17g", val)
+  elseif t == "string" then
+    return string.format("s:%d:%s", #val, escape_control_bytes(val))
+  elseif t == "table" then
+    local keyed = {}
+    for k, v in pairs(val) do
+      local ck = canonicalize_tool_args(k, depth + 1)
+      keyed[#keyed + 1] = { ck = ck, v = v }
+    end
+    table.sort(keyed, function(a, b)
+      return a.ck < b.ck
+    end)
+    local entries = {}
+    for _, item in ipairs(keyed) do
+      entries[#entries + 1] = item.ck .. "=" .. canonicalize_tool_args(item.v, depth + 1)
+    end
+    return "t:{" .. table.concat(entries, ",") .. "}"
+  end
+  return "u:" .. escape_control_bytes(tostring(val))
+end
+
+local function scope_key_for_tool(tool_name, args)
+  if type(args) ~= "table" then
+    return tostring(tool_name)
+  end
+  if tool_name == "run_command" and type(args.command) == "string" then
+    -- Preserve exact command bytes after injective escaping so quoted spacing cannot collide.
+    if args.command == "" then
+      return "run_command:*"
+    end
+    return "run_command:" .. escape_control_bytes(args.command)
+  end
+  return tostring(tool_name)
+end
+
+local function strictest_mode(a, b)
+  if not a then return b end
+  if not b then return a end
+  return (PERM_LEVEL[a] or 0) >= (PERM_LEVEL[b] or 0) and a or b
+end
+
+local function retire_pending_to_stale(gate)
+  gate._session_cache = {}
+  gate._once_cache = {}
+  for _, item in ipairs(gate._pending) do
+    if item and item.id and not gate._stale_pending_ids[item.id] then
+      gate._stale_pending_ids[item.id] = true
+      table.insert(gate._stale_pending_order, item.id)
+      if #gate._stale_pending_order > MAX_PENDING_APPROVALS then
+        local evict = table.remove(gate._stale_pending_order, 1)
+        gate._stale_pending_ids[evict] = nil
+      end
+    end
+  end
+  gate._pending = {}
+end
+
+--- Create a PermissionGate implementing allow / ask / deny and session caching
+-- fenced by monotonic `policy_generation` (CONTEXT-ARCHITECTURE.md §10.3).
+function PermissionGate.new(opts)
+  opts = opts or {}
+  local self = setmetatable({}, PermissionGate)
+  self.policy = {}
+  for k, v in pairs(opts.policy or {}) do
+    if PERM_LEVEL[v] then
+      self.policy[k] = v
+    end
+  end
+  self.layers = opts.layers
+  self.session_id = tostring(opts.session_id or "default")
+  self.policy_generation = tonumber(opts.policy_generation) or 1
+  self.approver = type(opts.approver) == "function" and opts.approver or nil
+  self._session_cache = {}
+  self._once_cache = {}
+  self._pending = {}
+  self._stale_pending_ids = {}
+  self._stale_pending_order = {}
+  self._seq = 0
+  return self
+end
+
+function PermissionGate:set_policy_generation(gen)
+  local num = tonumber(gen)
+  if num and num ~= self.policy_generation then
+    self.policy_generation = num
+    retire_pending_to_stale(self)
+  end
+end
+
+function PermissionGate:set_session_id(sid)
+  if type(sid) == "string" and sid ~= "" and sid ~= self.session_id then
+    self.session_id = sid
+    retire_pending_to_stale(self)
+  end
+end
+
+function PermissionGate:effective_mode(tool_name)
+  local resolved = nil
+  if type(self.layers) == "table" then
+    for _, layer in ipairs(self.layers) do
+      if type(layer) == "table" then
+        local m = layer[tool_name] or layer["*"]
+        if m and PERM_LEVEL[m] then
+          resolved = strictest_mode(resolved, m)
+        end
+      end
+    end
+  end
+  local direct = self.policy[tool_name] or self.policy["*"]
+  if direct and PERM_LEVEL[direct] then
+    resolved = strictest_mode(resolved, direct)
+  end
+  return resolved or "allow"
+end
+
+function PermissionGate:list_pending()
+  local out = {}
+  for i, item in ipairs(self._pending) do
+    local copy = {}
+    for k, v in pairs(item) do
+      if k ~= "_args_key" then
+        copy[k] = v
+      end
+    end
+    out[i] = copy
+  end
+  return out
+end
+
+function PermissionGate:resolve_pending(approval_id, decision)
+  if decision ~= "allow_once" and decision ~= "allow_session" and decision ~= "deny" then
+    return false, "invalid_decision"
+  end
+  if self._stale_pending_ids[approval_id] then
+    self._stale_pending_ids[approval_id] = nil
+    return false, "stale_policy_generation"
+  end
+  for i, item in ipairs(self._pending) do
+    if item.id == approval_id then
+      table.remove(self._pending, i)
+      if item.policy_generation ~= self.policy_generation then
+        return false, "stale_policy_generation"
+      end
+      if decision == "allow_once" then
+        local once_key = string.format(
+          "%s|%s|%d|%s",
+          self.session_id,
+          item.scope_key,
+          self.policy_generation,
+          tostring(item._args_key or "")
+        )
+        self._once_cache[once_key] = (self._once_cache[once_key] or 0) + 1
+      elseif decision == "allow_session" then
+        local cache_key = string.format("%s|%s|%d", self.session_id, item.scope_key, self.policy_generation)
+        self._session_cache[cache_key] = true
+      end
+      return true, decision
+    end
+  end
+  return false, "approval_not_found"
+end
+
+function PermissionGate:authorize(tool_name, args, ctx)
+  local mode = self:effective_mode(tool_name)
+  if mode == "allow" then
+    return true, { decision = "allow", mode = "allow" }
+  end
+  if mode == "deny" then
+    return false, WheelErrors.capability_denied(
+      "permission_denied:" .. tostring(tool_name),
+      string.format("tool '%s' is denied by permission policy", tostring(tool_name))
+    )
+  end
+
+  -- mode == "ask"
+  local skey = scope_key_for_tool(tool_name, args)
+  local cache_key = string.format("%s|%s|%d", self.session_id, skey, self.policy_generation)
+  if self._session_cache[cache_key] == true then
+    return true, { decision = "allow_session_cached", mode = "ask" }
+  end
+  local args_fp = canonicalize_tool_args(args)
+  local once_key = string.format("%s|%s|%d|%s", self.session_id, skey, self.policy_generation, args_fp)
+  local once_count = self._once_cache[once_key] or 0
+  if once_count > 0 then
+    if once_count <= 1 then
+      self._once_cache[once_key] = nil
+    else
+      self._once_cache[once_key] = once_count - 1
+    end
+    return true, { decision = "allow_once", mode = "ask" }
+  end
+
+  local summary = sanitize_approval_summary(tool_name, args)
+  if not self.approver then
+    self._seq = self._seq + 1
+    if #self._pending >= MAX_PENDING_APPROVALS then
+      table.remove(self._pending, 1)
+    end
+    local rec = {
+      id = string.format("apr-%s-%d", self.session_id, self._seq),
+      tool = tostring(tool_name),
+      scope_key = skey,
+      summary = summary,
+      session_id = self.session_id,
+      policy_generation = self.policy_generation,
+      status = "pending",
+      _args_key = args_fp,
+    }
+    table.insert(self._pending, rec)
+    return false, WheelErrors.capability_denied(
+      "approval_required_unattended:" .. tostring(tool_name),
+      string.format("tool '%s' requires interactive approval (unattended mode fails closed)", tostring(tool_name))
+    )
+  end
+
+  local reply = self.approver({
+    tool = tostring(tool_name),
+    scope_key = skey,
+    summary = summary,
+    session_id = self.session_id,
+    policy_generation = self.policy_generation,
+    agent_name = ctx and ctx.agent_name or nil,
+  })
+  local decision = type(reply) == "table" and reply.decision or reply
+  if decision == "allow_once" then
+    return true, { decision = "allow_once", mode = "ask" }
+  elseif decision == "allow_session" then
+    self._session_cache[cache_key] = true
+    return true, { decision = "allow_session", mode = "ask" }
+  end
+  return false, WheelErrors.capability_denied(
+    "approval_denied:" .. tostring(tool_name),
+    string.format("interactive approval denied for tool '%s'", tostring(tool_name))
+  )
+end
+
+WheelTool.PermissionGate = PermissionGate
+
 -- Global default registry singleton
 local _default_registry = nil
 function WheelTool.get_default_registry()

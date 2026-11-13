@@ -29,6 +29,7 @@ FAKE_KEY = "not-a-real-key"
 OPENROUTER = client.PROVIDERS["openrouter"]
 COMMANDCODE = client.PROVIDERS["commandcode"]
 OPENAI_CACHE = client.PROVIDERS["openai-cache"]
+OPENCODE_GO = client.PROVIDERS["opencode-go"]
 
 
 class _BinarySink:
@@ -108,6 +109,8 @@ assert client.select_provider("OpenRouter") is OPENROUTER
 assert client.select_provider(" commandcode ") is COMMANDCODE
 assert client.select_provider("CommandCode") is COMMANDCODE
 assert client.select_provider(" OPENAI-CACHE ") is OPENAI_CACHE
+assert client.select_provider(" opencode-go ") is OPENCODE_GO
+assert client.select_provider("OpenCode-Go") is OPENCODE_GO
 print("PASS live provider selector defaults to OpenRouter and is case-insensitive")
 
 # 2. Unknown values fail closed instead of falling back to another provider.
@@ -156,6 +159,10 @@ _expect_invalid_request(
 _expect_invalid_request(
     _wire_spec("https://api.commandcode.ai.example/provider/v1/chat/completions"),
     allowed_host=COMMANDCODE.allowed_host,
+)
+_expect_invalid_request(
+    _wire_spec("https://openrouter.ai/api/v1/chat/completions"),
+    allowed_host=OPENCODE_GO.allowed_host,
 )
 print("PASS live HTTP client binds HTTPS requests to the selected provider host")
 
@@ -347,7 +354,7 @@ fetch_mock.assert_not_called()
 assert exit_code == 1
 message = stderr.getvalue()
 assert message == (
-    "unsupported WHEEL_LIVE_PROVIDER value; expected openrouter or commandcode or openai-cache\n"
+    "unsupported WHEEL_LIVE_PROVIDER value; expected openrouter or commandcode or openai-cache or opencode-go\n"
 )
 assert FAKE_KEY not in message
 assert fake_stdout.buffer.data == b""
@@ -367,6 +374,7 @@ else:
     env.pop(OPENROUTER.api_key_env, None)
     env.pop(COMMANDCODE.api_key_env, None)
     env.pop(OPENAI_CACHE.api_key_env, None)
+    env.pop(OPENCODE_GO.api_key_env, None)
     result = subprocess.run(
         [lua, "tests/test_live_provider.lua"],
         cwd=repo_root,

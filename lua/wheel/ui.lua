@@ -281,6 +281,7 @@ function WheelUI.build_dashboard_view(team_or_snapshot, opts)
   for _, ho in ipairs(snapshot.handoffs or {}) do
     if ho.state == "offered" then pending_handoffs = pending_handoffs + 1 end
   end
+  local pending_approvals = clone_ui(opts.pending_approvals or snapshot.pending_approvals or {})
 
   local sel_view = snapshot.selected_view
   return {
@@ -294,6 +295,7 @@ function WheelUI.build_dashboard_view(team_or_snapshot, opts)
       busy_count = busy_count,
       open_requests = open_requests,
       pending_handoffs = pending_handoffs,
+      pending_approvals = #pending_approvals,
     },
     context_head = {
       branch = sel_view and sel_view.context_branch or "main",
@@ -303,6 +305,7 @@ function WheelUI.build_dashboard_view(team_or_snapshot, opts)
     selected_view = clone_ui(sel_view),
     requests = clone_ui(snapshot.requests or {}),
     handoffs = clone_ui(snapshot.handoffs or {}),
+    pending_approvals = pending_approvals,
     diagnostics = clone_ui(snapshot.diagnostics),
   }
 end

@@ -9919,7 +9919,7 @@ run_test("WheelHost: process environment allowlist and stdin channel", function(
   local allowed = {
     PATH = true, HOME = true, LANG = true, LC_ALL = true, TERM = true,
     TMPDIR = true, XDG_RUNTIME_DIR = true, XDG_STATE_HOME = true,
-    XDG_CONFIG_HOME = true,
+    XDG_CONFIG_HOME = true, XDG_DATA_HOME = true,
   }
   local listed = WheelHost.proc.run_program("env", {})
   assert(listed.ok and listed.code == 0, "the environment inventory must run")

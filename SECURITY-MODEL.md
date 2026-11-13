@@ -178,7 +178,8 @@ not receive it.
   rules above apply.
 - The child environment is rebuilt from a fixed allowlist rather than
   inherited: `PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`,
-  `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, and `XDG_CONFIG_HOME`, plus explicit
+  `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`,
+  plus explicit
   caller declarations. `PATH` is copied from the parent and sanitized to
   absolute entries; it is not inherited implicitly. Secret-shaped names (`*_KEY`, `*_TOKEN`, `*_SECRET`,
   `*_PASSWORD`, `*_PASSWD`, `*_CREDENTIAL[S]`), `LD_*`/`DYLD_*`, and shell
@@ -332,6 +333,15 @@ authority.
   user-level configuration and built-in adapter defaults. A project
   configuration may select an existing provider profile but may not add a
   destination, change a host, or override a base URL.
+- `WheelProvider.default_http_client` executes `curl` through
+  `WheelHost.proc.run_program` with `--proto =https`, `--max-redirs 0`, and
+  bounded timeouts. Plaintext HTTP is rejected unless the user explicitly sets
+  `allow_loopback_http = true` AND the parsed URL targets loopback
+  (`127.0.0.1`, `::1`, or `localhost`). Sensitive headers (`Authorization`,
+  `x-api-key`) and optional proxy URLs are staged exclusively in private `0600`
+  `curl` config files created via `WheelHost.fs.create_private_file` and
+  deleted on exit — never passed via process argv or child environment
+  variables.
 - TLS certificate verification is mandatory and cannot be disabled by project
   configuration, model output, or a tool call. Plaintext HTTP is permitted only
   for a loopback provider endpoint that the user configured explicitly.
@@ -354,11 +364,16 @@ authority.
 
 - The harness reads only an explicit, finite allowlist of names: the provider
   key names it supports (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
-  `DEEPSEEK_API_KEY`) and additional provider key names a user references by
+  `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_GO_API_KEY`) and
+  additional provider key names a user references by
   exact name in user-level provider configuration. Prefix wildcards, bulk
   environment imports, and `env.read:*` equivalents are forbidden. Non-provider
   secret names (source-host tokens, cloud credentials) are outside this 0.1.0
   model; adding one is a widening.
+- Credential resolution follows one deterministic precedence order:
+  `session_override > env_var > global_config_provider_key > data_credentials > ""`.
+  `WheelConfig.export_single_file` recursively scrubs `api_key` and
+  `credentials` keys before emitting serialized Lua configuration.
 - Secret access is centralized in the provider adapter boundary. Other modules
   do not call the environment directly for secret material.
 - Values are held in memory only for the lifetime of the provider client. They
@@ -412,9 +427,15 @@ authority.
   instead of a false success. The ambient
   `os.tmpname` location is not used.
 - Durable harness state lives under `$XDG_STATE_HOME/wheel/`; user
-  configuration lives under `$XDG_CONFIG_HOME/wheel/`. Both are user-owned and
-  outside model-visible workspace authority. No state path is hardcoded to a
-  developer checkout.
+  configuration lives under `$XDG_CONFIG_HOME/wheel/` (`init.lua` plus optional
+  modular `providers/*.lua`, `agents/*.lua`, `commands/*.lua`, `tools/*.lua`,
+  and `skills/*/SKILL.md`); user-private runtime settings and optional local
+  provider credentials live under `$XDG_DATA_HOME/wheel/` (`settings.json` and
+  `credentials.json` inside a `0700` directory with `0600` regular non-symlink
+  user-owned modes, written atomically via private temp-file rename and refused
+  on symlink/foreign-uid/weaker-mode detection). All three XDG roots are
+  user-owned and outside model-visible workspace authority. No state path is
+  hardcoded to a developer checkout.
 - The trust store is written atomically with restrictive permissions: the
   harness-owned directory is `0700`, the file `0600`, and a same-directory
   temporary file is renamed over the target. The store has no `/tmp` or other
@@ -581,6 +602,16 @@ security principals. The following matrix is mandatory and fail-closed:
   as a capability denial for a surface that does not exist.
 - Project configuration may narrow a role's tool set. It may not widen a role
   beyond the matrix, grant a read-only role a mutating tool, or disable a gate.
+- Runtime settings resolve across five deterministic layers
+  (`session_override > trusted_project > global_config > data_settings > RUNTIME_DEFAULTS`).
+  `WheelConfig` enforces project non-escalation (`project_config_escalation`):
+  `.wheel/` configuration is rejected if it sets `api_key`, `credentials`, or
+  provider `base_url`, or weakens any tool permission mode (`deny > ask > allow`).
+- Interactive tool execution passes through `WheelTool.PermissionGate`:
+  unattended `ask` fails closed with `E_CAPABILITY_DENIED` while queueing an
+  entry in `pending_approvals`; `allow_once` permits one invocation only;
+  `allow_session` caches approval strictly within `(session_id, scope_key, policy_generation)`
+  and invalidates automatically when `policy_generation` advances.
 
 ## Command deny-list
 

@@ -303,9 +303,9 @@ local MAX_SLEEP_MS = 60000
 
 --- Environment variables passed through when present. Nothing else is
 --- inherited: the child environment is rebuilt from this list plus explicit
---- caller declarations. XDG_STATE_HOME/XDG_CONFIG_HOME are included because a
---- nested harness process (for example a trust-restart probe) must resolve the
---- same user state; they are paths, never secrets.
+--- caller declarations. XDG_STATE_HOME/XDG_CONFIG_HOME/XDG_DATA_HOME are
+--- included because a nested harness process (for example a trust-restart probe)
+--- must resolve the same user state; they are paths, never secrets.
 local ENV_ALLOWLIST = {
   "PATH",
   "HOME",
@@ -316,6 +316,7 @@ local ENV_ALLOWLIST = {
   "XDG_RUNTIME_DIR",
   "XDG_STATE_HOME",
   "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
 }
 
 --- Allowlisted names whose value must be an absolute path.
@@ -325,6 +326,7 @@ local ENV_PATH_NAMES = {
   XDG_RUNTIME_DIR = true,
   XDG_STATE_HOME = true,
   XDG_CONFIG_HOME = true,
+  XDG_DATA_HOME = true,
 }
 
 --- Locale/terminal values accepted without shell-active characters.

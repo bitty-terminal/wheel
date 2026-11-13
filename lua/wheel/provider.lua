@@ -136,6 +136,209 @@ WheelProvider.PROMPT_CACHE_CAPABILITY_VERSION = "wheel-prompt-cache/1"
 WheelProvider.MAX_PROMPT_CACHE_PREFIX_BYTES = 64 * 1024
 local OPENAI_BASE_URL = "https://api.openai.com/v1"
 local ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1"
+local OPENCODE_GO_BASE_URL = "https://opencode.ai/inference/go/openai/v1"
+local DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+local OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+local OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1"
+local MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024
+local MAX_HTTP_URL_BYTES = 4096
+
+--- Built-in provider templates for daily CLI and UI configuration.
+WheelProvider.TEMPLATES = {
+  ["opencode-go"] = {
+    name = "opencode-go",
+    label = "OpenCode Go",
+    type = "openai",
+    base_url = OPENCODE_GO_BASE_URL,
+    default_model = "deepseek-v4.1-flash",
+    api_key_env = "OPENCODE_GO_API_KEY",
+    requires_session_header = true,
+    attribution_supported = false,
+    reasoning_effort_supported = true,
+    thinking_supported = true,
+  },
+  openai = {
+    name = "openai",
+    label = "OpenAI",
+    type = "openai",
+    base_url = OPENAI_BASE_URL,
+    default_model = "gpt-4o",
+    api_key_env = "OPENAI_API_KEY",
+    requires_session_header = false,
+    attribution_supported = true,
+    reasoning_effort_supported = true,
+    thinking_supported = true,
+  },
+  anthropic = {
+    name = "anthropic",
+    label = "Anthropic",
+    type = "anthropic",
+    base_url = ANTHROPIC_BASE_URL,
+    default_model = "claude-3-5-sonnet-20241022",
+    api_key_env = "ANTHROPIC_API_KEY",
+    requires_session_header = false,
+    attribution_supported = false,
+    reasoning_effort_supported = false,
+    thinking_supported = true,
+  },
+  deepseek = {
+    name = "deepseek",
+    label = "DeepSeek",
+    type = "openai",
+    base_url = DEEPSEEK_BASE_URL,
+    default_model = "deepseek-reasoner",
+    api_key_env = "DEEPSEEK_API_KEY",
+    requires_session_header = false,
+    attribution_supported = true,
+    reasoning_effort_supported = true,
+    thinking_supported = true,
+  },
+  openrouter = {
+    name = "openrouter",
+    label = "OpenRouter",
+    type = "openai",
+    base_url = OPENROUTER_BASE_URL,
+    default_model = "deepseek/deepseek-v4.1-flash",
+    api_key_env = "OPENROUTER_API_KEY",
+    requires_session_header = false,
+    attribution_supported = false,
+    reasoning_effort_supported = true,
+    thinking_supported = true,
+  },
+  ollama = {
+    name = "ollama",
+    label = "Ollama (local)",
+    type = "stdio",
+    base_url = OLLAMA_BASE_URL,
+    default_model = "qwen2.5-coder",
+    api_key_env = nil,
+    requires_session_header = false,
+    attribution_supported = false,
+    reasoning_effort_supported = false,
+    thinking_supported = false,
+    loopback_only = true,
+  },
+}
+
+--- Unified thinking gears across OpenAI-compatible and Anthropic providers.
+WheelProvider.THINKING_GEARS = {
+  off = { enabled = false, gear = "off", effort = "off", budget_tokens = 0 },
+  low = { enabled = true, gear = "low", effort = "low", budget_tokens = 2048 },
+  medium = { enabled = true, gear = "medium", effort = "medium", budget_tokens = 4096 },
+  high = { enabled = true, gear = "high", effort = "high", budget_tokens = 8192 },
+  max = { enabled = true, gear = "max", effort = "high", budget_tokens = 16384 },
+}
+
+local function copy_shallow(tbl)
+  local out = {}
+  for k, v in pairs(tbl or {}) do
+    out[k] = v
+  end
+  return out
+end
+
+--- Return a shallow copy of a built-in provider template by name.
+function WheelProvider.get_template(name)
+  if type(name) ~= "string" then return nil end
+  local tmpl = WheelProvider.TEMPLATES[string.lower(name)]
+  if not tmpl then return nil end
+  return copy_shallow(tmpl)
+end
+
+--- List built-in provider templates sorted deterministically by name.
+function WheelProvider.list_templates()
+  local names = {}
+  for name in pairs(WheelProvider.TEMPLATES) do
+    table.insert(names, name)
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    table.insert(out, copy_shallow(WheelProvider.TEMPLATES[name]))
+  end
+  return out
+end
+
+--- Normalize a thinking gear or table into `{ enabled, gear, effort, budget_tokens }`.
+function WheelProvider.normalize_thinking(spec)
+  if spec == nil then
+    return copy_shallow(WheelProvider.THINKING_GEARS.off), nil
+  end
+  if type(spec) == "boolean" then
+    return copy_shallow(spec and WheelProvider.THINKING_GEARS.medium or WheelProvider.THINKING_GEARS.off), nil
+  end
+  if type(spec) == "string" then
+    local key = string.lower((spec:gsub("^%s+", ""):gsub("%s+$", "")))
+    local gear = WheelProvider.THINKING_GEARS[key]
+    if not gear then
+      return nil, "invalid thinking gear '" .. tostring(spec) .. "' (expected off, low, medium, high, or max)"
+    end
+    return copy_shallow(gear), nil
+  end
+  if type(spec) == "table" then
+    if spec.enabled == false or (type(spec.effort) == "string" and string.lower(spec.effort) == "off")
+      or (type(spec.gear) == "string" and string.lower(spec.gear) == "off") then
+      return copy_shallow(WheelProvider.THINKING_GEARS.off), nil
+    end
+    local gear_name = spec.gear or spec.effort
+    if type(gear_name) == "string" then
+      local key = string.lower(gear_name)
+      local base = WheelProvider.THINKING_GEARS[key]
+      if not base then
+        return nil, "invalid thinking gear '" .. tostring(gear_name) .. "' (expected off, low, medium, high, or max)"
+      end
+      local resolved = copy_shallow(base)
+      if spec.budget_tokens ~= nil then
+        if type(spec.budget_tokens) ~= "number" or spec.budget_tokens <= 0 or spec.budget_tokens % 1 ~= 0 then
+          return nil, "thinking.budget_tokens must be a positive integer"
+        end
+        resolved.budget_tokens = spec.budget_tokens
+      end
+      return resolved, nil
+    end
+    if spec.budget_tokens ~= nil then
+      if type(spec.budget_tokens) ~= "number" or spec.budget_tokens <= 0 or spec.budget_tokens % 1 ~= 0 then
+        return nil, "thinking.budget_tokens must be a positive integer"
+      end
+      local effort = "medium"
+      local gname = "medium"
+      if spec.budget_tokens <= 2048 then
+        effort, gname = "low", "low"
+      elseif spec.budget_tokens >= 16384 then
+        effort, gname = "high", "max"
+      elseif spec.budget_tokens >= 8192 then
+        effort, gname = "high", "high"
+      end
+      return { enabled = true, gear = gname, effort = effort, budget_tokens = spec.budget_tokens }, nil
+    end
+    if spec.enabled == true then
+      return copy_shallow(WheelProvider.THINKING_GEARS.medium), nil
+    end
+    return copy_shallow(WheelProvider.THINKING_GEARS.off), nil
+  end
+  return nil, "thinking configuration must be boolean, string gear, or table"
+end
+
+local function load_host_optional()
+  local ok, h = pcall(require, "wheel.host")
+  if ok and type(h) == "table" then return h end
+  ok, h = pcall(require, "lua.wheel.host")
+  if ok and type(h) == "table" then return h end
+  return nil
+end
+
+local opencode_session_counter = 0
+
+local function format_uuid_v4_from_hex32(hex)
+  local a = hex:sub(1, 8)
+  local b = hex:sub(9, 12)
+  local c = "4" .. hex:sub(14, 16)
+  local v = tonumber(hex:sub(17, 17), 16) or 0
+  local variants = { "8", "9", "a", "b" }
+  local d = variants[(v % 4) + 1] .. hex:sub(18, 20)
+  local e = hex:sub(21, 32)
+  return string.format("%s-%s-%s-%s-%s", a, b, c, d, e)
+end
 
 --- Hash cache identity through the shared configuration boundary, or decline.
 local function prompt_cache_digest(value)
@@ -145,6 +348,337 @@ local function prompt_cache_digest(value)
     return config.compute_hash(value)
   end
   return nil
+end
+
+--- Derive or generate an RFC 4122 UUIDv4 for x-opencode-session headers.
+function WheelProvider.derive_opencode_session_id(seed)
+  if type(seed) == "string" and #seed > 0 then
+    local digest = prompt_cache_digest("wheel-opencode-session:" .. seed)
+    if type(digest) == "string" and #digest >= 32 then
+      return format_uuid_v4_from_hex32(digest:sub(1, 32))
+    end
+  end
+  local host = load_host_optional()
+  if host and host.fs and type(host.fs.random_bytes) == "function" then
+    local ok_rb, raw = pcall(host.fs.random_bytes, 16)
+    if ok_rb and type(raw) == "string" and #raw >= 16 then
+      local hex = {}
+      for i = 1, 16 do
+        hex[i] = string.format("%02x", string.byte(raw, i))
+      end
+      return format_uuid_v4_from_hex32(table.concat(hex, ""))
+    end
+  end
+  opencode_session_counter = opencode_session_counter + 1
+  local now_s = (host and host.time and host.time.now and host.time.now()) or 0
+  local clk_s = (host and host.time and host.time.clock and host.time.clock()) or 0
+  local material = string.format("fallback:%d:%f:%d", now_s, clk_s, opencode_session_counter)
+  local digest = prompt_cache_digest(material)
+  if type(digest) == "string" and #digest >= 32 then
+    return format_uuid_v4_from_hex32(digest:sub(1, 32))
+  end
+  local fallback_hex = string.format("%08x%04x4%03x8%03x%012x",
+    math.random(0, 0x7fffffff), math.random(0, 0xffff), math.random(0, 0xfff),
+    math.random(0, 0xfff), math.random(0, 0x7fffffff))
+  return format_uuid_v4_from_hex32(fallback_hex:sub(1, 32))
+end
+
+local function extract_text_content(content)
+  if type(content) == "string" then
+    return content
+  end
+  if type(content) ~= "table" then
+    return ""
+  end
+  local parts = {}
+  for _, part in ipairs(content) do
+    if type(part) == "string" then
+      table.insert(parts, part)
+    elseif type(part) == "table" then
+      local txt = part.text or part.content
+      if type(txt) == "string" and #txt > 0 then
+        table.insert(parts, txt)
+      end
+    end
+  end
+  return table.concat(parts, "")
+end
+
+local function extract_reasoning_text(obj)
+  if type(obj) ~= "table" then return nil end
+  if type(obj.reasoning_content) == "string" and #obj.reasoning_content > 0 then
+    return obj.reasoning_content
+  end
+  if type(obj.reasoning) == "string" and #obj.reasoning > 0 then
+    return obj.reasoning
+  end
+  local details = obj.reasoning_details
+  if type(details) == "string" and #details > 0 then
+    return details
+  end
+  if type(details) == "table" then
+    local parts = {}
+    for _, item in ipairs(details) do
+      if type(item) == "string" and #item > 0 then
+        table.insert(parts, item)
+      elseif type(item) == "table" then
+        local txt = item.text or item.summary or item.reasoning
+        if type(txt) == "string" and #txt > 0 then
+          table.insert(parts, txt)
+        end
+      end
+    end
+    if #parts > 0 then
+      return table.concat(parts, "")
+    end
+  end
+  return nil
+end
+
+local function curl_quote(value)
+  local escaped = tostring(value):gsub("\\", "\\\\"):gsub('"', '\\"')
+  return '"' .. escaped .. '"'
+end
+
+local function valid_http_header_name(name)
+  return type(name) == "string" and #name > 0 and #name <= 128 and name:match("^[A-Za-z0-9%-_]+$") ~= nil
+end
+
+local function has_ctl_or_crlf(value)
+  return type(value) ~= "string" or value:find("[%z\1-\31\127]") ~= nil
+end
+
+local function is_loopback_host(authority)
+  if type(authority) ~= "string" then return false end
+  local host = authority:match("^%[([^%]]+)%]$")
+    or authority:match("^%[([^%]]+)%]:%d+$")
+    or authority:match("^([^:%[%]]+):%d+$")
+    or authority:match("^([^:%[%]]+)$")
+  if not host then return false end
+  host = string.lower(host)
+  return host == "127.0.0.1" or host == "::1" or host == "localhost"
+end
+
+local function read_env_var(host, name)
+  if host and host.env and type(host.env.read) == "function" then
+    local v = host.env.read(name)
+    if v ~= nil and v ~= "" then return v end
+  end
+  if type(os) == "table" and type(os.getenv) == "function" then
+    local v = os.getenv(name)
+    if v ~= nil and v ~= "" then return v end
+  end
+  return nil
+end
+
+local function resolve_verified_http_tmp_dir(host)
+  local runtime_dir = nil
+  if host.tmp and type(host.tmp.dir) == "function" then
+    local ok_td, td = pcall(host.tmp.dir)
+    if ok_td and type(td) == "string" and td ~= "" then
+      runtime_dir = td
+    end
+  end
+  if not runtime_dir or runtime_dir == "" then
+    return nil, "private runtime directory is unavailable"
+  end
+  local tmp_base = runtime_dir:gsub("/+$", "") .. "/wheel-http"
+  if not host.fs.mkdir_p(tmp_base) then
+    return nil, "failed to create private HTTP temp directory"
+  end
+  local info = host.fs.stat(tmp_base)
+  if not info or not info.exists or info.symlink or not info.directory then
+    return nil, "HTTP temp directory is missing or unsafe (symlink/non-directory)"
+  end
+  if host.fs.chmod(tmp_base, "700") ~= true then
+    return nil, "failed to enforce 0700 mode on HTTP temp directory"
+  end
+  local verified = host.fs.stat(tmp_base)
+  if not verified or verified.symlink or not verified.directory or verified.mode ~= 448 then
+    return nil, "HTTP temp directory failed 0700 safety verification"
+  end
+  if info.uid ~= nil and verified.uid ~= nil and info.uid ~= verified.uid then
+    return nil, "HTTP temp directory ownership mismatch"
+  end
+  return tmp_base, nil
+end
+
+local function scrub_secret_text(text, secrets)
+  local out = tostring(text or "")
+  for _, secret in ipairs(secrets or {}) do
+    if type(secret) == "string" and #secret >= 4 then
+      out = out:gsub(secret:gsub("([^%w])", "%%%1"), "***REDACTED***")
+    end
+  end
+  return out:sub(1, 512)
+end
+
+local http_temp_counter = 0
+
+--- Fail-closed standalone HTTPS client implemented via curl + 0600 private config files.
+function WheelProvider.default_http_client(req)
+  if type(req) ~= "table" then
+    return nil, "HTTP request must be a table"
+  end
+  local url = req.url
+  if type(url) ~= "string" or #url == 0 or #url > MAX_HTTP_URL_BYTES or has_ctl_or_crlf(url)
+    or url:find("%s") then
+    return nil, "HTTP request URL is missing or invalid"
+  end
+  local scheme, authority = url:match("^(https?)://([^/?#]+)")
+  if not scheme or not authority then
+    return nil, "HTTP client requires an HTTPS URL"
+  end
+  if authority:find("@", 1, true) then
+    return nil, "HTTP client rejects URL userinfo"
+  end
+  local allow_loopback = req.allow_loopback_http == true and is_loopback_host(authority)
+  if scheme ~= "https" and not allow_loopback then
+    return nil, "HTTP client requires an HTTPS URL"
+  end
+
+  local method = req.method or "POST"
+  if type(method) ~= "string" or not method:match("^[A-Z]+$") then
+    return nil, "HTTP request method is invalid"
+  end
+
+  local headers = req.headers or {}
+  if type(headers) ~= "table" then
+    return nil, "HTTP request headers must be a table"
+  end
+  local secret_values = {}
+  local header_lines = {}
+  local header_names = {}
+  for name in pairs(headers) do
+    table.insert(header_names, name)
+  end
+  table.sort(header_names)
+  for _, name in ipairs(header_names) do
+    local val = headers[name]
+    if not valid_http_header_name(name) or (type(val) ~= "string" and type(val) ~= "number") then
+      return nil, "HTTP request contains an invalid header"
+    end
+    local val_str = tostring(val)
+    if has_ctl_or_crlf(val_str) then
+      return nil, "HTTP request header contains control characters"
+    end
+    local lower_name = string.lower(name)
+    if lower_name == "authorization" or lower_name == "x-api-key" then
+      table.insert(secret_values, val_str)
+      local bearer = val_str:match("^[Bb]earer%s+(.+)$")
+      if bearer then table.insert(secret_values, bearer) end
+    end
+    table.insert(header_lines, "header = " .. curl_quote(name .. ": " .. val_str))
+  end
+
+  local body = req.body or ""
+  if type(body) ~= "string" then
+    return nil, "HTTP request body must be a string"
+  end
+
+  local host = load_host_optional()
+  if not host or not host.fs or not host.proc then
+    return nil, "WheelHost filesystem and process capabilities are unavailable"
+  end
+
+  local tmp_base, tmp_err = resolve_verified_http_tmp_dir(host)
+  if not tmp_base then
+    return nil, tmp_err
+  end
+
+  http_temp_counter = http_temp_counter + 1
+  local now_s = (host.time and host.time.now and host.time.now()) or 0
+  local nonce = string.format("%d-%d-%d", now_s, http_temp_counter, math.random(100000, 999999))
+  if type(host.fs.random_bytes) == "function" then
+    local ok_rb, rb = pcall(host.fs.random_bytes, 8)
+    if ok_rb and type(rb) == "string" and #rb >= 8 then
+      local hx = {}
+      for i = 1, 8 do hx[i] = string.format("%02x", string.byte(rb, i)) end
+      nonce = table.concat(hx, "")
+    end
+  end
+
+  local cfg_path = tmp_base .. "/cfg-" .. nonce .. ".curl"
+  local body_path = tmp_base .. "/body-" .. nonce .. ".json"
+  local resp_path = tmp_base .. "/resp-" .. nonce .. ".out"
+
+  local function cleanup()
+    pcall(host.fs.remove_file, cfg_path)
+    pcall(host.fs.remove_file, body_path)
+    pcall(host.fs.remove_file, resp_path)
+  end
+
+  if not host.fs.create_private_file(body_path, body) then
+    cleanup()
+    return nil, "failed to create private HTTP body file"
+  end
+  if not host.fs.create_private_file(resp_path, "") then
+    cleanup()
+    return nil, "failed to create private HTTP response file"
+  end
+
+  local proto_spec = allow_loopback and "=http,https" or "=https"
+  local cfg_lines = {
+    "url = " .. curl_quote(url),
+    "request = " .. curl_quote(method),
+    "proto = " .. curl_quote(proto_spec),
+    'max-redirs = "0"',
+    'connect-timeout = "20"',
+    'max-time = "180"',
+    "data-binary = " .. curl_quote("@" .. body_path),
+  }
+  if not allow_loopback then
+    local proxy_url = read_env_var(host, "HTTPS_PROXY") or read_env_var(host, "https_proxy")
+      or read_env_var(host, "ALL_PROXY") or read_env_var(host, "NETWORK_PROXY")
+    if type(proxy_url) == "string" and #proxy_url > 0 and not has_ctl_or_crlf(proxy_url) then
+      table.insert(secret_values, proxy_url)
+      table.insert(cfg_lines, "proxy = " .. curl_quote(proxy_url))
+    end
+  end
+  for _, line in ipairs(header_lines) do
+    table.insert(cfg_lines, line)
+  end
+
+  if not host.fs.create_private_file(cfg_path, table.concat(cfg_lines, "\n") .. "\n") then
+    cleanup()
+    return nil, "failed to create private HTTP config file"
+  end
+
+  local argv = {
+    "-q",
+    "-sS",
+    "--max-redirs", "0",
+    "--proto", proto_spec,
+    "-o", resp_path,
+    "-w", "%{http_code}",
+    "-K", cfg_path,
+  }
+  local res = host.proc.run_program("curl", argv, { timeout_ms = 185000 })
+  local resp_body = host.fs.read_file_bounded(resp_path, MAX_HTTP_RESPONSE_BYTES + 1) or ""
+  cleanup()
+
+  if #resp_body > MAX_HTTP_RESPONSE_BYTES then
+    return nil, "HTTP response exceeded byte limit"
+  end
+  local exit_code = res and (res.exit_code ~= nil and res.exit_code or res.code)
+  if not res or not res.ok or (exit_code ~= nil and exit_code ~= 0) then
+    local detail = res and (res.stderr ~= "" and res.stderr or res.error)
+      or (exit_code and ("curl exited with status " .. tostring(exit_code)) or "curl failed")
+    return nil, scrub_secret_text(detail, secret_values)
+  end
+
+  local status_num = tonumber((res.stdout or ""):match("(%d%d%d)") or "") or 0
+  if (status_num < 200 or status_num >= 300) and #resp_body > 0 then
+    resp_body = scrub_secret_text(resp_body, secret_values)
+  end
+  if req.stream and type(req.on_stream_chunk) == "function" and #resp_body > 0 then
+    local chunk_size = 4096
+    for i = 1, #resp_body, chunk_size do
+      local stop = req.on_stream_chunk(resp_body:sub(i, i + chunk_size - 1))
+      if stop then break end
+    end
+  end
+  return { status = status_num, body = resp_body }, nil
 end
 
 --- Resolve request, adapter, then default policy and reject invalid values.
@@ -1497,6 +2031,7 @@ function OpenAIAdapter.new(opts)
   end
   local self = setmetatable({}, OpenAIAdapter)
   self.name = "openai"
+  self.provider_name = opts.provider_name or opts.name or "openai"
   self.api_key = opts.api_key or ""
   self.base_url = opts.base_url or OPENAI_BASE_URL
   self.model = opts.model or "gpt-4o"
@@ -1505,6 +2040,13 @@ function OpenAIAdapter.new(opts)
   self.max_completion_tokens = opts.max_completion_tokens
   self.prompt_cache_policy = opts.prompt_cache_policy
   self.prompt_cache_supported = opts.prompt_cache_supported == true
+  self.requires_session_header = opts.requires_session_header == true
+    or self.provider_name == "opencode-go"
+    or (type(self.base_url) == "string" and self.base_url:find("opencode.ai/inference", 1, true) ~= nil)
+  if self.requires_session_header then
+    self._opencode_session_id = opts.session_id or WheelProvider.derive_opencode_session_id(opts.session_seed)
+  end
+  self.allow_loopback_http = opts.allow_loopback_http == true
   if opts.stream_include_usage == nil then
     self.stream_include_usage = self.base_url:gsub("/+$", "") == OPENAI_BASE_URL
   else
@@ -1582,6 +2124,20 @@ function OpenAIAdapter:_format_payload(request, stream)
     payload.stream_options = { include_usage = true }
   end
 
+  local thinking = request.thinking
+  if thinking == nil then
+    thinking = self.thinking
+  end
+  if thinking ~= nil then
+    local norm_thinking, thinking_err = WheelProvider.normalize_thinking(thinking)
+    if not norm_thinking then
+      return nil, thinking_err
+    end
+    if norm_thinking.enabled and norm_thinking.effort ~= "off" then
+      payload.reasoning_effort = norm_thinking.effort
+    end
+  end
+
   if type(request.tools) == "table" and next(request.tools) ~= nil then
     local formatted_tools, tools_err = WheelProvider.format_tools_for_openai(request.tools)
     if not formatted_tools then return nil, tools_err end
@@ -1608,6 +2164,9 @@ function OpenAIAdapter:complete(request, opts)
   if #self.api_key > 0 then
     headers["Authorization"] = "Bearer " .. self.api_key
   end
+  if self._opencode_session_id then
+    headers["x-opencode-session"] = self._opencode_session_id
+  end
   apply_attribution_headers(headers, self._attribution_headers)
 
   local client = opts.http_client or self.http_client
@@ -1620,13 +2179,14 @@ function OpenAIAdapter:complete(request, opts)
     method = "POST",
     headers = headers,
     body = body_str,
+    allow_loopback_http = self.allow_loopback_http,
   })
 
   if not res then
-    return nil, "HTTP request failed: " .. tostring(err)
+    return nil, "HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status ~= 200 then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
@@ -1656,8 +2216,8 @@ function OpenAIAdapter:complete(request, opts)
   end
 
   return {
-    content = msg.content or "",
-    thinking_content = msg.reasoning_content or nil,
+    content = extract_text_content(msg.content),
+    thinking_content = extract_reasoning_text(msg),
     tool_calls = tool_calls,
     finish_reason = choice.finish_reason or "stop",
     usage = WheelProvider.normalize_usage(data.usage, self.name),
@@ -1681,6 +2241,9 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   if #self.api_key > 0 then
     headers["Authorization"] = "Bearer " .. self.api_key
   end
+  if self._opencode_session_id then
+    headers["x-opencode-session"] = self._opencode_session_id
+  end
   apply_attribution_headers(headers, self._attribution_headers)
 
   local client = opts.http_client or self.http_client
@@ -1702,6 +2265,7 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
     headers = headers,
     body = body_str,
     stream = true,
+    allow_loopback_http = self.allow_loopback_http,
     --- Parse OpenAI transport fragments without losing usage-only events.
     on_stream_chunk = function(chunk)
       if stream_err then return true end
@@ -1730,19 +2294,21 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
 
           local delta = ch.delta
           if delta then
-            -- 1. Thinking / reasoning content delta (DeepSeek reasoner)
-            if delta.reasoning_content and #delta.reasoning_content > 0 then
-              table.insert(accumulated_thinking, delta.reasoning_content)
+            -- 1. Thinking / reasoning content delta (reasoning_content, reasoning, reasoning_details)
+            local thinking_delta = extract_reasoning_text(delta)
+            if thinking_delta and #thinking_delta > 0 then
+              table.insert(accumulated_thinking, thinking_delta)
               if on_chunk then
-                on_chunk({ delta = delta.reasoning_content, type = "thinking" })
+                on_chunk({ delta = thinking_delta, type = "thinking" })
               end
             end
 
-            -- 2. Standard content delta
-            if delta.content and #delta.content > 0 then
-              table.insert(accumulated_content, delta.content)
+            -- 2. Standard content delta (string or array-of-parts)
+            local content_delta = extract_text_content(delta.content)
+            if content_delta and #content_delta > 0 then
+              table.insert(accumulated_content, content_delta)
               if on_chunk then
-                on_chunk({ delta = delta.content, type = "content" })
+                on_chunk({ delta = content_delta, type = "content" })
               end
             end
 
@@ -1779,10 +2345,10 @@ function OpenAIAdapter:stream(request, on_chunk, opts)
   })
 
   if not res then
-    return nil, "Streaming HTTP request failed: " .. tostring(err)
+    return nil, "Streaming HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status and (res.status < 200 or res.status >= 300) then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
   end
   if stream_err then
@@ -1954,14 +2520,29 @@ function AnthropicAdapter:_format_payload(request, stream)
   payload = cache_payload
 
   -- Thinking configuration
-  local thinking = request.thinking or self.thinking
-  if thinking and thinking.enabled and thinking.budget_tokens and thinking.budget_tokens > 0 then
-    payload.thinking = {
-      type = "enabled",
-      budget_tokens = thinking.budget_tokens,
-    }
-    -- Temperature must be 1.0 when thinking is enabled per Anthropic specification
-    payload.temperature = 1.0
+  local thinking = request.thinking
+  if thinking == nil then
+    thinking = self.thinking
+  end
+  if thinking ~= nil then
+    local norm_thinking, thinking_err = WheelProvider.normalize_thinking(thinking)
+    if not norm_thinking then
+      return nil, thinking_err
+    end
+    if norm_thinking.enabled and norm_thinking.budget_tokens and norm_thinking.budget_tokens > 0 then
+      local budget = math.min(norm_thinking.budget_tokens, WheelProvider.MAX_COMPLETION_TOKENS - 1)
+      if payload.max_tokens <= budget then
+        payload.max_tokens = math.min(WheelProvider.MAX_COMPLETION_TOKENS, budget + 1024)
+      end
+      payload.thinking = {
+        type = "enabled",
+        budget_tokens = budget,
+      }
+      -- Temperature must be 1.0 when thinking is enabled per Anthropic specification
+      payload.temperature = 1.0
+    elseif request.temperature then
+      payload.temperature = request.temperature
+    end
   elseif request.temperature then
     payload.temperature = request.temperature
   end
@@ -2006,10 +2587,10 @@ function AnthropicAdapter:complete(request, opts)
   })
 
   if not res then
-    return nil, "HTTP request failed: " .. tostring(err)
+    return nil, "HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status ~= 200 then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d error: %s", res.status, preview)
   end
 
@@ -2158,10 +2739,10 @@ function AnthropicAdapter:stream(request, on_chunk, opts)
   })
 
   if not res then
-    return nil, "Streaming HTTP request failed: " .. tostring(err)
+    return nil, "Streaming HTTP request failed: " .. scrub_secret_text(err, { self.api_key })
   end
   if res.status and (res.status < 200 or res.status >= 300) then
-    local preview = (res.body or ""):sub(1, 512)
+    local preview = scrub_secret_text(res.body or "", { self.api_key })
     return nil, string.format("HTTP %d streaming error: %s", res.status, preview)
   end
   if stream_err then
@@ -2425,10 +3006,47 @@ WheelProvider.StdioAdapter = StdioAdapter
 -- @param opts table? Additional options (e.g. http_client, api_key, base_url, attribution)
 -- @return table? WheelProvider adapter instance, or nil on failure
 -- @return string? Error message on failure
+local function resolve_provider_api_key(provider_name, env_name, opts)
+  if type(opts.api_key) == "string" and #opts.api_key > 0 then
+    return opts.api_key
+  end
+  if opts.resolve_stored_credentials == true then
+    local ok_cfg, cfg = pcall(require, "wheel.config")
+    if not ok_cfg then
+      ok_cfg, cfg = pcall(require, "lua.wheel.config")
+    end
+    if ok_cfg and type(cfg) == "table" and type(cfg.resolve_api_key) == "function" then
+      local resolved = cfg.resolve_api_key(provider_name, opts)
+      if type(resolved) == "string" and #resolved > 0 then
+        return resolved
+      end
+    end
+  end
+  if type(env_name) == "string" and #env_name > 0 then
+    return getenv(env_name) or ""
+  end
+  return ""
+end
+
+local function resolve_default_http_client(opts)
+  if opts.http_client == false then
+    return nil
+  end
+  if opts.http_client ~= nil then
+    return opts.http_client
+  end
+  if opts.use_default_http_client == true then
+    return WheelProvider.default_http_client
+  end
+  return nil
+end
+
 function WheelProvider.create(profile, opts)
   profile = profile or {}
   opts = opts or {}
-  local p_type = string.lower(profile.provider or opts.provider or "mock")
+  local raw_name = profile.provider or profile.name or opts.provider or opts.name or "mock"
+  local p_type = string.lower(raw_name)
+  local tmpl = WheelProvider.get_template(p_type)
 
   local requested_budget = profile.max_completion_tokens
   if requested_budget == nil then
@@ -2439,17 +3057,24 @@ function WheelProvider.create(profile, opts)
     return nil, budget_err
   end
 
-  -- Attribution applies to the OpenAI-compatible adapter family (the
-  -- `openai` and `deepseek` routes). Validate before construction so the
-  -- factory returns its usual `nil, typed error` contract; the adapter
-  -- constructor re-validates for direct callers and raises.
+  local is_openai_family = (p_type == "openai" or p_type == "deepseek"
+    or p_type == "opencode-go" or p_type == "openrouter"
+    or (tmpl and tmpl.type == "openai")
+    or (p_type == "ollama" and (profile.transport == "http" or opts.transport == "http")))
+
+  -- Attribution applies to OpenAI-compatible adapters that accept attribution.
   local attribution = nil
-  if p_type == "openai" or p_type == "deepseek" then
+  if is_openai_family and (not tmpl or tmpl.attribution_supported ~= false) then
     local attribution_err
     attribution, attribution_err = WheelProvider.validate_attribution(opts.attribution)
     if attribution_err then
       return nil, attribution_err
     end
+  end
+
+  local resolved_thinking = profile.thinking
+  if resolved_thinking == nil then
+    resolved_thinking = opts.thinking
   end
 
   if p_type == "mock" then
@@ -2460,55 +3085,54 @@ function WheelProvider.create(profile, opts)
       stream_chunk_size = opts.stream_chunk_size,
       max_completion_tokens = completion_budget,
       prompt_cache_policy = opts.prompt_cache_policy,
-       prompt_cache_supported = opts.prompt_cache_supported == true,
+      prompt_cache_supported = opts.prompt_cache_supported == true,
     })
-  elseif p_type == "openai" then
-    local api_key = opts.api_key or getenv("OPENAI_API_KEY") or ""
-    local base_url = opts.base_url or OPENAI_BASE_URL
+  elseif is_openai_family then
+    local adapter_name = (tmpl and tmpl.name) or p_type
+    local default_base = (tmpl and tmpl.base_url) or OPENAI_BASE_URL
+    local default_model = (tmpl and tmpl.default_model) or "gpt-4o"
+    local api_key_env
+    if tmpl ~= nil then
+      api_key_env = tmpl.api_key_env
+    elseif p_type ~= "ollama" and p_type ~= "local" and p_type ~= "stdio" then
+      api_key_env = (p_type == "deepseek" and "DEEPSEEK_API_KEY" or "OPENAI_API_KEY")
+    end
+    local api_key = resolve_provider_api_key(adapter_name, api_key_env, opts)
+    local base_url = profile.base_url or opts.base_url or default_base
     local cache_supported = base_url:gsub("/+$", "") == OPENAI_BASE_URL
     if opts.prompt_cache_supported ~= nil then cache_supported = opts.prompt_cache_supported == true end
     return OpenAIAdapter.new({
+      provider_name = adapter_name,
       api_key = api_key,
       base_url = base_url,
-      model = profile.model or opts.model or "gpt-4o",
+      model = profile.model or opts.model or default_model,
       temperature = profile.temperature or opts.temperature or 0.0,
-       thinking = profile.thinking or opts.thinking,
-       max_completion_tokens = completion_budget,
-       prompt_cache_policy = opts.prompt_cache_policy,
-       prompt_cache_supported = cache_supported,
-      stream_include_usage = opts.stream_include_usage,
-      attribution = attribution,
-      http_client = opts.http_client,
-    })
-  elseif p_type == "deepseek" then
-    local api_key = opts.api_key or getenv("DEEPSEEK_API_KEY") or ""
-    return OpenAIAdapter.new({
-      api_key = api_key,
-      base_url = opts.base_url or "https://api.deepseek.com/v1",
-      model = profile.model or opts.model or "deepseek-reasoner",
-      temperature = profile.temperature or opts.temperature or 0.0,
-      thinking = profile.thinking or opts.thinking,
+      thinking = resolved_thinking,
       max_completion_tokens = completion_budget,
       prompt_cache_policy = opts.prompt_cache_policy,
-       prompt_cache_supported = opts.prompt_cache_supported == true,
+      prompt_cache_supported = cache_supported,
       stream_include_usage = opts.stream_include_usage,
       attribution = attribution,
-      http_client = opts.http_client,
+      requires_session_header = profile.requires_session_header or (tmpl and tmpl.requires_session_header),
+      session_id = opts.session_id or profile.session_id,
+      session_seed = opts.session_seed or profile.session_seed,
+      allow_loopback_http = opts.allow_loopback_http == true or (tmpl and tmpl.loopback_only == true),
+      http_client = resolve_default_http_client(opts),
     })
   elseif p_type == "anthropic" then
-    local api_key = opts.api_key or getenv("ANTHROPIC_API_KEY") or ""
-    local base_url = opts.base_url or ANTHROPIC_BASE_URL
+    local api_key = resolve_provider_api_key("anthropic", "ANTHROPIC_API_KEY", opts)
+    local base_url = profile.base_url or opts.base_url or ANTHROPIC_BASE_URL
     local cache_supported = base_url:gsub("/+$", "") == ANTHROPIC_BASE_URL
     if opts.prompt_cache_supported ~= nil then cache_supported = opts.prompt_cache_supported == true end
     return AnthropicAdapter.new({
       api_key = api_key,
       base_url = base_url,
       model = profile.model or opts.model or "claude-3-5-sonnet-20241022",
-      thinking = profile.thinking or opts.thinking,
+      thinking = resolved_thinking,
       max_completion_tokens = completion_budget,
       prompt_cache_policy = opts.prompt_cache_policy,
       prompt_cache_supported = cache_supported,
-      http_client = opts.http_client,
+      http_client = resolve_default_http_client(opts),
     })
   elseif p_type == "stdio" or p_type == "local" or p_type == "ollama" then
     local cmd = opts.command
