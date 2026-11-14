@@ -936,10 +936,20 @@ end
 local approval_lock_seq = 0
 
 local function read_approvals_lock_owner(host, owner_file)
-  if type(host.fs.read_file) ~= "function" then
+  if type(host.fs.stat) == "function" then
+    local st = host.fs.stat(owner_file)
+    if type(st) ~= "table" or st.symlink == true or st.regular ~= true then
+      return nil
+    end
+  end
+  local raw
+  if type(host.fs.read_file_bounded) == "function" then
+    raw = host.fs.read_file_bounded(owner_file, 64)
+  elseif type(host.fs.read_file) == "function" then
+    raw = host.fs.read_file(owner_file)
+  else
     return nil
   end
-  local raw = host.fs.read_file(owner_file)
   if type(raw) ~= "string" then
     return nil
   end
@@ -970,7 +980,42 @@ local function release_approvals_lock(host, lock_dir, owner_file)
   pcall(host.fs.remove_dir, lock_dir)
 end
 
-local function try_reclaim_stale_approvals_lock(host, lock_dir)
+local function cleanup_stale_approvals_stage_dirs(host, data_dir)
+  if type(host.fs.list_dir) ~= "function" or not host.proc or type(host.proc.is_alive) ~= "function" then
+    return
+  end
+  local listing = host.fs.list_dir(data_dir)
+  if not listing or listing.ok ~= true then
+    return
+  end
+  local prefix = ".approvals.lock.stage."
+  for _, line in ipairs(listing.entries or {}) do
+    local name = line:match("%s([^%s]+)$")
+    if name and name:sub(1, #prefix) == prefix then
+      local rest = name:sub(#prefix + 1)
+      local stage_pid = tonumber(rest:match("^(%d+)%-"))
+      if stage_pid ~= nil and stage_pid >= 1 then
+        local alive, alive_err = host.proc.is_alive(stage_pid)
+        if alive == false and alive_err == nil then
+          remove_lock_dir_contents(host, data_dir .. "/" .. name)
+        end
+      end
+    end
+  end
+end
+
+local function publish_staged_approvals_lock(host, stage_dir, lock_dir)
+  if type(host.fs.stat) == "function" then
+    local st = host.fs.stat(lock_dir)
+    if type(st) == "table" and (st.exists == true or st.symlink == true) then
+      return false
+    end
+  end
+  return host.fs.rename(stage_dir, lock_dir) == true
+end
+
+local function try_reclaim_stale_approvals_lock(host, data_dir, lock_dir)
+  cleanup_stale_approvals_stage_dirs(host, data_dir)
   if type(host.fs.list_dir) ~= "function" or not host.proc or type(host.proc.is_alive) ~= "function" then
     return false
   end
@@ -978,37 +1023,46 @@ local function try_reclaim_stale_approvals_lock(host, lock_dir)
   if not listing or listing.ok ~= true then
     return false
   end
+  local saw_any_entry = false
   local unlinked_dead_entry = false
   for _, line in ipairs(listing.entries or {}) do
-    local name = line:match("%s([^%s]+)$")
-    if name and (name == "owner" or name:sub(1, 6) == "owner.") then
-      local entry_path = lock_dir .. "/" .. name
-      local owner_pid = read_approvals_lock_owner(host, entry_path)
-      if owner_pid ~= nil then
-        local alive, alive_err = host.proc.is_alive(owner_pid)
-        if alive == true or alive_err ~= nil then
-          return false
-        end
-        if name == "owner" then
-          local tagged = lock_dir .. "/owner.dead." .. tostring(owner_pid)
-          if host.fs.rename(entry_path, tagged) then
-            if read_approvals_lock_owner(host, tagged) == owner_pid then
-              pcall(host.fs.remove_file, tagged)
+    if not line:match("^total%s+%d+$") then
+      local name = line:match("%s([^%s]+)$")
+      if name and name ~= "." and name ~= ".." then
+        saw_any_entry = true
+        if name == "owner" or name:sub(1, 6) == "owner." then
+          local entry_path = lock_dir .. "/" .. name
+          local owner_pid = read_approvals_lock_owner(host, entry_path)
+          if owner_pid == nil then
+            return false
+          end
+          local alive, alive_err = host.proc.is_alive(owner_pid)
+          if alive == true or alive_err ~= nil then
+            return false
+          end
+          if name == "owner" then
+            local tagged = lock_dir .. "/owner.dead." .. tostring(owner_pid)
+            if host.fs.rename(entry_path, tagged) then
+              if read_approvals_lock_owner(host, tagged) == owner_pid then
+                pcall(host.fs.remove_file, tagged)
+                unlinked_dead_entry = true
+              else
+                pcall(host.fs.rename, tagged, entry_path)
+                return false
+              end
+            end
+          else
+            if host.fs.remove_file(entry_path) then
               unlinked_dead_entry = true
-            else
-              pcall(host.fs.rename, tagged, entry_path)
-              return false
             end
           end
         else
-          if host.fs.remove_file(entry_path) then
-            unlinked_dead_entry = true
-          end
+          return false
         end
       end
     end
   end
-  if unlinked_dead_entry and host.fs.remove_dir(lock_dir) then
+  if (unlinked_dead_entry or not saw_any_entry) and host.fs.remove_dir(lock_dir) then
     return true
   end
   return false
@@ -1044,7 +1098,7 @@ local function with_approvals_lock(data_dir, fn)
   local owner_file = lock_dir .. "/" .. owner_filename
   local acquired = false
   for attempt = 1, APPROVAL_LOCK_MAX_ATTEMPTS do
-    if host.fs.rename(stage_dir, lock_dir) then
+    if publish_staged_approvals_lock(host, stage_dir, lock_dir) then
       if read_approvals_lock_owner(host, owner_file) == pid then
         acquired = true
         break
@@ -1054,7 +1108,7 @@ local function with_approvals_lock(data_dir, fn)
     end
     local reclaimed = false
     if attempt >= APPROVAL_LOCK_RECLAIM_ATTEMPT then
-      reclaimed = try_reclaim_stale_approvals_lock(host, lock_dir)
+      reclaimed = try_reclaim_stale_approvals_lock(host, data_dir, lock_dir)
     end
     if not reclaimed and host.time and type(host.time.sleep_ms) == "function" then
       host.time.sleep_ms(APPROVAL_LOCK_SLEEP_MS)

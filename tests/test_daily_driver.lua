@@ -938,13 +938,22 @@ return {
     assert(WheelConfig.get_approval(pending_ids[1], { env = apr_env }) ~= nil,
       "pending entries must survive pruning while older resolved entries exist")
 
-    -- Reclaim dead-owner tokenized .approvals.lock/owner.<token> lock without rename
+    -- Reclaim dead-owner tokenized .approvals.lock/owner.<token> lock + dead stage dir + interrupted empty lock dir
+    local stale_stage_dir = apr_data .. "/.approvals.lock.stage.99999999-1-1"
+    assert(WheelHost.fs.mkdir(stale_stage_dir) == true)
+    assert(WheelHost.fs.write_file(stale_stage_dir .. "/owner.99999999-1-1", "99999999\n") == true)
     local stale_lock_dir = apr_data .. "/.approvals.lock"
     assert(WheelHost.fs.mkdir(stale_lock_dir) == true)
     assert(WheelHost.fs.write_file(stale_lock_dir .. "/owner.99999999-stale-1", "99999999\n") == true)
     local after_reclaim, reclaim_err = WheelConfig.resolve_approval_store(pending_ids[1], "allow_once", { env = apr_env, now = 1010 })
     assert(after_reclaim ~= nil, "resolve_approval_store must reclaim dead tokenized lock: " .. tostring(reclaim_err and reclaim_err.message))
     assert(not WheelHost.fs.exists(stale_lock_dir), "tokenized .approvals.lock must be removed after mutation")
+    assert(not WheelHost.fs.exists(stale_stage_dir), "dead .approvals.lock.stage.<token> dir must be swept")
+
+    assert(WheelHost.fs.mkdir(stale_lock_dir) == true)
+    local after_empty_reclaim, empty_reclaim_err = WheelConfig.resolve_approval_store(pending_ids[2], "allow_once", { env = apr_env, now = 1011 })
+    assert(after_empty_reclaim ~= nil, "resolve_approval_store must reclaim interrupted empty lock dir: " .. tostring(empty_reclaim_err and empty_reclaim_err.message))
+    assert(not WheelHost.fs.exists(stale_lock_dir), "empty .approvals.lock must be removed after mutation")
 
     -- Symlink refusal on approvals.json
     local sym_root = root .. "/approvals-symlink"
