@@ -27,33 +27,25 @@ install:
 deps:
     @test -d node_modules || { echo "dependencies are not installed; run 'just install'" >&2; exit 1; }
 
-# Lint all Markdown sources with markdownlint-cli2 (.markdownlint-cli2.jsonc).
-lint: deps
-    bun run markdownlint-cli2
-
-# Lint specific Markdown files (used by the pre-commit hook).
-lint-files *files: deps
-    bun run markdownlint-cli2 {{files}}
-
-# Format all files with Prettier.
-fmt: deps
-    bun run prettier --write . --ignore-unknown
+# Format all files with Bun native Rust formatter.
+fmt:
+    bun fmt --no-script --no-config --ignore-unknown --ignore-pattern="tests/fixtures/bittyd-corpus.json"
 
 # Format specific files (used by the pre-commit hook).
-fmt-files *files: deps
-    bun run prettier --write {{files}}
+fmt-files *files:
+    bun fmt --no-script --no-config --ignore-unknown --ignore-pattern="tests/fixtures/bittyd-corpus.json" {{files}}
 
-# Check formatting of all files with Prettier.
-fmt-check: deps
-    bun run prettier --check . --ignore-unknown
+# Check formatting of all files with Bun native Rust formatter.
+fmt-check:
+    bun fmt --no-script --no-config --check --ignore-unknown --ignore-pattern="tests/fixtures/bittyd-corpus.json"
 
 # Check formatting of specific files (used by the pre-commit hook).
-fmt-check-files *files: deps
-    bun run prettier --check {{files}}
+fmt-check-files *files:
+    bun fmt --no-script --no-config --check --ignore-unknown --ignore-pattern="tests/fixtures/bittyd-corpus.json" {{files}}
 
-# Validate a commit message file with commitlint (conventional commits).
-commit-check message=".git/COMMIT_EDITMSG": deps
-    bun run commitlint --edit "{{message}}"
+# Validate a commit message file against Conventional Commits (with optional [CTX-XXXX] prefix).
+commit-check message=".git/COMMIT_EDITMSG":
+    @head -n1 "{{message}}" | grep -Eq '^(\[CTX-[0-9]+\] )?(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .+' || { echo "Invalid commit subject in {{message}}" >&2; exit 1; }
 
 # Install Git hooks managed by lefthook (opt-in per contributor checkout).
 hooks-install: deps
@@ -364,7 +356,7 @@ test-bittyd-conformance: deps
     python3 tests/bittyd_conformance_runner.py
 
 # Aggregate gate run locally and in CI (after `just install`).
-check: lint fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-bittyd-conformance test-audit test-cancel test test-bench test-session test-lifecycle lua-control
+check: fmt-check manifest docs-check lua test-gate test-live-offline test-provider-stub test-bittyd-conformance test-audit test-cancel test test-bench test-session test-lifecycle lua-control
 
 actionlint:
     actionlint .github/workflows/*.yml

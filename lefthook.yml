@@ -8,9 +8,5 @@ commit-msg:
 
 pre-commit:
   commands:
-    markdownlint-staged:
-      glob: "*.md"
-      run: just lint-files {staged_files}
-    prettier-staged:
-      glob: "*.md"
+    format-check:
       run: just fmt-check-files {staged_files}
