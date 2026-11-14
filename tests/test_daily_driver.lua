@@ -938,6 +938,14 @@ return {
     assert(WheelConfig.get_approval(pending_ids[1], { env = apr_env }) ~= nil,
       "pending entries must survive pruning while older resolved entries exist")
 
+    -- Reclaim dead-owner tokenized .approvals.lock/owner.<token> lock without rename
+    local stale_lock_dir = apr_data .. "/.approvals.lock"
+    assert(WheelHost.fs.mkdir(stale_lock_dir) == true)
+    assert(WheelHost.fs.write_file(stale_lock_dir .. "/owner.99999999-stale-1", "99999999\n") == true)
+    local after_reclaim, reclaim_err = WheelConfig.resolve_approval_store(pending_ids[1], "allow_once", { env = apr_env, now = 1010 })
+    assert(after_reclaim ~= nil, "resolve_approval_store must reclaim dead tokenized lock: " .. tostring(reclaim_err and reclaim_err.message))
+    assert(not WheelHost.fs.exists(stale_lock_dir), "tokenized .approvals.lock must be removed after mutation")
+
     -- Symlink refusal on approvals.json
     local sym_root = root .. "/approvals-symlink"
     WheelHost.fs.mkdir_p(sym_root .. "/share/wheel")

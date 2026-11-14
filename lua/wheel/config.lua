@@ -933,6 +933,8 @@ local function bound_approval_scope_key(key)
   return "bounded:" .. WheelConfig.compute_hash(s)
 end
 
+local approval_lock_seq = 0
+
 local function read_approvals_lock_owner(host, owner_file)
   if type(host.fs.read_file) ~= "function" then
     return nil
@@ -942,19 +944,74 @@ local function read_approvals_lock_owner(host, owner_file)
     return nil
   end
   local parsed = tonumber(raw:match("^%s*(%d+)%s*$"))
-  if parsed ~= nil and parsed > 1 then
+  if parsed ~= nil and parsed >= 1 then
     return parsed
   end
   return nil
 end
 
-local function release_approvals_lock(host, lock_dir, owner_file, expected_pid)
-  local recorded_pid = read_approvals_lock_owner(host, owner_file)
-  if expected_pid > 1 and recorded_pid ~= nil and recorded_pid ~= expected_pid then
-    return
+local function remove_lock_dir_contents(host, dir)
+  if type(host.fs.list_dir) == "function" then
+    local listing = host.fs.list_dir(dir)
+    if listing and listing.ok == true then
+      for _, line in ipairs(listing.entries or {}) do
+        local name = line:match("%s([^%s]+)$")
+        if name and name ~= "." and name ~= ".." then
+          pcall(host.fs.remove_file, dir .. "/" .. name)
+        end
+      end
+    end
   end
+  pcall(host.fs.remove_dir, dir)
+end
+
+local function release_approvals_lock(host, lock_dir, owner_file)
   pcall(host.fs.remove_file, owner_file)
   pcall(host.fs.remove_dir, lock_dir)
+end
+
+local function try_reclaim_stale_approvals_lock(host, lock_dir)
+  if type(host.fs.list_dir) ~= "function" or not host.proc or type(host.proc.is_alive) ~= "function" then
+    return false
+  end
+  local listing = host.fs.list_dir(lock_dir)
+  if not listing or listing.ok ~= true then
+    return false
+  end
+  local unlinked_dead_entry = false
+  for _, line in ipairs(listing.entries or {}) do
+    local name = line:match("%s([^%s]+)$")
+    if name and (name == "owner" or name:sub(1, 6) == "owner.") then
+      local entry_path = lock_dir .. "/" .. name
+      local owner_pid = read_approvals_lock_owner(host, entry_path)
+      if owner_pid ~= nil then
+        local alive, alive_err = host.proc.is_alive(owner_pid)
+        if alive == true or alive_err ~= nil then
+          return false
+        end
+        if name == "owner" then
+          local tagged = lock_dir .. "/owner.dead." .. tostring(owner_pid)
+          if host.fs.rename(entry_path, tagged) then
+            if read_approvals_lock_owner(host, tagged) == owner_pid then
+              pcall(host.fs.remove_file, tagged)
+              unlinked_dead_entry = true
+            else
+              pcall(host.fs.rename, tagged, entry_path)
+              return false
+            end
+          end
+        else
+          if host.fs.remove_file(entry_path) then
+            unlinked_dead_entry = true
+          end
+        end
+      end
+    end
+  end
+  if unlinked_dead_entry and host.fs.remove_dir(lock_dir) then
+    return true
+  end
+  return false
 end
 
 local function with_approvals_lock(data_dir, fn)
@@ -964,46 +1021,51 @@ local function with_approvals_lock(data_dir, fn)
     return nil, dir_err
   end
   local lock_dir = data_dir .. "/.approvals.lock"
-  local owner_file = lock_dir .. "/owner"
   local pid = current_lock_pid(host)
+  approval_lock_seq = approval_lock_seq + 1
+  local now = (host.time and type(host.time.now) == "function" and host.time.now()) or 0
+  local token = tostring(pid) .. "-" .. tostring(now) .. "-" .. tostring(approval_lock_seq)
+  local owner_filename = "owner." .. token
+  local stage_dir = lock_dir .. ".stage." .. token
+  if not host.fs.mkdir(stage_dir) then
+    return nil, store_error("E_DATA_STORE_IO", "failed to create staged approvals lock dir")
+  end
+  local staged_owner = stage_dir .. "/" .. owner_filename
+  local wrote_owner = false
+  if type(host.fs.create_private_file) == "function" then
+    wrote_owner = host.fs.create_private_file(staged_owner, tostring(pid) .. "\n") == true
+  else
+    wrote_owner = host.fs.write_file(staged_owner, tostring(pid) .. "\n") == true
+  end
+  if not wrote_owner then
+    remove_lock_dir_contents(host, stage_dir)
+    return nil, store_error("E_DATA_STORE_IO", "failed to write staged approvals lock owner")
+  end
+  local owner_file = lock_dir .. "/" .. owner_filename
   local acquired = false
   for attempt = 1, APPROVAL_LOCK_MAX_ATTEMPTS do
-    if host.fs.mkdir(lock_dir) then
-      host.fs.write_file(owner_file, tostring(pid) .. "\n")
-      acquired = true
-      break
+    if host.fs.rename(stage_dir, lock_dir) then
+      if read_approvals_lock_owner(host, owner_file) == pid then
+        acquired = true
+        break
+      end
+      release_approvals_lock(host, lock_dir, owner_file)
+      return nil, store_error("E_DATA_STORE_IO", "failed to verify approvals lock owner")
     end
     local reclaimed = false
     if attempt >= APPROVAL_LOCK_RECLAIM_ATTEMPT then
-      local owner_pid = read_approvals_lock_owner(host, owner_file)
-      if owner_pid ~= nil and host.proc and type(host.proc.is_alive) == "function" then
-        local alive, alive_err = host.proc.is_alive(owner_pid)
-        if alive == false and alive_err == nil then
-          local now = (host.time and type(host.time.now) == "function" and host.time.now()) or 0
-          local stale_dir = lock_dir .. ".stale." .. tostring(pid) .. "." .. tostring(now)
-          if host.fs.rename(lock_dir, stale_dir) then
-            local stale_owner_file = stale_dir .. "/owner"
-            local stale_owner = read_approvals_lock_owner(host, stale_owner_file)
-            if stale_owner == nil or stale_owner == owner_pid then
-              pcall(host.fs.remove_file, stale_owner_file)
-              pcall(host.fs.remove_dir, stale_dir)
-              reclaimed = true
-            else
-              pcall(host.fs.rename, stale_dir, lock_dir)
-            end
-          end
-        end
-      end
+      reclaimed = try_reclaim_stale_approvals_lock(host, lock_dir)
     end
     if not reclaimed and host.time and type(host.time.sleep_ms) == "function" then
       host.time.sleep_ms(APPROVAL_LOCK_SLEEP_MS)
     end
   end
   if not acquired then
+    remove_lock_dir_contents(host, stage_dir)
     return nil, store_error("E_DATA_STORE_BUSY", "timed out acquiring approvals store lock")
   end
   local ok_call, res, err = pcall(fn)
-  release_approvals_lock(host, lock_dir, owner_file, pid)
+  release_approvals_lock(host, lock_dir, owner_file)
   if not ok_call then
     error(res, 0)
   end
