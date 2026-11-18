@@ -79,6 +79,11 @@ if not ok_provider then
 end
 WheelAgent.Provider = WheelProvider
 
+local ok_errors, WheelErrors = pcall(require, "wheel.errors")
+if not ok_errors then
+  WheelErrors = nil
+end
+
 local ok_runner, WheelRunner = pcall(require, "wheel.runner")
 if not ok_runner then
   local ok_r2, WheelR2 = pcall(require, "lua.wheel.runner")
@@ -545,33 +550,18 @@ local function model_name_of(value)
   return nil
 end
 
---- Resolve the model profile for a role.
+--- Resolve the model profile for a role. First match wins:
+---   1. `opts.model_profile` (strict complete override)
+---   2. `opts.model`: name/`provider/model` (compatible prefix) or table; a
+---      table without a name keeps tuning and falls through
+---   3. `config.roles[role].model_profile` for the active provider or none
+---   4. `config.roles[role].model`: bare name applies to the active provider;
+---      a foreign provider claim (string prefix or table provider) is skipped
+---   5. `opts.provider_default_model` (config `model`, else template default)
 ---
---- Precedence (first match wins):
----   1. `opts.model_profile` (complete explicit profile override)
----   2. `opts.model` (the `--model` flag): a model name, `provider/model`, or a
----      table `{ name, provider, temperature }`
----   3. `config.roles[role].model_profile`, but only when its provider matches
----      the active provider (or it names none); a profile without a model name
----      falls through
----   4. `config.roles[role].model`; an explicit foreign provider is ignored, a
----      bare model (or `provider/model` for the active provider) is applied to
----      the active provider
----   5. `opts.provider_default_model` (the effective provider model the caller
----      resolved from provider config and the provider template default)
----
---- The built-in role default profile supplies the remaining fields and is the
---- model fallback only when no provider default model is available.
----
---- A table model without a `name`/`model` field is not a model selection: its
---- tuning fields are kept and resolution continues to the next step, so the
---- active provider's default model wins (D1: never send the role default to a
---- provider that does not host it).
----
---- Without an active provider (library callers that supply no adapter and no
---- `provider_name`) the role default profile is returned unchanged.
---- @param role string
---- @param opts table
+--- The built-in role default supplies remaining fields and is the model
+--- fallback only when no provider default model exists. Without an active
+--- provider the role default is returned unchanged.
 --- @return table? profile, string? error_reason
 function WheelAgent.resolve_model(role, opts)
   opts = opts or {}
@@ -607,7 +597,9 @@ function WheelAgent.resolve_model(role, opts)
   end
 
   -- 2. The explicit `--model` flag wins over every configuration layer. A
-  -- table without a model name keeps its tuning and falls through.
+  -- table without a model name keeps its tuning and falls through. A table
+  -- that names a provider honours that claim; a string is an opaque model id
+  -- except for a `provider/model` prefix compatible with the active provider.
   if type(opts.model) == "table" and opts.model.temperature ~= nil then
     profile.temperature = opts.model.temperature
   end
@@ -619,7 +611,12 @@ function WheelAgent.resolve_model(role, opts)
       profile.model = rest
     else
       profile.model = explicit_name
-      if active_provider then profile.provider = active_provider end
+      local claimed = type(opts.model) == "table" and opts.model.provider or nil
+      if type(claimed) == "string" and claimed ~= "" then
+        profile.provider = known_provider_name(claimed) or claimed
+      elseif active_provider then
+        profile.provider = active_provider
+      end
     end
     return profile, nil
   end
@@ -654,11 +651,17 @@ function WheelAgent.resolve_model(role, opts)
 
   -- 4. Role model from configuration. A bare model (no provider claim) is an
   -- explicit model id for the active provider; a `provider/model` string or a
-  -- table naming another provider stays foreign and is skipped. A table with
-  -- only tuning fields (no model name) keeps its tuning and falls through.
+  -- table naming another provider is a foreign claim and is skipped. A table
+  -- with only tuning fields (no model name) keeps its tuning and falls
+  -- through.
   local role_model = role_cfg.model
   if role_model ~= nil then
-    local claimed_provider = type(role_model) == "table" and role_model.provider or nil
+    local claimed_provider
+    if type(role_model) == "table" then
+      claimed_provider = role_model.provider
+    elseif type(role_model) == "string" then
+      claimed_provider = WheelAgent.split_provider_model(role_model, nil)
+    end
     local belongs = not active_provider
       or claimed_provider == nil or claimed_provider == ""
       or (type(claimed_provider) == "string" and string.lower(claimed_provider) == active_provider)
@@ -692,35 +695,52 @@ function WheelAgent.resolve_model(role, opts)
   return profile, nil
 end
 
---- Validate resolved tool names against the agent's registry.
---- Unknown names fail closed: silently dropping a tool would leave the prompt
---- advertising a capability the run cannot execute (the "role tool lists lie"
---- defect). Returns a bounded, actionable diagnostic naming the role to fix.
---- The constructor applies this to configuration-derived lists; explicit
---- `opts.tools` remains caller authority and fails closed at dispatch instead.
---- @param agent_name string
---- @param role string
---- @param tools table
---- @param registry table?
+--- Typed role-tool diagnostic string (bounded; `E_AGENT_TOOL_UNKNOWN` prefix).
+local function tool_list_error(role, detail)
+  if WheelErrors and type(WheelErrors.agent_tool_unknown) == "function" then
+    local err = WheelErrors.agent_tool_unknown(role, detail)
+    return string.format("%s: %s", err.code, err.message)
+  end
+  return "E_AGENT_TOOL_UNKNOWN: role '" .. tostring(role) .. "': " .. tostring(detail)
+end
+WheelAgent.tool_list_error = tool_list_error
+
+--- Validate config-derived tool names against the agent's registry. Unknown
+--- names, map-shaped lists, and sparse lists fail closed with a typed, bounded
+--- diagnostic; `"*"` is the supported wildcard. Explicit `opts.tools` is
+--- caller authority and fails closed at dispatch instead.
 --- @return boolean ok, string? message
 function WheelAgent.validate_tool_list(agent_name, role, tools, registry)
-  if type(tools) ~= "table" or type(registry) ~= "table"
-    or type(registry.get_tool) ~= "function"
-  then
+  if type(tools) ~= "table" then
+    return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
+      .. ".tools must be an array of tool names")
+  end
+  if type(registry) ~= "table" or type(registry.get_tool) ~= "function" then
     return true, nil
+  end
+  -- Reject map-shaped and sparse lists: ipairs would silently see no tools.
+  local count = 0
+  for key in pairs(tools) do
+    if type(key) ~= "number" then
+      return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
+        .. ".tools must be a dense array of tool names, not a map")
+    end
+    count = count + 1
+  end
+  if count ~= #tools then
+    return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
+      .. ".tools must be a dense array without holes")
   end
   local unknown = {}
   for _, name in ipairs(tools) do
-    if type(name) ~= "string" or name == "" or registry:get_tool(name) == nil then
-      unknown[#unknown + 1] = tostring(name)
+    if name ~= "*" then
+      if type(name) ~= "string" or name == "" or registry:get_tool(name) == nil then
+        unknown[#unknown + 1] = tostring(name)
+      end
     end
   end
   if #unknown == 0 then return true, nil end
-  table.sort(unknown)
-  return false, string.format(
-    "E_AGENT_TOOL_UNKNOWN: agent '%s' role '%s' lists unregistered tools: %s; "
-      .. "register them or fix roles.%s.tools",
-    tostring(agent_name), tostring(role), table.concat(unknown, ", "), tostring(role))
+  return false, WheelAgent.tool_list_error(role, unknown)
 end
 
 --- Create a new Agent instance.

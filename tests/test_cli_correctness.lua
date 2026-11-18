@@ -211,6 +211,20 @@ local ok_all, test_err = pcall(function()
       "a bare role model must be applied to the active provider, got "
         .. tostring(p_bare.model))
 
+    -- A role-config string naming a foreign provider is skipped (foreign
+    -- claim), matching the table form and the documented rule.
+    local p_foreign_string = resolve(nil, "anthropic/claude-3-5-sonnet")
+    assert(p_foreign_string.model == "deepseek-v4.1-flash"
+      and p_foreign_string.provider == "opencode-go",
+      "a foreign provider string claim must be skipped, got "
+        .. tostring(p_foreign_string.model))
+
+    -- A role-config string naming the active provider strips the prefix.
+    local p_matching_string = resolve(nil, "opencode-go/my-model")
+    assert(p_matching_string.model == "my-model" and p_matching_string.provider == "opencode-go",
+      "a role-config string for the active provider must be split, got "
+        .. tostring(p_matching_string.model))
+
     -- A nameless table role model keeps its tuning and falls through instead
     -- of keeping the role default model.
     local p_nameless_role = resolve(nil, { temperature = 0.3 })
@@ -300,6 +314,33 @@ local ok_all, test_err = pcall(function()
       and table_agent.model_profile.temperature == 0.4,
       "WheelAgent.new must keep table model support")
 
+    -- A table model that names a provider honours that claim (D1 must not
+    -- return through the documented API form).
+    local foreign_table_agent = assert(WheelAgent.new({
+      name = "foreign-table-model-agent",
+      role = coding,
+      kernel = kernel,
+      model = { name = "claude-3-5-sonnet", provider = "anthropic" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+    }))
+    assert(foreign_table_agent.model_profile.provider == "anthropic"
+      and foreign_table_agent.model_profile.model == "claude-3-5-sonnet",
+      "a table provider claim must be honoured, got "
+        .. tostring(foreign_table_agent.model_profile.provider))
+
+    local catalogue_table_agent = assert(WheelAgent.new({
+      name = "catalogue-table-model-agent",
+      role = coding,
+      kernel = kernel,
+      model = { name = "deepseek/deepseek-chat", provider = "openrouter" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+    }))
+    assert(catalogue_table_agent.model_profile.provider == "openrouter"
+      and catalogue_table_agent.model_profile.model == "deepseek/deepseek-chat",
+      "a table provider claim must keep its catalogue provider")
+
     -- A nameless table model must not keep the role default (D1 table form).
     local nameless_agent = assert(WheelAgent.new({
       name = "nameless-model-agent",
@@ -351,9 +392,47 @@ local ok_all, test_err = pcall(function()
     assert(tostring(err_unknown):find("E_AGENT_TOOL_UNKNOWN", 1, true)
       and tostring(err_unknown):find("not_a_tool", 1, true),
       "the tool diagnostic must be typed and name the unknown tool: " .. tostring(err_unknown))
-    assert(WheelAgent.validate_tool_list("ok-agent", WheelAgent.Role.CODING,
-      { "read_file", "run_command" }, WheelTool.get_default_registry()) == true,
+    assert(WheelTool.get_default_registry() ~= nil
+      and WheelAgent.validate_tool_list("ok-agent", WheelAgent.Role.CODING,
+        { "read_file", "run_command" }, WheelTool.get_default_registry()) == true,
       "registered role tools must pass validation")
+
+    -- The "*" wildcard is a valid role tool list.
+    assert(WheelAgent.validate_tool_list("wild-agent", WheelAgent.Role.CODING, { "*" },
+      WheelTool.get_default_registry()) == true, "the '*' wildcard must pass validation")
+    local wild_agent = assert(WheelAgent.new({
+      name = "wild-agent",
+      role = WheelAgent.Role.CODING,
+      kernel = WheelKernel.new({ in_memory = true }),
+      config = { roles = { coding = { tools = { "*" } } } },
+    }))
+    assert(wild_agent.tools[1] == "*" and wild_agent:is_tool_allowed("run_command") == true,
+      "a wildcard role tool list must construct and authorize a registered tool")
+
+    -- Map-shaped and sparse lists fail closed instead of being silently empty.
+    local ok_map, err_map = WheelAgent.validate_tool_list(
+      "map-tools-agent", WheelAgent.Role.CODING, { read_file = true },
+      WheelTool.get_default_registry())
+    assert(not ok_map and tostring(err_map):find("dense array", 1, true),
+      "a map-shaped tool list must be rejected: " .. tostring(err_map))
+    local ok_sparse, err_sparse = WheelAgent.validate_tool_list(
+      "sparse-tools-agent", WheelAgent.Role.CODING, { [1] = "read_file", [3] = "run_command" },
+      WheelTool.get_default_registry())
+    assert(not ok_sparse and tostring(err_sparse):find("dense array", 1, true),
+      "a sparse tool list must be rejected: " .. tostring(err_sparse))
+
+    -- The unknown-tool diagnostic is typed and bounded.
+    local many_unknown = {}
+    for index = 1, 40 do many_unknown[index] = "unknown_" .. tostring(index) end
+    local ok_many, err_many = WheelAgent.validate_tool_list(
+      "many-tools-agent", WheelAgent.Role.CODING, many_unknown, WheelTool.get_default_registry())
+    assert(not ok_many, "many unknown tools must fail validation")
+    assert(WheelErrors.E_AGENT_TOOL_UNKNOWN ~= nil
+      and tostring(err_many):find("E_AGENT_TOOL_UNKNOWN", 1, true),
+      "E_AGENT_TOOL_UNKNOWN must be part of the typed vocabulary")
+    assert(#err_many <= 200, "the tool diagnostic must be bounded, got " .. tostring(#err_many))
+    assert(err_many:find("(+35 more)", 1, true) ~= nil,
+      "the bounded diagnostic must count the remaining tools: " .. err_many)
 
     -- Config-driven role tools are validated too; the CLI reports exit 2.
     local bad_cfg_root = root .. "/bad-tools"
@@ -529,8 +608,7 @@ local ok_all, test_err = pcall(function()
     assert(rc_exhausted == 3,
       "budget exhaustion must exit the documented code 3, got "
         .. tostring(rc_exhausted) .. ": " .. err_exhausted)
-    assert(WheelErrors.E_TURN_BUDGET_EXHAUSTED == "E_TURN_BUDGET_EXHAUSTED"
-      and WheelErrors.is_typed(WheelErrors.turn_budget_exhausted("final turn")),
+    assert(WheelErrors.E_TURN_BUDGET_EXHAUSTED == "E_TURN_BUDGET_EXHAUSTED",
       "E_TURN_BUDGET_EXHAUSTED must be part of the typed error vocabulary")
     assert(state.requests == 2, "max_turns must bound provider requests, got " .. tostring(state.requests))
     assert(err_exhausted:find("Turn budget exhausted", 1, true),

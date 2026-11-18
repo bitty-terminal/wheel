@@ -8,18 +8,20 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### CLI
 
-- `--model` accepts a model name or `provider/model` and is now applied to the
-  agent; `wheel run --model` previously kept the role-default model. Model
-  precedence is resolved once in `WheelAgent.resolve_model`: `--model` > role
-  config model (a bare name applies to the active provider; a foreign provider
-  claim is skipped) > the provider's effective default model. The
-  `WheelAgent.new` API also accepts `{ name, provider, temperature }`; a table
-  without a model name is not a model selection.
-- `provider/model` is split only when it cannot be confused with a catalogue
-  id: an explicit `--provider P` only splits `P/model`; otherwise the string is
-  an opaque model id for `P` (OpenRouter `deepseek/deepseek-v4.1-flash` keeps
-  its endpoint). Without `--provider`, a known provider prefix selects that
-  provider.
+- `--model`/`opts.model` accepts a model name or `provider/model`; the
+  `WheelAgent.new` API also accepts `{ name, provider, temperature }`. The
+  table honours its `provider` claim; a table without a model name is not a
+  selection (tuning kept, resolution continues). A string is an opaque model
+  id for the resolved provider unless a `provider/model` prefix names a known
+  provider and is compatible with the selection (no provider selected, or the
+  prefix equals the selected/active provider), so OpenRouter catalogue ids
+  such as `deepseek/deepseek-v4.1-flash` survive an explicit `--provider`.
+- Model precedence is resolved once in `WheelAgent.resolve_model`:
+  `--model`/`opts.model` > `roles.<role>.model_profile` for the active provider
+  (or provider-less) > `roles.<role>.model`, where a bare name applies to the
+  active provider and a `provider/model` string or table naming a different
+  provider is a foreign claim and is skipped > the provider's effective default
+  model. `wheel run --model` previously kept the role-default model.
 - `wheel ask|run|chat --help` and `wheel help <command>` print documented usage
   and exit 0 without contacting the provider. Unknown options are usage errors
   (exit 2) instead of being sent to the model as prompt text. `--stream` and
@@ -32,9 +34,12 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `wheel run --trace` (alias `--verbose`) prints one stderr line per tool call
   with tool name, outcome status, exit code, byte counts, and the first
   observation content line, redacted and bounded. Default output is unchanged.
-- `WheelAgent.new` fails closed with `E_AGENT_TOOL_UNKNOWN` when the resolved
-  role tool list names tools missing from the registry, and the built-in role
-  defaults now reference only registered core tools.
+- `WheelAgent.new` fails closed with `E_AGENT_TOOL_UNKNOWN` (typed, bounded)
+  when a configuration-derived role tool list names tools missing from the
+  registry, is map-shaped, or is sparse; `"*"` wildcard lists remain valid. The
+  built-in role defaults now reference only registered core tools; the
+  commander keeps `run_command` intentionally (execute is in its capability
+  matrix and `permissions.run_command = "ask"` gates it).
 
 ### Agent
 

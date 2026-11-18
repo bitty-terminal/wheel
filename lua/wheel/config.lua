@@ -81,6 +81,9 @@ WheelConfig.DEFAULTS = {
     commander = {
       name = "commander",
       model = { temperature = 0.2 },
+      -- Execute is part of the commander capability matrix. run_command stays
+      -- gated by permissions.run_command = "ask"; the commander does not list
+      -- write_file/edit_file, so shell writes are the only mutating surface.
       tools = { "read_file", "list_directory", "search_code", "read_blob", "run_command" },
       budget = { max_iterations = 20, max_tokens = 65536 },
     },

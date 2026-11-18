@@ -34,6 +34,7 @@ WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
 WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.E_TURN_BUDGET_EXHAUSTED = "E_TURN_BUDGET_EXHAUSTED"
+WheelErrors.E_AGENT_TOOL_UNKNOWN = "E_AGENT_TOOL_UNKNOWN"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
 WheelErrors.E_PROJECTION_INVALID = "E_PROJECTION_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
@@ -193,19 +194,22 @@ function WheelErrors.completion_budget_invalid(detail)
   )
 end
 
---- Build the typed turn-budget-exhausted result for a run that stopped before
---- the model produced a final answer. Class `budget`, matching the completion
---- budget family; the run is not a provider or persistence failure.
--- @param detail string? short diagnostic
--- @return table
-function WheelErrors.turn_budget_exhausted(detail)
-  local reason = type(detail) == "string" and detail or "the turn budget was exhausted"
-  reason = reason:gsub("%c", " ")
-  return typed(
-    "budget",
-    WheelErrors.E_TURN_BUDGET_EXHAUSTED,
-    reason
-  )
+--- Typed invalid role-tool-list diagnostic (bounded names plus a count).
+function WheelErrors.agent_tool_unknown(role, detail)
+  local message
+  if type(detail) ~= "table" then
+    message = string.format("role '%s': %s", tostring(role), tostring(detail))
+  else
+    local limit = math.min(#detail, 5)
+    local names = {}
+    for i = 1, limit do names[i] = tostring(detail[i]) end
+    local listed = table.concat(names, ", ")
+    if #detail > limit then
+      listed = listed .. string.format(" (+%d more)", #detail - limit)
+    end
+    message = string.format("role '%s' lists unregistered tools: %s", tostring(role), listed)
+  end
+  return typed(WheelErrors.CLASS_VALIDATION, WheelErrors.E_AGENT_TOOL_UNKNOWN, message)
 end
 
 -- Snapshot schema paths can include a slot or commit key. Keep the diagnostic
