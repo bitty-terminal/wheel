@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import select
 import socket
 import sys
 import threading
@@ -29,36 +28,31 @@ DEFAULT_IDLE_TIMEOUT = 180.0
 
 
 def pump(client, upstream, timeout):
-    total = 0
-    client.setblocking(False)
-    upstream.setblocking(False)
-    try:
-        while True:
-            readable, _writable, exceptional = select.select(
-                [client, upstream], [], [client, upstream], timeout
-            )
-            if exceptional or not readable:
-                return
-            for source in readable:
-                sink = upstream if source is client else client
-                try:
-                    data = source.recv(65536)
-                except BlockingIOError:
-                    continue
+    """Relay bytes both ways until either side closes.
+
+    Each direction owns a thread so a destination that is not writable at that
+    instant cannot make the bridge drop the pending bytes it already read.
+    """
+
+    def relay(source, sink):
+        try:
+            while True:
+                data = source.recv(65536)
                 if not data:
-                    try:
-                        sink.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
-                    return
-                total += len(data)
+                    break
                 sink.sendall(data)
-    finally:
-        for sock in (client, upstream):
+        except OSError:
+            pass
+        finally:
             try:
-                sock.setblocking(True)
+                sink.shutdown(socket.SHUT_WR)
             except OSError:
                 pass
+
+    reverse = threading.Thread(target=relay, args=(upstream, client), daemon=True)
+    reverse.start()
+    relay(client, upstream)
+    reverse.join(timeout)
 
 
 def serve_connection(client, relay_path, timeout):

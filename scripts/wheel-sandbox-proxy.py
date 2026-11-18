@@ -76,6 +76,7 @@ RESERVED_HEADERS = frozenset(
 )
 
 TOKEN_RE = re.compile(rb"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+TARGET_RE = re.compile(rb"^[\x21-\x7e]+$")
 HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-_]*[a-z0-9])?$")
 HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -163,6 +164,42 @@ def is_exact_entry(entries, host, port):
     )
 
 
+def read_auth_hosts():
+    """Destinations that may receive the injected credential.
+
+    A credential has no business travelling to every allowlisted host, so the
+    receiving destinations are a separate, explicit list. An empty list with a
+    configured credential is a startup failure rather than an implicit
+    "inject everywhere".
+    """
+    raw = os.environ.get("WHEEL_SANDBOX_AUTH_HOSTS", "")
+    entries = []
+    for item in raw.split(","):
+        entry = item.strip().lower()
+        if not entry:
+            continue
+        if "*" in entry or "/" in entry or "@" in entry or " " in entry:
+            fail("WHEEL_SANDBOX_AUTH_HOSTS entries must be host[:port]")
+        host, sep, port_text = entry.partition(":")
+        if sep:
+            if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
+                fail("WHEEL_SANDBOX_AUTH_HOSTS entry has an invalid port")
+            port = int(port_text)
+        else:
+            port = None
+        if not host:
+            fail("WHEEL_SANDBOX_AUTH_HOSTS entry is empty")
+        entries.append((host, port))
+    return entries
+
+
+def auth_host_matches(entries, host, port):
+    return any(
+        entry_host == host and (entry_port is None or entry_port == port)
+        for entry_host, entry_port in entries
+    )
+
+
 def read_upstream_credential():
     """Return [(name, value)] for one injected header, or an empty list."""
     raw = os.environ.get("WHEEL_SANDBOX_UPSTREAM_AUTH", "")
@@ -199,7 +236,19 @@ class Relay:
         self.upstream_context = ssl.create_default_context(
             cafile=args.upstream_ca or None
         )
-        self.auth_headers = read_upstream_credential()
+        # A transparent tunnel cannot carry a credential, so tunnel-only mode
+        # neither reads one nor requires the destination list that binds it.
+        if args.tunnel_only:
+            self.auth_headers = []
+            self.auth_hosts = []
+        else:
+            self.auth_headers = read_upstream_credential()
+            self.auth_hosts = read_auth_hosts()
+            if self.auth_headers and not self.auth_hosts:
+                fail(
+                    "a credential is configured; name the destinations allowed to receive it "
+                    "with WHEEL_SANDBOX_AUTH_HOSTS"
+                )
         self.client_context = None
         self.tls_ca_path = None
 
@@ -480,8 +529,13 @@ class Relay:
                     }
                 )
                 return
+        inject = (
+            self.auth_headers
+            if auth_host_matches(self.auth_hosts, host, port)
+            else []
+        )
         upstream_head = build_upstream_head(
-            method, target, host, port, headers, self.auth_headers, body
+            method, target, host, port, headers, inject, body
         )
         upstream = connect_upstream(
             host,
@@ -532,7 +586,7 @@ class Relay:
                     "status": status_code,
                     "request_bytes": len(body),
                     "response_bytes": len(response_body),
-                    "injected": bool(self.auth_headers),
+                    "injected": bool(inject),
                 }
             )
         finally:
@@ -680,15 +734,43 @@ def write_ready(path, ca_path):
 
 
 def connect_upstream(host, port, connect_timeout, io_timeout, context):
+    """Connect (and hand-shake) under one deadline across all addresses.
+
+    ``socket.create_connection`` applies the timeout per address, so a host
+    with two unreachable addresses can take twice the budget, and the TLS
+    handshake would start a fresh one. Resolution is bounded by the caller's
+    own timeout; every address attempt and the handshake share this deadline.
+    """
+    deadline = time.monotonic() + connect_timeout
     try:
-        raw = socket.create_connection((host, port), timeout=connect_timeout)
+        addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
+        return None
+    raw = None
+    for family, socktype, proto, _canonical, sockaddr in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        candidate = socket.socket(family, socktype, proto)
+        candidate.settimeout(remaining)
+        try:
+            candidate.connect(sockaddr)
+        except OSError:
+            candidate.close()
+            continue
+        raw = candidate
+        break
+    if raw is None:
         return None
     if context is None:
         raw.settimeout(io_timeout)
         return raw
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        close_quietly(raw)
+        return None
     try:
-        raw.settimeout(connect_timeout)
+        raw.settimeout(remaining)
         tls = context.wrap_socket(raw, server_hostname=host)
     except (ssl.SSLError, OSError):
         close_quietly(raw)
@@ -707,6 +789,8 @@ def parse_head(head):
     method, target, version = parts
     if not TOKEN_RE.match(method) or not version.startswith(b"HTTP/1."):
         return None
+    if not TARGET_RE.match(target):
+        return None
     headers = []
     for line in lines[1:]:
         if not line:
@@ -714,7 +798,13 @@ def parse_head(head):
         name, sep, value = line.partition(b":")
         if not sep or not TOKEN_RE.match(name):
             return None
-        headers.append((name.lower(), value.strip()))
+        value = value.strip()
+        # A bare CR, LF, or NUL can only arrive folded inside a value and
+        # would be re-serialised into the upstream request. Refuse it before
+        # any credential is written next to it.
+        if b"\r" in value or b"\n" in value or b"\x00" in value:
+            return None
+        headers.append((name.lower(), value))
     return method, target, version, headers
 
 
@@ -914,39 +1004,37 @@ def send_status(conn, code, reason):
 
 
 def pump(client, upstream, limit, timeout):
-    import select
+    """Relay bytes both ways until either side closes.
 
-    total = 0
-    client.setblocking(False)
-    upstream.setblocking(False)
-    try:
-        while True:
-            readable, _writable, exceptional = select.select(
-                [client, upstream], [], [client, upstream], timeout
-            )
-            if exceptional:
-                return
-            if not readable:
-                return
-            for source in readable:
-                sink = upstream if source is client else client
-                try:
-                    data = source.recv(65536)
-                except BlockingIOError:
-                    continue
+    Each direction runs in its own thread so a slow or blocked peer cannot
+    make the other direction drop a partial write: the previous single-thread
+    ``select`` loop called ``sendall`` on a non-blocking socket and lost bytes
+    when the destination was not writable.
+    """
+
+    def relay(source, sink):
+        total = 0
+        try:
+            while True:
+                data = source.recv(65536)
                 if not data:
-                    try:
-                        sink.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
-                    return
+                    break
                 total += len(data)
                 if total > limit:
-                    return
+                    break
                 sink.sendall(data)
-    finally:
-        client.setblocking(True)
-        upstream.setblocking(True)
+        except OSError:
+            pass
+        finally:
+            try:
+                sink.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    reverse = threading.Thread(target=relay, args=(upstream, client), daemon=True)
+    reverse.start()
+    relay(client, upstream)
+    reverse.join(timeout)
 
 
 def close_quietly(sock):

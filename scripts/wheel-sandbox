@@ -39,6 +39,8 @@
 #   WHEEL_SANDBOX_TLS_CA/CERT/KEY      operator-supplied relay server certificate
 #   WHEEL_SANDBOX_UPSTREAM_AUTH="Name: value"  relay credential header
 #   OPENCODE_GO_API_KEY                relay credential (Bearer) when the above is unset
+#   WHEEL_SANDBOX_AUTH_HOSTS=a,b:port  destinations allowed to receive that credential
+#                                      (required when a credential is configured)
 #   WHEEL_SANDBOX_TUNNEL_ONLY=1        proxy mode without credential injection
 #
 # Requirements: bwrap for every mode, python3 for proxy mode, and openssl for
@@ -215,6 +217,22 @@ main() {
     esac
   fi
 
+  # A workspace bound read-write inside a credential store or Wheel's own state
+  # would hand the session exactly what the sandbox exists to withhold.
+  local protected
+  for protected in \
+    "${XDG_CONFIG_HOME:-${HOME:-}/.config}/wheel" \
+    "${XDG_DATA_HOME:-${HOME:-}/.local/share}/wheel" \
+    "${XDG_STATE_HOME:-${HOME:-}/.local/state}/wheel" \
+    "${HOME:-}/.ssh" "${HOME:-}/.aws" "${HOME:-}/.gnupg" "${HOME:-}/.config"; do
+    [ -n "$protected" ] || continue
+    case $workspace/ in
+    "$protected"/*)
+      die "refusing a workspace inside a protected credential or runtime root: $protected"
+      ;;
+    esac
+  done
+
   if [ -z "$session" ]; then
     session="$(date -u +%Y%m%dT%H%M%SZ)-$$"
   fi
@@ -238,21 +256,9 @@ main() {
 
   local session_root cache_root
   session_root=$cache_base/$session
-  if [ -e "$session_root" ]; then
-    die "session directory already exists: $session_root (choose a new --session name)"
-  fi
   cache_root=$session_root/work
-  mkdir -p -- "$session_root/host" "$cache_root"
-  mkdir -p -- \
-    "$cache_root/tmp" \
-    "$cache_root/cargo" \
-    "$cache_root/xdg-cache" \
-    "$cache_root/xdg-data" \
-    "$cache_root/xdg-state" \
-    "$cache_root/xdg-config" \
-    "$cache_root/npm"
 
-  local relay_pid="" sandbox_pid=""
+  local relay_pid="" sandbox_pid="" session_reserved=0
   cleanup() {
     local status=$?
     trap - EXIT
@@ -264,7 +270,7 @@ main() {
       kill -TERM "$relay_pid" 2>/dev/null || true
       wait "$relay_pid" 2>/dev/null || true
     fi
-    if [ "$keep" -ne 1 ] && [ -n "$session_root" ] && [ -d "$session_root" ]; then
+    if [ "$keep" -ne 1 ] && [ "$session_reserved" -eq 1 ] && [ -d "$session_root" ]; then
       case $session_root in
       "$cache_base"/*) rm -rf -- "$session_root" ;;
       *) note "refusing to remove an unexpected session path" ;;
@@ -273,6 +279,24 @@ main() {
     exit "$status"
   }
   trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+
+  # Reserve the session directory atomically: mkdir fails on an existing path,
+  # so two launchers cannot share a session root or its credential socket.
+  mkdir -m 700 -- "$session_root" 2>/dev/null ||
+    die "cannot reserve session directory: $session_root (choose a new --session name)"
+  session_reserved=1
+  mkdir -p -- "$session_root/host" "$cache_root"
+  mkdir -p -- \
+    "$cache_root/tmp" \
+    "$cache_root/cargo" \
+    "$cache_root/xdg-cache" \
+    "$cache_root/xdg-data" \
+    "$cache_root/xdg-state" \
+    "$cache_root/xdg-config" \
+    "$cache_root/npm"
 
   local bwrap_args=(
     --unshare-pid
@@ -411,40 +435,43 @@ main() {
       sleep 0.05
     done
 
-    local ca_path=$session_root/host/tls/ca.pem
-    if [ -n "${WHEEL_SANDBOX_TLS_CA:-}" ]; then
-      ca_path=$WHEEL_SANDBOX_TLS_CA
+    # The relay reports the CA it serves. An empty value means it runs in
+    # tunnel-only mode, where no TLS is terminated and no trust anchor is
+    # needed; requiring one there would break that mode.
+    local ca_path
+    ca_path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("ca", ""))' "$ready") ||
+      die "cannot read the egress relay readiness record"
+
+    bwrap_args+=(--bind "$relay_socket" /run/wheel-relay/relay.sock)
+
+    if [ -n "$ca_path" ]; then
+      [ -r "$ca_path" ] || die "the egress relay did not provide a readable session CA certificate"
+
+      local system_bundle="" candidate
+      if [ -n "${WHEEL_SANDBOX_CA_BUNDLE:-}" ]; then
+        system_bundle=$WHEEL_SANDBOX_CA_BUNDLE
+      else
+        for candidate in "${CA_BUNDLE_CANDIDATES[@]}"; do
+          if [ -r "$candidate" ]; then
+            system_bundle=$candidate
+            break
+          fi
+        done
+      fi
+      [ -n "$system_bundle" ] ||
+        die "cannot locate a system CA bundle to extend; set WHEEL_SANDBOX_CA_BUNDLE"
+
+      # bwrap refuses to mount over a symlink, and every mainstream
+      # distribution ships this path as one; bind the resolved file instead.
+      local bundle_target=$system_bundle
+      if [ -L "$system_bundle" ]; then
+        bundle_target=$(readlink -f -- "$system_bundle")
+      fi
+
+      local bundle=$session_root/host/ca-bundle.pem
+      cat -- "$system_bundle" "$ca_path" >"$bundle"
+      bwrap_args+=(--ro-bind "$bundle" "$bundle_target")
     fi
-    [ -r "$ca_path" ] || die "the egress relay did not provide a session CA certificate"
-
-    local system_bundle="" candidate
-    if [ -n "${WHEEL_SANDBOX_CA_BUNDLE:-}" ]; then
-      system_bundle=$WHEEL_SANDBOX_CA_BUNDLE
-    else
-      for candidate in "${CA_BUNDLE_CANDIDATES[@]}"; do
-        if [ -r "$candidate" ]; then
-          system_bundle=$candidate
-          break
-        fi
-      done
-    fi
-    [ -n "$system_bundle" ] ||
-      die "cannot locate a system CA bundle to extend; set WHEEL_SANDBOX_CA_BUNDLE"
-
-    # bwrap refuses to mount over a symlink, and every mainstream distribution
-    # ships this path as one; bind the resolved file instead.
-    local bundle_target=$system_bundle
-    if [ -L "$system_bundle" ]; then
-      bundle_target=$(readlink -f -- "$system_bundle")
-    fi
-
-    local bundle=$session_root/host/ca-bundle.pem
-    cat -- "$system_bundle" "$ca_path" >"$bundle"
-
-    bwrap_args+=(
-      --ro-bind "$bundle" "$bundle_target"
-      --bind "$relay_socket" /run/wheel-relay/relay.sock
-    )
 
     command=(
       python3 "$script_dir/wheel-sandbox-bridge.py"
@@ -461,7 +488,11 @@ main() {
   # The session directories above are private; the sandboxed command keeps a
   # conventional umask so builds behave as they do outside the sandbox.
   umask 022
-  bwrap "${bwrap_args[@]}" "${env_args[@]}" -- "${command[@]}" &
+  # A non-interactive shell redirects a background job's stdin from /dev/null.
+  # The harness is interactive, so keep the caller's stdin on fd 3 across the
+  # background launch and hand it to bwrap explicitly.
+  exec 3<&0
+  bwrap "${bwrap_args[@]}" "${env_args[@]}" -- "${command[@]}" <&3 &
   sandbox_pid=$!
   local status=0
   wait "$sandbox_pid" || status=$?

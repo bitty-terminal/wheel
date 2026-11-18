@@ -943,6 +943,11 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-user --unshare-net \
       -- <command>
 ```
 
+The launcher reserves its session directory with an atomic `mkdir` rather than
+an existence check, so two concurrent launches cannot share a session root or
+its credential socket, and it keeps the caller's stdin across the background
+`bwrap` launch so an interactive session still has a terminal on stdin.
+
 - **Read-only system trees.** `/usr`, `/etc`, `/bin`, `/sbin`, `/lib`, `/lib64`
   are mounted read-only; a write attempt fails with `EROFS`. Node names that are
   symlinks on a merged-`/usr` distribution are recreated as symlinks.
@@ -1000,7 +1005,10 @@ The relay:
 - replaces the credential header with the value from
   `WHEEL_SANDBOX_UPSTREAM_AUTH` (`Name: value`) or `OPENCODE_GO_API_KEY`
   (`Authorization: Bearer …`), so the provider key exists only in the relay's
-  environment and never in the sandbox;
+  environment and never in the sandbox; the credential is bound to the
+  destinations named in `WHEEL_SANDBOX_AUTH_HOSTS`, so an allowlisted host that
+  is not a credential destination receives no credential header at all, and a
+  configured credential without that list is a startup failure;
 - bounds header bytes, request body, response body, connect time, and
   connection count, and returns a refusal instead of forwarding past a bound;
 - writes one JSON record per decision (destination, method, path, status,
@@ -1008,8 +1016,9 @@ The relay:
   header value or a body.
 
 `WHEEL_SANDBOX_TUNNEL_ONLY=1` relays opaque bytes with the same destination
-allowlist. It exists for protocols the relay cannot re-originate; it cannot
-inject a credential and makes no credential-isolation claim.
+allowlist. It exists for protocols the relay cannot re-originate; it neither
+reads nor injects a credential, needs no session certificate, and makes no
+credential-isolation claim.
 
 ### Three isolation tiers
 
@@ -1038,8 +1047,10 @@ container and gVisor/microVM tiers are for, and neither is implemented here.
   repository, so tracked files, `.git/config`, and build outputs are writable;
   only hooks and the listed credential-shaped paths are masked.
 - **Readable system trees.** `/etc` and `/usr` are readable, so hostnames,
-  package metadata, and distribution configuration are visible. No user secret
-  is stored there, but this is not a "no host file is readable" claim.
+  package metadata, and distribution configuration are visible. The backend
+  does not verify that every file under `/etc` is secret-free: a user who stores
+  a secret there exposes it to the session, and this is not a "no host file is
+  readable" claim.
 - **The relay.** It runs on the host as the same user, terminates TLS, and
   therefore sees provider traffic in plaintext; its socket is reachable by any
   process of that user. It removes the credential and the route from the

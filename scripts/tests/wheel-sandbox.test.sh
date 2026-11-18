@@ -24,8 +24,14 @@ readonly STUB
 REQUIRE="${WHEEL_SANDBOX_REQUIRE:-0}"
 
 SANDBOX_SCRATCH="${TMPDIR:-/tmp}/bitty"
-mkdir -p "$SANDBOX_SCRATCH"
-WORK="$(mktemp -d "$SANDBOX_SCRATCH/wheel-sandbox-test.XXXXXX")"
+if ! mkdir -p "$SANDBOX_SCRATCH"; then
+  printf 'FAIL cannot create the scratch base %s\n' "$SANDBOX_SCRATCH" >&2
+  exit 1
+fi
+if ! WORK="$(mktemp -d "$SANDBOX_SCRATCH/wheel-sandbox-test.XXXXXX")"; then
+  printf 'FAIL cannot create a test directory under %s\n' "$SANDBOX_SCRATCH" >&2
+  exit 1
+fi
 readonly WORK
 readonly FAKE_HOME="$WORK/home"
 readonly WS="$WORK/ws"
@@ -39,6 +45,7 @@ pass=0
 fail=0
 skip=0
 stub_pid=""
+stub_pids=()
 
 report_pass() {
   pass=$((pass + 1))
@@ -59,10 +66,13 @@ report_skip() {
 }
 
 cleanup() {
-  if [ -n "$stub_pid" ] && kill -0 "$stub_pid" 2>/dev/null; then
-    kill -TERM "$stub_pid" 2>/dev/null || true
-    wait "$stub_pid" 2>/dev/null || true
-  fi
+  local pid
+  for pid in "${stub_pids[@]+"${stub_pids[@]}"}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
   if [ -d "$WORK" ]; then
     rm -rf -- "$WORK"
   fi
@@ -96,9 +106,37 @@ expect_failure() {
   shift
   if output=$("$@" 2>&1); then
     report_fail "$description" "command succeeded: ${output%%$'\n'*}"
-  else
-    report_pass "$description"
+    return
   fi
+  # A launcher or setup failure is not evidence that the sandbox denied the
+  # operation; only a sandboxed command's own failure counts.
+  case $output in
+  *"wheel-sandbox:"* | *"wheel-sandbox-proxy:"* | *"bwrap: "*)
+    report_fail "$description" "the sandbox did not start: ${output%%$'\n'*}"
+    ;;
+  *)
+    report_pass "$description"
+    ;;
+  esac
+}
+
+expect_launcher_refusal() {
+  local description=$1 fragment=$2 output status
+  shift 2
+  output=$("$@" 2>&1)
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    report_fail "$description" "the launcher exited 0"
+    return
+  fi
+  case $output in
+  *"$fragment"*)
+    report_pass "$description"
+    ;;
+  *)
+    report_fail "$description" "saw: ${output%%$'\n'*}"
+    ;;
+  esac
 }
 
 expect_success() {
@@ -228,6 +266,13 @@ process_group() {
     in_sandbox 'setsid -w sh -c "exit 0"'
   expect_success "GNU timeout runs inside the sandbox" \
     in_sandbox 'timeout 10 sh -c "exit 0"'
+  local stdin_output
+  stdin_output=$(printf 'stdin-probe\n' | in_sandbox 'cat' 2>&1)
+  if [ "$stdin_output" = "stdin-probe" ]; then
+    report_pass "the sandboxed command keeps the caller's stdin"
+  else
+    report_fail "the sandboxed command keeps the caller's stdin" "saw: $stdin_output"
+  fi
   local procs
   procs=$(in_sandbox 'ps -o pid= 2>/dev/null | wc -l' 2>&1 | tr -d ' ')
   if [ "${procs:-0}" -ge 1 ] && [ "${procs:-0}" -lt 50 ]; then
@@ -241,9 +286,9 @@ network_group() {
   printf '\n# network confinement (default mode)\n'
 
   expect_failure "direct HTTPS egress fails without a route" \
-    in_sandbox 'curl -sS --max-time 8 https://example.com'
+    in_sandbox 'curl --noproxy "*" -sS --max-time 8 https://example.com'
   expect_failure "direct IP egress fails without a route" \
-    in_sandbox 'curl -sS --max-time 8 http://1.1.1.1'
+    in_sandbox 'curl --noproxy "*" -sS --max-time 8 http://1.1.1.1'
   expect_failure "DNS resolution has no resolver to reach" \
     in_sandbox 'getent hosts example.com'
 }
@@ -270,18 +315,21 @@ mint_stub_certificate() {
 }
 
 start_stub() {
-  STUB_EXPECT_AUTH="Bearer $SYNTHETIC_KEY" python3 "$STUB" \
+  local name=$1 expect=$2
+  : >"$WORK/$name.port"
+  STUB_EXPECT_AUTH="$expect" python3 "$STUB" \
     --cert "$WORK/stub.pem" --key "$WORK/stub.key" \
-    --port-file "$WORK/stub.port" --state "$WORK/stub.jsonl" \
-    --shutdown-marker "$WORK/stub.stopped" >"$WORK/stub.log" 2>&1 &
+    --port-file "$WORK/$name.port" --state "$WORK/$name.jsonl" \
+    --shutdown-marker "$WORK/$name.stopped" >"$WORK/$name.log" 2>&1 &
   stub_pid=$!
+  stub_pids+=("$stub_pid")
   local tries=0
-  while [ ! -s "$WORK/stub.port" ]; do
+  while [ ! -s "$WORK/$name.port" ]; do
     if ! kill -0 "$stub_pid" 2>/dev/null; then
       return 1
     fi
     tries=$((tries + 1))
-    if [ "$tries" -gt 100 ]; then
+    if [ "$tries" -gt 200 ]; then
       return 1
     fi
     sleep 0.05
@@ -304,12 +352,22 @@ proxy_group() {
     report_fail "mint the throwaway stub certificate"
     return
   fi
-  if ! start_stub; then
+  if ! start_stub primary "Bearer $SYNTHETIC_KEY"; then
     report_fail "start the loopback HTTPS stub"
     return
   fi
-  local port
-  port=$(cat "$WORK/stub.port")
+  local port primary_pid
+  port=$(cat "$WORK/primary.port")
+  primary_pid=$stub_pid
+
+  # A second allowlisted stub that is deliberately not an authorised credential
+  # destination: it must never see the provider key.
+  if ! start_stub other ""; then
+    report_fail "start the second loopback HTTPS stub"
+    return
+  fi
+  local other_port
+  other_port=$(cat "$WORK/other.port")
 
   local session="proxy-allow"
   local proxy_env=(
@@ -319,6 +377,7 @@ proxy_group() {
     "WHEEL_SANDBOX_WORKSPACE=$WS"
     "WHEEL_SANDBOX_KEEP=1"
     "WHEEL_SANDBOX_UPSTREAM_CA=$WORK/ca.pem"
+    "WHEEL_SANDBOX_AUTH_HOSTS=127.0.0.1:$port"
     "OPENCODE_GO_API_KEY=$SYNTHETIC_KEY"
   )
 
@@ -331,21 +390,39 @@ proxy_group() {
     report_fail "an allowlisted destination succeeds through the relay" "saw: $allowed_output"
   fi
 
-  if grep -q '"auth_matches":true' "$WORK/stub.jsonl" 2>/dev/null; then
+  if grep -q '"auth_matches":true' "$WORK/primary.jsonl" 2>/dev/null; then
     report_pass "the relay injects the credential the sandbox never receives"
   else
     report_fail "the relay injects the credential the sandbox never receives"
   fi
 
-  local key_seen
-  key_seen=$(in_sandbox 'env' 2>&1 | grep -c "$SYNTHETIC_KEY" || true)
-  if [ "${key_seen:-1}" -eq 0 ]; then
-    report_pass "the sandbox environment has no provider key in proxy mode"
+  # The credential is bound to its configured destination: an allowlisted host
+  # that is not in WHEEL_SANDBOX_AUTH_HOSTS must not receive it.
+  local other_output
+  other_output=$("${proxy_env[@]}" "$WRAPPER" --proxy \
+    --allow "127.0.0.1:$port,127.0.0.1:$other_port" \
+    --session "proxy-auth-scope" --exec -- \
+    sh -c "curl -sS --max-time 20 https://127.0.0.1:$other_port/v1/other" 2>&1)
+  if [ "$other_output" = '{"ok":true}' ] &&
+    grep -q '"auth_present":false' "$WORK/other.jsonl" 2>/dev/null; then
+    report_pass "an allowlisted host outside the credential scope receives no credential"
   else
-    report_fail "the sandbox environment has no provider key in proxy mode"
+    report_fail "an allowlisted host outside the credential scope receives no credential" \
+      "saw: $other_output"
   fi
 
-  local relay_log="$CACHE_BASE/$session/host/requests.jsonl"
+  local proxy_environment key_seen
+  proxy_environment=$("${proxy_env[@]}" "$WRAPPER" --proxy --allow "127.0.0.1:$port" \
+    --session "proxy-env" --exec -- sh -c 'env' 2>&1)
+  key_seen=$(printf '%s\n' "$proxy_environment" | grep -c "$SYNTHETIC_KEY" || true)
+  if [ "${key_seen:-1}" -eq 0 ] &&
+    ! printf '%s\n' "$proxy_environment" | grep -q '^OPENCODE_GO_API_KEY='; then
+    report_pass "the proxy-mode sandbox environment has no provider key"
+  else
+    report_fail "the proxy-mode sandbox environment has no provider key"
+  fi
+
+  local relay_log="$CACHE_BASE/proxy-allow/host/requests.jsonl"
   if [ -f "$relay_log" ] && ! grep -qF "$SYNTHETIC_KEY" "$relay_log"; then
     report_pass "the relay request log carries no credential value"
   else
@@ -380,7 +457,11 @@ proxy_group() {
   local interpreter
   interpreter=$(bash "$SCRIPT_DIR/../test-gate.sh" --print-selection)
   if [ "$interpreter" = "none" ]; then
-    report_skip "the harness curl transport needs a Lua interpreter"
+    if [ "$REQUIRE" = 1 ]; then
+      report_fail "the harness curl transport needs a Lua interpreter"
+    else
+      report_skip "the harness curl transport needs a Lua interpreter"
+    fi
   else
     cat >"$WS/provider-probe.lua" <<LUA
 package.path = "$REPO_ROOT/lua/?.lua;$REPO_ROOT/lua/?/init.lua;" .. package.path
@@ -410,7 +491,8 @@ LUA
 
   local egress_output
   egress_output=$("${proxy_env[@]}" "$WRAPPER" --proxy --allow "127.0.0.1:$port" \
-    --session "proxy-egress" --exec -- sh -c 'curl -sS --max-time 8 https://example.com' 2>&1)
+    --session "proxy-egress" --exec -- \
+    sh -c 'curl --noproxy "*" -sS --max-time 8 https://example.com' 2>&1)
   case $egress_output in
   *"{"* | *"<html"* | *"<HTML"*)
     report_fail "proxy mode has no direct egress outside the relay" "saw: $egress_output"
@@ -420,10 +502,20 @@ LUA
     ;;
   esac
 
-  kill -TERM "$stub_pid" 2>/dev/null || true
-  wait "$stub_pid" 2>/dev/null || true
-  stub_pid=""
-  if [ -f "$WORK/stub.stopped" ]; then
+  # Tunnel-only mode relays opaque bytes: no certificate, no injection.
+  local tunnel_output
+  tunnel_output=$("${proxy_env[@]}" "WHEEL_SANDBOX_TUNNEL_ONLY=1" "$WRAPPER" --proxy \
+    --allow "127.0.0.1:$port" --session "proxy-tunnel" --exec -- \
+    sh -c "curl -sk --max-time 20 https://127.0.0.1:$port/v1/tunnel; printf ' rc=%s' \$?" 2>&1)
+  if [ "$tunnel_output" = '{"ok":true} rc=0' ]; then
+    report_pass "tunnel-only mode relays without a session certificate"
+  else
+    report_fail "tunnel-only mode relays without a session certificate" "saw: $tunnel_output"
+  fi
+
+  kill -TERM "$primary_pid" 2>/dev/null || true
+  wait "$primary_pid" 2>/dev/null || true
+  if [ -f "$WORK/primary.stopped" ]; then
     report_pass "the stub shut down cleanly"
   else
     report_fail "the stub shut down cleanly"
@@ -433,39 +525,29 @@ LUA
 fail_closed_group() {
   printf '\n# fail-closed launcher behavior\n'
 
-  local output
-  output=$(WHEEL_SANDBOX_CACHE="$CACHE_BASE" "$WRAPPER" --proxy --exec -- true 2>&1)
-  case $output in
-  *allowlist*)
-    report_pass "proxy mode refuses an empty allowlist"
-    ;;
-  *)
-    report_fail "proxy mode refuses an empty allowlist" "saw: $output"
-    ;;
-  esac
+  expect_launcher_refusal "proxy mode refuses an empty allowlist" "allowlist" \
+    env "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "$WRAPPER" --proxy --exec -- true
 
-  output=$(WHEEL_SANDBOX_CACHE="$CACHE_BASE" "$WRAPPER" --workspace / --exec -- true 2>&1)
-  case $output in
-  *refusing*)
-    report_pass "the launcher refuses to bind / as a workspace"
-    ;;
-  *)
-    report_fail "the launcher refuses to bind / as a workspace" "saw: $output"
-    ;;
-  esac
+  expect_launcher_refusal "proxy mode refuses a configured credential without a destination" \
+    "WHEEL_SANDBOX_AUTH_HOSTS" \
+    env "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "OPENCODE_GO_API_KEY=synthetic-$RANDOM" \
+    "$WRAPPER" --proxy --allow 127.0.0.1:443 --exec -- true
 
-  output=$(HOME="$FAKE_HOME" WHEEL_SANDBOX_CACHE="$CACHE_BASE" \
-    "$WRAPPER" --workspace "$FAKE_HOME" --exec -- true 2>&1)
-  case $output in
-  *home*)
-    report_pass "the launcher refuses to use the owner's home as a workspace"
-    ;;
-  *)
-    report_fail "the launcher refuses to use the owner's home as a workspace" "saw: $output"
-    ;;
-  esac
+  expect_launcher_refusal "the launcher refuses a wildcard allowlist" "wildcard" \
+    env "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "$WRAPPER" --proxy --allow "*" --exec -- true
+
+  expect_launcher_refusal "the launcher refuses to bind / as a workspace" "refusing" \
+    env "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "$WRAPPER" --workspace / --exec -- true
+
+  expect_launcher_refusal "the launcher refuses the owner's home as a workspace" "home" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+    "$WRAPPER" --workspace "$FAKE_HOME" --exec -- true
+
+  expect_launcher_refusal "the launcher refuses a workspace inside a credential store" \
+    "protected credential" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+    "$WRAPPER" --workspace "$FAKE_HOME/.ssh" --exec -- true
 }
-
 require_backend
 prepare_fixtures
 filesystem_group

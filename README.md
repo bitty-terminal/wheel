@@ -56,7 +56,8 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
 - **What the session gets:** the workspace read-write at its own path, one
   per-session scratch directory mounted at `/cache` (and exported as `TMPDIR`,
   `CARGO_HOME`, and the `XDG_*` roots), read-only `/usr`, `/etc`, `/bin`,
-  `/sbin`, `/lib`, `/lib64`, a private `/proc`, a fresh `/tmp`, and a private
+  `/sbin`, `/lib`, `/lib64` (plus the harness tree itself, read-only, when it
+  lives outside the workspace), a private `/proc`, a fresh `/tmp`, and a private
   PID/UTS/IPC/user namespace. Nothing else is mounted, so `$HOME` (unset), SSH
   and cloud credentials, `~/.config/wheel`, shell rc files, `.git/hooks`,
   `.mcp.json`, the Wayland/D-Bus sockets, `/run/user/*`, and the
@@ -65,8 +66,9 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   route. `--proxy` adds the single road out: a host-side CONNECT relay over a
   bind-mounted Unix socket with a default-deny allowlist
   (`WHEEL_SANDBOX_ALLOW`), per-request logging, bounds, and relay-side
-  credential injection, so `OPENCODE_GO_API_KEY` never enters the sandbox
-  environment.
+  credential injection bound to `WHEEL_SANDBOX_AUTH_HOSTS`, so
+  `OPENCODE_GO_API_KEY` never enters the sandbox environment and never reaches
+  a host outside that list.
 - **Fail-closed:** the launcher refuses to start when `bwrap` is missing and
   never falls back to an unsandboxed run.
 - **Configuration continuity:** inside the sandbox the harness starts with an
@@ -75,7 +77,9 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   relay's job.
 - **Requirements and evidence:** `bwrap`, `python3` for proxy mode, and
   `openssl` for proxy-mode session certificates. `just test-sandbox` runs the
-  escape tests; `SECURITY-MODEL.md` records what is still unprotected.
+  escape tests; `WHEEL_SANDBOX_REQUIRE=1 just test-sandbox` runs them as a hard
+  gate instead of skipping without `bwrap`. `SECURITY-MODEL.md` records what is
+  still unprotected.
 - **Platforms:** Linux native today. macOS is supported at the core level, but
   its sandbox backend (Seatbelt) is not implemented yet and `--sandbox` fails
   closed there. Windows is supported **only through WSL2**; native Windows fails
