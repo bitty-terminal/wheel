@@ -37,8 +37,8 @@ Or run the standalone daily-driver CLI (`scripts/wheel`):
 ./scripts/wheel config show               # show effective config with precedence metadata
 ./scripts/wheel auth set opencode-go      # store credential via stdin/tty into $XDG_DATA_HOME/wheel/credentials.json (0600)
 ./scripts/wheel ask "Summarize this repo" # single-turn completion
-./scripts/wheel run "Fix failing tests"   # ReAct tool-loop run with interactive allow/ask/deny gate
-./scripts/wheel chat                      # interactive REPL (/model, /think, /provider, /exit)
+./scripts/wheel run --max-turns 24 "Fix failing tests"  # ReAct tool-loop run with interactive allow/ask/deny gate
+./scripts/wheel chat                      # interactive REPL (/thinking, /exit)
 ```
 
 - **Gate interpreter:** Lua 5.1 (`lua5.1` primary release gate; `luajit` and `lua` development fallbacks with JIT disabled for evaluated project-config chunks).
@@ -47,6 +47,27 @@ Or run the standalone daily-driver CLI (`scripts/wheel`):
 ## Commands
 
 Wheel exposes 14 commands declared in `lua/wheel/init.lua` (`M.command_catalog`). Every command validates arguments against a closed schema before running and returns a bounded `{ title, body }` projection (`title <= 64` bytes, `body <= 8000` bytes).
+
+### Daily-driver CLI flags
+
+`wheel ask`, `wheel run`, and `wheel chat` accept the flags below. Each subcommand prints its own usage with `wheel ask --help`, `wheel run -h`, `wheel chat --help`, or `wheel help <command>`, and exits 0 without contacting the provider. Unknown options are usage errors (exit 2), never prompt text.
+
+| Flag                     | Commands             | Behaviour                                                                                                                     |
+| ------------------------ | -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `--provider <name>`      | `ask`, `run`, `chat` | Selects a built-in provider template; defaults to the configured provider.                                                    |
+| `--model <name>`         | `ask`, `run`, `chat` | Model name or `provider/model`; outranks role config and the provider default (see model precedence below).                   |
+| `--thinking <gear>`      | `ask`, `run`, `chat` | Thinking gear: `off`, `low`, `medium`, `high`, or `max`.                                                                      |
+| `--stream`/`--no-stream` | `ask`                | Stream the response (default) or wait for the complete response.                                                              |
+| `--workspace <dir>`      | `run`                | Workspace root for tools; defaults to the current directory.                                                                  |
+| `--approval-mode <m>`    | `run`                | `prompt` (default), `dashboard`, or `auto-deny`.                                                                              |
+| `--auto-deny`            | `run`                | Shorthand for `--approval-mode auto-deny`.                                                                                    |
+| `--max-turns <n>`        | `run`                | Turn budget, integer `1..200`, default `24`.                                                                                  |
+| `--trace`, `--verbose`   | `run`                | Print one stderr line per tool call: tool name, outcome status, exit code, stdout/stderr byte counts, first observation line. |
+| `--`                     | all                  | End option parsing; everything after it is prompt/task text.                                                                  |
+
+**Model precedence** (resolved once in `WheelAgent.resolve_model`): `--model` (string, `provider/model`, or table) → `roles.<role>.model` from configuration **only when it belongs to the active provider** (an explicit provider claim, a `provider/model` prefix, or a model without a claim inheriting the role's default provider family) → the provider's effective default model (provider config `model`, then template default). A `provider/model` prefix selects that provider unless `--provider` names a different one, which is a usage error.
+
+`wheel run` exit codes: `0` the model produced a final answer inside the turn budget; `1` provider, persistence, or run failure; `2` usage/validation error; `3` turn budget exhausted before a final answer (workspace changes already written are kept, the run is not resumed, and this is not a provider or tool failure).
 
 | Command       | Invocation                         | Arguments schema                                                       | Result contract   |
 | ------------- | ---------------------------------- | ---------------------------------------------------------------------- | ----------------- |

@@ -492,12 +492,185 @@ function WheelAgent.validate_model_profile(profile)
   return true, nil
 end
 
+--- Resolve a built-in provider template name, or nil when the value is not
+--- one of Wheel's known providers.
+local function known_provider_name(name)
+  if type(name) ~= "string" or name == "" then return nil end
+  if WheelProvider and type(WheelProvider.get_template) == "function"
+    and WheelProvider.get_template(name) then
+    return string.lower(name)
+  end
+  return nil
+end
+
+--- Split a `provider/model` string when the prefix names a built-in provider.
+--- Model names that contain a slash but no known provider prefix (for example
+--- an OpenRouter catalogue id) stay intact.
+--- @param value any
+--- @return string? provider, string? model
+function WheelAgent.split_provider_model(value)
+  if type(value) ~= "string" then return nil, nil end
+  local prefix, rest = value:match("^([%w%-_%.]+)/(.+)$")
+  if not prefix or rest == "" then return nil, nil end
+  local known = known_provider_name(prefix)
+  if not known then return nil, nil end
+  return known, rest
+end
+
+--- Resolve the model profile for a role.
+---
+--- Precedence (first match wins):
+---   1. `opts.model_profile` (complete explicit profile override)
+---   2. `opts.model` (the `--model` CLI flag): string, `provider/model`, or table
+---   3. `config.roles[role].model_profile`, but only when its provider matches
+---      the active provider (or it names none)
+---   4. `config.roles[role].model`, but only when it belongs to the active
+---      provider (an explicit provider claim or `provider/model` prefix must
+---      match the active provider)
+---   5. `opts.provider_default_model` (the effective provider model the caller
+---      resolved from provider config and the provider template default)
+---
+--- The built-in role default profile supplies the remaining fields and is the
+--- model fallback only when no provider default model is available.
+---
+--- Without an active provider (library callers that supply no adapter and no
+--- `provider_name`) the role default profile is returned unchanged.
+--- @param role string
+--- @param opts table
+--- @return table? profile, string? error_reason
+function WheelAgent.resolve_model(role, opts)
+  opts = opts or {}
+  local cfg = opts.config
+  local role_cfg = (type(cfg) == "table" and type(cfg.roles) == "table" and cfg.roles[role]) or {}
+
+  local active_provider
+  if type(opts.provider_name) == "string" and opts.provider_name ~= "" then
+    active_provider = string.lower(opts.provider_name)
+  elseif type(opts.provider) == "table" then
+    local candidate = opts.provider.provider_name or opts.provider.name
+    if type(candidate) == "string" and candidate ~= "" then
+      active_provider = string.lower(candidate)
+    end
+  end
+
+  local provider_default_model = opts.provider_default_model
+  if provider_default_model == nil and active_provider and WheelProvider then
+    local tmpl = WheelProvider.get_template(active_provider)
+    provider_default_model = tmpl and tmpl.default_model or nil
+  end
+
+  local profile = WheelAgent.get_default_model_profile(role)
+
+  -- Apply a model value (string, `provider/model`, or table) to the profile.
+  local function apply_model(m)
+    if type(m) == "table" then
+      local name = m.name or m.model
+      if type(name) == "string" and name ~= "" then profile.model = name end
+      if m.provider ~= nil and m.provider ~= "" then
+        profile.provider = known_provider_name(m.provider) or m.provider
+      end
+      if m.temperature ~= nil then profile.temperature = m.temperature end
+      return true
+    end
+    if type(m) == "string" and m ~= "" then
+      local pref, rest = WheelAgent.split_provider_model(m)
+      if pref then
+        profile.provider = pref
+        profile.model = rest
+      else
+        profile.model = m
+      end
+      return true
+    end
+    return false
+  end
+
+  -- 1. Complete explicit profile.
+  if opts.model_profile ~= nil then
+    local ok_val, val_err = WheelAgent.validate_model_profile(opts.model_profile)
+    if not ok_val then
+      return nil, "Invalid model_profile: " .. tostring(val_err)
+    end
+    for k, v in pairs(opts.model_profile) do profile[k] = v end
+    return profile, nil
+  end
+
+  -- 2. The explicit `--model` flag wins over every configuration layer.
+  if opts.model ~= nil and apply_model(opts.model) then
+    local claimed_provider
+    if type(opts.model) == "table" then
+      claimed_provider = opts.model.provider
+    elseif type(opts.model) == "string" then
+      claimed_provider = WheelAgent.split_provider_model(opts.model)
+    end
+    if active_provider and (claimed_provider == nil or claimed_provider == "") then
+      profile.provider = active_provider
+    end
+    return profile, nil
+  end
+
+  -- 3. Role model profile from configuration, accepted only when its provider
+  -- matches the active provider (or it names no provider).
+  if role_cfg.model_profile ~= nil then
+    local ok_val, val_err = WheelAgent.validate_model_profile(role_cfg.model_profile)
+    if not ok_val then
+      return nil, "Invalid role model_profile: " .. tostring(val_err)
+    end
+    local cfg_provider = role_cfg.model_profile.provider
+    if not active_provider or cfg_provider == nil
+      or (type(cfg_provider) == "string" and string.lower(cfg_provider) == active_provider)
+    then
+      for k, v in pairs(role_cfg.model_profile) do profile[k] = v end
+      return profile, nil
+    end
+  end
+
+  -- 4. Role model, accepted only when it belongs to the active provider. A
+  -- model without an explicit provider claim inherits the role default
+  -- provider family; a model that names another provider is ignored so it can
+  -- never override the active provider's model (the "claude model sent to
+  -- OpenCode Go" defect class).
+  if role_cfg.model ~= nil then
+    local m = role_cfg.model
+    local claimed_provider
+    if type(m) == "table" then
+      claimed_provider = m.provider
+    elseif type(m) == "string" then
+      claimed_provider = WheelAgent.split_provider_model(m)
+    end
+    local belongs = true
+    if active_provider then
+      if claimed_provider == nil or claimed_provider == "" then
+        claimed_provider = profile.provider
+      end
+      belongs = type(claimed_provider) == "string"
+        and string.lower(claimed_provider) == active_provider
+    end
+    if belongs and apply_model(m) then
+      if active_provider then profile.provider = active_provider end
+      return profile, nil
+    end
+  end
+
+  -- 5/6. The effective provider model outranks the built-in role default. The
+  -- role default only survives when the provider has no default model.
+  if active_provider then
+    if type(provider_default_model) == "string" and provider_default_model ~= "" then
+      profile.model = provider_default_model
+    end
+    profile.provider = active_provider
+  end
+  return profile, nil
+end
+
 --- Create a new Agent instance.
 --- @param opts table
 ---   opts.name string: Agent identity (e.g. "commander-01", "worker-coding-01")
 ---   opts.role string: One of WheelAgent.Role
 ---   opts.kernel table: WheelKernel instance
----   opts.model table?: Model config { name = string, temperature = number }
+---   opts.model string|table?: Model name, `provider/model`, or { name, provider, temperature }
+---   opts.provider_name string?: Active provider name used for model precedence
+---   opts.provider_default_model string?: Effective provider model used as the last fallback
 ---   opts.model_profile table?: Heterogeneous model profile table
 ---   opts.tools table?: List of allowed tool names
 ---   opts.budget table?: Budget limits { max_iterations = number, max_tokens = number }
@@ -567,28 +740,18 @@ local function new_agent(opts, issued_binding)
   -- Role config resolution from opts.config if present
   local role_cfg = (opts.config and opts.config.roles and opts.config.roles[role_binding.role]) or {}
 
-  -- Model profile resolution (heterogeneous model profile support)
-  local default_profile = WheelAgent.get_default_model_profile(role_binding.role)
-  local user_profile = opts.model_profile or (role_cfg and role_cfg.model_profile)
-  if user_profile then
-    local ok_val, val_err = WheelAgent.validate_model_profile(user_profile)
-    if not ok_val then
-      error("Invalid model_profile for agent '" .. self.name .. "': " .. tostring(val_err))
-    end
-    for k, v in pairs(user_profile) do
-      default_profile[k] = v
-    end
-  elseif opts.model or (role_cfg and role_cfg.model) then
-    local m = opts.model or role_cfg.model
-    if type(m) == "table" then
-      default_profile.model = m.name or m.model or default_profile.model
-      if m.temperature ~= nil then
-        default_profile.temperature = m.temperature
-      end
-      if m.provider ~= nil then
-        default_profile.provider = m.provider
-      end
-    end
+  -- Model profile resolution is defined once in WheelAgent.resolve_model so the
+  -- CLI `--model` flag, role configuration, and provider defaults agree.
+  local default_profile, profile_err = WheelAgent.resolve_model(role_binding.role, {
+    model = opts.model,
+    model_profile = opts.model_profile,
+    provider = opts.provider,
+    provider_name = opts.provider_name,
+    provider_default_model = opts.provider_default_model,
+    config = opts.config,
+  })
+  if not default_profile then
+    error("Invalid model profile for agent '" .. self.name .. "': " .. tostring(profile_err))
   end
   self.model_profile = default_profile
 

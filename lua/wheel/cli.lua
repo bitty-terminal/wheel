@@ -14,6 +14,20 @@ local WheelRunner = require("wheel.runner")
 
 local WheelCLI = {}
 
+-- `wheel run` turn budget. A turn is one model request plus any tool calls it
+-- requests; the run ends successfully only when the model answers without a
+-- further tool call, so the budget bounds unfinished work, not completed work.
+WheelCLI.MAX_TURNS_DEFAULT = 24
+WheelCLI.MAX_TURNS_MIN = 1
+WheelCLI.MAX_TURNS_MAX = 200
+
+-- Distinct exit code for "turn budget exhausted, state kept". `1` stays the
+-- provider/tool failure code and `2` the usage/validation code.
+WheelCLI.EXIT_BUDGET_EXHAUSTED = 3
+
+-- Bytes of the first observation line shown by `--trace`.
+local TRACE_PREVIEW_BYTES = 120
+
 local function trim(s)
   if type(s) ~= "string" then return "" end
   return (s:gsub("^%s+", ""):gsub("%s+$", ""))
@@ -506,25 +520,80 @@ local function cmd_auth(args, io_ctx)
   return 2
 end
 
-local function parse_runtime_flags(args)
+--- True when the argument list asks for command help. `--` ends flag parsing,
+--- so a prompt that starts with a dash can still use a literal `--help` token.
+local function wants_help(args)
+  for _, a in ipairs(args) do
+    if a == "--" then return false end
+    if a == "--help" or a == "-h" then return true end
+  end
+  return false
+end
+
+local function parse_max_turns(raw)
+  if type(raw) ~= "string" or not raw:match("^%d+$") then
+    return nil, string.format("--max-turns expects an integer between %d and %d",
+      WheelCLI.MAX_TURNS_MIN, WheelCLI.MAX_TURNS_MAX)
+  end
+  local value = tonumber(raw)
+  if not value or value < WheelCLI.MAX_TURNS_MIN or value > WheelCLI.MAX_TURNS_MAX then
+    return nil, string.format("--max-turns expects an integer between %d and %d",
+      WheelCLI.MAX_TURNS_MIN, WheelCLI.MAX_TURNS_MAX)
+  end
+  return value, nil
+end
+
+--- Parse runtime flags. Unknown options are errors (never prompt text); the
+--- `features` set selects the options a subcommand accepts.
+--- @param args string[]
+--- @param features table? { workspace, approval, max_turns, trace }
+--- @return table? opts, string? error_message
+local function parse_runtime_flags(args, features)
+  features = features or {}
   local opts = {
     stream = true,
     positional = {},
   }
+  local function take_value(flag, index)
+    local value = args[index + 1]
+    if value == nil or value == "" then
+      return nil, flag .. " requires a value"
+    end
+    return value
+  end
+  local function reject(flag)
+    return nil, string.format("unknown option '%s' (see 'wheel <command> --help')", flag)
+  end
   local i = 1
+  local end_of_flags = false
   while i <= #args do
     local a = args[i]
-    if a == "--provider" and args[i + 1] then
-      opts.provider = args[i + 1]
+    if end_of_flags then
+      table.insert(opts.positional, a)
+      i = i + 1
+    elseif a == "--" then
+      end_of_flags = true
+      i = i + 1
+    elseif a == "--provider" then
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      opts.provider = value
       i = i + 2
-    elseif a == "--model" and args[i + 1] then
-      opts.model = args[i + 1]
+    elseif a == "--model" then
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      opts.model = value
       i = i + 2
-    elseif a == "--thinking" and args[i + 1] then
-      opts.thinking = args[i + 1]
+    elseif a == "--thinking" then
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      opts.thinking = value
       i = i + 2
-    elseif a == "--workspace" and args[i + 1] then
-      opts.workspace = args[i + 1]
+    elseif a == "--workspace" then
+      if not features.workspace then return reject(a) end
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      opts.workspace = value
       i = i + 2
     elseif a == "--no-stream" then
       opts.stream = false
@@ -533,17 +602,45 @@ local function parse_runtime_flags(args)
       opts.stream = true
       i = i + 1
     elseif a == "--auto-deny" then
+      if not features.approval then return reject(a) end
       opts.approval_mode = "auto-deny"
       i = i + 1
-    elseif a == "--approval-mode" and args[i + 1] then
-      opts.approval_mode = args[i + 1]
+    elseif a == "--approval-mode" then
+      if not features.approval then return reject(a) end
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      if value ~= "prompt" and value ~= "dashboard" and value ~= "auto-deny" then
+        return nil, "invalid approval_mode: expected prompt, dashboard, or auto-deny"
+      end
+      opts.approval_mode = value
       i = i + 2
+    elseif a == "--max-turns" then
+      if not features.max_turns then return reject(a) end
+      local value, err = take_value(a, i)
+      if not value then return nil, err end
+      local turns, parse_err = parse_max_turns(value)
+      if not turns then return nil, parse_err end
+      opts.max_turns = turns
+      i = i + 2
+    elseif a == "--trace" or a == "--verbose" then
+      if not features.trace then return reject(a) end
+      opts.trace = true
+      i = i + 1
+    elseif a:sub(1, 1) == "-" and a ~= "-" then
+      return reject(a)
     else
       table.insert(opts.positional, a)
       i = i + 1
     end
   end
-  return opts
+  if opts.model ~= nil and opts.provider ~= nil then
+    local prefix = WheelAgent.split_provider_model(opts.model)
+    if prefix and string.lower(opts.provider) ~= prefix then
+      return nil, string.format("--model prefix '%s' conflicts with --provider '%s'",
+        prefix, opts.provider)
+    end
+  end
+  return opts, nil
 end
 
 local function build_provider_from_cli(parsed, io_ctx)
@@ -563,9 +660,21 @@ local function build_provider_from_cli(parsed, io_ctx)
   end
   local cfg = eff.config
   local pname = string.lower(parsed.provider or cfg.default_provider or "opencode-go")
+  local model = parsed.model
+  -- A `provider/model` value selects the provider unless --provider names a
+  -- different one; a bare model string keeps the selected provider.
+  local model_provider, model_name = WheelAgent.split_provider_model(parsed.model)
+  if model_provider then
+    if parsed.provider ~= nil and string.lower(parsed.provider) ~= model_provider then
+      return nil, nil, string.format("--model prefix '%s' conflicts with --provider '%s'",
+        model_provider, tostring(parsed.provider))
+    end
+    pname = model_provider
+    model = model_name
+  end
   local pcfg = (type(cfg.providers) == "table" and cfg.providers[pname]) or {}
   local tmpl = WheelProvider.get_template(pname)
-  local model = parsed.model or pcfg.model or cfg.default_model or (tmpl and tmpl.default_model)
+  model = model or pcfg.model or cfg.default_model or (tmpl and tmpl.default_model)
   local thinking = parsed.thinking or pcfg.thinking or WheelConfig.effective_thinking(cfg)
   local api_key = WheelConfig.resolve_api_key(pname, {
     env = io_ctx.env,
@@ -601,8 +710,90 @@ local function build_provider_from_cli(parsed, io_ctx)
   }, nil
 end
 
+local COMMAND_USAGE = {
+  ask = [[Usage: wheel ask [options] <prompt>
+
+Send one prompt through the resolved provider.
+
+Options:
+  --provider <name>   Provider template (default: configured provider)
+  --model <name>      Model name or provider/model; overrides role and template defaults
+  --thinking <gear>   Thinking gear: off | low | medium | high | max
+  --stream            Stream the response (default)
+  --no-stream         Wait for the complete response
+  -h, --help          Show this help and exit]],
+  run = [[Usage: wheel run [options] <task>
+
+Run an agent task with tool approval gating.
+
+Options:
+  --provider <name>   Provider template (default: configured provider)
+  --model <name>      Model name or provider/model; overrides role and template defaults
+  --thinking <gear>   Thinking gear: off | low | medium | high | max
+  --workspace <dir>   Workspace root for tools (default: current directory)
+  --approval-mode <m> prompt | dashboard | auto-deny
+  --auto-deny         Shorthand for --approval-mode auto-deny
+  --max-turns <n>     Turn budget, 1..200 (default: 24)
+  --trace, --verbose  Print each tool call to stderr
+  -h, --help          Show this help and exit]],
+  chat = [[Usage: wheel chat [options]
+
+Start a multi-turn interactive chat session.
+
+Options:
+  --provider <name>   Provider template (default: configured provider)
+  --model <name>      Model name or provider/model; overrides role and template defaults
+  --thinking <gear>   Thinking gear: off | low | medium | high | max
+  -h, --help          Show this help and exit]],
+}
+
+--- Print documented usage for one subcommand. Returns the exit code (0).
+local function print_command_usage(name, io_ctx)
+  local text = COMMAND_USAGE[name]
+  if text then
+    io_ctx.println(text)
+  end
+  return 0
+end
+
+local function first_line(text)
+  if type(text) ~= "string" then return "" end
+  local line = text:match("^[^\n]*") or ""
+  if #line > TRACE_PREVIEW_BYTES then
+    line = line:sub(1, TRACE_PREVIEW_BYTES - 3) .. "..."
+  end
+  return line
+end
+
+--- Emit one stderr trace line per tool call so a failed run is debuggable
+--- from the log alone. stdout is never touched.
+local function trace_tool_result(io_ctx, tool_call, outcome)
+  local status = outcome and outcome.status
+  if type(status) ~= "string" or status == "" then
+    status = (outcome and outcome.success) and "success" or "failure"
+  end
+  local observation = ""
+  if outcome and type(outcome.format_observation) == "function" then
+    local ok_obs, text = pcall(outcome.format_observation, outcome)
+    if ok_obs then observation = first_line(text) end
+  end
+  io_ctx.errln(string.format(
+    "[wheel trace] tool=%s status=%s exit=%s out=%sB err=%sB %s",
+    tostring((tool_call and tool_call.name) or (outcome and outcome.tool) or "tool"),
+    status,
+    tostring(outcome and outcome.exit_code or 0),
+    tostring(outcome and outcome.stdout_bytes or 0),
+    tostring(outcome and outcome.stderr_bytes or 0),
+    observation))
+end
+
 local function cmd_ask(args, io_ctx)
-  local parsed = parse_runtime_flags(args)
+  if wants_help(args) then return print_command_usage("ask", io_ctx) end
+  local parsed, parse_err = parse_runtime_flags(args)
+  if not parsed then
+    io_ctx.errln("wheel ask: " .. tostring(parse_err))
+    return 2
+  end
   local prompt = trim(table.concat(parsed.positional, " "))
   if prompt == "" then
     io_ctx.errln("Usage: wheel ask [--provider P] [--model M] [--thinking G] [--no-stream] <prompt>")
@@ -653,10 +844,21 @@ local function cmd_ask(args, io_ctx)
 end
 
 local function cmd_run(args, io_ctx)
-  local parsed = parse_runtime_flags(args)
+  if wants_help(args) then return print_command_usage("run", io_ctx) end
+  local parsed, parse_err = parse_runtime_flags(args, {
+    workspace = true,
+    approval = true,
+    max_turns = true,
+    trace = true,
+  })
+  if not parsed then
+    io_ctx.errln("wheel run: " .. tostring(parse_err))
+    return 2
+  end
   local task_desc = trim(table.concat(parsed.positional, " "))
   if task_desc == "" then
-    io_ctx.errln("Usage: wheel run [--provider P] [--model M] [--thinking G] [--workspace DIR] [--approval-mode prompt|dashboard|auto-deny] <task>")
+    io_ctx.errln("Usage: wheel run [--provider P] [--model M] [--thinking G] [--workspace DIR]"
+      .. " [--approval-mode prompt|dashboard|auto-deny] [--max-turns N] [--trace] <task>")
     return 2
   end
   local adapter, meta, err = build_provider_from_cli(parsed, io_ctx)
@@ -684,6 +886,9 @@ local function cmd_run(args, io_ctx)
     tool_registry = registry,
     workspace = { root = workspace_root },
     provider = adapter,
+    provider_name = meta.provider_name,
+    provider_default_model = meta.model,
+    model = parsed.model,
     permission_gate = gate,
     config = meta.config,
   })
@@ -694,23 +899,34 @@ local function cmd_run(args, io_ctx)
     priority = 1,
   })
   local report = WheelRunner.run_task(agent, task, {
-    max_turns = 12,
+    max_turns = parsed.max_turns or WheelCLI.MAX_TURNS_DEFAULT,
     on_token = function(delta, kind)
       if kind == "content" and delta then
         io_ctx.out(delta)
       end
     end,
+    on_tool_result = parsed.trace and function(tool_call, outcome)
+      trace_tool_result(io_ctx, tool_call, outcome)
+    end or nil,
   })
   if report.success then
     io_ctx.out("\n")
     return 0
   end
   io_ctx.errln("wheel run: " .. tostring(report.error or "task failed"))
+  if report.error_code == WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED then
+    return WheelCLI.EXIT_BUDGET_EXHAUSTED
+  end
   return 1
 end
 
 local function cmd_chat(args, io_ctx)
-  local parsed = parse_runtime_flags(args)
+  if wants_help(args) then return print_command_usage("chat", io_ctx) end
+  local parsed, parse_err = parse_runtime_flags(args)
+  if not parsed then
+    io_ctx.errln("wheel chat: " .. tostring(parse_err))
+    return 2
+  end
   local adapter, meta, err = build_provider_from_cli(parsed, io_ctx)
   if not adapter then
     io_ctx.errln("wheel chat: " .. tostring(err))
@@ -812,17 +1028,50 @@ Commands:
   approvals   Inspect or resolve pending Dashboard approvals (list | resolve)
   ask         Send a prompt using resolved provider and thinking settings
   run         Run an agent task with tool approval gating
-  chat        Start a multi-turn interactive chat session]])
+  chat        Start a multi-turn interactive chat session
+  help        Show this help, or 'wheel help <command>' for one command
+
+Global options:
+  -h, --help  Show this help and exit
+  --           End option parsing; everything after it is prompt/task text]])
 end
+
+local KNOWN_COMMANDS = {
+  init = true,
+  providers = true,
+  config = true,
+  auth = true,
+  approvals = true,
+  ask = true,
+  run = true,
+  chat = true,
+}
 
 --- Entry point callable from both `scripts/wheel` and offline unit tests.
 function WheelCLI.main(argv, harness)
   local io_ctx = make_io(harness)
   local list = collect_args_list(argv)
   local cmd = list[1]
-  if not cmd or cmd == "-h" or cmd == "--help" or cmd == "help" then
+  if not cmd or cmd == "-h" or cmd == "--help" then
     print_usage(io_ctx)
     return 0
+  end
+  if cmd == "help" then
+    local topic = list[2]
+    if topic == nil then
+      print_usage(io_ctx)
+      return 0
+    end
+    if COMMAND_USAGE[topic] then
+      return print_command_usage(topic, io_ctx)
+    end
+    if KNOWN_COMMANDS[topic] then
+      print_usage(io_ctx)
+      return 0
+    end
+    io_ctx.errln("wheel: unknown command '" .. tostring(topic) .. "'")
+    print_usage(io_ctx)
+    return 2
   end
   local rest = {}
   for i = 2, #list do
