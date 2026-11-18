@@ -17,8 +17,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and exit 0 without contacting the provider. Unknown options are usage errors
   (exit 2) instead of being sent to the model as prompt text.
 - `wheel run --max-turns <1..200>` (default 24) bounds the ReAct loop. Budget
-  exhaustion exits `3` with a message that reports kept state and distinguishes
-  it from provider/tool failures; completed runs still exit `0`.
+  exhaustion exits `3` with a message that reports the exhaustion honestly and
+  distinguishes it from provider/tool failures; already-written workspace
+  changes remain, but the run is not resumed. Completed runs still exit `0`.
 - `wheel run --trace` (alias `--verbose`) prints one stderr line per tool call
   with tool name, outcome status, exit code, byte counts, and the first
   observation line. Default output is unchanged.

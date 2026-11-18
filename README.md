@@ -67,7 +67,7 @@ Wheel exposes 14 commands declared in `lua/wheel/init.lua` (`M.command_catalog`)
 
 **Model precedence** (resolved once in `WheelAgent.resolve_model`): `--model` (string, `provider/model`, or table) → `roles.<role>.model` from configuration **only when it belongs to the active provider** (an explicit provider claim, a `provider/model` prefix, or a model without a claim inheriting the role's default provider family) → the provider's effective default model (provider config `model`, then template default). A `provider/model` prefix selects that provider unless `--provider` names a different one, which is a usage error.
 
-`wheel run` exit codes: `0` the model produced a final answer inside the turn budget; `1` provider, persistence, or run failure; `2` usage/validation error; `3` turn budget exhausted before a final answer (checkpoints and workspace changes are kept — this is not a provider or tool failure).
+`wheel run` exit codes: `0` the model produced a final answer inside the turn budget; `1` provider, persistence, or run failure; `2` usage/validation error; `3` turn budget exhausted before a final answer (workspace changes already written are kept, the run is not resumed, and this is not a provider or tool failure).
 
 | Command       | Invocation                         | Arguments schema                                                       | Result contract   |
 | ------------- | ---------------------------------- | ---------------------------------------------------------------------- | ----------------- |

@@ -170,6 +170,41 @@ local ok_all, test_err = pcall(function()
     assert(p_bare.model == "deepseek-v4.1-flash" and p_bare.provider == "opencode-go",
       "bare role model without a matching provider family must fall back to the provider default")
 
+    -- A foreign-provider role model_profile is ignored like a foreign model.
+    local p_foreign_profile = WheelAgent.resolve_model(coding, {
+      provider_name = "opencode-go",
+      provider_default_model = "deepseek-v4.1-flash",
+      config = {
+        roles = {
+          [coding] = { model_profile = { provider = "anthropic", model = "claude-3-7-sonnet" } },
+        },
+      },
+    })
+    assert(p_foreign_profile.model == "deepseek-v4.1-flash",
+      "role model_profile from another provider must not override the active provider model")
+
+    local p_matching_profile = WheelAgent.resolve_model(coding, {
+      provider_name = "opencode-go",
+      provider_default_model = "deepseek-v4.1-flash",
+      config = {
+        roles = {
+          [coding] = { model_profile = { provider = "opencode-go", model = "go-profile-model" } },
+        },
+      },
+    })
+    assert(p_matching_profile.model == "go-profile-model",
+      "role model_profile for the active provider must be kept")
+
+    -- The effective provider model outranks the built-in role default even when
+    -- the role default names the same provider family.
+    local p_same_family = WheelAgent.resolve_model(coding, {
+      provider_name = "anthropic",
+      provider_default_model = "configured-anthropic-model",
+    })
+    assert(p_same_family.model == "configured-anthropic-model"
+      and p_same_family.provider == "anthropic",
+      "the configured provider model must win over the hardcoded role default")
+
     -- --model outranks a belonging role config model.
     local p_flag = resolve("flag-model", { name = "deepseek-reasoner", provider = "opencode-go" })
     assert(p_flag.model == "flag-model", "--model must outrank role configuration")
@@ -279,6 +314,8 @@ local ok_all, test_err = pcall(function()
       "run-only options must be rejected by ask")
     assert(run_cli({ "run", "--provider", "opencode-go", "--model", "openai/gpt-4o", "task" }, prov) == 2,
       "a --model provider prefix conflicting with --provider must exit 2")
+    assert(run_cli({ "run", "--approval-mode", "bogus", "task" }, prov) == 2,
+      "an invalid --approval-mode must be a usage error (exit 2)")
     print("PASS subcommand help and unknown-option rejection")
   end
 

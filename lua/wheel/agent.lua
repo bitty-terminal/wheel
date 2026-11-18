@@ -522,14 +522,16 @@ end
 --- Precedence (first match wins):
 ---   1. `opts.model_profile` (complete explicit profile override)
 ---   2. `opts.model` (the `--model` CLI flag): string, `provider/model`, or table
----   3. `config.roles[role].model_profile`
+---   3. `config.roles[role].model_profile`, but only when its provider matches
+---      the active provider (or it names none)
 ---   4. `config.roles[role].model`, but only when it belongs to the active
 ---      provider (an explicit provider claim or `provider/model` prefix must
 ---      match the active provider)
----   5. the role default profile, but only when its provider matches the active
----      provider
----   6. `opts.provider_default_model` (the effective provider model the caller
+---   5. `opts.provider_default_model` (the effective provider model the caller
 ---      resolved from provider config and the provider template default)
+---
+--- The built-in role default profile supplies the remaining fields and is the
+--- model fallback only when no provider default model is available.
 ---
 --- Without an active provider (library callers that supply no adapter and no
 --- `provider_name`) the role default profile is returned unchanged.
@@ -607,14 +609,20 @@ function WheelAgent.resolve_model(role, opts)
     return profile, nil
   end
 
-  -- 3. Role model profile from configuration.
+  -- 3. Role model profile from configuration, accepted only when its provider
+  -- matches the active provider (or it names no provider).
   if role_cfg.model_profile ~= nil then
     local ok_val, val_err = WheelAgent.validate_model_profile(role_cfg.model_profile)
     if not ok_val then
       return nil, "Invalid role model_profile: " .. tostring(val_err)
     end
-    for k, v in pairs(role_cfg.model_profile) do profile[k] = v end
-    return profile, nil
+    local cfg_provider = role_cfg.model_profile.provider
+    if not active_provider or cfg_provider == nil
+      or (type(cfg_provider) == "string" and string.lower(cfg_provider) == active_provider)
+    then
+      for k, v in pairs(role_cfg.model_profile) do profile[k] = v end
+      return profile, nil
+    end
   end
 
   -- 4. Role model, accepted only when it belongs to the active provider. A
@@ -644,13 +652,10 @@ function WheelAgent.resolve_model(role, opts)
     end
   end
 
-  -- 5/6. Role default belongs to the active provider, otherwise fall back to
-  -- the provider's effective default model.
+  -- 5/6. The effective provider model outranks the built-in role default. The
+  -- role default only survives when the provider has no default model.
   if active_provider then
-    local role_provider = type(profile.provider) == "string" and string.lower(profile.provider) or nil
-    if role_provider ~= active_provider
-      and type(provider_default_model) == "string" and provider_default_model ~= ""
-    then
+    if type(provider_default_model) == "string" and provider_default_model ~= "" then
       profile.model = provider_default_model
     end
     profile.provider = active_provider

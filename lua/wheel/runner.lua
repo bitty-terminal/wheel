@@ -77,7 +77,8 @@ WheelRunner.MAX_CONTEXT_REF_TURNS = 9007199254740991
 
 -- Distinct run outcome: the turn budget ran out before the model produced a
 -- final answer. Callers must report this separately from provider/tool
--- failures; completed work and checkpoints are retained.
+-- failures; files written before exhaustion remain on disk, but the run is not
+-- resumed.
 WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED = "E_TURN_BUDGET_EXHAUSTED"
 
 -- The runner's checkpoint rationale keeps the historical six-field contract;
@@ -1453,10 +1454,10 @@ function WheelRunner.run_task(agent, task, opts)
 
   if not loop_success and not final_error then
     final_error = string.format(
-      "Turn budget exhausted after %d turns without a final answer for task %s; "
-        .. "checkpoints and file changes are kept (%d checkpoint(s)). "
+      "Turn budget exhausted after %d turns without a final answer for task %s. "
+        .. "Workspace changes already written are kept, but this run is not resumed. "
         .. "This is not a provider or tool failure.",
-      max_turns, task_id, #checkpoints)
+      max_turns, task_id)
     final_error_code = WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED
   end
 

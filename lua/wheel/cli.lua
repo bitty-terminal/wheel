@@ -609,6 +609,9 @@ local function parse_runtime_flags(args, features)
       if not features.approval then return reject(a) end
       local value, err = take_value(a, i)
       if not value then return nil, err end
+      if value ~= "prompt" and value ~= "dashboard" and value ~= "auto-deny" then
+        return nil, "invalid approval_mode: expected prompt, dashboard, or auto-deny"
+      end
       opts.approval_mode = value
       i = i + 2
     elseif a == "--max-turns" then
