@@ -149,6 +149,17 @@ test: deps
         exit 1; \
     fi; \
     "$interpreter" tests/test_observation_budget.lua
+    bash scripts/tests/wheel-sandbox.test.sh
+
+# OS-level sandbox escape tests for the Linux bubblewrap backend: no write
+# outside the workspace, no read of a planted credential store, no direct
+# egress, allowlisted egress through the host relay with relay-side credential
+# injection, and fail-closed launcher behavior. Real bwrap, real namespaces,
+# real loopback HTTPS stub; no external network. Skips with a message when
+# bwrap (or python3/openssl for the proxy group) is absent; set
+# WHEEL_SANDBOX_REQUIRE=1 to make every skip a failure.
+test-sandbox:
+    bash scripts/tests/wheel-sandbox.test.sh
 
 # Local session-daemon integration gate: starts a real detached daemon in a
 # temporary runtime root and drives it from separate client processes. POSIX
@@ -289,8 +300,8 @@ verify-package:
 # workflow-*.sh scripts are outside this gate; reformatting them is a separate
 # change.
 shell:
-    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc
-    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc
+    shellcheck -S warning scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc scripts/wheel-sandbox scripts/tests/wheel-sandbox.test.sh
+    shfmt -d scripts/package.sh scripts/install-local.sh scripts/verify-package.sh scripts/test-gate.sh scripts/test-concurrency.sh scripts/test-root-guard.sh bench/run.sh scripts/wheel scripts/wheel-session scripts/wheel-proc scripts/wheel-sandbox scripts/tests/wheel-sandbox.test.sh
 
 # Offline gates for the live provider test: no credential, no network. The
 # key-free redirect-policy test runs first, then the provider-selection and

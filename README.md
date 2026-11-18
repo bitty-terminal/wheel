@@ -9,6 +9,7 @@ Wheel — the coding-agent harness for the Bitty terminal (mascot: Bittie the ha
 - **Independent harness process (Option B).** Wheel runs as its own OS process under the user's authority, governed by [SECURITY-MODEL.md](SECURITY-MODEL.md). A Bitty panel or terminal supplies presentation and input only.
 - **Software-engineering domain only.** Roles (`Primary`, `Commander`, `Coding`, `Debug`, `Research`, `Reviewer`) vary by configuration and capability bindings (`RoleBinding` + monotonic `policy_generation`), never by class explosion.
 - **One artifact for `0.1.0`.** `dist/wheel-0.1.0.tar.gz` ships the Lua module tree and core reference docs. The in-tree `bitty-plugin.toml` is retained only as a transitional artifact and is not the `0.1.0` distribution or authority model.
+- **Opt-in OS-level sandbox.** `wheel --sandbox …` runs the session behind a platform backend (Linux: `bubblewrap`) with a read-only system tree, one writable workspace, no `$HOME`, and no network route unless the operator allows specific destinations through a credential-injecting host relay. See [OS-level sandbox](#os-level-sandbox).
 - **Daemon ownership stays with `bittyd`.** Final session hosting, IPC, attach/detach, lease generation, and worker supervision belong to `bittyd`. Wheel consumes that contract through the replaceable transport-injectable `WheelBittydAdapter` (`lua/wheel/bittyd_adapter.lua`); `scripts/wheel-session` remains a local development prototype.
 
 ## Install
@@ -40,6 +41,45 @@ Or run the standalone daily-driver CLI (`scripts/wheel`):
 ./scripts/wheel run --max-turns 24 "Fix failing tests"  # ReAct tool-loop run with interactive allow/ask/deny gate
 ./scripts/wheel chat                      # interactive REPL (/thinking, /exit)
 ```
+
+### OS-level sandbox
+
+`wheel --sandbox <command>` runs the harness inside an OS-level sandbox instead
+of with the invoking user's ambient authority. The sandbox is a policy layer
+with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
+
+```sh
+./scripts/wheel --sandbox run "Fix the failing test"                    # no egress at all
+./scripts/wheel --sandbox --proxy --allow api.example.com -- ask "hi"   # allowlisted egress
+```
+
+- **What the session gets:** the workspace read-write at its own path, one
+  per-session scratch directory mounted at `/cache` (and exported as `TMPDIR`,
+  `CARGO_HOME`, and the `XDG_*` roots), read-only `/usr`, `/etc`, `/bin`,
+  `/sbin`, `/lib`, `/lib64`, a private `/proc`, a fresh `/tmp`, and a private
+  PID/UTS/IPC/user namespace. Nothing else is mounted, so `$HOME` (unset), SSH
+  and cloud credentials, `~/.config/wheel`, shell rc files, `.git/hooks`,
+  `.mcp.json`, the Wayland/D-Bus sockets, `/run/user/*`, and the
+  Docker/Podman socket are unreachable by construction rather than filtered.
+- **Network:** the default mode is `netless` — loopback only, no resolver, no
+  route. `--proxy` adds the single road out: a host-side CONNECT relay over a
+  bind-mounted Unix socket with a default-deny allowlist
+  (`WHEEL_SANDBOX_ALLOW`), per-request logging, bounds, and relay-side
+  credential injection, so `OPENCODE_GO_API_KEY` never enters the sandbox
+  environment.
+- **Fail-closed:** the launcher refuses to start when `bwrap` is missing and
+  never falls back to an unsandboxed run.
+- **Configuration continuity:** inside the sandbox the harness starts with an
+  empty configuration, credential, approval, and trust store under `/cache`,
+  because the owner's `$XDG_*` state is not mounted. Provider access is the
+  relay's job.
+- **Requirements and evidence:** `bwrap`, `python3` for proxy mode, and
+  `openssl` for proxy-mode session certificates. `just test-sandbox` runs the
+  escape tests; `SECURITY-MODEL.md` records what is still unprotected.
+- **Platforms:** Linux native today. macOS is supported at the core level, but
+  its sandbox backend (Seatbelt) is not implemented yet and `--sandbox` fails
+  closed there. Windows is supported **only through WSL2**; native Windows fails
+  closed at seam construction, has no process backend, and none is planned.
 
 - **Gate interpreter:** Lua 5.1 (`lua5.1` primary release gate; `luajit` and `lua` development fallbacks with JIT disabled for evaluated project-config chunks).
 - **Platform:** POSIX hosts with GNU coreutils, `util-linux` (`setsid`), `tar`, and `gzip`.
@@ -145,6 +185,7 @@ Named configuration failures returned by `lua/wheel/config.lua`: `untrusted_proj
 just install                  # bun install --frozen-lockfile
 just check                    # lint, fmt-check, manifest, docs-check, lua parse, bittyd conformance, unit & offline suites
 just test-bittyd-conformance  # run pinned Core bittyd-conformance-corpus/1 (V-29, V-30, V-33) against WheelBittydAdapter
+just test-sandbox             # OS-level sandbox escape tests (requires bwrap)
 just test-real-host           # opt-in real-host fixture (requires lua5.1)
 just verify-package           # deterministic package build, install, upgrade, rollback, and refusal checks
 ```

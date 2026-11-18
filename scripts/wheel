@@ -30,6 +30,14 @@ select_interpreter() {
   return 1
 }
 
+# `--sandbox` routes the same invocation through the OS-level sandbox
+# launcher. The flag is consumed here so the harness CLI never sees it, and the
+# launcher refuses to continue when its backend (bwrap) is missing.
+if [ "${1-}" = "--sandbox" ]; then
+  shift
+  exec "$SCRIPT_DIR/wheel-sandbox" "$@"
+fi
+
 INTERPRETER="$(select_interpreter)"
 readonly INTERPRETER
 

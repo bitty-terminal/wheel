@@ -105,9 +105,13 @@ The trust boundary is therefore the OS user account:
   network responses, third-party tools and dependencies, and any future IPC
   peer.
 
-A harness defect is user-level compromise. No claim in this repository may
-describe the 0.1.0 harness as sandboxed, confined, or least-privilege at the OS
-level.
+A harness defect is user-level compromise. A session started through
+`wheel --sandbox` additionally runs inside an OS-level sandbox (see
+[OS-level sandbox](#os-level-sandbox)). That control confines the _session and
+the harness process running inside it_; it is not a claim about the invoking
+user's account, and it does not make a plain `scripts/wheel` run confined. No
+claim in this repository may describe the 0.1.0 harness as sandboxed,
+confined, or least-privilege at the OS level outside that entry point.
 
 ### Authority ledger
 
@@ -323,18 +327,24 @@ controls are mandatory:
     leader generation and signals only the recorded group (TERM, bounded grace,
     KILL). Cancellation is distinct from timeout in the result and audit.
 
-Residual risk: a shell command can write outside the workspace root because the
-harness has no OS-level confinement in 0.1.0. The path sandbox governs
-harness-mediated file tools, not arbitrary programs. Audit, cwd, environment
-scrubbing, the deny-list, and explicit session opt-in reduce the blast radius;
-they do not eliminate it. OS confinement (for example Landlock or a cgroup) is
-an open point and a prerequisite candidate before any widening of shell
-authority.
+Residual risk: a shell command can write anywhere the invoking user can write
+unless the session runs under the OS-level sandbox. The path sandbox governs
+harness-mediated file tools, not arbitrary programs, and a plain `scripts/wheel`
+invocation has no OS confinement. Audit, cwd, environment scrubbing, the
+deny-list, and explicit session opt-in reduce the blast radius; they do not
+eliminate it. The Linux sandbox backend (`wheel --sandbox`) does eliminate
+writes outside the workspace and reads of the owner's credential stores, but it
+is an opt-in entry point, it is Linux-only today, and it inherits the residual
+risks listed in [OS-level sandbox](#os-level-sandbox).
 
 ### Network egress
 
 - The harness opens outbound connections only. It never listens on a socket,
-  accepts inbound connections, or exposes a local service in 0.1.0.
+  accepts inbound connections, or exposes a local service in 0.1.0. In proxy
+  mode a launcher component (the in-sandbox bridge) listens on an ephemeral
+  loopback port and splices to the host relay; the harness itself still never
+  listens, and that port is unreachable from outside the sandbox's own network
+  namespace.
 - Harness-owned clients connect only to provider endpoints resolved from
   user-level configuration and built-in adapter defaults. A project
   configuration may select an existing provider profile but may not add a
@@ -362,7 +372,10 @@ authority.
   They are never forwarded to a different destination, a redirect target, or a
   child process.
 - Child processes spawned through argv or shell are outside this mediation.
-  Their egress is user-level authority and remains a residual risk.
+  Their egress is user-level authority and remains a residual risk. Under
+  `wheel --sandbox` the network namespace has loopback only, so their egress is
+  refused by the kernel unless the session runs in proxy mode, where the host
+  relay applies the destination allowlist.
 - The harness sends no telemetry by default. Any future telemetry is a separate
   authority decision and evidence gate.
 
@@ -874,6 +887,213 @@ runs with the user's authority.
   same-user attacker who controls the prefix or the repository checkout.
   Installing as root or into a system prefix is not a 0.1.0 use case.
 
+## OS-level sandbox
+
+### Position
+
+Wheel's confinement is a **policy layer plus per-platform backends**. The policy
+decides two things for a session: which filesystem paths exist, and which
+network destinations are reachable. A backend enforces that policy with the
+mechanism its platform provides. The policy, the entry point
+(`scripts/wheel-sandbox`, also reachable as `wheel --sandbox`), the modes, the
+allowlist grammar, the credential-injection contract, and the escape tests are
+shared; only enforcement differs per platform. That is why a macOS or WSL2
+backend would not change this document's policy text.
+
+Status: the **Linux backend is implemented** with bubblewrap (`bwrap`) and
+covered by `just test-sandbox`. It is the first real OS-level confinement in
+Wheel. It is an **opt-in entry point**, not the default for a bare
+`scripts/wheel` run: inside the sandbox the harness sees a fresh, empty
+configuration, credential, approval, and trust store, so making it the default
+would silently remove the owner's configuration from every interactive launch.
+A plain `scripts/wheel` invocation remains unconfined and is described as such
+throughout this document.
+
+### Modes
+
+| Mode                  | Entry point                                                    | Network reach                                                                    |
+| --------------------- | -------------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| `netless` (default)   | `wheel --sandbox …`                                            | Loopback only, in a private network namespace. No resolver, no route, no egress. |
+| `proxy`               | `wheel --sandbox --proxy …`                                    | Loopback plus one Unix socket to the host relay; only allowlisted destinations.  |
+| `proxy --tunnel-only` | `wheel --sandbox --proxy …` with `WHEEL_SANDBOX_TUNNEL_ONLY=1` | Same reach, opaque byte tunnel, **no** credential injection.                     |
+
+`netless` is the default because egress is the authority that turns a confined
+process into an exfiltration path. `proxy` is a deliberate per-session
+widening with a default-deny allowlist.
+
+### What the Linux backend enforces
+
+Every session runs under one `bwrap` invocation:
+
+```text
+bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-user --unshare-net \
+      --die-with-parent --cap-drop ALL --hostname wheel-sandbox \
+      --dev /dev --proc /proc --tmpfs /tmp --chdir <workspace> \
+      --ro-bind /usr /usr --ro-bind /etc /etc \
+      --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /lib /lib \
+      --ro-bind /lib64 /lib64 \
+      --bind <workspace> <workspace> \
+      --bind <session>/work /cache \
+      [--ro-bind <harness-tree> <harness-tree>] \
+      [--ro-bind /dev/null <workspace>/.mcp.json …] \
+      [--ro-bind <empty> <workspace>/.git/hooks] \
+      --ro-bind <ca-bundle> <system-bundle>        # proxy mode only
+      --bind <session>/host/relay.sock /run/wheel-relay/relay.sock  # proxy mode only
+      --clearenv --setenv PATH=/usr/local/bin:/usr/bin:/bin …
+      -- <command>
+```
+
+- **Read-only system trees.** `/usr`, `/etc`, `/bin`, `/sbin`, `/lib`, `/lib64`
+  are mounted read-only; a write attempt fails with `EROFS`. Node names that are
+  symlinks on a merged-`/usr` distribution are recreated as symlinks.
+- **Workspace at its own path.** The workspace is bound read-write at the same
+  absolute path, so tooling that embeds paths keeps working.
+- **One writable scratch directory.** `<session>/work` is mounted at `/cache`
+  and exported as `TMPDIR`, `CARGO_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
+  `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, and `npm_config_cache`. Nothing else is
+  writable except the private tmpfs on `/tmp` and the workspace.
+- **No `$HOME`.** `--clearenv` drops the environment and `HOME` is never set.
+  Credential stores, shell rc files, `~/.config/wheel`, the trust store, and the
+  audit history are therefore _absent_ rather than filtered: the paths do not
+  resolve, and their parent directories are never mounted.
+- **No runtime, display, or bus sockets.** `/run/user/*`, the Wayland socket,
+  the D-Bus session bus, the Docker/Podman socket, and the PipeWire/PulseAudio
+  sockets are unreachable for the same reason. `WAYLAND_DISPLAY`,
+  `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` are unset, so Wheel cannot
+  reach the owner's live session or draw on their display.
+- **Masked in-workspace code paths.** `.git/hooks` is replaced by an empty
+  directory (a hook would execute outside the harness's process tree) and
+  `.mcp.json`, `.git-credentials`, `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`,
+  and `.kube` inside the workspace are masked when present.
+- **No privilege.** `--cap-drop ALL`, a private user namespace, a private PID
+  namespace, a private UTS namespace (hostname `wheel-sandbox`), a private IPC
+  namespace, and `--die-with-parent` so the sandbox cannot outlive the launcher.
+- **Fixed environment.** `PATH=/usr/local/bin:/usr/bin:/bin`; `LANG`, `LC_ALL`,
+  and `TERM` pass through only as plain tokens. No proxy variable, no secret,
+  and no host `XDG_*` value survives.
+- **Fail-closed launcher.** The launcher refuses to start when `bwrap` is
+  missing, when the mode is unknown, when proxy mode has an empty allowlist,
+  when the workspace is `/`, the owner's home, a system root, or an ancestor of
+  the owner's home, and when the session directory already exists. It never
+  falls back to an unsandboxed run.
+
+### Egress relay and credential injection
+
+Proxy mode keeps `--unshare-net`. The sandbox therefore still has no route; the
+only egress is a bind-mounted Unix socket into the session directory, served by
+`scripts/wheel-sandbox-proxy.py` on the host. An in-sandbox bridge
+(`scripts/wheel-sandbox-bridge.py`) listens on an ephemeral loopback port and
+splices bytes to that socket, then sets `HTTPS_PROXY` to it, so the existing
+`curl` transport is used unchanged.
+
+The relay:
+
+- accepts `CONNECT host:port` only, and denies every destination that is not in
+  `WHEEL_SANDBOX_ALLOW` (comma-separated `host` or `host:port`; bare `host`
+  covers port 443; a domain entry matches itself and its subdomains; wildcards
+  are rejected; a single-label entry other than `localhost` is rejected);
+- refuses a non-443 port unless the exact `host:port` is allowlisted;
+- terminates the client TLS leg with a per-session certificate minted at
+  startup (or `WHEEL_SANDBOX_TLS_CA`/`CERT`/`KEY`), checks that the SNI matches
+  the CONNECT destination, and re-originates one HTTP/1.1 request upstream over
+  verified TLS;
+- replaces the credential header with the value from
+  `WHEEL_SANDBOX_UPSTREAM_AUTH` (`Name: value`) or `OPENCODE_GO_API_KEY`
+  (`Authorization: Bearer …`), so the provider key exists only in the relay's
+  environment and never in the sandbox;
+- bounds header bytes, request body, response body, connect time, and
+  connection count, and returns a refusal instead of forwarding past a bound;
+- writes one JSON record per decision (destination, method, path, status,
+  sizes, injected flag) to `<session>/host/requests.jsonl`, and never records a
+  header value or a body.
+
+`WHEEL_SANDBOX_TUNNEL_ONLY=1` relays opaque bytes with the same destination
+allowlist. It exists for protocols the relay cannot re-originate; it cannot
+inject a credential and makes no credential-isolation claim.
+
+### Three isolation tiers
+
+| Tier                      | Mechanism                                                                                                  | Use for                                                            | Not for                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------- |
+| Local sandbox (this work) | `bwrap` user/mount/PID/UTS/IPC/net namespaces, `--cap-drop ALL`, bind policy, destination allowlist        | Model-driven tools, builds, tests, repository scripts in a session | Code you would refuse to run as your own user at all      |
+| Disposable container      | Rootless `podman run --rm --network=none`, ephemeral filesystem, no workspace bind except an explicit copy | Untrusted dependencies, generated or pasted code, one-off analysis | Anything needing the owner's session, GPU, or USB devices |
+| gVisor / microVM          | User-space kernel (gVisor) or a VM boundary (Firecracker/KVM)                                              | Adversarial code, multi-tenant execution, untrusted plugins        | Everyday builds: compatibility and startup cost           |
+
+The tiers are cumulative choices, not claims of equivalence: the local sandbox
+protects the owner's files, credentials, and network from a session; it does
+not defend the host kernel from a determined attacker. That is what the
+container and gVisor/microVM tiers are for, and neither is implemented here.
+
+### What this does not protect yet
+
+- **The host kernel.** `bwrap` is a namespace and mount-policy tool, not a
+  kernel boundary. A kernel bug in the unprivileged user-namespace or mount
+  surface, or in `bwrap` itself, escapes the sandbox. This host has
+  unprivileged user namespaces enabled, which the backend requires.
+- **CPU, memory, PID, and disk.** No seccomp filter, no Landlock rules, no
+  cgroup, and no rlimit is applied. A session can consume host CPU and memory
+  until the kernel reclaims them, and can fill the filesystem through its
+  workspace and scratch directory.
+- **The workspace is writable by design.** The session is meant to edit the
+  repository, so tracked files, `.git/config`, and build outputs are writable;
+  only hooks and the listed credential-shaped paths are masked.
+- **Readable system trees.** `/etc` and `/usr` are readable, so hostnames,
+  package metadata, and distribution configuration are visible. No user secret
+  is stored there, but this is not a "no host file is readable" claim.
+- **The relay.** It runs on the host as the same user, terminates TLS, and
+  therefore sees provider traffic in plaintext; its socket is reachable by any
+  process of that user. It removes the credential and the route from the
+  _sandbox_, not from the owner's account.
+- **Provider authentication outside proxy mode.** `netless` mode has no egress
+  at all, so a session that must reach a provider needs `--proxy` with an
+  allowlist. Without a configured credential the relay forwards the request
+  without injection and the provider rejects it; that failure is the honest
+  outcome, not a fallback.
+- **Configuration continuity.** Inside the sandbox the harness starts with an
+  empty configuration, credential store, approval queue, and trust store under
+  `/cache`. Provider profiles, global configuration, earlier trust approvals,
+  and the host audit history are not visible. Relay-side authentication is the
+  supported path for provider access.
+- **Git worktrees.** A checkout whose `.git` is a file pointing at a git
+  directory outside the workspace cannot resolve that directory inside the
+  sandbox. This is a compatibility limit of binding only the workspace.
+- **Platform coverage.** No macOS and no native Windows backend exists in this
+  change.
+
+### Platform support
+
+| Platform       | Status                                                                                                          | Backend                                                                                                                                                                                      |
+| -------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux (native) | Supported. `wheel --sandbox` runs the backend in this document.                                                 | `bwrap` user/mount/PID/UTS/IPC/net namespaces plus the bind policy.                                                                                                                          |
+| macOS (native) | Core POSIX surface supported; the sandbox backend is **not implemented**. `wheel --sandbox` fails closed there. | Planned Seatbelt (`sandbox-exec`) profile generated from the same policy.                                                                                                                    |
+| Windows        | **WSL2 only.** The Linux backend runs inside WSL2.                                                              | Native Windows fails closed at seam construction: there is no native process backend (no `setsid`, POSIX FIFOs, or `sh -c` equivalent), and none is planned. The sandbox is not the blocker. |
+
+The evidence in this document is Linux evidence. No macOS or Windows claim is
+made, and no macOS or Windows code is added.
+
+### Evidence
+
+`just test-sandbox` (`scripts/tests/wheel-sandbox.test.sh`) runs real
+namespaces and a real loopback HTTPS stub, and asserts at least: a workspace
+write succeeds while `/usr`, `/etc`, the owner's home, `/run`, and the container
+socket path all refuse writes; a planted `~/.ssh` key and `~/.aws` credential
+are unreadable inside and readable outside; a workspace symlink to the owner's
+home does not resolve; `.git/hooks` and `.mcp.json` are masked; `HOME`,
+`WAYLAND_DISPLAY`, `DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, and the
+provider keys are absent from the environment; `setsid` and GNU `timeout` still
+work with a private PID namespace; direct HTTPS, direct-IP, and DNS egress fail;
+in proxy mode an allowlisted destination succeeds with the credential injected
+at the relay while the key is absent from the sandbox environment, the harness's
+own `WheelProvider.default_http_client` transport reaches that destination
+unchanged, and a non-allowlisted destination is refused and recorded; and the
+launcher refuses an empty allowlist, `/` as a workspace, and the owner's home as
+a workspace. The suite skips with a message when `bwrap` is absent and fails
+when `WHEEL_SANDBOX_REQUIRE=1` is set.
+
+This is Gate 1-style mechanism evidence for the sandbox itself. It is not the
+0.1.0 ceiling evidence, it is not an independent security review, and it does
+not close the residual risks above.
+
 ## Audit and logging
 
 - The harness writes a local, append-only audit stream under
@@ -982,31 +1202,34 @@ secret environment reads.
 
 ### Threats and controls
 
-| Threat                                            | Control                                                                                                                                      | Residual risk                                                                                                                                           |
-| ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                                                                          | A legitimate-looking destructive command can still pass                                                                                                 |
-| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval                                                       | The model can be persuaded within its granted authority                                                                                                 |
-| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget                                                          | Trusted code can still consume CPU/memory and shape policy                                                                                              |
-| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors                                                        | TOCTOU races the runtime cannot fully close                                                                                                             |
-| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests                                                        | Novel secret shapes may evade heuristic redaction                                                                                                       |
-| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification                                                      | Compromised harness or user-level malware can exfiltrate                                                                                                |
-| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in                                                                                       | Shell can write anywhere the user can; no OS confinement                                                                                                |
-| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                                                     | Upstream compromise remains possible                                                                                                                    |
-| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                                                  | Same-user processes can rewrite it                                                                                                                      |
-| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                                                | Same-user processes can tamper with the log                                                                                                             |
-| Orphaned or daemonized processes                  | setsid-recorded PGID held by a retained leader through TERM/grace/KILL, status written before signaling, typed unverified cleanup, no detach | A child that calls setsid or joins another group escapes; an externally killed leader leaves descendants unswept but unsignaled (reported `unverified`) |
-| Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration                                 | Disk capture during a run has no file-size quota; CPU is not budgeted                                                                                   |
-| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                                                   | A reader may still assume plugin semantics                                                                                                              |
-| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                                                               | Not designed or implemented in 0.1.0                                                                                                                    |
-| Local session control-plane abuse                 | Private 0700/0600 paths, ownership/symlink refusal, bounded frames, static errors, explicit shutdown, no client signals                      | Same-user processes can open the FIFO; no peer credentials; a partial frame can stall the daemon                                                        |
-| Update-channel compromise                         | Signed artifacts and verified updates are required before release                                                                            | No signing or update channel exists yet                                                                                                                 |
-| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                                                            | A tool with a root grant can reach that whole root                                                                                                      |
-| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                                                             | Runtime-level dumps are outside harness control                                                                                                         |
+| Threat                                            | Control                                                                                                                                                            | Residual risk                                                                                                                                           |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Model-driven destructive command                  | Role gates, deny-list, confirmation gates, audit, process ownership                                                                                                | A legitimate-looking destructive command can still pass                                                                                                 |
+| Prompt injection in repository or command output  | Treat all content as data, no automatic tool escalation, audit, explicit user approval                                                                             | The model can be persuaded within its granted authority                                                                                                 |
+| Malicious project configuration                   | No ambient execution, explicit consent, hash pinning, restricted evaluation, budget                                                                                | Trusted code can still consume CPU/memory and shape policy                                                                                              |
+| Path traversal or symlink escape                  | Canonical root, normalized containment, symlink target resolution, fail-closed errors                                                                              | TOCTOU races the runtime cannot fully close                                                                                                             |
+| Secret leakage through logs or artifacts          | Central accessor, exact and shape redaction, fail-closed persistence, synthetic tests                                                                              | Novel secret shapes may evade heuristic redaction                                                                                                       |
+| Secret exfiltration through network redirection   | Provider allowlist, no project base-URL override, same-host redirects, TLS verification; in the sandbox the provider key stays in the host relay                   | Compromised harness or user-level malware can exfiltrate                                                                                                |
+| Sandbox escape or unlogged egress                 | `--unshare-net` by default, destination allowlist plus per-request relay log in proxy mode, `--cap-drop ALL`, private namespaces, masked credential and hook paths | Kernel or `bwrap` bugs, same-user relay abuse, and the fact that the sandbox is an opt-in entry point                                                   |
+| Shell escaping the workspace                      | cwd, scrubbed env, deny-list, audit, unattended opt-in; OS-level sandbox with a read-only system tree and a single writable workspace (`wheel --sandbox`)          | A plain `scripts/wheel` run has no OS confinement; a sandboxed session still shares the host kernel and consumes unbudgeted CPU, memory, and disk       |
+| Supply-chain compromise of tools or dependencies  | Pinned versions, lockfiles, provenance review, no install scripts with ambient authority                                                                           | Upstream compromise remains possible                                                                                                                    |
+| Trust-store tampering                             | User-owned restrictive file, atomic writes, fail-closed corruption handling                                                                                        | Same-user processes can rewrite it                                                                                                                      |
+| Audit bypass                                      | Mandatory pre-spawn records, fail-closed high-risk operations                                                                                                      | Same-user processes can tamper with the log                                                                                                             |
+| Orphaned or daemonized processes                  | setsid-recorded PGID held by a retained leader through TERM/grace/KILL, status written before signaling, typed unverified cleanup, no detach                       | A child that calls setsid or joins another group escapes; an externally killed leader leaves descendants unswept but unsignaled (reported `unverified`) |
+| Denial of service through output or configuration | Finite 256 KiB-per-stream capture, finite timeouts, instruction/time/memory budget for project configuration                                                       | Disk capture during a run has no file-size quota; CPU is not budgeted                                                                                   |
+| Stale manifest misread as authority               | Descriptor and docs state the manifest is transitional; manifest unchanged and not widened                                                                         | A reader may still assume plugin semantics                                                                                                              |
+| Future IPC confused deputy                        | Per-scope, per-client consent and server-side evaluation; no authority lending                                                                                     | Not designed or implemented in 0.1.0                                                                                                                    |
+| Local session control-plane abuse                 | Private 0700/0600 paths, ownership/symlink refusal, bounded frames, static errors, explicit shutdown, no client signals                                            | Same-user processes can open the FIFO; no peer credentials; a partial frame can stall the daemon                                                        |
+| Update-channel compromise                         | Signed artifacts and verified updates are required before release                                                                                                  | No signing or update channel exists yet                                                                                                                 |
+| Cross-workspace access in multi-root sessions     | Tool bound to one root; explicit root grants; no implicit nesting                                                                                                  | A tool with a root grant can reach that whole root                                                                                                      |
+| Secret exposure through crash reporting           | No secret values in traces; disable crash reporting when it cannot be guaranteed                                                                                   | Runtime-level dumps are outside harness control                                                                                                         |
 
 ### Residual risks accepted for 0.1.0
 
-- The harness is trusted software running as the user. There is no OS sandbox,
-  privilege drop, or per-agent isolation.
+- The harness is trusted software running as the user, with no privilege drop
+  and no per-agent isolation. The OS-level sandbox confines a session started
+  with `wheel --sandbox`; it does not confine the invoking account, and a plain
+  `scripts/wheel` invocation is not confined at all.
 - The local session control plane is same-user only: FIFO mode bits are not peer
   authentication, any process running as the user can send requests, and a
   partial or stalled frame can make the daemon unresponsive until it is stopped
@@ -1211,6 +1434,17 @@ that the policy relies on, and they remain unverified until the gates pass:
   per-stream capture cap, a rebuilt allowlist environment, and an explicit
   stdin channel. No direct `io.open`, `io.popen`, `os.remove`, `os.execute`,
   `os.tmpname`, `os.time`, or `os.clock` call remains outside `host.lua`.
+- an OS-level sandbox for Linux (`scripts/wheel-sandbox`,
+  `wheel --sandbox`): a policy layer plus a `bwrap` backend that unshares the
+  user, mount, PID, UTS, IPC, and network namespaces, drops all capabilities,
+  binds read-only system trees, gives one writable scratch directory and the
+  workspace, clears the environment including `HOME`, masks Git hooks and
+  `.mcp.json`, and denies all egress unless the operator starts proxy mode.
+  Proxy mode adds a host-side CONNECT relay over a bind-mounted Unix socket with
+  a default-deny allowlist, per-request logging, bounds, and relay-side
+  credential injection (`scripts/wheel-sandbox-proxy.py`). Escape tests:
+  `just test-sandbox`. Status: first implemented confinement, opt-in,
+  Linux-only, and without seccomp, Landlock, or cgroup budgets;
 - a local execution audit sink (`lua/wheel/audit.lua`) with a 16 KiB record
   bound, 1 MiB x 4 rotation, `0700`/`0600` paths, an append-only JSONL file, a
   monotonic sequence and SHA-256 previous-hash chain, static
@@ -1238,7 +1472,9 @@ backend, the standalone POSIX surface, selected explicitly with
 host, no `bitty.api_version` authority probe, and no implicit in-process
 adapter. A non-POSIX platform fails closed at seam construction. A future host
 IPC client is presentation-only; adding an execution adapter requires the
-widening process above.
+widening process above. The sandbox backend is a separate, layered concern:
+the execution seam stays the standalone POSIX surface, and the sandbox decides
+where that surface may reach (see [OS-level sandbox](#os-level-sandbox)).
 
 Known gaps relative to this policy (not claims of compliance):
 
@@ -1301,7 +1537,8 @@ Known gaps relative to this policy (not claims of compliance):
   escapes the recorded group; if the leader is killed before the sweep (for
   example an external same-user kill or an OOM kill), no signal is sent,
   `cleanup` is `unverified`, and descendants may survive; and there is no
-  rlimit, cgroup, seccomp, or OS confinement for spawned programs.
+  rlimit, cgroup, or seccomp budget for spawned programs. OS confinement exists
+  only through the opt-in Linux sandbox backend.
 - Temporary-file creation and the subsequent content write are separate
   operations. The directory is `0700`, so another OS user cannot substitute a
   path, but a same-user process could replace the freshly created path before
@@ -1366,10 +1603,12 @@ Known gaps relative to this policy (not claims of compliance):
   implemented (one `workspace_root` per session).
 - CI and unattended runs have no implicit-trust enforcement in the current
   loader; trust behavior in CI is not gated.
-- There is no OS-level confinement for argv or shell execution, no reviewed
-  in-tree network client (provider adapters accept an injected client), no
-  signed release artifact or update channel, and no Gate 1/Gate 2 evidence for
-  the 0.1.0 ceiling. The local install path verifies a SHA-256 digest and
+- OS-level confinement exists only through `scripts/wheel-sandbox` (the Linux
+  bwrap backend) and only when the operator starts the session with
+  `--sandbox`; a plain `scripts/wheel` invocation is unconfined, and there is no
+  macOS or Windows backend. There is no reviewed in-tree network client
+  (provider adapters accept an injected client), no signed release artifact or
+  update channel, and no Gate 1/Gate 2 evidence for the 0.1.0 ceiling. The local install path verifies a SHA-256 digest and
   rejects unsafe members and targets, but it provides integrity only: it does
   not authenticate the publisher, and the marker and sidecar are same-user
   mutable.
@@ -1381,8 +1620,10 @@ These gaps are blockers for release evidence, not for recording the policy.
 
 ## Open points
 
-- OS confinement for spawned programs: Landlock, cgroups, seccomp, or an
-  equivalent, and whether it becomes a prerequisite for shell authority.
+- OS confinement for spawned programs beyond the Linux `bwrap` backend:
+  Landlock and seccomp rules inside the sandbox, cgroup/rlimit budgets, the
+  macOS Seatbelt backend, WSL2 validation, and whether confinement becomes a
+  prerequisite for shell authority rather than an opt-in entry point.
 - Default-on audit wiring for every high-risk tool and trust call site, plus
   cross-process append serialization and external anchoring of the hash chain.
 - Redaction coverage for provider-specific key shapes and streamed fragments.
@@ -1421,7 +1662,7 @@ An independent reviewer verifies at least:
 7. Audit and redaction requirements cover every persistence sink and fail
    closed where required.
 8. Residual risks are honest about user-level authority, shell escape, trusted
-   configuration, and missing confinement.
+   configuration, and exactly what the sandbox does and does not confine.
 9. The evidence gates are reproducible and the widening process requires both
    gates plus independent review and owner approval.
 10. No implementation, release, or compatibility claim exceeds the evidence.

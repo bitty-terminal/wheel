@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# Wheel OS-level sandbox launcher: policy layer plus the Linux backend.
+#
+# The sandbox is a policy layer. It decides which filesystem and network reach
+# a harness session gets; a platform backend enforces it. This file declares
+# the policy and implements the Linux backend with bubblewrap (bwrap). It is
+# intentionally not the only possible backend: a macOS Seatbelt backend and a
+# WSL2 backend would enforce the same policy with the same entry point. There
+# is no native Windows backend, and none is planned.
+#
+# What the policy grants a session:
+#   - the workspace, read-write, at its own absolute path;
+#   - one per-session scratch directory, read-write, mounted at /cache and
+#     exported as TMPDIR, CARGO_HOME, XDG_CACHE_HOME, XDG_DATA_HOME,
+#     XDG_STATE_HOME, XDG_CONFIG_HOME, and npm_config_cache;
+#   - the read-only system trees (/usr, /etc, /bin, /sbin, /lib, /lib64), a
+#     minimal /dev, a private /proc, and a fresh tmpfs on /tmp;
+#   - the harness tree itself, read-only, when it lives outside the workspace;
+#   - loopback only. External egress exists only in --proxy mode, and only
+#     through the host relay for allowlisted destinations.
+#
+# What it does not grant: the owner's home directory, SSH and cloud
+# credentials, the Wheel credential and trust stores, shell rc files, Git
+# hooks, .mcp.json, the container sockets, /run/user/*, the Wayland socket, or
+# the D-Bus session bus. Those are absent by construction rather than filtered:
+# they are never mounted, and there is no HOME to resolve them against.
+#
+# Exit status is the sandboxed command's status. Setup failures exit non-zero
+# and never fall back to an unsandboxed run.
+#
+# Environment:
+#   WHEEL_SANDBOX_MODE=netless|proxy   default netless
+#   WHEEL_SANDBOX_ALLOW=host[:port],…  proxy-mode allowlist (default deny)
+#   WHEEL_SANDBOX_SESSION=name         session directory name (default: UTC+pid)
+#   WHEEL_SANDBOX_WORKSPACE=path       workspace root (default: $PWD)
+#   WHEEL_SANDBOX_CACHE=path           session directory base
+#   WHEEL_SANDBOX_KEEP=1               keep the session directory
+#   WHEEL_SANDBOX_UPSTREAM_CA=path     relay upstream trust anchor (tests, private CAs)
+#   WHEEL_SANDBOX_TLS_CA/CERT/KEY      operator-supplied relay server certificate
+#   WHEEL_SANDBOX_UPSTREAM_AUTH="Name: value"  relay credential header
+#   OPENCODE_GO_API_KEY                relay credential (Bearer) when the above is unset
+#   WHEEL_SANDBOX_TUNNEL_ONLY=1        proxy mode without credential injection
+#
+# Requirements: bwrap for every mode, python3 for proxy mode, and openssl for
+# proxy mode unless WHEEL_SANDBOX_TLS_CA/CERT/KEY are supplied.
+set -euo pipefail
+
+PROG=wheel-sandbox
+readonly PROG
+# Trust anchors curl consults, per distribution. The bundle is extended rather
+# than replaced so a session keeps normal public-CA verification for the
+# destinations the relay forwards to; direct egress still has no route.
+readonly CA_BUNDLE_CANDIDATES=(
+  /etc/ssl/certs/ca-certificates.crt
+  /etc/pki/tls/certs/ca-bundle.crt
+  /etc/ssl/cert.pem
+)
+readonly SYSTEM_PATH=/usr/local/bin:/usr/bin:/bin
+
+die() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+  exit 1
+}
+
+note() {
+  printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+usage() {
+  cat <<'EOF'
+Usage: wheel-sandbox [OPTIONS] [--] [WHEEL-ARGS...]
+
+Run the Wheel harness inside the OS-level sandbox. Options must precede the
+harness arguments; the first unrecognized argument starts the harness command.
+
+  --proxy                 allow egress through the host relay (default: no egress)
+  --netless               explicit default mode: no network route at all
+  --allow LIST            proxy allowlist, comma separated host[:port]
+  --session NAME          session directory name
+  --workspace DIR         workspace root (default: the current directory)
+  --keep                  keep the per-session directory for inspection
+  --exec                  run the arguments as a command instead of the harness
+  -h, --help              this text
+
+Examples:
+  wheel --sandbox run "Fix the failing test"
+  wheel-sandbox --proxy --allow api.example.com -- ask "hello"
+  wheel-sandbox --exec -- sh -c 'cat /etc/hostname'
+
+The sandbox refuses to start when bwrap is missing; it never falls back to an
+unsandboxed run. Proxy mode is fail-closed: an empty allowlist is an error.
+EOF
+}
+
+resolve_self() {
+  local source=$1 resolved
+  if resolved=$(readlink -f -- "$source" 2>/dev/null); then
+    printf '%s\n' "$resolved"
+  else
+    printf '%s\n' "$source"
+  fi
+}
+
+main() {
+  local mode=${WHEEL_SANDBOX_MODE:-netless}
+  local allow=${WHEEL_SANDBOX_ALLOW:-}
+  local session=${WHEEL_SANDBOX_SESSION:-}
+  local workspace=${WHEEL_SANDBOX_WORKSPACE:-$PWD}
+  local cache_base=${WHEEL_SANDBOX_CACHE:-}
+  local keep=0 exec_mode=0
+  local wheel_args=()
+
+  while [ "$#" -gt 0 ]; do
+    case $1 in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --proxy)
+      mode=proxy
+      shift
+      ;;
+    --netless)
+      mode=netless
+      shift
+      ;;
+    --keep)
+      keep=1
+      shift
+      ;;
+    --exec)
+      exec_mode=1
+      shift
+      ;;
+    --allow)
+      [ "$#" -ge 2 ] || die "--allow requires a value"
+      allow=$2
+      shift 2
+      ;;
+    --allow=*)
+      allow=${1#*=}
+      shift
+      ;;
+    --session)
+      [ "$#" -ge 2 ] || die "--session requires a value"
+      session=$2
+      shift 2
+      ;;
+    --session=*)
+      session=${1#*=}
+      shift
+      ;;
+    --workspace)
+      [ "$#" -ge 2 ] || die "--workspace requires a value"
+      workspace=$2
+      shift 2
+      ;;
+    --workspace=*)
+      workspace=${1#*=}
+      shift
+      ;;
+    --)
+      shift
+      wheel_args=("$@")
+      break
+      ;;
+    *)
+      wheel_args=("$@")
+      break
+      ;;
+    esac
+  done
+
+  case $mode in
+  netless | proxy) ;;
+  *) die "unknown mode '$mode' (expected netless or proxy)" ;;
+  esac
+
+  if [ "${WHEEL_SANDBOX_KEEP:-0}" = 1 ]; then
+    keep=1
+  fi
+
+  command -v bwrap >/dev/null 2>&1 ||
+    die "bubblewrap (bwrap) is not installed; refusing to run without the OS sandbox (run scripts/wheel without --sandbox only if you accept an unsandboxed run)"
+
+  if [ "$(id -u)" -eq 0 ]; then
+    die "refusing to run the sandbox as root; run it as the owning user"
+  fi
+
+  local script_dir repo_root
+  script_dir=$(cd -- "$(dirname -- "$(resolve_self "$0")")" && pwd -P)
+  readonly script_dir
+  repo_root=$(cd -- "$script_dir/.." && pwd -P)
+  readonly repo_root
+
+  [ -d "$workspace" ] || die "workspace does not exist: $workspace"
+  workspace=$(cd -- "$workspace" && pwd -P)
+
+  case $workspace in
+  / | /home | /root | /run | /usr | /etc | /var | /boot | /proc | /sys | /dev | /tmp | /mnt | /media | /opt | /srv)
+    die "refusing to bind $workspace read-write as a workspace; choose a project directory"
+    ;;
+  esac
+
+  if [ -n "${HOME:-}" ]; then
+    local home
+    home=$(cd -- "${HOME}" 2>/dev/null && pwd -P) || home=${HOME}
+    if [ "$workspace" = "$home" ]; then
+      die "refusing to use the owner's home directory as a workspace"
+    fi
+    case $home in
+    "$workspace"/*)
+      die "the workspace contains the owner's home directory; binding it read-write would expose $home"
+      ;;
+    esac
+  fi
+
+  if [ -z "$session" ]; then
+    session="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  fi
+  case $session in
+  '' | *[!A-Za-z0-9._-]*) die "session name must match [A-Za-z0-9._-]+" ;;
+  esac
+  [ "${#session}" -le 64 ] || die "session name is too long (max 64 characters)"
+
+  if [ -z "$cache_base" ]; then
+    if [ -n "${XDG_CACHE_HOME:-}" ]; then
+      cache_base=$XDG_CACHE_HOME/wheel/sandbox
+    elif [ -n "${HOME:-}" ]; then
+      cache_base=$HOME/.cache/wheel/sandbox
+    else
+      die "set WHEEL_SANDBOX_CACHE (or XDG_CACHE_HOME/HOME) for the session directory base"
+    fi
+  fi
+  umask 077
+  mkdir -p -- "$cache_base"
+  cache_base=$(cd -- "$cache_base" && pwd -P)
+
+  local session_root cache_root
+  session_root=$cache_base/$session
+  if [ -e "$session_root" ]; then
+    die "session directory already exists: $session_root (choose a new --session name)"
+  fi
+  cache_root=$session_root/work
+  mkdir -p -- "$session_root/host" "$cache_root"
+  mkdir -p -- \
+    "$cache_root/tmp" \
+    "$cache_root/cargo" \
+    "$cache_root/xdg-cache" \
+    "$cache_root/xdg-data" \
+    "$cache_root/xdg-state" \
+    "$cache_root/xdg-config" \
+    "$cache_root/npm"
+
+  local relay_pid="" sandbox_pid=""
+  cleanup() {
+    local status=$?
+    trap - EXIT
+    if [ -n "$sandbox_pid" ] && kill -0 "$sandbox_pid" 2>/dev/null; then
+      kill -TERM "$sandbox_pid" 2>/dev/null || true
+      wait "$sandbox_pid" 2>/dev/null || true
+    fi
+    if [ -n "$relay_pid" ]; then
+      kill -TERM "$relay_pid" 2>/dev/null || true
+      wait "$relay_pid" 2>/dev/null || true
+    fi
+    if [ "$keep" -ne 1 ] && [ -n "$session_root" ] && [ -d "$session_root" ]; then
+      case $session_root in
+      "$cache_base"/*) rm -rf -- "$session_root" ;;
+      *) note "refusing to remove an unexpected session path" ;;
+      esac
+    fi
+    exit "$status"
+  }
+  trap cleanup EXIT
+
+  local bwrap_args=(
+    --unshare-pid
+    --unshare-uts
+    --unshare-ipc
+    --unshare-user
+    --unshare-net
+    --die-with-parent
+    --cap-drop ALL
+    --hostname wheel-sandbox
+    --dev /dev
+    --proc /proc
+    --tmpfs /tmp
+    --chdir "$workspace"
+  )
+
+  bind_system_path() {
+    local path=$1 target
+    if [ -L "$path" ]; then
+      target=$(readlink -- "$path")
+      target=${target#/}
+      bwrap_args+=(--symlink "$target" "$path")
+    elif [ -d "$path" ]; then
+      bwrap_args+=(--ro-bind "$path" "$path")
+    fi
+  }
+
+  local path
+  for path in /usr /etc /bin /sbin /lib /lib64 /lib32; do
+    bind_system_path "$path"
+  done
+
+  bwrap_args+=(
+    --bind "$workspace" "$workspace"
+    --bind "$cache_root" /cache
+  )
+
+  case $repo_root/ in
+  "$workspace"/*) ;;
+  *) bwrap_args+=(--ro-bind "$repo_root" "$repo_root") ;;
+  esac
+
+  mask_file() {
+    if [ -e "$1" ]; then
+      bwrap_args+=(--ro-bind /dev/null "$1")
+    fi
+  }
+
+  mask_dir() {
+    if [ -d "$1" ]; then
+      local empty=$session_root/host/empty
+      mkdir -p -- "$empty"
+      bwrap_args+=(--ro-bind "$empty" "$1")
+    fi
+  }
+
+  # Git hooks and MCP server declarations are code that would run outside the
+  # sandbox's process tree; credential stores inside a checkout are masked too.
+  mask_dir "$workspace/.git/hooks"
+  mask_file "$workspace/.mcp.json"
+  mask_file "$workspace/.git-credentials"
+  mask_file "$workspace/.netrc"
+  mask_dir "$workspace/.ssh"
+  mask_dir "$workspace/.aws"
+  mask_dir "$workspace/.gnupg"
+  mask_dir "$workspace/.docker"
+  mask_dir "$workspace/.kube"
+
+  local env_args=(
+    --clearenv
+    --setenv PATH "$SYSTEM_PATH"
+    --setenv TMPDIR /cache/tmp
+    --setenv CARGO_HOME /cache/cargo
+    --setenv XDG_CACHE_HOME /cache/xdg-cache
+    --setenv XDG_DATA_HOME /cache/xdg-data
+    --setenv XDG_STATE_HOME /cache/xdg-state
+    --setenv XDG_CONFIG_HOME /cache/xdg-config
+    --setenv npm_config_cache /cache/npm
+    --setenv WHEEL_SANDBOX 1
+    --setenv WHEEL_SANDBOX_MODE "$mode"
+    --setenv WHEEL_SANDBOX_SESSION "$session"
+  )
+
+  local name value
+  for name in LANG LC_ALL TERM; do
+    value=${!name:-}
+    case $value in
+    '' | *[!A-Za-z0-9_.@-]*) continue ;;
+    esac
+    env_args+=(--setenv "$name" "$value")
+  done
+
+  local command=()
+  if [ "$exec_mode" -eq 1 ]; then
+    [ "${#wheel_args[@]}" -gt 0 ] || die "--exec requires a command after --"
+    command=("${wheel_args[@]}")
+  else
+    [ "${wheel_args[0]:-}" != "--sandbox" ] || die "refusing a nested --sandbox invocation"
+    command=("$script_dir/wheel" ${wheel_args[@]+"${wheel_args[@]}"})
+  fi
+
+  local relay_socket="" relay_log="" ready=""
+  if [ "$mode" = proxy ]; then
+    command -v python3 >/dev/null 2>&1 || die "proxy mode requires python3"
+    [ -n "$allow" ] || die "proxy mode requires an allowlist: --allow or WHEEL_SANDBOX_ALLOW"
+    case $allow in
+    *'*'*) die "wildcard allowlist entries are not permitted" ;;
+    esac
+    relay_socket=$session_root/host/relay.sock
+    relay_log=$session_root/host/requests.jsonl
+    ready=$session_root/host/relay.ready
+    python3 "$script_dir/wheel-sandbox-proxy.py" \
+      --socket "$relay_socket" \
+      --allow "$allow" \
+      --log "$relay_log" \
+      --session "$session" \
+      --ready-file "$ready" \
+      --tls-dir "$session_root/host/tls" &
+    relay_pid=$!
+
+    local tries=0
+    while [ ! -s "$ready" ]; do
+      if ! kill -0 "$relay_pid" 2>/dev/null; then
+        wait "$relay_pid" 2>/dev/null || true
+        relay_pid=""
+        die "the egress relay failed to start (proxy mode is fail-closed)"
+      fi
+      tries=$((tries + 1))
+      if [ "$tries" -gt 200 ]; then
+        die "the egress relay did not become ready"
+      fi
+      sleep 0.05
+    done
+
+    local ca_path=$session_root/host/tls/ca.pem
+    if [ -n "${WHEEL_SANDBOX_TLS_CA:-}" ]; then
+      ca_path=$WHEEL_SANDBOX_TLS_CA
+    fi
+    [ -r "$ca_path" ] || die "the egress relay did not provide a session CA certificate"
+
+    local system_bundle="" candidate
+    if [ -n "${WHEEL_SANDBOX_CA_BUNDLE:-}" ]; then
+      system_bundle=$WHEEL_SANDBOX_CA_BUNDLE
+    else
+      for candidate in "${CA_BUNDLE_CANDIDATES[@]}"; do
+        if [ -r "$candidate" ]; then
+          system_bundle=$candidate
+          break
+        fi
+      done
+    fi
+    [ -n "$system_bundle" ] ||
+      die "cannot locate a system CA bundle to extend; set WHEEL_SANDBOX_CA_BUNDLE"
+
+    # bwrap refuses to mount over a symlink, and every mainstream distribution
+    # ships this path as one; bind the resolved file instead.
+    local bundle_target=$system_bundle
+    if [ -L "$system_bundle" ]; then
+      bundle_target=$(readlink -f -- "$system_bundle")
+    fi
+
+    local bundle=$session_root/host/ca-bundle.pem
+    cat -- "$system_bundle" "$ca_path" >"$bundle"
+
+    bwrap_args+=(
+      --ro-bind "$bundle" "$bundle_target"
+      --bind "$relay_socket" /run/wheel-relay/relay.sock
+    )
+
+    command=(
+      python3 "$script_dir/wheel-sandbox-bridge.py"
+      --socket /run/wheel-relay/relay.sock
+      --
+      ${command[@]+"${command[@]}"}
+    )
+  fi
+
+  if [ "${WHEEL_SANDBOX_VERBOSE:-0}" = 1 ]; then
+    note "mode=$mode workspace=$workspace session=$session_root"
+  fi
+
+  # The session directories above are private; the sandboxed command keeps a
+  # conventional umask so builds behave as they do outside the sandbox.
+  umask 022
+  bwrap "${bwrap_args[@]}" "${env_args[@]}" -- "${command[@]}" &
+  sandbox_pid=$!
+  local status=0
+  wait "$sandbox_pid" || status=$?
+  sandbox_pid=""
+  exit "$status"
+}
+
+main "$@"

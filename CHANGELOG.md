@@ -24,6 +24,24 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with tool name, outcome status, exit code, byte counts, and the first
   observation line. Default output is unchanged.
 
+### Security
+
+- First OS-level sandbox for a Wheel session: `wheel --sandbox …` runs the
+  harness behind a platform backend, with `bubblewrap` providing the Linux
+  implementation. The session sees a read-only system tree, the workspace, one
+  per-session scratch directory, a private `/proc` and `/tmp`, and private
+  user/PID/UTS/IPC/network namespaces with all capabilities dropped. The owner's
+  home, SSH and cloud credentials, the Wheel credential and trust stores, shell
+  rc files, `.git/hooks`, `.mcp.json`, `/run/user/*`, the Wayland and D-Bus
+  sockets, and the container socket are unreachable by construction. The default
+  mode has no network route at all; `--proxy` adds a host-side CONNECT relay over
+  a bind-mounted Unix socket with a default-deny allowlist, bounded transfers,
+  per-request logging, and relay-side credential injection, so the provider key
+  never enters the sandbox environment. The launcher fails closed when `bwrap`
+  is missing and never falls back to an unsandboxed run. Linux only; the macOS
+  backend is not implemented, and Windows is WSL2-only. Evidence:
+  `just test-sandbox`.
+
 ### Provider Cache
 
 - Provider prompt-cache negotiation for `off`, `prefer` (default), and
