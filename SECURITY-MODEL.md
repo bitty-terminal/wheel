@@ -165,6 +165,12 @@ not receive it.
   Complete output is retained only in the existing content-addressed spillover
   blob and remains subject to the process capture and retention bounds; raw
   stdout/stderr are not long-lived action-record fields.
+- The model-facing observation projection is a separate bounded budget
+  (`context.observation_max_bytes`, clamped by the Zone 3 tail budget) applied
+  to one tool result before it reaches a provider. It passes the same redaction
+  passes as every other output sink, states the dropped byte count and the
+  blob reference when it truncates, and never widens the persisted action
+  record's bounded preview fields.
 
 ### Arbitrary argv
 

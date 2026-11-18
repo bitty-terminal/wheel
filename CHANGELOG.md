@@ -19,6 +19,16 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Widen the model-facing tool observation from the hardcoded 256-byte preview
+  to a budgeted window (`context.observation_max_bytes`, default 8 KiB) clamped
+  by the Zone 3 tail budget. A 4 KiB `read_file` result now arrives complete with
+  its line boundaries intact; larger results spill to the content-addressed blob
+  with a marker naming the dropped byte count and the blob hash, `read_file`
+  spills only at the observation window while `run_command` keeps its 4 KiB
+  threshold, and the provider request bound derives from the same window so an
+  observation is not truncated twice. Redaction still scans the widened window,
+  and the persisted action record keeps its 256-byte bounded fields.
+
 - Preserve numeric indices and boolean `false` values in bounded provider tool
   arrays and nested JSON schema structures. Reject sparse, mixed-key,
   unsupported-key, colliding, cyclic, truncated, or redacted tool schemas as a

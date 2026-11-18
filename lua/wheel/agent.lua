@@ -971,6 +971,9 @@ function WheelAgent:execute_tool(tool_name, args)
     workspace_root = self.workspace and self.workspace.root or ".",
     kernel = self.kernel,
     context = self.context,
+    -- Observation projection budgets resolve from the effective configuration;
+    -- tool dispatch never decides them locally.
+    config = self.config,
   })
 end
 

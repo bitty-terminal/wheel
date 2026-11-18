@@ -113,6 +113,12 @@ WheelTool.DEFAULT_SPILLOVER_THRESHOLD = 4096
 --- Maximum bytes to read for file operations by default.
 WheelTool.DEFAULT_MAX_READ_BYTES = 65536
 
+--- Model-facing observation window used only when the configuration module is
+-- unavailable. The effective window is resolved from the `context` budgets by
+-- `WheelTool.resolve_observation_budget`, so this degraded path stays at the
+-- historical narrow bound instead of widening without a budget.
+WheelTool.OBSERVATION_FALLBACK_BYTES = 256
+
 --- Maximum caller-selectable file read bound (1 MiB).
 WheelTool.MAX_READ_BYTES = 1024 * 1024
 
@@ -177,16 +183,56 @@ end
 
 local function redact_complete(value)
   if type(value) ~= "string" or value == "" then return "" end
-  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
-    -- Pass the complete stream in one call so a secret's prefix cannot fall
-    -- outside the redaction window before head/tail slices are selected. The
-    -- audit helper folds newlines for single-line metadata, so preserve line
-    -- boundaries with a control separator while it scans the complete stream.
-    local separator = "\v"
-    local scan_value = value:gsub("\r\n", "\n"):gsub("[\r\n]", separator)
-    return WheelAudit.redact_bounded(scan_value, #scan_value):gsub(separator, "\n")
+  if WheelAudit and type(WheelAudit.redact_block) == "function" then
+    -- Scan the complete stream in one call so a secret's prefix cannot fall
+    -- outside the redaction window before head/tail slices are selected, and
+    -- keep line boundaries because this is a model-facing block.
+    return WheelAudit.redact_block(value, #value)
   end
   return "[redacted]"
+end
+
+--- Marker that closes a spilled observation.
+-- The blob hash is the recovery path for the complete payload, and the
+-- dropped-byte count keeps a spilled observation from looking complete.
+-- @param total_bytes number
+-- @param shown_bytes number
+-- @param hash string
+-- @return string
+local function spill_marker(total_bytes, shown_bytes, hash)
+  local dropped = total_bytes - shown_bytes
+  if dropped < 0 then dropped = 0 end
+  return string.format(
+    "\n[... %d bytes dropped; %d of %d bytes shown, full output spilled to blob: %s (use read_blob to inspect full content) ...]\n",
+    dropped, shown_bytes, total_bytes, tostring(hash))
+end
+
+--- Slice a stream head without cutting the final line in half.
+-- @param stream string
+-- @param length number
+-- @return string
+local function head_slice(stream, length)
+  if length >= #stream then return stream end
+  local slice = stream:sub(1, length)
+  local last_newline = slice:match("^.*()\n")
+  if last_newline and last_newline > 1 then
+    return slice:sub(1, last_newline)
+  end
+  return slice
+end
+
+--- Slice a stream tail without cutting its first line in half.
+-- @param stream string
+-- @param length number
+-- @return string
+local function tail_slice(stream, length)
+  if length >= #stream then return stream end
+  local start = #stream - length + 1
+  local next_newline = stream:find("\n", start, true)
+  if next_newline and next_newline < #stream then
+    return stream:sub(next_newline + 1)
+  end
+  return stream:sub(start)
 end
 
 local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
@@ -195,35 +241,52 @@ local function bounded_spill_preview(stdout, stderr, hash, total_bytes, limit)
     stream = stream .. (#stream > 0 and "\n" or "") .. "STDERR: " .. stderr
   end
   stream = redact_complete(stream)
-  if #stream <= limit then
-    return safe_preview(stream, limit)
+  -- Reserve the widest possible marker first (one shown byte, everything else
+  -- dropped); the rendered marker can only be shorter.
+  local available = limit - #spill_marker(total_bytes, 1, hash) - 2
+  if #stream <= available then
+    -- The payload fits the window, but it is still spilled: keep the marker so
+    -- the outcome cannot be mistaken for a complete one, and name the blob.
+    return stream .. spill_marker(total_bytes, math.min(#stream, total_bytes), hash)
   end
-  local marker = string.format(
-    "\n[... %d bytes spilled to blob: %s (use read_blob to inspect full content) ...]\n",
-    total_bytes, hash)
-  local fragments = split_content_lines(stream)
-  local fragment_limit = 32
-  local selected = {}
-  if #fragments > 0 then selected[#selected + 1] = fragments[1] end
-  if #fragments >= 10 then selected[#selected + 1] = fragments[10] end
-  if #fragments > 1 then selected[#selected + 1] = fragments[#fragments] end
-  if #selected > 0 then
-    -- Reserve space for the complete redacted marker and keep all selected
-    -- fragments visible instead of truncating the preview in its middle.
-    local separators = #selected - 1
-    fragment_limit = math.floor((limit - #marker - separators) / #selected)
-    fragment_limit = math.max(1, math.min(fragment_limit, 32))
+  if available < 2 then
+    return stream:sub(1, limit)
   end
-  local parts = {}
-  for _, fragment in ipairs(selected) do
-    parts[#parts + 1] = safe_preview(fragment, fragment_limit)
-  end
-  parts[#parts + 1] = marker
-  local preview = table.concat(parts, "\n")
+  -- The window is shared between a head and a tail of the complete stream, so
+  -- the model keeps both the opening context and the latest output.
+  local head_len = math.floor(available / 2)
+  local head = head_slice(stream, head_len)
+  local tail = tail_slice(stream, available - head_len)
+  local marker = spill_marker(total_bytes, #head + #tail, hash)
+  local preview = head .. marker .. tail
   if #preview > limit then
-    return preview:sub(1, limit)
+    preview = preview:sub(1, limit)
   end
   return preview
+end
+
+--- Bound a derived observation stream while preserving its line boundaries.
+-- The model reads source code, so the observation keeps newlines instead of
+-- the folded single-line form used for audit metadata. Redaction still scans
+-- the complete stream in one call. When the stream exceeds the window the tail
+-- is replaced by a marker that states exactly how many bytes were dropped.
+-- @param stream string
+-- @param limit number
+-- @return string
+local function bounded_observation_preview(stream, limit)
+  if type(stream) ~= "string" or stream == "" then return "" end
+  local safe = redact_complete(stream)
+  if #safe <= limit then
+    return safe
+  end
+  local marker = string.format(
+    "\n[... %d bytes dropped; %d of %d bytes shown (raise context.observation_max_bytes to widen the window) ...]",
+    #safe - limit, limit, #safe)
+  if #marker >= limit then
+    return safe:sub(1, limit)
+  end
+  local head = limit - #marker
+  return safe:sub(1, head) .. marker
 end
 
 local function supplied_or_derived_preview(supplied, derived, limit)
@@ -231,7 +294,9 @@ local function supplied_or_derived_preview(supplied, derived, limit)
     local safe = safe_preview(supplied, limit)
     if safe ~= "" then return safe end
   end
-  return safe_preview(derived, limit)
+  -- The derived stream is the tool's own output, so keep its line boundaries
+  -- and state the dropped bytes when it exceeds the window.
+  return bounded_observation_preview(derived, limit)
 end
 
 -- ---------------------------------------------------------------------------
@@ -408,8 +473,26 @@ end
 local ActionOutcome = {}
 ActionOutcome.__index = ActionOutcome
 
+--- Resolve the model-facing observation window in bytes.
+-- The window is derived from the context budget (Zone 3 tail) so the tool layer
+-- and the runner share one policy. A missing configuration module falls back to
+-- the narrow historical bound: observations stay readable-safe rather than wide.
+-- @param config table? full configuration or context table
+-- @return number window_bytes
+function WheelTool.resolve_observation_budget(config)
+  if WheelConfig and type(WheelConfig.resolve_observation_budget) == "function" then
+    local ok, window = pcall(WheelConfig.resolve_observation_budget, config)
+    if ok and type(window) == "number" and window > 0 then
+      return window
+    end
+  end
+  return WheelTool.OBSERVATION_FALLBACK_BYTES
+end
+
 --- Format an outcome for insertion into Zone 3 dynamic prompt context.
--- If the outcome spilled, includes the content-addressed blob hash and head/tail preview.
+-- If the outcome spilled, includes the content-addressed blob hash and head/tail
+-- preview. The body is bounded by the resolved observation window; the header
+-- line is additional because the runner reserves header space separately.
 -- @return string Formatted observation string
 function ActionOutcome:format_observation()
   local lines = {}
@@ -430,8 +513,9 @@ function ActionOutcome:format_observation()
     flags)
   table.insert(lines, header)
 
-  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
-  local safe = safe_preview(self.preview, preview_limit)
+  local window = tonumber(self.observation_max_bytes)
+    or WheelTool.resolve_observation_budget(nil)
+  local safe = bounded_observation_preview(self.preview, window)
   if safe ~= "" then
     table.insert(lines, safe)
   else
@@ -476,12 +560,14 @@ WheelTool.ActionOutcome = ActionOutcome
 -- If stdout + stderr exceeds threshold, persists full output into context/kernel
 -- as a content-addressed blob, and returns bounded head/tail preview.
 -- @param raw table { tool = string, intent = string, success = boolean, exit_code = number, stdout = string, stderr = string, duration_ms = number, action_id = string? }
--- @param opts table? { threshold_bytes = number?, context = table?, kernel = table? }
+-- @param opts table? { threshold_bytes = number?, observation_max_bytes = number?, config = table?, context = table?, kernel = table? }
 -- @return table ActionOutcome instance
 function WheelTool.process_spillover(raw, opts)
   opts = opts or {}
   raw = raw or {}
   local threshold = opts.threshold_bytes or WheelTool.DEFAULT_SPILLOVER_THRESHOLD
+  local observation_max = tonumber(opts.observation_max_bytes)
+    or WheelTool.resolve_observation_budget(opts.config)
   local stdout = raw.stdout or ""
   local stderr = raw.stderr or ""
   local total_bytes = #stdout + #stderr
@@ -499,9 +585,11 @@ function WheelTool.process_spillover(raw, opts)
   self.stdout_bytes = tonumber(raw.stdout_bytes) or #stdout
   self.stderr_bytes = tonumber(raw.stderr_bytes) or #stderr
   self.size_bytes = tonumber(raw.size_bytes) or total_bytes
-  local preview_limit = WheelAction and WheelAction.MAX_INLINE_PREVIEW_BYTES or 256
-  self.stdout_preview = safe_preview(raw.stdout_preview or stdout, preview_limit)
-  self.stderr_preview = safe_preview(raw.stderr_preview or stderr, preview_limit)
+  -- The resolved window is carried on the outcome so format_observation uses
+  -- the same budget the preview was built with.
+  self.observation_max_bytes = observation_max
+  self.stdout_preview = safe_preview(raw.stdout_preview or stdout, observation_max)
+  self.stderr_preview = safe_preview(raw.stderr_preview or stderr, observation_max)
   self.outcome = raw.outcome
   self.timed_out = raw.timed_out == true
   self.truncated = raw.truncated == true
@@ -518,7 +606,7 @@ function WheelTool.process_spillover(raw, opts)
       self.spillover_hash = nil
       self.spillover_bytes = 0
       self.preview = supplied_or_derived_preview(
-        raw.preview, raw.stdout_preview or stdout, preview_limit)
+        raw.preview, raw.stdout_preview or stdout, observation_max)
       return self
     end
 
@@ -529,41 +617,13 @@ function WheelTool.process_spillover(raw, opts)
       opts.kernel:put_slot("blobs/" .. hash, full_payload)
     end
 
-    -- Construct bounded head/tail preview
-    local lines = {}
-    for line in stdout:gmatch("([^\r\n]*)\r?\n?") do
-      if #line > 0 or #lines == 0 then
-        table.insert(lines, line)
-      end
-    end
-
-    local preview_lines = {}
-    local max_head = 10
-    local max_tail = 5
-    local total_lines = #lines
-
-    if total_lines <= (max_head + max_tail) then
-      for _, l in ipairs(lines) do
-        table.insert(preview_lines, l)
-      end
-    else
-      for i = 1, max_head do
-        table.insert(preview_lines, lines[i])
-      end
-      local spilled_count = total_bytes
-      table.insert(preview_lines, string.format("\n[... %d bytes spilled to blob: %s (use read_blob to inspect full content) ...]\n", spilled_count, hash))
-      for i = total_lines - max_tail + 1, total_lines do
-        table.insert(preview_lines, lines[i])
-      end
-    end
-
     self.spilled = true
     self.spillover_hash = hash
     self.spillover_bytes = total_bytes
     local derived_preview = bounded_spill_preview(
-      stdout, stderr, hash, total_bytes, preview_limit)
+      stdout, stderr, hash, total_bytes, observation_max)
     if type(raw.preview) == "string" and raw.preview ~= "" then
-      self.preview = supplied_or_derived_preview(raw.preview, derived_preview, preview_limit)
+      self.preview = supplied_or_derived_preview(raw.preview, derived_preview, observation_max)
     else
       -- The derived spill preview has already been completely redacted and
       -- budgeted.  Do not run it through a prefix-only bound a second time,
@@ -578,7 +638,7 @@ function WheelTool.process_spillover(raw, opts)
     if #stderr > 0 then
       p = p .. (#p > 0 and "\n" or "") .. "STDERR: " .. stderr
     end
-    self.preview = supplied_or_derived_preview(raw.preview, p, preview_limit)
+    self.preview = supplied_or_derived_preview(raw.preview, p, observation_max)
   end
 
   return self
@@ -593,6 +653,10 @@ end
 local tool_read_file = {
   name = "read_file",
   intent = WheelTool.ActionIntent.INSPECT,
+  -- read_file already applies its own bounded read (64 KiB default), so its
+  -- observation spills at the model-facing window rather than at the generic
+  -- command-output threshold.
+  observation_window_threshold = true,
   description = "Read file content within workspace root with optional line range and bounds",
   parameters = {
     type = "object",
@@ -1143,13 +1207,17 @@ local WheelToolRegistry = {}
 WheelToolRegistry.__index = WheelToolRegistry
 
 --- Create a new WheelToolRegistry.
--- @param opts table? { spillover_threshold = number? }
+-- @param opts table? { spillover_threshold = number?, observation_max_bytes = number?, config = table? }
 -- @return table WheelToolRegistry instance
 function WheelToolRegistry.new(opts)
   opts = opts or {}
   local self = setmetatable({}, WheelToolRegistry)
   self._tools = {}
   self.spillover_threshold = opts.spillover_threshold or WheelTool.DEFAULT_SPILLOVER_THRESHOLD
+  -- An explicit window wins; otherwise the window is resolved per dispatch from
+  -- the effective configuration so a run-level override is honored.
+  self.observation_max_bytes = tonumber(opts.observation_max_bytes)
+  self.config = opts.config
 
   -- Register default core tools
   for _, tool in ipairs(WheelTool.CORE_TOOLS) do
@@ -1285,8 +1353,18 @@ function WheelToolRegistry:dispatch(name, args, env)
   end
 
   -- 3. Run auto-spillover pipeline
+  local observation_max = self.observation_max_bytes
+    or WheelTool.resolve_observation_budget(env.config or self.config)
+  local spill_threshold = self.spillover_threshold
+  if tool.observation_window_threshold then
+    -- A tool that returns a bounded read of its own (read_file) spills only
+    -- when the result cannot fit the model-facing window, so a normal source
+    -- file arrives complete instead of as a 256-byte head.
+    spill_threshold = observation_max
+  end
   local outcome = WheelTool.process_spillover(raw_outcome, {
-    threshold_bytes = self.spillover_threshold,
+    threshold_bytes = spill_threshold,
+    observation_max_bytes = observation_max,
     context = env.context,
     kernel = env.kernel,
   })
@@ -1629,6 +1707,11 @@ function PermissionGate:authorize(tool_name, args, ctx)
 end
 
 WheelTool.PermissionGate = PermissionGate
+
+--- Tool registry class. Callers that need a different observation window or
+-- spillover threshold construct their own instead of mutating the shared
+-- default instance.
+WheelTool.WheelToolRegistry = WheelToolRegistry
 
 -- Global default registry singleton
 local _default_registry = nil

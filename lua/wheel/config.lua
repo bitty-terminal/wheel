@@ -137,6 +137,7 @@ WheelConfig.DEFAULTS = {
     zone2_max_bytes = 32768,
     zone3_max_bytes = 16384,
     spillover_threshold_bytes = 4096,
+    observation_max_bytes = 8192,
     prune_scratchpads = true,
   },
   -- 7. Headless panel container policy
@@ -170,6 +171,61 @@ WheelConfig.RUNTIME_DEFAULTS = {
     run_command = "ask",
   },
 }
+
+--- Model-facing observation projection policy.
+-- One tool result reaches the model as a single observation. Its window is a
+-- byte budget (`context.observation_max_bytes`) clamped by the Zone 3 tail
+-- budget, so widening the window can never push the compiled prompt past its
+-- configured zone space. The historical fixed 256-byte preview bound is the
+-- floor: a smaller window cannot carry a usable source fragment.
+WheelConfig.MIN_OBSERVATION_BYTES = 256
+
+--- Bytes reserved for the observation header line when the same window is
+--- projected into one provider request message.
+WheelConfig.OBSERVATION_HEADER_RESERVE_BYTES = 256
+
+--- Parse a strictly positive integer byte budget.
+-- @param value any
+-- @return number? value
+local function positive_integer(value)
+  local number = tonumber(value)
+  if not number or number ~= math.floor(number) or number < 1 then
+    return nil
+  end
+  return number
+end
+
+--- Resolve the model-facing observation window in bytes.
+-- Accepts a full configuration table or a `context` table. A missing or
+-- malformed override falls back to the configured default, and the result is
+-- clamped by `context.zone3_max_bytes` so the Zone 3 prompt budget is never
+-- exceeded. Tightening the override always takes effect; widening is bounded.
+-- @param config table? full configuration or context table
+-- @return number window_bytes
+function WheelConfig.resolve_observation_budget(config)
+  local context = type(config) == "table" and config or {}
+  if type(context.context) == "table" then
+    context = context.context
+  end
+  local defaults = WheelConfig.DEFAULTS.context
+  local zone3 = positive_integer(context.zone3_max_bytes)
+    or positive_integer(defaults.zone3_max_bytes)
+  local window = positive_integer(context.observation_max_bytes)
+    or positive_integer(defaults.observation_max_bytes)
+  window = math.min(window, zone3)
+  if window < WheelConfig.MIN_OBSERVATION_BYTES then
+    window = math.min(WheelConfig.MIN_OBSERVATION_BYTES, zone3)
+  end
+  return window
+end
+
+--- Provider request message bound that carries one observation unchanged.
+-- @param config table? full configuration or context table
+-- @return number message_bytes
+function WheelConfig.resolve_observation_message_bytes(config)
+  return WheelConfig.resolve_observation_budget(config)
+    + WheelConfig.OBSERVATION_HEADER_RESERVE_BYTES
+end
 
 --- Check if a table is an array-like sequence.
 local function is_array(tbl)
@@ -3053,6 +3109,17 @@ local PROJECT_FORBIDDEN_PROVIDER_KEYS = {
 local function validate_project_override(base_config, project_tbl)
   if type(project_tbl) ~= "table" then
     return false, "project_config_escalation", "project config must return a table"
+  end
+  if project_tbl.context ~= nil and type(project_tbl.context) ~= "table" then
+    return false, "project_config_escalation", "project config context must be a table"
+  end
+  if type(project_tbl.context) == "table" then
+    local observation = project_tbl.context.observation_max_bytes
+    if observation ~= nil and (type(observation) ~= "number"
+      or observation ~= math.floor(observation) or observation < 1) then
+      return false, "project_config_escalation",
+        "project config context.observation_max_bytes must be a positive integer byte budget"
+    end
   end
   if project_tbl.approval_mode ~= nil and project_tbl.approval_mode ~= "auto-deny" then
     return false, "project_config_escalation", "project config may only tighten approval_mode to auto-deny"

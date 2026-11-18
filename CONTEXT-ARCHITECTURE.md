@@ -319,9 +319,12 @@ Context      -> conclusions, evidence, risks, decisions, next actions
 The current implementation already has:
 
 - 256 KiB per-stream process capture bounds;
-- 4 KiB tool spillover threshold;
+- 4 KiB `run_command` spillover threshold;
+- a budgeted model-facing observation window (`context.observation_max_bytes`,
+  default 8 KiB, clamped by the Zone 3 tail budget) so a normal source file
+  reaches the model complete and `read_file` spills only at that window;
 - content-addressed `blobs/<hash>` storage;
-- head/tail previews;
+- head/tail previews that name the dropped byte count and the blob hash;
 - bounded `search_code` output;
 - `read_blob` range reads;
 - timeout/truncation/spillover metadata.

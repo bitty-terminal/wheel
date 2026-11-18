@@ -43,7 +43,28 @@ WheelRunner.MAX_EVIDENCE_ITEMS = 8
 WheelRunner.MAX_STATE_FIELD_BYTES = 1024
 WheelRunner.MAX_REQUEST_BYTES = 48 * 1024
 WheelRunner.MAX_REQUEST_MESSAGES = 12
-WheelRunner.MAX_REQUEST_MESSAGE_BYTES = 4096
+--- Floor for the per-message request bound. Lowering this below the historical
+-- value would truncate non-observation messages for no security benefit.
+WheelRunner.MIN_REQUEST_MESSAGE_BYTES = 4096
+
+--- Derive the per-message request bound from the observation window.
+-- A tool observation must reach the model through request projection without a
+-- second, narrower truncation, so the message bound is the resolved observation
+-- window plus the observation header reserve.
+-- @param config table? effective configuration
+-- @return number message_bytes
+local function observation_message_bytes(config)
+  local window = 0
+  if WheelConfig and type(WheelConfig.resolve_observation_budget) == "function" then
+    local ok, resolved = pcall(WheelConfig.resolve_observation_budget, config)
+    if ok and type(resolved) == "number" then window = resolved end
+  end
+  local reserve = (WheelConfig and WheelConfig.OBSERVATION_HEADER_RESERVE_BYTES) or 0
+  return math.max(WheelRunner.MIN_REQUEST_MESSAGE_BYTES, window + reserve)
+end
+
+WheelRunner.MAX_REQUEST_MESSAGE_BYTES = observation_message_bytes(
+  WheelConfig and WheelConfig.DEFAULTS or nil)
 WheelRunner.MAX_REQUEST_VALUE_BYTES = 2048
 WheelRunner.MAX_REQUEST_ARGUMENT_BYTES = 4096
 WheelRunner.MAX_REQUEST_VALUE_NODES = 256
@@ -408,6 +429,22 @@ local function safe_string(value, limit, budget)
   return text
 end
 
+--- Bound a multi-line message body without folding its line boundaries.
+-- Observations are source code; metadata redaction folds newlines, which would
+-- turn a delivered file into one unreadable line before it reaches the model.
+local function safe_content(value, limit, budget)
+  if not budget_node(budget) then return nil end
+  local text
+  if WheelAudit and type(WheelAudit.redact_block) == "function" then
+    text = WheelAudit.redact_block(value, limit)
+  else
+    text = redact_bounded(value, limit)
+  end
+  local size = encoded_size(text)
+  if not size or not budget_bytes(budget, size) then return nil end
+  return text
+end
+
 sorted_keys = function(value, limit)
   local keys = {}
   local overflow = false
@@ -569,22 +606,23 @@ local function encoded_request(request)
   return ok and type(encoded) == "string" and encoded or nil
 end
 
-local function bounded_message(message, budget)
+local function bounded_message(message, budget, content_limit)
   budget = budget or make_budget(WheelRunner.MAX_REQUEST_VALUE_NODES,
     WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_ARGUMENT_BYTES)
+  content_limit = content_limit or WheelRunner.MAX_REQUEST_MESSAGE_BYTES
   if not budget_node(budget) or not budget_bytes(budget, 2) then
     return nil
   end
   local bounded = {}
-  local function field(name, value, limit)
+  local function field(name, value, limit, project)
     if not budget_key(budget) then return end
     local key_size = encoded_size(name)
     if not key_size or not budget_bytes(budget, key_size + 1) then return end
-    local safe = safe_string(value, limit, budget)
+    local safe = (project or safe_string)(value, limit, budget)
     if safe ~= nil then bounded[name] = safe end
   end
   field("role", message.role or "user", WheelRunner.MAX_REQUEST_VALUE_BYTES)
-  field("content", message.content or "", WheelRunner.MAX_REQUEST_MESSAGE_BYTES)
+  field("content", message.content or "", content_limit, safe_content)
   if bounded.role == nil or bounded.content == nil then return nil end
   if message.tool_call_id then field("tool_call_id", message.tool_call_id, WheelRunner.MAX_REQUEST_VALUE_BYTES) end
   if type(message.tool_calls) == "table" then
@@ -623,7 +661,11 @@ local function bounded_message(message, budget)
 end
 
 --- Bound request fields and serialized prefix together before provider dispatch.
-local function bound_provider_request(request)
+-- @param request table provider request
+-- @param message_bytes number? per-message content bound (defaults to the
+--   module bound derived from the observation window)
+local function bound_provider_request(request, message_bytes)
+  message_bytes = message_bytes or WheelRunner.MAX_REQUEST_MESSAGE_BYTES
   local value_budget = make_budget(WheelRunner.MAX_REQUEST_NODES,
     WheelRunner.MAX_REQUEST_KEYS, WheelRunner.MAX_REQUEST_BYTES)
   local bounded = { messages = {} }
@@ -678,7 +720,7 @@ local function bound_provider_request(request)
     if message.role == "system" then first_system = message; break end
   end
   if first_system then
-    local bounded_system = bounded_message(first_system, value_budget)
+    local bounded_system = bounded_message(first_system, value_budget, message_bytes)
     if bounded_system then bounded.messages[#bounded.messages + 1] = bounded_system end
   end
 
@@ -690,7 +732,8 @@ local function bound_provider_request(request)
   end
   local pinned_bounded = nil
   if pinned_task then
-    pinned_bounded = bounded_message(pinned_task, value_budget) or bounded_message(pinned_task)
+    pinned_bounded = bounded_message(pinned_task, value_budget, message_bytes)
+      or bounded_message(pinned_task, nil, message_bytes)
     if pinned_bounded then bounded.messages[#bounded.messages + 1] = pinned_bounded end
   end
 
@@ -738,7 +781,7 @@ local function bound_provider_request(request)
     local trial_budget = copy_budget(value_budget)
     local bounded_group = {}
     for _, message in ipairs(group) do
-      local bounded_item = bounded_message(message, trial_budget)
+      local bounded_item = bounded_message(message, trial_budget, message_bytes)
       if not bounded_item then
         bounded_group = nil
         break
@@ -1201,7 +1244,8 @@ function WheelRunner.run_task(agent, task, opts)
       end
     end
 
-    req = bound_provider_request(req)
+    req = bound_provider_request(req,
+      observation_message_bytes(agent.config))
     if not req then
       final_error = "Provider tool definitions exceed request bounds"
       append_unique_bounded(retained_state.failures, final_error, WheelRunner.MAX_STATE_FIELD_BYTES)

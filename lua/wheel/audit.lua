@@ -692,6 +692,24 @@ function WheelAudit.redact_bounded(value, limit)
   return redacted
 end
 
+--- Redact an untrusted multi-line block while preserving line boundaries.
+-- `redact_bounded` folds newlines because it exists for single-line metadata.
+-- Prompt and observation blocks keep them so the model still sees the source
+-- structure. The complete value is scanned in one call, so a secret's prefix
+-- cannot fall outside the retained window before the block is bounded.
+-- @param value any
+-- @param limit number
+-- @return string
+function WheelAudit.redact_block(value, limit)
+  if type(value) ~= "string" or value == "" then
+    return ""
+  end
+  local separator = "\v"
+  local scan_value = value:gsub("\r\n", "\n"):gsub("[\r\n]", separator)
+  local redacted = WheelAudit.redact_bounded(scan_value, limit)
+  return (redacted:gsub(separator, "\n"))
+end
+
 --- Redact an argv vector with flag/value context and a total byte budget.
 -- @param program string
 -- @param args table?

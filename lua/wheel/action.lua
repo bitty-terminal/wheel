@@ -11,6 +11,10 @@ local ok_audit, WheelAudit = pcall(require, "wheel.audit")
 if not ok_audit then WheelAudit = nil end
 
 Action.SPILLOVER_THRESHOLD_BYTES = 4096
+-- Bound for the persisted action record's preview fields. The model-facing
+-- observation window is a separate, larger budget resolved from the context
+-- configuration (`WheelConfig.resolve_observation_budget`); a wider observation
+-- is still persisted here as a bounded record.
 Action.MAX_INLINE_PREVIEW_BYTES = 256
 Action.MAX_DIAGNOSTICS_ITEMS = 32
 Action.MAX_DIAGNOSTIC_TEXT_BYTES = 256

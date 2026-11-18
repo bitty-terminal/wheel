@@ -544,12 +544,13 @@ run_test("WheelTool: every supplied preview is bounded and redacted", function()
   local raw_preview = "Bearer " .. secret .. string.rep("x", 512)
   local large_output = string.rep("output\n", 900)
 
+  local window = WheelTool.resolve_observation_budget(nil)
   local spilled = WheelTool.process_spillover({
     stdout = large_output,
     preview = raw_preview,
     success = true,
   })
-  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#spilled.preview <= window)
   assert(not spilled.preview:find(secret, 1, true))
   assert(not spilled:format_observation():find(secret, 1, true))
 
@@ -558,7 +559,7 @@ run_test("WheelTool: every supplied preview is bounded and redacted", function()
     preview = raw_preview,
     success = true,
   })
-  assert(#small.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#small.preview <= window)
   assert(not small.preview:find(secret, 1, true))
   assert(not small:format_observation():find(secret, 1, true))
 
@@ -570,49 +571,57 @@ run_test("WheelTool: every supplied preview is bounded and redacted", function()
     success = true,
   })
   WheelTool.compute_hash = original_hash
-  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
+  assert(#fallback.preview <= window)
   assert(not fallback.preview:find(secret, 1, true))
   assert(not fallback:format_observation():find(secret, 1, true))
 end)
 
-run_test("WheelTool: empty supplied previews never expose raw output", function()
-  local non_spilled_output = string.rep("non-spilled-output\n", 40)
-  local non_spilled = WheelTool.process_spillover({
-    stdout = non_spilled_output,
+run_test("WheelTool: empty supplied previews fall back to bounded derived output", function()
+  local window = WheelTool.resolve_observation_budget(nil)
+  local small_output = string.rep("non-spilled-output\n", 10)
+  local small = WheelTool.process_spillover({
+    stdout = small_output,
     preview = "",
     success = true,
   })
-  local non_spilled_observation = non_spilled:format_observation()
-  assert(#non_spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
-  assert(#non_spilled_observation < #non_spilled_output)
-  assert(not non_spilled_observation:find(non_spilled_output, 1, true))
-  assert(non_spilled_observation:find("non-spilled-output", 1, true) ~= nil)
+  local small_observation = small:format_observation()
+  assert(small.spilled == false)
+  assert(#small.preview <= window)
+  assert(small_observation:find(small_output, 1, true) ~= nil,
+    "a result that fits the observation window must arrive complete")
 
-  local spilled_output = string.rep("spilled-output\n", 500)
+  local oversized_output = string.rep("spilled-output\n", 1000)
+  assert(#oversized_output > window, "the oversized fixture must exceed the window")
   local spilled = WheelTool.process_spillover({
-    stdout = spilled_output,
+    stdout = oversized_output,
     preview = "",
     success = true,
   })
   local spilled_observation = spilled:format_observation()
-  assert(#spilled.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
-  assert(#spilled_observation < #spilled_output)
-  assert(not spilled_observation:find(spilled_output, 1, true))
+  assert(spilled.spilled == true)
+  assert(#spilled.preview <= window)
+  assert(#spilled_observation < #oversized_output)
+  assert(not spilled_observation:find(oversized_output, 1, true))
   assert(spilled_observation:find("spilled-output", 1, true) ~= nil)
 
+  -- Without a content hash the payload cannot spill, so the preview itself must
+  -- stay inside the window and state how much it dropped.
   local original_hash = WheelTool.compute_hash
   WheelTool.compute_hash = function() return nil end
   local fallback = WheelTool.process_spillover({
-    stdout = spilled_output,
+    stdout = oversized_output,
     preview = "",
     success = true,
   })
   WheelTool.compute_hash = original_hash
   local fallback_observation = fallback:format_observation()
-  assert(#fallback.preview <= WheelAction.MAX_INLINE_PREVIEW_BYTES)
-  assert(#fallback_observation < #spilled_output)
-  assert(not fallback_observation:find(spilled_output, 1, true))
+  assert(fallback.spilled == false)
+  assert(#fallback.preview <= window)
+  assert(#fallback_observation < #oversized_output)
+  assert(not fallback_observation:find(oversized_output, 1, true))
   assert(fallback_observation:find("spilled-output", 1, true) ~= nil)
+  assert(fallback_observation:find("bytes dropped", 1, true) ~= nil,
+    "a bounded fallback preview must state the dropped bytes")
 end)
 
 run_test("WheelAction: file locations reject URLs and dotted hosts", function()
@@ -5965,14 +5974,16 @@ run_test("WheelTool: Auto-spillover pipeline and content-addressed blob recovery
   local kernel = WheelKernel.new({ in_memory = true })
   local context = WheelContext.new({ kernel = kernel })
 
-  -- Generate 6 KiB payload (150 lines > 4096 threshold)
+  -- Generate a payload well beyond the observation window so the head/tail
+  -- preview cannot hold the middle.
   local line_pattern = "Record #%04d: Event telemetry outcome payload for pipeline\n"
   local lines = {}
-  for i = 1, 150 do
+  for i = 1, 400 do
     table.insert(lines, string.format(line_pattern, i))
   end
   local big_output = table.concat(lines)
-  assert(#big_output > 4096, "output is over 4 KiB spillover threshold")
+  assert(#big_output > WheelTool.resolve_observation_budget(nil),
+    "output is over the observation window")
 
   -- Process outcome through spillover pipeline
   local outcome = WheelTool.process_spillover({
@@ -5994,12 +6005,14 @@ run_test("WheelTool: Auto-spillover pipeline and content-addressed blob recovery
   assert(type(outcome.spillover_hash) == "string")
   assert(#outcome.spillover_hash == 64, "spillover hash is 64 hex characters")
 
-  -- Preview contains first 10 lines, notice, and last 5 lines
+  -- Preview contains the head, the notice, and the tail
   assert(string.find(outcome.preview, "Record #0001:", 1, true) ~= nil, "preview contains head")
   assert(string.find(outcome.preview, "Record #0010:", 1, true) ~= nil)
   assert(string.find(outcome.preview, "spilled to blob: " .. outcome.spillover_hash, 1, true) ~= nil, "preview contains notice")
-  assert(string.find(outcome.preview, "Record #0150:", 1, true) ~= nil, "preview contains tail")
-  assert(string.find(outcome.preview, "Record #0050:", 1, true) == nil, "preview omits middle lines")
+  assert(string.find(outcome.preview, "Record #0400:", 1, true) ~= nil, "preview contains tail")
+  assert(string.find(outcome.preview, "Record #0200:", 1, true) == nil, "preview omits middle lines")
+  assert(string.find(outcome.preview, "bytes dropped", 1, true) ~= nil,
+    "preview states the dropped bytes")
 
   -- Formatted observation contains tool header and preview
   local obs = outcome:format_observation()
