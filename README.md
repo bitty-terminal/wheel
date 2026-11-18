@@ -79,7 +79,7 @@ Configuration is resolved by `lua/wheel/config.lua` across deterministic precede
   - `tools` — tool allow/deny lists and custom tool declarations.
   - `skills` — session skill filters discovered from `.agents/`.
   - `verification` — change-gated verification declarations and test commands.
-  - `context` — Three-Zone context budgets (64 KiB total: 16 KiB Zone 1, 32 KiB Zone 2, 16 KiB Zone 3) and 4 KiB spillover threshold.
+  - `context` — Three-Zone context budgets (64 KiB total: 16 KiB Zone 1, 32 KiB Zone 2, 16 KiB Zone 3), the 4 KiB `run_command` spillover threshold, and `observation_max_bytes` (default 8 KiB), the model-facing tool observation window. The window is clamped by `zone3_max_bytes` so it can never exceed the Zone 3 prompt budget; a result that fits the window reaches the model complete, and a larger one spills to the content-addressed blob with a marker naming the dropped bytes and the blob hash.
   - `panel` — Headless Panel working-container policy.
   - `hooks` — lifecycle hooks.
 

@@ -129,15 +129,25 @@ lua: deps
     bun run luaparse --quiet --file tests/test_cache_telemetry.lua
     bun run luaparse --quiet --file tests/test_bittyd_adapter.lua
     bun run luaparse --quiet --file tests/test_daily_driver.lua
+    bun run luaparse --quiet --file tests/test_observation_budget.lua
     bun run luaparse --quiet --file tests/bittyd_adapter_bridge.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
 # Run the test suite with the deterministic interpreter selection: lua5.1
 # first, then luajit, then lua. Lua 5.1 is the release gate; the LuaJIT
 # fallback disables the JIT for evaluated config chunks so the instruction-limit
-# test cannot hang. `just test-gate` verifies the selection branches.
+# test cannot hang. `just test-gate` verifies the selection branches. The
+# observation-budget suite proves the model-facing tool window stays readable
+# and bounded.
 test: deps
     bash scripts/test-gate.sh
+    @set -e; \
+    interpreter="$(bash scripts/test-gate.sh --print-selection)"; \
+    if [ "$interpreter" = "none" ]; then \
+        echo "test-observation requires a Lua interpreter" >&2; \
+        exit 1; \
+    fi; \
+    "$interpreter" tests/test_observation_budget.lua
 
 # Local session-daemon integration gate: starts a real detached daemon in a
 # temporary runtime root and drives it from separate client processes. POSIX
