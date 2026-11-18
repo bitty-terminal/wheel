@@ -1068,6 +1068,12 @@ container and gVisor/microVM tiers are for, and neither is implemented here.
 - **Git worktrees.** A checkout whose `.git` is a file pointing at a git
   directory outside the workspace cannot resolve that directory inside the
   sandbox. This is a compatibility limit of binding only the workspace.
+- **The controlling terminal.** The session shares the launcher's terminal, so
+  it can emit escape sequences that affect the owner's terminal display.
+  `TIOCSTI` keystroke injection is mitigated only by the kernel default
+  (`dev.tty.legacy_tiocsti=0`), not by the sandbox: `bwrap --new-session` is
+  deliberately not used because it would detach the interactive harness from
+  its TTY.
 - **Session directory cleanup.** The launcher removes its session directory on
   normal exit, on `SIGINT`/`SIGTERM`, and on setup failure. A `SIGKILL` or a
   host crash leaves it behind, and nothing else collects it; remove it by hand
