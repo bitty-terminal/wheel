@@ -375,6 +375,10 @@ main() {
   fi
 
   local relay_socket="" relay_log="" ready=""
+  if [ "$mode" != proxy ] && [ -n "$allow" ]; then
+    note "ignoring --allow: netless mode has no egress (use --proxy to allow destinations)"
+    allow=""
+  fi
   if [ "$mode" = proxy ]; then
     command -v python3 >/dev/null 2>&1 || die "proxy mode requires python3"
     [ -n "$allow" ] || die "proxy mode requires an allowlist: --allow or WHEEL_SANDBOX_ALLOW"

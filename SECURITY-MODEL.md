@@ -1057,6 +1057,10 @@ container and gVisor/microVM tiers are for, and neither is implemented here.
 - **Git worktrees.** A checkout whose `.git` is a file pointing at a git
   directory outside the workspace cannot resolve that directory inside the
   sandbox. This is a compatibility limit of binding only the workspace.
+- **Session directory cleanup.** The launcher removes its session directory on
+  normal exit, on `SIGINT`/`SIGTERM`, and on setup failure. A `SIGKILL` or a
+  host crash leaves it behind, and nothing else collects it; remove it by hand
+  or use `--keep` deliberately.
 - **Platform coverage.** No macOS and no native Windows backend exists in this
   change.
 
@@ -1088,7 +1092,9 @@ own `WheelProvider.default_http_client` transport reaches that destination
 unchanged, and a non-allowlisted destination is refused and recorded; and the
 launcher refuses an empty allowlist, `/` as a workspace, and the owner's home as
 a workspace. The suite skips with a message when `bwrap` is absent and fails
-when `WHEEL_SANDBOX_REQUIRE=1` is set.
+when `WHEEL_SANDBOX_REQUIRE=1` is set. The default CI image has no `bwrap`, so
+CI reports the skip; a release gate must run the suite on a Linux host or image
+that has it and set `WHEEL_SANDBOX_REQUIRE=1`.
 
 This is Gate 1-style mechanism evidence for the sandbox itself. It is not the
 0.1.0 ceiling evidence, it is not an independent security review, and it does
