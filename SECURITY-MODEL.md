@@ -931,7 +931,7 @@ bwrap --unshare-pid --unshare-uts --unshare-ipc --unshare-user --unshare-net \
       --dev /dev --proc /proc --tmpfs /tmp --chdir <workspace> \
       --ro-bind /usr /usr --ro-bind /etc /etc \
       --ro-bind /bin /bin --ro-bind /sbin /sbin --ro-bind /lib /lib \
-      --ro-bind /lib64 /lib64 \
+      --ro-bind /lib64 /lib64 \                        # or --symlink usr/bin /bin …
       --bind <workspace> <workspace> \
       --bind <session>/work /cache \
       [--ro-bind <harness-tree> <harness-tree>] \
