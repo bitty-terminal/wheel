@@ -33,6 +33,7 @@ WheelErrors.E_ARGS_INVALID = "E_ARGS_INVALID"
 WheelErrors.E_SCHEMA_INVALID = "E_SCHEMA_INVALID"
 WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
+WheelErrors.E_TURN_BUDGET_EXHAUSTED = "E_TURN_BUDGET_EXHAUSTED"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
 WheelErrors.E_PROJECTION_INVALID = "E_PROJECTION_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
@@ -189,6 +190,21 @@ function WheelErrors.completion_budget_invalid(detail)
     WheelErrors.CLASS_VALIDATION,
     WheelErrors.E_COMPLETION_BUDGET_INVALID,
     "invalid completion budget: " .. reason
+  )
+end
+
+--- Build the typed turn-budget-exhausted result for a run that stopped before
+--- the model produced a final answer. Class `budget`, matching the completion
+--- budget family; the run is not a provider or persistence failure.
+-- @param detail string? short diagnostic
+-- @return table
+function WheelErrors.turn_budget_exhausted(detail)
+  local reason = type(detail) == "string" and detail or "the turn budget was exhausted"
+  reason = reason:gsub("%c", " ")
+  return typed(
+    "budget",
+    WheelErrors.E_TURN_BUDGET_EXHAUSTED,
+    reason
   )
 end
 

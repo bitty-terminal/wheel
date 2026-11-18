@@ -12,6 +12,9 @@ local WheelContext = require("wheel.context")
 local WheelAgent = require("wheel.agent")
 local WheelRunner = require("wheel.runner")
 
+local ok_audit, WheelAudit = pcall(require, "wheel.audit")
+if not ok_audit then WheelAudit = nil end
+
 local WheelCLI = {}
 
 -- `wheel run` turn budget. A turn is one model request plus any tool calls it
@@ -596,9 +599,11 @@ local function parse_runtime_flags(args, features)
       opts.workspace = value
       i = i + 2
     elseif a == "--no-stream" then
+      if not features.stream then return reject(a) end
       opts.stream = false
       i = i + 1
     elseif a == "--stream" then
+      if not features.stream then return reject(a) end
       opts.stream = true
       i = i + 1
     elseif a == "--auto-deny" then
@@ -633,13 +638,6 @@ local function parse_runtime_flags(args, features)
       i = i + 1
     end
   end
-  if opts.model ~= nil and opts.provider ~= nil then
-    local prefix = WheelAgent.split_provider_model(opts.model)
-    if prefix and string.lower(opts.provider) ~= prefix then
-      return nil, string.format("--model prefix '%s' conflicts with --provider '%s'",
-        prefix, opts.provider)
-    end
-  end
   return opts, nil
 end
 
@@ -661,14 +659,11 @@ local function build_provider_from_cli(parsed, io_ctx)
   local cfg = eff.config
   local pname = string.lower(parsed.provider or cfg.default_provider or "opencode-go")
   local model = parsed.model
-  -- A `provider/model` value selects the provider unless --provider names a
-  -- different one; a bare model string keeps the selected provider.
-  local model_provider, model_name = WheelAgent.split_provider_model(parsed.model)
+  -- Split `provider/model` only when the prefix is compatible with the
+  -- selected provider. Otherwise the whole string is an opaque model id for
+  -- that provider (for example an OpenRouter catalogue id).
+  local model_provider, model_name = WheelAgent.split_provider_model(parsed.model, parsed.provider)
   if model_provider then
-    if parsed.provider ~= nil and string.lower(parsed.provider) ~= model_provider then
-      return nil, nil, string.format("--model prefix '%s' conflicts with --provider '%s'",
-        model_provider, tostring(parsed.provider))
-    end
     pname = model_provider
     model = model_name
   end
@@ -756,26 +751,34 @@ local function print_command_usage(name, io_ctx)
   return 0
 end
 
-local function first_line(text)
-  if type(text) ~= "string" then return "" end
-  local line = text:match("^[^\n]*") or ""
-  if #line > TRACE_PREVIEW_BYTES then
-    line = line:sub(1, TRACE_PREVIEW_BYTES - 3) .. "..."
-  end
-  return line
-end
-
 --- Emit one stderr trace line per tool call so a failed run is debuggable
 --- from the log alone. stdout is never touched.
+--- First non-empty content line of an observation, without the `[Tool: ...]`
+--- header (the trace already carries tool/status/exit).
+local function trace_body_line(outcome)
+  if not outcome or type(outcome.format_observation) ~= "function" then return "" end
+  local ok_obs, text = pcall(outcome.format_observation, outcome)
+  if not ok_obs or type(text) ~= "string" then return "" end
+  local body = text:match("^%[Tool:[^\n]*%]\n?(.*)$") or text
+  for line in body:gmatch("[^\n]+") do
+    if line:match("%S") then return line end
+  end
+  return ""
+end
+
 local function trace_tool_result(io_ctx, tool_call, outcome)
   local status = outcome and outcome.status
   if type(status) ~= "string" or status == "" then
     status = (outcome and outcome.success) and "success" or "failure"
   end
+  -- Redacted and bounded: trace output never carries full or unredacted
+  -- observation content. Without the audit redactor, omit the content.
   local observation = ""
-  if outcome and type(outcome.format_observation) == "function" then
-    local ok_obs, text = pcall(outcome.format_observation, outcome)
-    if ok_obs then observation = first_line(text) end
+  if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
+    local line = trace_body_line(outcome)
+    if line ~= "" then
+      observation = WheelAudit.redact_bounded(line, TRACE_PREVIEW_BYTES)
+    end
   end
   io_ctx.errln(string.format(
     "[wheel trace] tool=%s status=%s exit=%s out=%sB err=%sB %s",
@@ -789,7 +792,7 @@ end
 
 local function cmd_ask(args, io_ctx)
   if wants_help(args) then return print_command_usage("ask", io_ctx) end
-  local parsed, parse_err = parse_runtime_flags(args)
+  local parsed, parse_err = parse_runtime_flags(args, { stream = true })
   if not parsed then
     io_ctx.errln("wheel ask: " .. tostring(parse_err))
     return 2
@@ -878,7 +881,8 @@ local function cmd_run(args, io_ctx)
     policy_generation = 1,
     approver = approver,
   })
-  local agent = WheelAgent.new({
+  local agent
+  local agent_ok, agent_or_err = pcall(WheelAgent.new, {
     name = "wheel-cli",
     role = WheelAgent.Role.CODING,
     kernel = kernel,
@@ -892,6 +896,11 @@ local function cmd_run(args, io_ctx)
     permission_gate = gate,
     config = meta.config,
   })
+  if not agent_ok then
+    io_ctx.errln("wheel run: " .. tostring(agent_or_err))
+    return 2
+  end
+  agent = agent_or_err
   local task = kernel:create_task({
     id = "CLI-TASK-1",
     title = task_desc:sub(1, 80),
