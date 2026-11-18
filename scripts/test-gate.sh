@@ -165,4 +165,7 @@ fi
 if [ "$status" -eq 0 ]; then
   "$interpreter" "$REPO_ROOT/tests/test_daily_driver.lua" || status=$?
 fi
+if [ "$status" -eq 0 ]; then
+  "$interpreter" "$REPO_ROOT/tests/test_cli_correctness.lua" || status=$?
+fi
 exit "$status"

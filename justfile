@@ -130,6 +130,7 @@ lua: deps
     bun run luaparse --quiet --file tests/test_bittyd_adapter.lua
     bun run luaparse --quiet --file tests/test_daily_driver.lua
     bun run luaparse --quiet --file tests/test_observation_budget.lua
+    bun run luaparse --quiet --file tests/test_cli_correctness.lua
     bun run luaparse --quiet --file tests/bittyd_adapter_bridge.lua
     bun run luaparse --quiet --file tests/real_host_fixture.lua
 
