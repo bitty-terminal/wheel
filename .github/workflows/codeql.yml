@@ -26,7 +26,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [actions, javascript-typescript]
+        # The repository ships Lua, shell, and Markdown only; there is no
+        # JavaScript/TypeScript source for CodeQL to analyse. The previous
+        # `javascript-typescript` leg failed every run with "could not process
+        # any code written in JavaScript/TypeScript" and blocked PRs through a
+        # required check that could never pass. Analysis covers the workflow
+        # YAML, which is the only executable non-Lua surface here.
+        language: [actions]
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
