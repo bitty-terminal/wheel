@@ -16,19 +16,23 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   provider and is compatible with the selection (no provider selected, or the
   prefix equals the selected/active provider), so OpenRouter catalogue ids
   such as `deepseek/deepseek-v4.1-flash` survive an explicit `--provider`.
-- Model precedence is resolved once in `WheelAgent.resolve_model`:
+- Model precedence is resolved once in `WheelAgent.resolve_model` for
+  `wheel run` and the agent API (`wheel ask`/`wheel chat` use `--model` or the
+  provider's configured/template model without role-model resolution):
   `--model`/`opts.model` > `roles.<role>.model_profile` for the active provider
   (or provider-less) > `roles.<role>.model`, where a bare name applies to the
   active provider and a `provider/model` string or table naming a different
   provider is a foreign claim and is skipped > the provider's effective default
-  model. `wheel run --model` previously kept the role-default model.
+  model. An active provider with no default model and no usable role model
+  fails with a typed error instead of inheriting another provider's id.
+  `wheel run --model` previously kept the role-default model.
 - `wheel ask|run|chat --help` and `wheel help <command>` print documented usage
   and exit 0 without contacting the provider. Unknown options are usage errors
   (exit 2) instead of being sent to the model as prompt text. `--stream` and
   `--no-stream` belong to `ask` and are rejected by `run`/`chat`.
 - `wheel run --max-turns <1..200>` (default 24) bounds the ReAct loop. Budget
   exhaustion exits `3` with a message that reports the exhaustion honestly,
-  names failed tool calls from the final turn, and notes that already-written
+  counts failed tool calls from the final turn, and notes that already-written
   workspace changes remain while the run is not resumed. Completed runs still
   exit `0`.
 - `wheel run --trace` (alias `--verbose`) prints one stderr line per tool call
@@ -37,9 +41,9 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `WheelAgent.new` fails closed with `E_AGENT_TOOL_UNKNOWN` (typed, bounded)
   when a configuration-derived role tool list names tools missing from the
   registry, is map-shaped, or is sparse; `"*"` wildcard lists remain valid. The
-  built-in role defaults now reference only registered core tools; the
-  commander keeps `run_command` intentionally (execute is in its capability
-  matrix and `permissions.run_command = "ask"` gates it).
+  built-in role defaults now reference only registered core tools, and the
+  commander lists no shell or write tool so its tool list adds no authority
+  beyond the permission gate.
 
 ### Agent
 

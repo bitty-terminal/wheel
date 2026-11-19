@@ -194,20 +194,27 @@ function WheelErrors.completion_budget_invalid(detail)
   )
 end
 
---- Typed invalid role-tool-list diagnostic (bounded names plus a count).
 function WheelErrors.agent_tool_unknown(role, detail)
   local message
   if type(detail) ~= "table" then
     message = string.format("role '%s': %s", tostring(role), tostring(detail))
   else
-    local limit = math.min(#detail, 5)
-    local names = {}
-    for i = 1, limit do names[i] = tostring(detail[i]) end
-    local listed = table.concat(names, ", ")
-    if #detail > limit then
-      listed = listed .. string.format(" (+%d more)", #detail - limit)
+    local listed, used, omitted = {}, 0, 0
+    for index = 1, #detail do
+      local name = tostring(detail[index])
+      local width = #name + (#listed > 0 and 2 or 0)
+      if #listed < 5 and used + width <= 80 then
+        listed[#listed + 1] = name
+        used = used + width
+      else
+        omitted = omitted + 1
+      end
     end
-    message = string.format("role '%s' lists unregistered tools: %s", tostring(role), listed)
+    local text = table.concat(listed, ", ")
+    if omitted > 0 then
+      text = (#text > 0 and text .. " " or "") .. string.format("(+%d more)", omitted)
+    end
+    message = string.format("role '%s' lists unregistered tools: %s", tostring(role), text)
   end
   return typed(WheelErrors.CLASS_VALIDATION, WheelErrors.E_AGENT_TOOL_UNKNOWN, message)
 end

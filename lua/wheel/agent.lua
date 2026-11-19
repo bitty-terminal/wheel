@@ -536,15 +536,17 @@ function WheelAgent.split_provider_model(value, selected_provider)
 end
 
 --- Return a usable model name from a string or table model value.
---- Tables without a `name`/`model` field are not model selections.
+--- Role profiles keep `model` canonical; other tables accept `name` first.
+--- Tables without either field are not model selections.
 --- @param value any
+--- @param prefer_model boolean?
 --- @return string?
-local function model_name_of(value)
+local function model_name_of(value, prefer_model)
   if type(value) == "string" then
     return value ~= "" and value or nil
   end
   if type(value) == "table" then
-    local name = value.name or value.model
+    local name = prefer_model and (value.model or value.name) or (value.name or value.model)
     if type(name) == "string" and name ~= "" then return name end
   end
   return nil
@@ -585,6 +587,11 @@ function WheelAgent.resolve_model(role, opts)
   end
 
   local profile = WheelAgent.get_default_model_profile(role)
+  local explicit_temperature = type(opts.model) == "table" and opts.model.temperature or nil
+  local function finish()
+    if explicit_temperature ~= nil then profile.temperature = explicit_temperature end
+    return profile, nil
+  end
 
   -- 1. Complete explicit profile.
   if opts.model_profile ~= nil then
@@ -618,14 +625,14 @@ function WheelAgent.resolve_model(role, opts)
         profile.provider = active_provider
       end
     end
-    return profile, nil
+    return finish()
   end
 
   -- 3. Role model profile from configuration, accepted only when its provider
   -- matches the active provider (or it names none).
   local role_profile = role_cfg.model_profile
   if type(role_profile) == "table" then
-    local name = model_name_of(role_profile)
+    local name = model_name_of(role_profile, true)
     local cfg_provider = role_profile.provider
     local belongs = not active_provider
       or cfg_provider == nil or cfg_provider == ""
@@ -633,8 +640,9 @@ function WheelAgent.resolve_model(role, opts)
     if name ~= nil and belongs then
       local candidate = {}
       for k, v in pairs(role_profile) do candidate[k] = v end
-      if (candidate.provider == nil or candidate.provider == "") and active_provider then
-        candidate.provider = active_provider
+      candidate.model = name
+      if candidate.provider == nil or candidate.provider == "" then
+        candidate.provider = active_provider or profile.provider
       end
       if type(candidate.provider) == "string" and candidate.provider ~= "" then
         local ok_val, val_err = WheelAgent.validate_model_profile(candidate)
@@ -645,7 +653,7 @@ function WheelAgent.resolve_model(role, opts)
       for k, v in pairs(candidate) do profile[k] = v end
       profile.model = name
       if active_provider then profile.provider = active_provider end
-      return profile, nil
+      return finish()
     end
   end
 
@@ -669,7 +677,7 @@ function WheelAgent.resolve_model(role, opts)
       if type(role_model) == "table" and role_model.temperature ~= nil then
         profile.temperature = role_model.temperature
       end
-      local role_model_name = model_name_of(role_model)
+      local role_model_name = model_name_of(role_model, true)
       if role_model_name ~= nil then
         local pref, rest = WheelAgent.split_provider_model(role_model, active_provider)
         if pref then
@@ -677,29 +685,42 @@ function WheelAgent.resolve_model(role, opts)
           profile.model = rest
         else
           profile.model = role_model_name
-          if active_provider then profile.provider = active_provider end
+          if active_provider then
+            profile.provider = active_provider
+          elseif claimed_provider ~= nil and claimed_provider ~= "" then
+            profile.provider = known_provider_name(claimed_provider) or claimed_provider
+          end
         end
-        return profile, nil
+        return finish()
       end
     end
   end
 
-  -- 5. The effective provider model outranks the built-in role default. The
-  -- role default only survives when the provider has no default model.
+  -- 5. The effective provider model outranks the built-in role default. A
+  -- cross-provider role default must not be sent under another provider name;
+  -- non-network built-in providers keep the legacy fallback.
   if active_provider then
     if type(provider_default_model) == "string" and provider_default_model ~= "" then
       profile.model = provider_default_model
+    else
+      local role_provider = type(profile.provider) == "string" and string.lower(profile.provider) or nil
+      local builtin = active_provider == "mock" or active_provider == "local"
+        or active_provider == "stdio"
+      if role_provider ~= active_provider and not builtin then
+        return nil, string.format(
+          "no default model for provider '%s'; pass --model or configure providers.%s.model",
+          active_provider, active_provider)
+      end
     end
     profile.provider = active_provider
   end
-  return profile, nil
+  return finish()
 end
 
---- Typed role-tool diagnostic string (bounded; `E_AGENT_TOOL_UNKNOWN` prefix).
+--- Typed role-tool diagnostic (table when available, else a coded string).
 local function tool_list_error(role, detail)
   if WheelErrors and type(WheelErrors.agent_tool_unknown) == "function" then
-    local err = WheelErrors.agent_tool_unknown(role, detail)
-    return string.format("%s: %s", err.code, err.message)
+    return WheelErrors.agent_tool_unknown(role, detail)
   end
   return "E_AGENT_TOOL_UNKNOWN: role '" .. tostring(role) .. "': " .. tostring(detail)
 end
@@ -720,16 +741,20 @@ function WheelAgent.validate_tool_list(agent_name, role, tools, registry)
   end
   -- Reject map-shaped and sparse lists: ipairs would silently see no tools.
   local count = 0
+  local keys = {}
   for key in pairs(tools) do
-    if type(key) ~= "number" then
+    if type(key) ~= "number" or key < 1 or key % 1 ~= 0 then
       return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
         .. ".tools must be a dense array of tool names, not a map")
     end
+    keys[key] = true
     count = count + 1
   end
-  if count ~= #tools then
-    return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
-      .. ".tools must be a dense array without holes")
+  for index = 1, count do
+    if not keys[index] then
+      return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
+        .. ".tools must be a dense array without holes")
+    end
   end
   local unknown = {}
   for _, name in ipairs(tools) do

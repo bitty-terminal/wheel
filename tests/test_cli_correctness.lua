@@ -371,6 +371,66 @@ local ok_all, test_err = pcall(function()
     print("PASS model precedence (string, provider/model, table, role, template default)")
   end
 
+  -- 1a. Round-2 review regressions: explicit tuning, canonical role-profile
+  -- model, provider claims without an active provider, and the typed
+  -- no-default-model failure.
+  do
+    local coding = WheelAgent.Role.CODING
+    local function resolve(opts)
+      return WheelAgent.resolve_model(coding, opts)
+    end
+
+    -- Explicit temperature survives a role-supplied model name.
+    local tuned, tuned_err = resolve({
+      model = { temperature = 0.7 },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model = { name = "role-model", temperature = 0.2 } } } },
+    })
+    assert(tuned and tuned.model == "role-model" and tuned.temperature == 0.7,
+      "explicit temperature must win over role tuning: " .. tostring(tuned_err))
+
+    -- A named provider-less role profile is still validated.
+    local invalid, invalid_err = resolve({
+      config = { roles = { [coding] = { model_profile = { model = "x", temperature = "hot" } } } },
+    })
+    assert(invalid == nil and invalid_err and invalid_err:find("temperature", 1, true),
+      "an invalid provider-less role profile must fail validation: " .. tostring(invalid_err))
+
+    -- `model` is canonical for a role profile, not the `name` alias.
+    local canonical = resolve({
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "intended-model", name = "profile-label",
+      } } } },
+    })
+    assert(canonical and canonical.model == "intended-model",
+      "a role profile must resolve its canonical model, got " .. tostring(canonical and canonical.model))
+
+    -- With no active provider, a role model table keeps its provider claim.
+    local claimed = resolve({
+      config = { roles = { [coding] = { model = {
+        name = "deepseek/deepseek-chat", provider = "openrouter",
+      } } } },
+    })
+    assert(claimed and claimed.provider == "openrouter"
+      and claimed.model == "deepseek/deepseek-chat",
+      "a role table provider claim must survive without an active provider")
+
+    -- An active provider with no default model must not inherit another
+    -- provider's role default.
+    local missing, missing_err = resolve({
+      provider_name = "gateway",
+      provider_default_model = "",
+    })
+    assert(missing == nil and missing_err
+      and missing_err:find("no default model", 1, true),
+      "a providerless default must fail typed, got " .. tostring(missing and missing.model))
+
+    print("PASS round-2 model-resolution regressions")
+  end
+
   -- 1b. Role tool lists must only name registered tools.
   do
     local registry = WheelTool.get_default_registry()
@@ -430,9 +490,29 @@ local ok_all, test_err = pcall(function()
     assert(WheelErrors.E_AGENT_TOOL_UNKNOWN ~= nil
       and tostring(err_many):find("E_AGENT_TOOL_UNKNOWN", 1, true),
       "E_AGENT_TOOL_UNKNOWN must be part of the typed vocabulary")
-    assert(#err_many <= 200, "the tool diagnostic must be bounded, got " .. tostring(#err_many))
-    assert(err_many:find("(+35 more)", 1, true) ~= nil,
-      "the bounded diagnostic must count the remaining tools: " .. err_many)
+    local rendered_many = tostring(err_many)
+    assert(#rendered_many <= 200, "the tool diagnostic must be bounded, got " .. tostring(#rendered_many))
+    assert(rendered_many:find("(+35 more)", 1, true) ~= nil,
+      "the bounded diagnostic must count the remaining tools: " .. rendered_many)
+
+    -- An index-0/short list must not hide an unknown tool past the ipairs hole.
+    local ok_index0, err_index0 = WheelAgent.validate_tool_list(
+      "index0-agent", WheelAgent.Role.CODING,
+      { [0] = "read_file", [1] = "read_file", [3] = "not_a_tool" },
+      WheelTool.get_default_registry())
+    assert(not ok_index0 and tostring(err_index0):find("dense array", 1, true),
+      "non-1-based keys must be rejected: " .. tostring(err_index0))
+
+    -- Long names must not squeeze the omitted-count suffix out of the message.
+    local long_name = string.rep("x", 200)
+    local ok_long, err_long = WheelAgent.validate_tool_list(
+      "long-tools-agent", WheelAgent.Role.CODING,
+      { long_name, "a", "b", "c", "d", "e" }, WheelTool.get_default_registry())
+    local rendered_long = tostring(err_long)
+    assert(not ok_long and #rendered_long <= 200
+      and rendered_long:find("(+1 more)", 1, true) ~= nil
+      and not rendered_long:find(long_name, 1, true),
+      "the bounded diagnostic must reserve room for the omitted count: " .. rendered_long)
 
     -- Config-driven role tools are validated too; the CLI reports exit 2.
     local bad_cfg_root = root .. "/bad-tools"
@@ -670,6 +750,19 @@ local ok_all, test_err = pcall(function()
     assert(not err_secret:find("trace-secret-12345", 1, true),
       "trace must redact secret-shaped observation content: " .. err_secret)
     assert(err_secret:find("%[redacted:"), "trace must mark the redacted value")
+
+    -- Terminal control bytes are escaped, never written raw to stderr.
+    local client_ctl, _ = make_run_http({
+      tool_turns = 1,
+      tool_args = '{"command":"printf \'\\\\033[31mred\\\\033[0m\\\\n\'"}',
+    })
+    local _, _, err_ctl = run_cli({
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "print colour",
+    }, { http_client = client_ctl, approver = function() return { decision = "allow_once" } end })
+    assert(not err_ctl:find("\27", 1, true),
+      "trace must not write raw escape bytes: " .. err_ctl)
+    assert(err_ctl:find("\\x1b", 1, true),
+      "trace must render control bytes as escapes: " .. err_ctl)
 
     local client_plain, _ = make_run_http({ tool_turns = 1 })
     local rc_plain, out_plain, err_plain = run_cli({

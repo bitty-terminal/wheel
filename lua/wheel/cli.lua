@@ -751,20 +751,25 @@ local function print_command_usage(name, io_ctx)
   return 0
 end
 
---- Emit one stderr trace line per tool call so a failed run is debuggable
---- from the log alone. stdout is never touched.
 --- First non-empty content line of an observation, without the `[Tool: ...]`
---- header (the trace already carries tool/status/exit).
+--- header, with terminal control bytes escaped.
 local function trace_body_line(outcome)
   if not outcome or type(outcome.format_observation) ~= "function" then return "" end
   local ok_obs, text = pcall(outcome.format_observation, outcome)
   if not ok_obs or type(text) ~= "string" then return "" end
   local body = text:match("^%[Tool:[^\n]*%]\n?(.*)$") or text
   for line in body:gmatch("[^\n]+") do
-    if line:match("%S") then return line end
+    if line:match("%S") then
+      return (line:gsub("%c", function(ch)
+        return string.format("\\x%02x", string.byte(ch))
+      end))
+    end
   end
   return ""
 end
+
+--- Emit one stderr trace line per tool call so a failed run is debuggable
+--- from the log alone. stdout is never touched.
 
 local function trace_tool_result(io_ctx, tool_call, outcome)
   local status = outcome and outcome.status
