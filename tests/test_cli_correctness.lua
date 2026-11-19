@@ -99,12 +99,13 @@ local ok_all, test_err = pcall(function()
   -- `always_tool` keeps requesting tools until the runner stops.
   local function make_run_http(opts)
     opts = opts or {}
-    local state = { requests = 0, models = {}, urls = {} }
+    local state = { requests = 0, models = {}, urls = {}, bodies = {} }
     local client = function(req)
       state.requests = state.requests + 1
       local decoded = WheelProvider.JSON.decode(req.body or "{}")
       table.insert(state.models, decoded.model)
       table.insert(state.urls, req.url)
+      table.insert(state.bodies, req.body or "")
       local message, finish
       if opts.always_tool or state.requests <= (opts.tool_turns or 0) then
         message = {
@@ -394,8 +395,12 @@ local ok_all, test_err = pcall(function()
     local invalid, invalid_err = resolve({
       config = { roles = { [coding] = { model_profile = { model = "x", temperature = "hot" } } } },
     })
-    assert(invalid == nil and invalid_err and invalid_err:find("temperature", 1, true),
+    assert(invalid == nil and invalid_err
+      and tostring(invalid_err):find("temperature", 1, true),
       "an invalid provider-less role profile must fail validation: " .. tostring(invalid_err))
+    assert(type(invalid_err) == "table" and WheelErrors.is_typed(invalid_err)
+      and invalid_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "a model-profile validation failure must be typed")
 
     -- `model` is canonical for a role profile, not the `name` alias.
     local canonical = resolve({
@@ -425,8 +430,36 @@ local ok_all, test_err = pcall(function()
       provider_default_model = "",
     })
     assert(missing == nil and missing_err
-      and missing_err:find("no default model", 1, true),
+      and tostring(missing_err):find("no default model", 1, true),
       "a providerless default must fail typed, got " .. tostring(missing and missing.model))
+    assert(type(missing_err) == "table" and WheelErrors.is_typed(missing_err)
+      and missing_err.code == WheelErrors.E_MODEL_PROVIDER_UNRESOLVED,
+      "an unresolved provider default must be typed")
+
+    -- F2: a non-string provider must fail validation, not reach provider create.
+    for _, bad_provider in ipairs({ 123, {}, true }) do
+      local bad, bad_err = resolve({
+        config = { roles = { [coding] = { model_profile = {
+          model = "custom", provider = bad_provider, temperature = "hot",
+        } } } },
+      })
+      assert(bad == nil and type(bad_err) == "table"
+        and WheelErrors.is_typed(bad_err)
+        and bad_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+        "a non-string model_profile provider must fail typed, got " .. tostring(bad_err))
+    end
+    local ok_bad_agent, bad_agent_err = pcall(WheelAgent.new, {
+      name = "bad-provider-agent",
+      role = coding,
+      kernel = WheelKernel.new({ in_memory = true }),
+      config = { roles = { [coding] = { model_profile = {
+        model = "custom", provider = 123, temperature = "hot",
+      } } } },
+    })
+    assert(not ok_bad_agent and type(bad_agent_err) == "table"
+      and WheelErrors.is_typed(bad_agent_err)
+      and bad_agent_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "WheelAgent.new must reject a non-string profile provider typed")
 
     print("PASS round-2 model-resolution regressions")
   end
@@ -763,6 +796,42 @@ local ok_all, test_err = pcall(function()
       "trace must not write raw escape bytes: " .. err_ctl)
     assert(err_ctl:find("\\x1b", 1, true),
       "trace must render control bytes as escapes: " .. err_ctl)
+
+    -- F1: redaction runs on the raw line before escaping. Drive the real CLI
+    -- and the runner's invalid-outcome fallback with a tab-separated
+    -- Authorization header plus a newline-separated Bearer token.
+    local original_execute = WheelAgent.execute_tool
+    WheelAgent.execute_tool = function()
+      error("Authorization\t: Basic dGVzdA== upstream rejected\nBearer\tsecret-token-abc123", 0)
+    end
+    local client_f1, state_f1 = make_run_http({ tool_turns = 1 })
+    local ran_f1, rc_f1, _, err_f1 = pcall(run_cli, {
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "fail dispatch",
+    }, { http_client = client_f1, approver = function() return { decision = "allow_once" } end })
+    WheelAgent.execute_tool = original_execute
+    assert(ran_f1 and rc_f1 == 0, "fallback run must complete: " .. tostring(err_f1))
+    assert(not err_f1:find("dGVzdA==", 1, true), "F1: Basic credential leaked: " .. err_f1)
+    assert(not err_f1:find("secret-token-abc123", 1, true), "F1: Bearer credential leaked: " .. err_f1)
+    assert(not err_f1:find("\t", 1, true) and not err_f1:find("\27", 1, true),
+      "F1: raw control byte in trace: " .. err_f1)
+    assert(err_f1:find("%[redacted:"), "F1: trace must carry a redaction marker")
+    assert(state_f1.bodies[2] and not state_f1.bodies[2]:find("dGVzdA==", 1, true)
+      and not state_f1.bodies[2]:find("secret-token-abc123", 1, true),
+      "F1: model-facing observation must not carry the credential")
+
+    -- A control byte inside the secret itself is redacted as a whole.
+    WheelAgent.execute_tool = function()
+      error("Authorization\t: Basic dGVz\27dA== upstream rejected", 0)
+    end
+    local client_f1b, _ = make_run_http({ tool_turns = 1 })
+    local ran_f1b, rc_f1b, _, err_f1b = pcall(run_cli, {
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "fail dispatch again",
+    }, { http_client = client_f1b, approver = function() return { decision = "allow_once" } end })
+    WheelAgent.execute_tool = original_execute
+    assert(ran_f1b and rc_f1b == 0, "embedded-control fallback run must complete")
+    assert(not err_f1b:find("dGVz", 1, true) and not err_f1b:find("\27", 1, true),
+      "F1: embedded control byte must not leak the secret: " .. err_f1b)
+    assert(err_f1b:find("%[redacted:"), "F1: embedded-control trace must be redacted")
 
     local client_plain, _ = make_run_http({ tool_turns = 1 })
     local rc_plain, out_plain, err_plain = run_cli({

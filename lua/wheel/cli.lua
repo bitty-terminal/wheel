@@ -28,8 +28,11 @@ WheelCLI.MAX_TURNS_MAX = 200
 -- provider/tool failure code and `2` the usage/validation code.
 WheelCLI.EXIT_BUDGET_EXHAUSTED = 3
 
--- Bytes of the first observation line shown by `--trace`.
-local TRACE_PREVIEW_BYTES = 120
+-- Final printed observation window for `--trace` (after control-byte
+-- escaping, where one raw byte can expand to four characters). Redaction runs
+-- on a larger raw window first so escaping cannot hide a credential.
+local TRACE_PREVIEW_BYTES = 256
+local TRACE_RAW_SCAN_BYTES = 8192
 
 local function trim(s)
   if type(s) ~= "string" then return "" end
@@ -752,20 +755,24 @@ local function print_command_usage(name, io_ctx)
 end
 
 --- First non-empty content line of an observation, without the `[Tool: ...]`
---- header, with terminal control bytes escaped.
+--- header. Returned raw: redaction must run before control bytes are escaped.
 local function trace_body_line(outcome)
   if not outcome or type(outcome.format_observation) ~= "function" then return "" end
   local ok_obs, text = pcall(outcome.format_observation, outcome)
   if not ok_obs or type(text) ~= "string" then return "" end
   local body = text:match("^%[Tool:[^\n]*%]\n?(.*)$") or text
   for line in body:gmatch("[^\n]+") do
-    if line:match("%S") then
-      return (line:gsub("%c", function(ch)
-        return string.format("\\x%02x", string.byte(ch))
-      end))
-    end
+    if line:match("%S") then return line end
   end
   return ""
+end
+
+--- Escape terminal control bytes as `\xNN`. NUL is already dropped upstream by
+--- the observation/audit pipeline; every other control byte is rendered.
+local function escape_control_bytes(text)
+  return (text:gsub("%c", function(ch)
+    return string.format("\\x%02x", string.byte(ch))
+  end))
 end
 
 --- Emit one stderr trace line per tool call so a failed run is debuggable
@@ -776,13 +783,19 @@ local function trace_tool_result(io_ctx, tool_call, outcome)
   if type(status) ~= "string" or status == "" then
     status = (outcome and outcome.success) and "success" or "failure"
   end
-  -- Redacted and bounded: trace output never carries full or unredacted
-  -- observation content. Without the audit redactor, omit the content.
+  -- Redact the RAW line first, then escape control bytes, then bound the
+  -- escaped text. Escaping before redaction would hide a tab-mangled header
+  -- from the scanner. Without the audit redactor, omit the content.
   local observation = ""
   if WheelAudit and type(WheelAudit.redact_bounded) == "function" then
     local line = trace_body_line(outcome)
     if line ~= "" then
-      observation = WheelAudit.redact_bounded(line, TRACE_PREVIEW_BYTES)
+      local redacted = WheelAudit.redact_bounded(line, TRACE_RAW_SCAN_BYTES)
+      local escaped = escape_control_bytes(redacted)
+      if #escaped > TRACE_PREVIEW_BYTES then
+        escaped = escaped:sub(1, TRACE_PREVIEW_BYTES - 3) .. "..."
+      end
+      observation = escaped
     end
   end
   io_ctx.errln(string.format(

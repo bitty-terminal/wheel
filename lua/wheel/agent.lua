@@ -552,13 +552,24 @@ local function model_name_of(value, prefer_model)
   return nil
 end
 
+--- Typed model-resolution failure (table when the errors module is present).
+local function model_profile_error(detail)
+  if WheelErrors and type(WheelErrors.model_profile_invalid) == "function" then
+    return WheelErrors.model_profile_invalid(detail)
+  end
+  return "Invalid " .. tostring(detail)
+end
+
 --- Resolve the model profile for a role. First match wins:
 ---   1. `opts.model_profile` (strict complete override)
----   2. `opts.model`: name/`provider/model` (compatible prefix) or table; a
----      table without a name keeps tuning and falls through
+---   2. `opts.model`: name/`provider/model` (compatible prefix) or table; an
+---      explicit table `temperature` applies to the final profile; a table
+---      without a name keeps tuning and falls through
 ---   3. `config.roles[role].model_profile` for the active provider or none
 ---   4. `config.roles[role].model`: bare name applies to the active provider;
----      a foreign provider claim (string prefix or table provider) is skipped
+---      a foreign provider claim (string prefix or table provider) is skipped;
+---      role tables prefer `model` over `name` while `opts.model` prefers
+---      `name` (documented API form)
 ---   5. `opts.provider_default_model` (config `model`, else template default)
 ---
 --- The built-in role default supplies remaining fields and is the model
@@ -597,7 +608,7 @@ function WheelAgent.resolve_model(role, opts)
   if opts.model_profile ~= nil then
     local ok_val, val_err = WheelAgent.validate_model_profile(opts.model_profile)
     if not ok_val then
-      return nil, "Invalid model_profile: " .. tostring(val_err)
+      return nil, model_profile_error("model_profile: " .. tostring(val_err))
     end
     for k, v in pairs(opts.model_profile) do profile[k] = v end
     return profile, nil
@@ -629,7 +640,9 @@ function WheelAgent.resolve_model(role, opts)
   end
 
   -- 3. Role model profile from configuration, accepted only when its provider
-  -- matches the active provider (or it names none).
+  -- matches the active provider (or it names none). Unlike `roles.<role>.model`,
+  -- an explicit profile's `provider/model` string is a complete override and
+  -- is validated rather than treated as a skippable foreign claim.
   local role_profile = role_cfg.model_profile
   if type(role_profile) == "table" then
     local name = model_name_of(role_profile, true)
@@ -644,11 +657,9 @@ function WheelAgent.resolve_model(role, opts)
       if candidate.provider == nil or candidate.provider == "" then
         candidate.provider = active_provider or profile.provider
       end
-      if type(candidate.provider) == "string" and candidate.provider ~= "" then
-        local ok_val, val_err = WheelAgent.validate_model_profile(candidate)
-        if not ok_val then
-          return nil, "Invalid role model_profile: " .. tostring(val_err)
-        end
+      local ok_val, val_err = WheelAgent.validate_model_profile(candidate)
+      if not ok_val then
+        return nil, model_profile_error("role model_profile: " .. tostring(val_err))
       end
       for k, v in pairs(candidate) do profile[k] = v end
       profile.model = name
@@ -707,6 +718,9 @@ function WheelAgent.resolve_model(role, opts)
       local builtin = active_provider == "mock" or active_provider == "local"
         or active_provider == "stdio"
       if role_provider ~= active_provider and not builtin then
+        if WheelErrors and type(WheelErrors.model_provider_unresolved) == "function" then
+          return nil, WheelErrors.model_provider_unresolved(active_provider)
+        end
         return nil, string.format(
           "no default model for provider '%s'; pass --model or configure providers.%s.model",
           active_provider, active_provider)
@@ -730,7 +744,7 @@ WheelAgent.tool_list_error = tool_list_error
 --- names, map-shaped lists, and sparse lists fail closed with a typed, bounded
 --- diagnostic; `"*"` is the supported wildcard. Explicit `opts.tools` is
 --- caller authority and fails closed at dispatch instead.
---- @return boolean ok, string? message
+--- @return boolean ok, table|string? typed_error_or_message
 function WheelAgent.validate_tool_list(agent_name, role, tools, registry)
   if type(tools) ~= "table" then
     return false, WheelAgent.tool_list_error(role, "roles." .. tostring(role)
@@ -856,6 +870,7 @@ local function new_agent(opts, issued_binding)
     config = opts.config,
   })
   if not default_profile then
+    if type(profile_err) == "table" then error(profile_err, 0) end
     error("Invalid model profile for agent '" .. self.name .. "': " .. tostring(profile_err))
   end
   self.model_profile = default_profile

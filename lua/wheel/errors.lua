@@ -1,26 +1,10 @@
 -- lua/wheel/errors.lua
 -- Wheel: typed runtime errors for command dispatch.
 --
--- Capability denials follow the accepted Plugin API v1 bridge contract: a
--- catchable Lua error table with exactly `class`, `code`, and `message`
--- (`bitty-plugins-docs/sdk/reference/overview.md`). `E_CAPABILITY_DENIED` is
--- the accepted stable code for an ungranted capability, and the message
--- mirrors the host wording while naming the missing capability.
---
--- `E_INTERNAL` has no accepted host code yet. It is deliberately Wheel-local
--- and marks an unexpected handler failure so a real defect is never reported
--- as a capability denial. Replace it when the host vocabulary defines a
--- generic internal or runtime failure code.
---
--- Command schema and argument failures use the SDK mock-host validation
--- vocabulary (`E_SCHEMA_INVALID`, `E_ARGS_INVALID`, `E_RESULT_INVALID`) with
--- class `validation`, and the same three-field bridge shape.
---
--- Context snapshot validation failures use a Wheel-local
--- `E_SNAPSHOT_INVALID` validation code. The snapshot is caller-supplied,
--- potentially tampered data; the cause stays a bounded single-line schema path
--- so validation never reflects slot content or an unbounded attacker-controlled
--- key.
+-- Capability denials use the accepted bridge contract with exactly `class`,
+-- `code`, and `message` (`bitty-plugins-docs/sdk/reference/overview.md`).
+-- `E_INTERNAL` is a Wheel-local unexpected-handler failure; schema/argument
+-- failures use the SDK validation vocabulary. Diagnostics stay bounded.
 
 local WheelErrors = {}
 
@@ -35,6 +19,8 @@ WheelErrors.E_RESULT_INVALID = "E_RESULT_INVALID"
 WheelErrors.E_COMPLETION_BUDGET_INVALID = "E_COMPLETION_BUDGET_INVALID"
 WheelErrors.E_TURN_BUDGET_EXHAUSTED = "E_TURN_BUDGET_EXHAUSTED"
 WheelErrors.E_AGENT_TOOL_UNKNOWN = "E_AGENT_TOOL_UNKNOWN"
+WheelErrors.E_MODEL_PROFILE_INVALID = "E_MODEL_PROFILE_INVALID"
+WheelErrors.E_MODEL_PROVIDER_UNRESOLVED = "E_MODEL_PROVIDER_UNRESOLVED"
 WheelErrors.E_SNAPSHOT_INVALID = "E_SNAPSHOT_INVALID"
 WheelErrors.E_PROJECTION_INVALID = "E_PROJECTION_INVALID"
 WheelErrors.E_MODULE_LOAD_FAILED = "E_MODULE_LOAD_FAILED"
@@ -63,9 +49,6 @@ local IDENTIFIER_MAX_LENGTH = 64
 local unpack_values = table.unpack or unpack
 
 --- Bound a message to one short line.
--- @param text string?
--- @param limit number
--- @return string?
 local function bounded(text, limit)
   if type(text) ~= "string" then
     return nil
@@ -194,6 +177,8 @@ function WheelErrors.completion_budget_invalid(detail)
   )
 end
 
+--- Build a typed invalid role-tool-list diagnostic. `detail` is an array of
+--- unknown names (first few plus a count) or a short malformed-list reason.
 function WheelErrors.agent_tool_unknown(role, detail)
   local message
   if type(detail) ~= "table" then
@@ -217,6 +202,26 @@ function WheelErrors.agent_tool_unknown(role, detail)
     message = string.format("role '%s' lists unregistered tools: %s", tostring(role), text)
   end
   return typed(WheelErrors.CLASS_VALIDATION, WheelErrors.E_AGENT_TOOL_UNKNOWN, message)
+end
+
+--- Typed invalid model-profile diagnostic.
+function WheelErrors.model_profile_invalid(detail)
+  return typed(
+    WheelErrors.CLASS_VALIDATION,
+    WheelErrors.E_MODEL_PROFILE_INVALID,
+    "invalid model profile: " .. tostring(detail)
+  )
+end
+
+--- Typed failure for an active provider with no resolvable default model.
+function WheelErrors.model_provider_unresolved(provider)
+  local name = tostring(provider)
+  return typed(
+    WheelErrors.CLASS_RESOLUTION,
+    WheelErrors.E_MODEL_PROVIDER_UNRESOLVED,
+    string.format("no default model for provider '%s'; pass --model or configure providers.%s.model",
+      name, name)
+  )
 end
 
 -- Snapshot schema paths can include a slot or commit key. Keep the diagnostic

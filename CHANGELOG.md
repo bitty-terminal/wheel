@@ -10,22 +10,29 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `--model`/`opts.model` accepts a model name or `provider/model`; the
   `WheelAgent.new` API also accepts `{ name, provider, temperature }`. The
-  table honours its `provider` claim; a table without a model name is not a
-  selection (tuning kept, resolution continues). A string is an opaque model
-  id for the resolved provider unless a `provider/model` prefix names a known
-  provider and is compatible with the selection (no provider selected, or the
-  prefix equals the selected/active provider), so OpenRouter catalogue ids
-  such as `deepseek/deepseek-v4.1-flash` survive an explicit `--provider`.
+  table honours its `provider` claim, an explicit table `temperature` applies
+  to the final profile, and a table without a model name is not a selection
+  (tuning kept, resolution continues). A string is an opaque model id for the
+  resolved provider unless a `provider/model` prefix names a known provider and
+  is compatible with the selection (no provider selected, or the prefix equals
+  the selected/active provider), so OpenRouter catalogue ids such as
+  `deepseek/deepseek-v4.1-flash` survive an explicit `--provider`.
 - Model precedence is resolved once in `WheelAgent.resolve_model` for
   `wheel run` and the agent API (`wheel ask`/`wheel chat` use `--model` or the
   provider's configured/template model without role-model resolution):
-  `--model`/`opts.model` > `roles.<role>.model_profile` for the active provider
-  (or provider-less) > `roles.<role>.model`, where a bare name applies to the
-  active provider and a `provider/model` string or table naming a different
-  provider is a foreign claim and is skipped > the provider's effective default
-  model. An active provider with no default model and no usable role model
-  fails with a typed error instead of inheriting another provider's id.
-  `wheel run --model` previously kept the role-default model.
+  `opts.model_profile` (strict complete override) > `--model`/`opts.model` >
+  `roles.<role>.model_profile` for the active provider (or provider-less; a
+  complete override that is validated) > `roles.<role>.model`, where a bare
+  name applies to the active provider, a `provider/model` string or table
+  naming a different provider is a foreign claim and is skipped, role model
+  tables prefer `model` while `opts.model` tables prefer `name`, > the
+  provider's effective default model. An active provider with no default model
+  and no usable role model fails with the typed `E_MODEL_PROVIDER_UNRESOLVED`
+  error instead of inheriting another provider's id. `wheel run --model`
+  previously kept the role-default model.
+- A malformed model profile (including a non-string provider) or an unresolved
+  provider default is rejected with a typed error (`E_MODEL_PROFILE_INVALID`,
+  `E_MODEL_PROVIDER_UNRESOLVED`) instead of reaching provider creation.
 - `wheel ask|run|chat --help` and `wheel help <command>` print documented usage
   and exit 0 without contacting the provider. Unknown options are usage errors
   (exit 2) instead of being sent to the model as prompt text. `--stream` and

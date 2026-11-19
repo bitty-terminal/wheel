@@ -1348,7 +1348,7 @@ function WheelRunner.run_task(agent, task, opts)
                 tostring(self.tool or "tool"),
                 self.exit_code or 1,
                 self.duration_ms or 0,
-                self.stderr or ""
+                self.preview or ""
               )
             end,
           }
