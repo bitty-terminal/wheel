@@ -601,6 +601,10 @@ function WheelAgent.resolve_model(role, opts)
   local explicit_temperature = type(opts.model) == "table" and opts.model.temperature or nil
   local function finish()
     if explicit_temperature ~= nil then profile.temperature = explicit_temperature end
+    local ok_val, val_err = WheelAgent.validate_model_profile(profile)
+    if not ok_val then
+      return nil, model_profile_error("resolved profile: " .. tostring(val_err))
+    end
     return profile, nil
   end
 

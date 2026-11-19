@@ -391,6 +391,19 @@ local ok_all, test_err = pcall(function()
     assert(tuned and tuned.model == "role-model" and tuned.temperature == 0.7,
       "explicit temperature must win over role tuning: " .. tostring(tuned_err))
 
+    -- Invalid explicit tuning must be validated, not applied after validation.
+    local hot, hot_err = resolve({
+      model = { temperature = "hot" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "role-model", temperature = 0.2,
+      } } } },
+    })
+    assert(hot == nil and type(hot_err) == "table" and WheelErrors.is_typed(hot_err)
+      and hot_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "invalid explicit temperature must fail typed: " .. tostring(hot_err))
+
     -- A named provider-less role profile is still validated.
     local invalid, invalid_err = resolve({
       config = { roles = { [coding] = { model_profile = { model = "x", temperature = "hot" } } } },
