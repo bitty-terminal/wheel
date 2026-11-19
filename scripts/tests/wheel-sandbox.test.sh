@@ -21,6 +21,8 @@ WRAPPER="$REPO_ROOT/scripts/wheel-sandbox"
 readonly WRAPPER
 STUB="$SCRIPT_DIR/wheel-sandbox-stub.py"
 readonly STUB
+RELAY="$REPO_ROOT/scripts/wheel-sandbox-proxy.py"
+readonly RELAY
 REQUIRE="${WHEEL_SANDBOX_REQUIRE:-0}"
 
 SANDBOX_SCRATCH="${TMPDIR:-/tmp}/bitty"
@@ -120,6 +122,23 @@ expect_failure() {
   esac
 }
 
+expect_failure_matching() {
+  local description=$1 reason=$2 output
+  shift 2
+  if output=$("$@" 2>&1); then
+    report_fail "$description" "command succeeded: ${output%%$'\n'*}"
+    return
+  fi
+  case $output in
+  *"$reason"*)
+    report_pass "$description"
+    ;;
+  *)
+    report_fail "$description" "expected '$reason', saw: ${output%%$'\n'*}"
+    ;;
+  esac
+}
+
 expect_launcher_refusal() {
   local description=$1 fragment=$2 output status
   shift 2
@@ -181,15 +200,17 @@ filesystem_group() {
     report_fail "workspace write reaches the real workspace"
   fi
 
-  expect_failure "write to /usr is denied (read-only system tree)" \
+  expect_failure_matching "write to /usr is denied as read-only" "Read-only file system" \
     in_sandbox 'touch /usr/wheel-sandbox-escape'
-  expect_failure "write to /etc is denied (read-only system tree)" \
+  expect_failure_matching "write to /etc is denied as read-only" "Read-only file system" \
     in_sandbox 'touch /etc/wheel-sandbox-escape'
-  expect_failure "write to the owner's home is denied (not mounted)" \
+  expect_failure_matching "write to the owner's home is denied as absent" \
+    "No such file or directory" \
     in_sandbox "touch '$FAKE_HOME/escape'"
-  expect_failure "write to /run is denied (not mounted)" \
+  expect_failure_matching "write to /run is denied as absent" "No such file or directory" \
     in_sandbox 'touch /run/wheel-sandbox-escape'
-  expect_failure "write to the container socket directory is denied" \
+  expect_failure_matching "write to the container socket path is denied as absent" \
+    "No such file or directory" \
     in_sandbox 'touch /run/docker.sock'
 
   expect_failure "reading a planted ~/.ssh key fails inside the sandbox" \
@@ -502,6 +523,107 @@ LUA
     ;;
   esac
 
+  # A bare credential destination means port 443, so a non-443 allowlisted port
+  # must not receive the credential even when the host is listed.
+  local bare_output
+  bare_output=$("${proxy_env[@]}" "WHEEL_SANDBOX_AUTH_HOSTS=127.0.0.1" "$WRAPPER" --proxy \
+    --allow "127.0.0.1:$port" --session "proxy-bare-auth" --exec -- \
+    sh -c "curl -sS --max-time 20 https://127.0.0.1:$port/v1/bare" 2>&1)
+  if [ "$bare_output" = '{"ok":true}' ] &&
+    tail -1 "$WORK/primary.jsonl" | grep -q '"auth_present":false'; then
+    report_pass "a bare credential destination authorises only port 443"
+  else
+    report_fail "a bare credential destination authorises only port 443" \
+      "saw: $bare_output"
+  fi
+
+  # Framing cases the relay must refuse: an absolute-URI target inside the
+  # tunnel, a pipelined second request, and an HTTP/2 preface.
+  cat >"$WS/relay-probe.py" <<'PYPROBE'
+import os
+import socket
+import ssl
+import sys
+
+stub_port = int(sys.argv[1])
+proxy_port = int(os.environ["HTTPS_PROXY"].rsplit(":", 1)[1])
+authority = "127.0.0.1:%d" % stub_port
+context = ssl.create_default_context()
+
+
+def tunnel():
+    raw = socket.create_connection(("127.0.0.1", proxy_port), timeout=10)
+    raw.sendall(("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" % (authority, authority)).encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = raw.recv(4096)
+        if not chunk:
+            raise SystemExit("connect-failed")
+        head += chunk
+    if b" 200 " not in head.split(b"\r\n")[0]:
+        raise SystemExit("connect-refused")
+    return context.wrap_socket(raw, server_hostname="127.0.0.1")
+
+
+def status(tls):
+    data = b""
+    while b"\r\n" not in data:
+        chunk = tls.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data.split(b"\r\n")[0].decode("latin-1")
+
+
+tls = tunnel()
+tls.sendall(
+    ("GET https://%s/absolute HTTP/1.1\r\nHost: %s\r\n\r\n" % (authority, authority)).encode()
+)
+print("absolute-uri=%s" % status(tls).split(" ")[1])
+tls.close()
+
+tls = tunnel()
+tls.sendall(
+    (
+        "GET /one HTTP/1.1\r\nHost: %s\r\n\r\n"
+        "GET /two HTTP/1.1\r\nHost: %s\r\n\r\n" % (authority, authority)
+    ).encode()
+)
+print("pipeline=%s" % status(tls).split(" ")[1])
+tls.close()
+
+tls = tunnel()
+tls.sendall(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+print("h2-preface=%s" % status(tls).split(" ")[1])
+tls.close()
+PYPROBE
+  local protocol_output
+  protocol_output=$("${proxy_env[@]}" "$WRAPPER" --proxy --allow "127.0.0.1:$port" \
+    --session "proxy-protocol" --exec -- python3 "$WS/relay-probe.py" "$port" 2>&1)
+  case $protocol_output in
+  *"absolute-uri=400"*)
+    report_pass "the relay refuses an absolute-URI target inside the tunnel"
+    ;;
+  *)
+    report_fail "the relay refuses an absolute-URI target inside the tunnel" \
+      "saw: $protocol_output"
+    ;;
+  esac
+  case $protocol_output in
+  *"h2-preface=400"*)
+    report_pass "the relay refuses an HTTP/2 preface"
+    ;;
+  *)
+    report_fail "the relay refuses an HTTP/2 preface" "saw: $protocol_output"
+    ;;
+  esac
+  if grep -q '"/one"' "$WORK/primary.jsonl" 2>/dev/null &&
+    ! grep -q '"/two"' "$WORK/primary.jsonl" 2>/dev/null; then
+    report_pass "the relay serves only the first pipelined request"
+  else
+    report_fail "the relay serves only the first pipelined request"
+  fi
+
   # Tunnel-only mode relays opaque bytes: no certificate, no injection.
   local tunnel_output
   tunnel_output=$("${proxy_env[@]}" "WHEEL_SANDBOX_TUNNEL_ONLY=1" "$WRAPPER" --proxy \
@@ -519,6 +641,174 @@ LUA
     report_pass "the stub shut down cleanly"
   else
     report_fail "the stub shut down cleanly"
+  fi
+}
+
+runtime_dir_group() {
+  printf '\n# runtime, display, and bus sockets\n'
+
+  local uid
+  uid=$(id -u)
+  if [ -d "/run/user/$uid" ]; then
+    expect_launcher_refusal "the launcher refuses the owner's runtime directory as a workspace" \
+      "runtime" env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+      "$WRAPPER" --workspace "/run/user/$uid" --exec -- true
+  else
+    report_skip "/run/user/$uid is absent on this host"
+  fi
+  expect_launcher_refusal "the launcher refuses /run/user as a workspace" "runtime tree" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+    "$WRAPPER" --workspace /run/user --exec -- true
+  expect_launcher_refusal "the launcher refuses /run as a workspace" "runtime tree" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+    "$WRAPPER" --workspace /run --exec -- true
+
+  # A synthetic runtime directory proves the XDG_RUNTIME_DIR rule without
+  # connecting to, or even reading, the owner's live session sockets.
+  local synthetic=$WORK/runtime-probe
+  mkdir -p "$synthetic/sub"
+  expect_launcher_refusal "the launcher refuses XDG_RUNTIME_DIR as a workspace" \
+    "runtime root" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "XDG_RUNTIME_DIR=$synthetic" \
+    "$WRAPPER" --workspace "$synthetic" --exec -- true
+  expect_launcher_refusal "the launcher refuses a workspace under XDG_RUNTIME_DIR" \
+    "runtime root" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "XDG_RUNTIME_DIR=$synthetic" \
+    "$WRAPPER" --workspace "$synthetic/sub" --exec -- true
+
+  # Nothing runtime-shaped is visible from inside either: no /run mount, no
+  # runtime directory, no display or bus socket.
+  local view
+  view=$(in_sandbox 'if [ -e /run/user ]; then echo RUNTIME-VISIBLE; fi; ls -A /run 2>/dev/null; echo "entries=$(ls -A /run 2>/dev/null | wc -l)"' 2>&1)
+  case $view in
+  *RUNTIME-VISIBLE*)
+    report_fail "no runtime directory is visible inside the sandbox"
+    ;;
+  *)
+    report_pass "no runtime directory is visible inside the sandbox"
+    ;;
+  esac
+  case $view in
+  *"entries=0"*)
+    report_pass "/run is empty or absent inside the sandbox"
+    ;;
+  *)
+    report_fail "/run is empty or absent inside the sandbox" "saw: $view"
+    ;;
+  esac
+}
+
+git_config_group() {
+  printf '\n# repository configuration and hooks\n'
+
+  local config_output
+  config_output=$(in_sandbox 'git config core.hooksPath .evil-hooks 2>&1; echo "config-rc=$?"' 2>&1)
+  case $config_output in
+  *"config-rc=0"*)
+    report_fail "the sandbox cannot set core.hooksPath"
+    ;;
+  *)
+    report_pass "the sandbox cannot set core.hooksPath"
+    ;;
+  esac
+
+  local append_output
+  append_output=$(in_sandbox 'printf x >> .git/config 2>&1; echo "append-rc=$?"' 2>&1)
+  case $append_output in
+  *"append-rc=0"*)
+    report_fail ".git/config is read-only inside the sandbox"
+    ;;
+  *)
+    report_pass ".git/config is read-only inside the sandbox"
+    ;;
+  esac
+
+  # Plant an executable hook through the writable workspace, then prove the
+  # host-side git invocation does not run it.
+  in_sandbox 'mkdir -p .evil-hooks && printf "#!/bin/sh\necho host-side-hook-executed\n" > .evil-hooks/pre-commit && chmod +x .evil-hooks/pre-commit' >/dev/null 2>&1 || true
+  local host_hooks_path host_hook
+  host_hooks_path=$(git -C "$WS" config --get core.hooksPath 2>/dev/null || true)
+  if [ -z "$host_hooks_path" ]; then
+    report_pass "a sandboxed session cannot redirect host-side git hooks"
+  else
+    report_fail "a sandboxed session cannot redirect host-side git hooks" \
+      "host hooksPath=$host_hooks_path"
+  fi
+  host_hook=$(git -C "$WS" hook run --ignore-missing pre-commit 2>&1 || true)
+  case $host_hook in
+  *host-side-hook-executed*)
+    report_fail "a planted workspace hook does not run on the host"
+    ;;
+  *)
+    report_pass "a planted workspace hook does not run on the host"
+    ;;
+  esac
+}
+
+matcher_group() {
+  printf '\n# allowlist and credential-destination grammar\n'
+
+  local probe=$WORK/matcher-probe.py output summary
+  cat >"$probe" <<'PYPROBE'
+import importlib.util
+import os
+import sys
+
+path = sys.argv[1]
+spec = importlib.util.spec_from_file_location("relay", path)
+relay = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(relay)
+
+checks = []
+
+
+def check(name, got, want):
+    checks.append((name, got, want))
+
+
+entries = relay.parse_allowlist("example.com,127.0.0.1:8443")
+check("apex-allowed", relay.allowlist_match(entries, "example.com", 443), True)
+check("subdomain-denied", relay.allowlist_match(entries, "api.example.com", 443), False)
+check("uppercase-allowed", relay.allowlist_match(entries, "EXAMPLE.COM", 443), True)
+check("port-80-denied", relay.allowlist_match(entries, "example.com", 80), False)
+check("explicit-port-allowed", relay.allowlist_match(entries, "127.0.0.1", 8443), True)
+check("explicit-port-other-denied", relay.allowlist_match(entries, "127.0.0.1", 443), False)
+
+for bad in ("example.com.", "user@example.com", "example.com:443:9", "*", "*.example.com"):
+    try:
+        relay.parse_allowlist(bad)
+        check("reject-%s" % bad, True, False)
+    except SystemExit:
+        check("reject-%s" % bad, False, False)
+
+os.environ["WHEEL_SANDBOX_AUTH_HOSTS"] = "127.0.0.1"
+auth = relay.read_auth_hosts()
+check("auth-bare-means-443", relay.allowlist_match(auth, "127.0.0.1", 443), True)
+check("auth-bare-denies-other-port", relay.allowlist_match(auth, "127.0.0.1", 8443), False)
+
+os.environ["WHEEL_SANDBOX_AUTH_HOSTS"] = "[::1]:443"
+auth6 = relay.read_auth_hosts()
+check("auth-ipv6-bracket", relay.allowlist_match(auth6, "::1", 443), True)
+
+for name, got, want in checks:
+    print(("ok " if got == want else "FAIL ") + name)
+print("SUMMARY %d %d" % (sum(1 for _n, got, want in checks if got == want), len(checks)))
+PYPROBE
+
+  output=$(python3 "$probe" "$RELAY" 2>&1 || true)
+  summary=$(printf '%s\n' "$output" | grep -o 'SUMMARY [0-9]* [0-9]*' | tail -1)
+  if [ -n "$summary" ]; then
+    local passed=${summary#SUMMARY }
+    passed=${passed%% *}
+    local total=${summary##* }
+    if [ "$passed" = "$total" ]; then
+      report_pass "the allowlist and credential grammar matches the documented rule ($passed/$total)"
+    else
+      report_fail "the allowlist and credential grammar matches the documented rule" \
+        "saw: $output"
+    fi
+  else
+    report_fail "the allowlist and credential grammar matches the documented rule" "no summary"
   fi
 }
 
@@ -552,9 +842,12 @@ require_backend
 prepare_fixtures
 filesystem_group
 environment_group
+runtime_dir_group
 process_group
 network_group
+matcher_group
 proxy_group
+git_config_group
 fail_closed_group
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"

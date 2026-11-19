@@ -58,17 +58,22 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   `CARGO_HOME`, and the `XDG_*` roots), read-only `/usr`, `/etc`, `/bin`,
   `/sbin`, `/lib`, `/lib64` (plus the harness tree itself, read-only, when it
   lives outside the workspace), a private `/proc`, a fresh `/tmp`, and a private
-  PID/UTS/IPC/user namespace. Nothing else is mounted, so `$HOME` (unset), SSH
-  and cloud credentials, `~/.config/wheel`, shell rc files, `.git/hooks`,
-  `.mcp.json`, the Wayland/D-Bus sockets, `/run/user/*`, and the
-  Docker/Podman socket are unreachable by construction rather than filtered.
+  PID/UTS/IPC/user namespace. `$HOME` is never set and no runtime tree is
+  mounted, so SSH and cloud credentials, `~/.config/wheel`, shell rc files, the
+  Wayland/D-Bus/PipeWire sockets, `/run/user/*`, and the Docker/Podman socket
+  do not resolve; the launcher also refuses a workspace anywhere under `/run` or
+  `$XDG_RUNTIME_DIR`, so they cannot be bound in by pointing `--workspace` at
+  them. `.git/hooks` is masked with an empty directory, and `.git/config` is
+  read-only so `core.hooksPath` cannot redirect host-side hooks; `.mcp.json` and
+  credential-shaped paths inside the workspace are masked the same way.
 - **Network:** the default mode is `netless` — loopback only, no resolver, no
   route. `--proxy` adds the single road out: a host-side CONNECT relay over a
   bind-mounted Unix socket with a default-deny allowlist
   (`WHEEL_SANDBOX_ALLOW`), per-request logging, bounds, and relay-side
   credential injection bound to `WHEEL_SANDBOX_AUTH_HOSTS`, so
-  `OPENCODE_GO_API_KEY` never enters the sandbox environment and never reaches
-  a host outside that list.
+  `OPENCODE_GO_API_KEY` never enters the sandbox environment and never reaches a
+  host or port outside that list. Both lists name one host and one port: a bare
+  entry means 443 and does not authorise subdomains.
 - **Fail-closed:** the launcher refuses to start when `bwrap` is missing and
   never falls back to an unsandboxed run.
 - **Configuration continuity:** inside the sandbox the harness starts with an

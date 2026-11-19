@@ -198,6 +198,19 @@ main() {
   [ -d "$workspace" ] || die "workspace does not exist: $workspace"
   workspace=$(cd -- "$workspace" && pwd -P)
 
+  # Host runtime trees: never a workspace, in any mode. /run holds the session
+  # bus, the Wayland and PipeWire sockets, and the container control socket, so
+  # a workspace anywhere under it would hand the sandbox the owner's live
+  # session. The exact-match list stays for grouping directories that are
+  # otherwise fine to use below.
+  local root
+  for root in /run /proc /sys /dev /boot /usr /etc; do
+    case $workspace/ in
+    "$root"/*)
+      die "refusing a workspace inside the host runtime tree $root: $workspace"
+      ;;
+    esac
+  done
   case $workspace in
   / | /home | /root | /run | /usr | /etc | /var | /boot | /proc | /sys | /dev | /tmp | /mnt | /media | /opt | /srv)
     die "refusing to bind $workspace read-write as a workspace; choose a project directory"
@@ -217,15 +230,28 @@ main() {
     esac
   fi
 
-  # A workspace bound read-write inside a credential store or Wheel's own state
-  # would hand the session exactly what the sandbox exists to withhold.
-  local protected
+  # A workspace bound read-write inside a credential store, Wheel's own state,
+  # or the owner's runtime directory would hand the session exactly what the
+  # sandbox exists to withhold. Every candidate is resolved before comparing so
+  # a symlinked runtime path cannot slip through.
+  local protected runtime_candidate
+  local runtime_dirs=(
+    "${XDG_RUNTIME_DIR:-}"
+    "/run/user/$(id -u)"
+  )
+  if command -v loginctl >/dev/null 2>&1; then
+    runtime_candidate=$(loginctl show-user --property=RuntimePath --value "$(id -un)" 2>/dev/null || true)
+    [ -n "$runtime_candidate" ] && runtime_dirs+=("$runtime_candidate")
+  fi
   for protected in \
     "${XDG_CONFIG_HOME:-${HOME:-}/.config}/wheel" \
     "${XDG_DATA_HOME:-${HOME:-}/.local/share}/wheel" \
     "${XDG_STATE_HOME:-${HOME:-}/.local/state}/wheel" \
-    "${HOME:-}/.ssh" "${HOME:-}/.aws" "${HOME:-}/.gnupg" "${HOME:-}/.config"; do
+    "${HOME:-}/.ssh" "${HOME:-}/.aws" "${HOME:-}/.gnupg" "${HOME:-}/.config" \
+    ${runtime_dirs[@]+"${runtime_dirs[@]}"}; do
     [ -n "$protected" ] || continue
+    [ -d "$protected" ] || continue
+    protected=$(cd -- "$protected" 2>/dev/null && pwd -P) || continue
     case $workspace/ in
     "$protected"/*)
       die "refusing a workspace inside a protected credential or runtime root: $protected"
@@ -355,7 +381,18 @@ main() {
 
   # Git hooks and MCP server declarations are code that would run outside the
   # sandbox's process tree; credential stores inside a checkout are masked too.
+  # Masking .git/hooks alone is not enough: core.hooksPath (or core.fsmonitor,
+  # core.pager, core.sshCommand, and filter drivers) in .git/config can point
+  # anywhere, so the repository configuration is read-only here as well.
+  mask_readonly_file() {
+    if [ -f "$1" ] && [ ! -L "$1" ]; then
+      bwrap_args+=(--ro-bind "$1" "$1")
+    fi
+  }
+
   mask_dir "$workspace/.git/hooks"
+  mask_readonly_file "$workspace/.git/config"
+  mask_readonly_file "$workspace/.git/config.worktree"
   mask_file "$workspace/.mcp.json"
   mask_file "$workspace/.git-credentials"
   mask_file "$workspace/.netrc"

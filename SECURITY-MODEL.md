@@ -961,15 +961,24 @@ its credential socket, and it keeps the caller's stdin across the background
   Credential stores, shell rc files, `~/.config/wheel`, the trust store, and the
   audit history are therefore _absent_ rather than filtered: the paths do not
   resolve, and their parent directories are never mounted.
-- **No runtime, display, or bus sockets.** `/run/user/*`, the Wayland socket,
-  the D-Bus session bus, the Docker/Podman socket, and the PipeWire/PulseAudio
-  sockets are unreachable for the same reason. `WAYLAND_DISPLAY`,
-  `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` are unset, so Wheel cannot
-  reach the owner's live session or draw on their display.
+- **No runtime, display, or bus sockets.** `/run`, `/run/user/*`,
+  `$XDG_RUNTIME_DIR`, and the runtime path `loginctl` reports are never mounted,
+  and the launcher **refuses any workspace inside them** (directly, under
+  `/run`, or under a resolved `$XDG_RUNTIME_DIR`), so the bind policy cannot be
+  talked into carrying the session bus, the Wayland socket, the PipeWire or
+  PulseAudio sockets, or the container socket into the sandbox.
+  `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` are unset,
+  so Wheel cannot reach the owner's live session or draw on their display.
 - **Masked in-workspace code paths.** `.git/hooks` is replaced by an empty
-  directory (a hook would execute outside the harness's process tree) and
-  `.mcp.json`, `.git-credentials`, `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`,
-  and `.kube` inside the workspace are masked when present.
+  directory (a hook would execute outside the harness's process tree), the
+  repository's `.git/config` and `.git/config.worktree` are mounted read-only so
+  `core.hooksPath`, `core.fsmonitor`, `core.pager`, `core.sshCommand`, and
+  filter drivers cannot be redirected, and `.mcp.json`, `.git-credentials`,
+  `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`, and `.kube` inside the
+  workspace are masked when present. A **nested** repository inside the
+  workspace keeps its own `.git`; its hooks and configuration are workspace
+  content, so a later host-side git invocation in that nested repository is
+  trusted-workspace territory.
 - **No privilege.** `--cap-drop ALL`, a private user namespace, a private PID
   namespace, a private UTS namespace (hostname `wheel-sandbox`), a private IPC
   namespace, and `--die-with-parent` so the sandbox cannot outlive the launcher.
@@ -978,7 +987,9 @@ its credential socket, and it keeps the caller's stdin across the background
   and no host `XDG_*` value survives.
 - **Fail-closed launcher.** The launcher refuses to start when `bwrap` is
   missing, when the mode is unknown, when proxy mode has an empty allowlist,
-  when the workspace is `/`, the owner's home, a system root, or an ancestor of
+  when the workspace is `/`, the owner's home, a grouping directory such as
+  `/home` or `/tmp`, anything under `/run`, `/proc`, `/sys`, `/dev`, `/boot`,
+  `/usr`, or `/etc`, a credential store, `$XDG_RUNTIME_DIR`, or an ancestor of
   the owner's home, and when the session directory already exists. It never
   falls back to an unsandboxed run.
 
@@ -994,9 +1005,16 @@ splices bytes to that socket, then sets `HTTPS_PROXY` to it, so the existing
 The relay:
 
 - accepts `CONNECT host:port` only, and denies every destination that is not in
-  `WHEEL_SANDBOX_ALLOW` (comma-separated `host` or `host:port`; bare `host`
-  covers port 443; a domain entry matches itself and its subdomains; wildcards
-  are rejected; a single-label entry other than `localhost` is rejected);
+  `WHEEL_SANDBOX_ALLOW`. One rule governs both lists: an entry names exactly one
+  host and one port; a bare `host` means port 443, anything else needs an
+  explicit `host:port`, IPv6 is written `[addr]` or `[addr]:port`, wildcards are
+  rejected, and a single-label entry other than `localhost` is rejected. An
+  entry never implies its subdomains: `example.com` does not authorise
+  `api.example.com`, and the minted certificate presents exactly the listed
+  names. Matching is case-insensitive. An allowlisted _name_ authorises every
+  address its resolver returns, including loopback, RFC 1918, and link-local
+  addresses; the operator writes that list, so a name that resolves somewhere
+  unexpected is a configuration decision, not a matcher bypass;
 - refuses a non-443 port unless the exact `host:port` is allowlisted;
 - terminates the client TLS leg with a per-session certificate minted at
   startup (or `WHEEL_SANDBOX_TLS_CA`/`CERT`/`KEY`), checks that the SNI matches
@@ -1006,14 +1024,21 @@ The relay:
   `WHEEL_SANDBOX_UPSTREAM_AUTH` (`Name: value`) or `OPENCODE_GO_API_KEY`
   (`Authorization: Bearer …`), so the provider key exists only in the relay's
   environment and never in the sandbox; the credential is bound to the
-  destinations named in `WHEEL_SANDBOX_AUTH_HOSTS`, so an allowlisted host that
-  is not a credential destination receives no credential header at all, and a
-  configured credential without that list is a startup failure;
+  destinations named in `WHEEL_SANDBOX_AUTH_HOSTS`, which uses the allowlist
+  grammar (a bare host means port 443, a non-443 port must be named explicitly),
+  so an allowlisted host or port that is not a credential destination receives
+  no credential header at all, and a configured credential without that list is
+  a startup failure;
 - bounds header bytes, request body, response body, connect time, and
   connection count, and returns a refusal instead of forwarding past a bound;
 - writes one JSON record per decision (destination, method, path, status,
   sizes, injected flag) to `<session>/host/requests.jsonl`, and never records a
-  header value or a body.
+  header value or a body. An upstream verification failure is recorded as
+  `upstream-tls-verify-failed`, distinct from `upstream-unreachable`, so a
+  private-CA mismatch is not mistaken for a dead host. An operator-supplied
+  `WHEEL_SANDBOX_UPSTREAM_CA` must satisfy strict X.509 verification on a modern
+  stack, including `subjectKeyIdentifier` and `authorityKeyIdentifier`; the
+  relay's own session certificates include both.
 
 `WHEEL_SANDBOX_TUNNEL_ONLY=1` relays opaque bytes with the same destination
 allowlist. It exists for protocols the relay cannot re-originate; it neither
@@ -1109,9 +1134,15 @@ own `WheelProvider.default_http_client` transport reaches that destination
 unchanged, and a non-allowlisted destination is refused and recorded; and the
 launcher refuses an empty allowlist, `/` as a workspace, and the owner's home as
 a workspace. The suite skips with a message when `bwrap` is absent and fails
-when `WHEEL_SANDBOX_REQUIRE=1` is set. The default CI image has no `bwrap`, so
-CI reports the skip; a release gate must run the suite on a Linux host or image
-that has it and set `WHEEL_SANDBOX_REQUIRE=1`.
+when `WHEEL_SANDBOX_REQUIRE=1` is set. The default `Quality gates` job has no
+`bwrap` and therefore reports the skip; a dedicated `Sandbox escape tests` job
+installs `bubblewrap` on a pinned `ubuntu-24.04` image, proves
+`bwrap --unshare-all` works there, and runs the suite with
+`WHEEL_SANDBOX_REQUIRE=1`. That job is currently `continue-on-error` and tracked
+by wheel#156, because Ubuntu 24.04 mediates unprivileged user namespaces through
+AppArmor and the gate must not be weakened to make it pass; until #156 closes, a
+green `Quality gates` run proves nothing about the sandbox, and the release gate
+must run the suite on a Linux host that has `bwrap`.
 
 This is Gate 1-style mechanism evidence for the sandbox itself. It is not the
 0.1.0 ceiling evidence, it is not an independent security review, and it does

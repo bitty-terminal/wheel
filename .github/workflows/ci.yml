@@ -38,3 +38,41 @@ jobs:
         run: just test-real-host
       - name: Verify package install, upgrade, and rollback
         run: just verify-package
+
+  # OS-level sandbox escape suite. Kept as its own job so a runner that cannot
+  # build a user namespace never blocks unrelated work.
+  #
+  # TODO(#156): remove continue-on-error once this job is proven on the chosen
+  # runner and make it a required check. The job has not been observed green on
+  # a hosted runner: Ubuntu 24.04 mediates unprivileged user namespaces through
+  # AppArmor, so bwrap fails with "setting up uid map: Permission denied" unless
+  # the mediation is relaxed. If that relaxation is refused on the runner, move
+  # this job to a self-hosted Linux runner instead of weakening the gate.
+  sandbox:
+    name: Sandbox escape tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install just
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2
+        with:
+          tool: just
+      - name: Install bubblewrap and the Lua gate interpreter
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap lua5.1
+      - name: Relax AppArmor userns mediation on this disposable runner
+        run: |
+          if [ "$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = 1 ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          if [ -f /etc/apparmor.d/bwrap-userns-restrict ]; then
+            sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict || true
+          fi
+      - name: Prove bubblewrap can build the sandbox
+        run: bwrap --unshare-all --die-with-parent -- /bin/true
+      - name: Run the escape suite as a hard gate
+        env:
+          WHEEL_SANDBOX_REQUIRE: "1"
+        run: just test-sandbox

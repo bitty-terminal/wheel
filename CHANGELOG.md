@@ -37,10 +37,14 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   mode has no network route at all; `--proxy` adds a host-side CONNECT relay over
   a bind-mounted Unix socket with a default-deny allowlist, bounded transfers,
   per-request logging, and relay-side credential injection, so the provider key
-  never enters the sandbox environment. The launcher fails closed when `bwrap`
-  is missing and never falls back to an unsandboxed run. Linux only; the macOS
-  backend is not implemented, and Windows is WSL2-only. Evidence:
-  `just test-sandbox`.
+  never enters the sandbox environment, and only the destinations in
+  `WHEEL_SANDBOX_AUTH_HOSTS` may receive it (a bare host means port 443). The
+  launcher refuses a workspace anywhere under `/run`, `$XDG_RUNTIME_DIR`, or the
+  runtime path `loginctl` reports, masks `.git/hooks`, and mounts `.git/config`
+  read-only so `core.hooksPath` cannot redirect host-side hooks. The launcher
+  fails closed when `bwrap` is missing and never falls back to an unsandboxed
+  run. Linux only; the macOS backend is not implemented, and Windows is
+  WSL2-only. Evidence: `just test-sandbox` (wheel#156 tracks the CI gate).
 
 ### Provider Cache
 

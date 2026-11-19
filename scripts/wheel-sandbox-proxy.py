@@ -99,14 +99,16 @@ class AllowEntry:
         self.exact_port = exact_port
 
     def matches(self, host, port):
-        if self.exact_port:
-            return host == self.host and port == self.port
-        if port != 443:
-            return False
-        return host == self.host or host.endswith("." + self.host)
+        # One rule for both lists: an entry names one host and one port. A bare
+        # entry means port 443, and no entry implies its subdomains. Widening to
+        # subdomains would also widen the minted certificate, which presents
+        # exactly the names in this list.
+        return host.lower() == self.host and port == (
+            self.port if self.exact_port else 443
+        )
 
 
-def parse_allowlist(raw):
+def parse_allowlist(raw, label="allowlist"):
     entries = []
     for item in raw.split(","):
         entry = item.strip().lower()
@@ -123,38 +125,38 @@ def parse_allowlist(raw):
             if not entry.endswith("]") and entry.count(":") > 1:
                 host, _, raw_port = entry.rpartition(":")
                 if not raw_port.isdigit():
-                    fail("allowlist entry has a non-numeric port")
+                    fail("%s entry has a non-numeric port" % label)
                 port = int(raw_port)
                 exact_port = True
             host = host.strip("[]")
         elif entry.count(":") == 1:
             host, _, raw_port = entry.partition(":")
             if not raw_port.isdigit():
-                fail("allowlist entry has a non-numeric port")
+                fail("%s entry has a non-numeric port" % label)
             port = int(raw_port)
             exact_port = True
         elif entry.count(":") > 1:
-            fail("allowlist entry is not host[:port]")
+            fail("%s entry is not host[:port]" % label)
         host = host.strip("[]").lower()
         if not host:
-            fail("allowlist entry is empty")
+            fail("%s entry is empty" % label)
         if port < 1 or port > 65535:
-            fail("allowlist entry has an out-of-range port")
+            fail("%s entry has an out-of-range port" % label)
         try:
             ipaddress.ip_address(host)
         except ValueError:
             if not HOST_RE.match(host):
-                fail("allowlist entry is not a valid host name")
+                fail("%s entry is not a valid host name" % label)
             if "." not in host and host != "localhost":
-                fail("allowlist entries must be a full domain name")
+                fail("%s entries must be a full domain name" % label)
         entries.append(AllowEntry(host, port, exact_port))
     if not entries:
-        fail("allowlist is empty; proxy mode is deny-all without one")
+        fail("%s is empty; proxy mode is deny-all without allowlist entries" % label)
     return entries
 
 
 def allowlist_match(entries, host, port):
-    return any(entry.matches(host, port) for entry in entries)
+    return any(entry.matches(host.lower(), port) for entry in entries)
 
 
 def is_exact_entry(entries, host, port):
@@ -168,36 +170,15 @@ def read_auth_hosts():
     """Destinations that may receive the injected credential.
 
     A credential has no business travelling to every allowlisted host, so the
-    receiving destinations are a separate, explicit list. An empty list with a
-    configured credential is a startup failure rather than an implicit
-    "inject everywhere".
+    receiving destinations are a separate, explicit list. It uses the allowlist
+    grammar verbatim: a bare host means port 443, a non-443 port must be named
+    explicitly, and IPv6 is written in brackets. An empty list with a configured
+    credential is a startup failure rather than an implicit "inject everywhere".
     """
     raw = os.environ.get("WHEEL_SANDBOX_AUTH_HOSTS", "")
-    entries = []
-    for item in raw.split(","):
-        entry = item.strip().lower()
-        if not entry:
-            continue
-        if "*" in entry or "/" in entry or "@" in entry or " " in entry:
-            fail("WHEEL_SANDBOX_AUTH_HOSTS entries must be host[:port]")
-        host, sep, port_text = entry.partition(":")
-        if sep:
-            if not port_text.isdigit() or not 1 <= int(port_text) <= 65535:
-                fail("WHEEL_SANDBOX_AUTH_HOSTS entry has an invalid port")
-            port = int(port_text)
-        else:
-            port = None
-        if not host:
-            fail("WHEEL_SANDBOX_AUTH_HOSTS entry is empty")
-        entries.append((host, port))
-    return entries
-
-
-def auth_host_matches(entries, host, port):
-    return any(
-        entry_host == host and (entry_port is None or entry_port == port)
-        for entry_host, entry_port in entries
-    )
+    if not raw.strip():
+        return []
+    return parse_allowlist(raw, "WHEEL_SANDBOX_AUTH_HOSTS")
 
 
 def read_upstream_credential():
@@ -398,14 +379,14 @@ class Relay:
 
     # -- transparent tunnel (destination allowlist only) -----------------
     def tunnel(self, conn, host, port, buffered=b""):
-        upstream = connect_upstream(
+        upstream, failure = connect_upstream(
             host, port, self.args.connect_timeout, self.args.io_timeout, None
         )
         if upstream is None:
             self.log(
                 {
                     "event": "refuse",
-                    "reason": "upstream-unreachable",
+                    "reason": failure or "upstream-unreachable",
                     "host": host,
                     "port": port,
                 }
@@ -531,13 +512,13 @@ class Relay:
                 return
         inject = (
             self.auth_headers
-            if auth_host_matches(self.auth_hosts, host, port)
+            if allowlist_match(self.auth_hosts, host, port)
             else []
         )
         upstream_head = build_upstream_head(
             method, target, host, port, headers, inject, body
         )
-        upstream = connect_upstream(
+        upstream, failure = connect_upstream(
             host,
             port,
             self.args.connect_timeout,
@@ -548,7 +529,7 @@ class Relay:
             self.log(
                 {
                     "event": "refuse",
-                    "reason": "upstream-unreachable",
+                    "reason": failure or "upstream-unreachable",
                     "host": host,
                     "port": port,
                 }
@@ -740,17 +721,21 @@ def connect_upstream(host, port, connect_timeout, io_timeout, context):
     with two unreachable addresses can take twice the budget, and the TLS
     handshake would start a fresh one. Resolution is bounded by the caller's
     own timeout; every address attempt and the handshake share this deadline.
+
+    Returns ``(socket, None)`` or ``(None, reason)``. A verification failure is
+    reported distinctly so a private-CA mismatch is not mistaken for an
+    unreachable host.
     """
     deadline = time.monotonic() + connect_timeout
     try:
         addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
     except OSError:
-        return None
+        return None, "upstream-resolve-failed"
     raw = None
     for family, socktype, proto, _canonical, sockaddr in addresses:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return None
+            return None, "upstream-connect-timeout"
         candidate = socket.socket(family, socktype, proto)
         candidate.settimeout(remaining)
         try:
@@ -761,22 +746,25 @@ def connect_upstream(host, port, connect_timeout, io_timeout, context):
         raw = candidate
         break
     if raw is None:
-        return None
+        return None, "upstream-unreachable"
     if context is None:
         raw.settimeout(io_timeout)
-        return raw
+        return raw, None
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         close_quietly(raw)
-        return None
+        return None, "upstream-connect-timeout"
     try:
         raw.settimeout(remaining)
         tls = context.wrap_socket(raw, server_hostname=host)
+    except ssl.SSLCertVerificationError:
+        close_quietly(raw)
+        return None, "upstream-tls-verify-failed"
     except (ssl.SSLError, OSError):
         close_quietly(raw)
-        return None
+        return None, "upstream-tls-failed"
     tls.settimeout(io_timeout)
-    return tls
+    return tls, None
 
 
 def parse_head(head):
