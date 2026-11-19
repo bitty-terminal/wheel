@@ -245,13 +245,13 @@ filesystem_group() {
   fi
 
   local mcp_output
-  mcp_output=$(in_sandbox 'cat .mcp.json' 2>&1)
+  mcp_output=$(in_sandbox 'printf "mcp-bytes=%s\n" "$(wc -c < .mcp.json 2>/dev/null)"; echo PROBE-OK' 2>&1)
   case $mcp_output in
-  *"$SECRET_MARKER"*)
-    report_fail ".mcp.json content is masked inside the sandbox"
+  *"mcp-bytes=0"*"PROBE-OK"*)
+    report_pass ".mcp.json content is masked inside the sandbox"
     ;;
   *)
-    report_pass ".mcp.json content is masked inside the sandbox"
+    report_fail ".mcp.json content is masked inside the sandbox" "saw: $mcp_output"
     ;;
   esac
 
@@ -705,21 +705,31 @@ runtime_dir_group() {
   # Nothing runtime-shaped is visible from inside either: no /run mount, no
   # runtime directory, no display or bus socket.
   local view
-  view=$(in_sandbox 'if [ -e /run/user ]; then echo RUNTIME-VISIBLE; fi; ls -A /run 2>/dev/null; echo "entries=$(ls -A /run 2>/dev/null | wc -l)"' 2>&1)
+  view=$(in_sandbox 'if [ -e /run/user ]; then echo RUNTIME-VISIBLE; fi; echo "entries=$(ls -A /run 2>/dev/null | wc -l)"; echo PROBE-OK' 2>&1)
   case $view in
-  *RUNTIME-VISIBLE*)
-    report_fail "no runtime directory is visible inside the sandbox"
+  *"PROBE-OK"*)
+    case $view in
+    *RUNTIME-VISIBLE*)
+      report_fail "no runtime directory is visible inside the sandbox"
+      ;;
+    *)
+      report_pass "no runtime directory is visible inside the sandbox"
+      ;;
+    esac
+    case $view in
+    *"entries=0"*)
+      report_pass "/run is empty or absent inside the sandbox"
+      ;;
+    *)
+      report_fail "/run is empty or absent inside the sandbox" "saw: $view"
+      ;;
+    esac
     ;;
   *)
-    report_pass "no runtime directory is visible inside the sandbox"
-    ;;
-  esac
-  case $view in
-  *"entries=0"*)
-    report_pass "/run is empty or absent inside the sandbox"
-    ;;
-  *)
-    report_fail "/run is empty or absent inside the sandbox" "saw: $view"
+    report_fail "no runtime directory is visible inside the sandbox" \
+      "the probe did not run: ${view%%$'\n'*}"
+    report_fail "/run is empty or absent inside the sandbox" \
+      "the probe did not run: ${view%%$'\n'*}"
     ;;
   esac
 }
@@ -796,8 +806,10 @@ git_config_group() {
 
   # Plant an executable hook through the writable workspace, then prove the
   # host-side git invocation does not run it.
+  local planted=1
   if ! in_sandbox 'mkdir -p .evil-hooks && printf "#!/bin/sh\necho host-side-hook-executed\n" > .evil-hooks/pre-commit && chmod +x .evil-hooks/pre-commit' >/dev/null 2>&1 ||
     [ ! -x "$WS/.evil-hooks/pre-commit" ]; then
+    planted=0
     report_fail "a hook can be planted in the writable workspace (probe setup)"
   else
     report_pass "a hook can be planted in the writable workspace (probe setup)"
@@ -898,15 +910,115 @@ git_config_group() {
     ;;
   esac
 
-  host_hook=$(git -C "$WS" hook run --ignore-missing pre-commit 2>&1 || true)
-  case $host_hook in
-  *host-side-hook-executed*)
-    report_fail "a planted workspace hook does not run on the host"
+  # A protected git directory is a mount point: it cannot be renamed out of the
+  # way and replaced by a fresh, writable one that the host would then use. This
+  # is the round-2 review probe (mv .git; git init; hooksPath -> host hook).
+  local rename_output
+  rename_output=$(in_sandbox 'mkdir -p .fakehooks
+printf "#!/bin/sh\necho RENAMED-GITDIR-HOOK-ON-HOST\n" > .fakehooks/pre-commit
+chmod +x .fakehooks/pre-commit
+mv .git .git-old 2>&1; echo "mv-git=$?"
+git init -q . 2>&1; echo "git-init=$?"
+git config core.hooksPath .fakehooks 2>&1; echo "hooksPath=$?"
+git config core.fsmonitor .fakehooks/pre-commit 2>&1; echo "fsmonitor=$?"
+[ -d .git ] && echo GIT-PRESENT
+[ -d .git-old ] && echo GIT-OLD-PRESENT
+echo PROBE-OK' 2>&1)
+  if ! printf '%s\n' "$rename_output" | grep -q 'PROBE-OK'; then
+    report_fail "a gitdir cannot be renamed and replaced" \
+      "the probe did not run: ${rename_output%%$'\n'*}"
+  elif ! printf '%s\n' "$rename_output" | grep -q 'Device or resource busy'; then
+    report_fail "a gitdir cannot be renamed and replaced" \
+      "no busy diagnostic: ${rename_output%%$'\n'*}"
+  elif ! printf '%s\n' "$rename_output" | grep -q 'GIT-PRESENT'; then
+    report_fail "a gitdir cannot be renamed and replaced" "the gitdir moved away"
+  elif printf '%s\n' "$rename_output" | grep -q 'GIT-OLD-PRESENT'; then
+    report_fail "a gitdir cannot be renamed and replaced" "the rename landed"
+  elif printf '%s\n' "$rename_output" | grep -qE 'hooksPath=0|fsmonitor=0'; then
+    report_fail "a gitdir cannot be renamed and replaced" \
+      "config became writable after the attempt"
+  else
+    report_pass "a gitdir cannot be renamed and replaced"
+  fi
+
+  local host_rename_hook
+  host_rename_hook=$(git -C "$WS" hook run --ignore-missing pre-commit 2>&1 || true)
+  case $host_rename_hook in
+  *RENAMED-GITDIR-HOOK-ON-HOST*)
+    report_fail "a renamed gitdir never reaches a host-side hook"
     ;;
   *)
-    report_pass "a planted workspace hook does not run on the host"
+    report_pass "a renamed gitdir never reaches a host-side hook"
     ;;
   esac
+  if [ -e "$WS/.git-old" ]; then
+    report_fail "the workspace gitdir is still in place after the attempt"
+  else
+    report_pass "the workspace gitdir is still in place after the attempt"
+  fi
+
+  # The same protection for a nested module git directory and a one-level
+  # nested checkout.
+  local module_rename
+  module_rename=$(in_sandbox 'mv .git/modules/demo .git/modules/demo-old 2>&1; echo "mv-module=$?"; [ -d .git/modules/demo ] && echo MODULE-PRESENT; echo PROBE-OK' 2>&1)
+  case $module_rename in
+  *"Device or resource busy"*"MODULE-PRESENT"*"PROBE-OK"*)
+    report_pass "a nested module gitdir cannot be renamed"
+    ;;
+  *)
+    report_fail "a nested module gitdir cannot be renamed" "saw: $module_rename"
+    ;;
+  esac
+  local nested_rename
+  nested_rename=$(in_sandbox 'mv nested-repo/.git nested-repo/.git-old 2>&1; echo "mv-nested=$?"; [ -d nested-repo/.git ] && echo NESTED-PRESENT; echo PROBE-OK' 2>&1)
+  case $nested_rename in
+  *"Device or resource busy"*"NESTED-PRESENT"*"PROBE-OK"*)
+    report_pass "a nested checkout gitdir cannot be renamed"
+    ;;
+  *)
+    report_fail "a nested checkout gitdir cannot be renamed" "saw: $nested_rename"
+    ;;
+  esac
+
+  # A linked worktree's .git file cannot be repointed or moved.
+  local wt_ws=$WORK/ws-worktree wt_output wt_before wt_after
+  mkdir -p "$wt_ws"
+  printf 'gitdir: %s\n' "$WS/.git/worktrees/demo" >"$wt_ws/.git"
+  wt_before=$(sha256sum -- "$wt_ws/.git" | cut -d' ' -f1)
+  wt_output=$(HOME=$FAKE_HOME WHEEL_SANDBOX_CACHE="$CACHE_BASE" WHEEL_SANDBOX_WORKSPACE="$wt_ws" \
+    "$WRAPPER" --exec -- sh -c 'printf "gitdir: /tmp\n" > .git 2>&1; echo "repoint=$?"; mv .git .git-moved 2>&1; echo "mv-file=$?"; [ -f .git ] && echo FILE-PRESENT; echo PROBE-OK' 2>&1)
+  wt_after=$(sha256sum -- "$wt_ws/.git" | cut -d' ' -f1)
+  case $wt_output in
+  *"repoint=0"*)
+    report_fail "a linked worktree gitdir file cannot be repointed"
+    ;;
+  *"Device or resource busy"*"FILE-PRESENT"*"PROBE-OK"*)
+    if [ "$wt_before" = "$wt_after" ]; then
+      report_pass "a linked worktree gitdir file cannot be repointed"
+    else
+      report_fail "a linked worktree gitdir file cannot be repointed" \
+        "the file changed"
+    fi
+    ;;
+  *)
+    report_fail "a linked worktree gitdir file cannot be repointed" "saw: $wt_output"
+    ;;
+  esac
+
+  if [ "$planted" -eq 1 ]; then
+    host_hook=$(git -C "$WS" hook run --ignore-missing pre-commit 2>&1 || true)
+    case $host_hook in
+    *host-side-hook-executed*)
+      report_fail "a planted workspace hook does not run on the host"
+      ;;
+    *)
+      report_pass "a planted workspace hook does not run on the host"
+      ;;
+    esac
+  else
+    report_fail "a planted workspace hook does not run on the host" \
+      "the plant step failed, so this probe proves nothing"
+  fi
 }
 
 matcher_group() {

@@ -974,20 +974,22 @@ its credential socket, and it keeps the caller's stdin across the background
   PulseAudio sockets, or the container socket into the sandbox.
   `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` are unset,
   so Wheel cannot reach the owner's live session or draw on their display.
-- **Masked in-workspace code paths.** `.git/hooks` is replaced by an empty
-  directory, reserved first when it is absent so a session cannot create and
-  fill it (a hook would execute outside the harness's process tree). `.git/config`
-  and `.git/config.worktree` are mounted read-only so `core.hooksPath`,
+- **Protected git metadata.** Each git directory (`.git`, every
+  `.git/modules/*` and `.git/worktrees/*`, and a one-level nested checkout's
+  `.git`) is self-bound, so it is a mount point that cannot be renamed out of the
+  way and replaced with a fresh, writable directory; a `.git` _file_ (linked
+  worktree or `--separate-git-dir`) is bound read-only so its `gitdir:` pointer
+  cannot be repointed. Inside them, `.git/hooks` is replaced by an empty
+  directory, reserved first when absent so a session cannot create and fill it,
+  and `config`/`config.worktree` are read-only, so `core.hooksPath`,
   `core.fsmonitor`, `core.pager`, `core.sshCommand`, and filter drivers cannot be
-  redirected; a symlinked configuration is protected through its resolved
-  target, and the same hook and config treatment applies to every nested git
-  directory under `.git/modules/*` and `.git/worktrees/*`. `.mcp.json`,
-  `.git-credentials`, `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`, and `.kube`
-  inside the workspace are masked when present. A **nested repository checked
-  out inside the workspace** keeps its own `.git` directory at that path; the
-  masks above cover git metadata directories, not every possible nested
-  checkout, so a nested repository's own hooks directory is workspace content
-  and a later host-side git invocation there is trusted-workspace territory.
+  written. A symlinked configuration is protected through its resolved target.
+  `.mcp.json`, `.git-credentials`, `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`,
+  and `.kube` inside the workspace are masked when present. What remains
+  writable is the rest of `.git` (objects, refs, logs) and any nested checkout
+  deeper than one level or checked out under a name reached only through unusual
+  layouts: a session can still plant content there, and a later host-side git
+  invocation in such a repository is trusted-workspace territory.
 - **No privilege.** `--cap-drop ALL`, a private user namespace, a private PID
   namespace, a private UTS namespace (hostname `wheel-sandbox`), a private IPC
   namespace, and `--die-with-parent` so the sandbox cannot outlive the launcher.
@@ -1156,7 +1158,7 @@ The dedicated `Sandbox escape tests` job is the explicit gate for this surface. 
 `ubuntu-24.04` image, relaxes AppArmor's unprivileged-userns mediation on the
 disposable runner, proves `bwrap --unshare-all` can build a sandbox there, and
 runs the suite with `WHEEL_SANDBOX_REQUIRE=1`, so a missing backend fails the
-job instead of skipping it. The job was observed green on that image (64
+job instead of skipping it. The job was observed green on that image (79
 assertions, 0 skipped); if a future image refuses the relaxation step, the job
 moves to a self-hosted Linux runner rather than weakening the gate (wheel#156).
 

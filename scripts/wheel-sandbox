@@ -370,9 +370,15 @@ main() {
   *) bwrap_args+=(--ro-bind "$repo_root" "$repo_root") ;;
   esac
 
+  # An empty regular file, not /dev/null: binding a device node read-only makes
+  # reads fail with EACCES instead of returning empty content, which is a
+  # surprising mask and impossible to assert against.
+  local empty_file=$session_root/host/empty-file
+  : >"$empty_file"
+  chmod 600 -- "$empty_file"
   mask_file() {
     if [ -e "$1" ]; then
-      bwrap_args+=(--ro-bind /dev/null "$1")
+      bwrap_args+=(--ro-bind "$empty_file" "$1")
     fi
   }
 
@@ -404,11 +410,29 @@ main() {
     fi
   }
 
+  # A read-only bind protects the inode but not its name: the parent directory
+  # can be renamed and a fresh, writable git directory installed in its place.
+  # Self-binding each protected git directory makes it a mount point, so `mv`
+  # fails with EBUSY and no new directory can take its place. A `.git` *file*
+  # (linked worktree, --separate-git-dir) is bound read-only so its `gitdir:`
+  # pointer cannot be repointed.
+  protect_git_dir() {
+    local path=$1
+    if [ -L "$path" ]; then
+      return 0
+    elif [ -d "$path" ]; then
+      bwrap_args+=(--bind "$path" "$path")
+    elif [ -f "$path" ]; then
+      bwrap_args+=(--ro-bind "$path" "$path")
+    fi
+  }
+
   # A repository without .git/hooks would let the session create one and plant a
   # hook for the next host-side git invocation, so reserve it before masking.
   if [ -d "$workspace/.git" ] && [ ! -e "$workspace/.git/hooks" ]; then
     mkdir -m 700 -- "$workspace/.git/hooks" 2>/dev/null || true
   fi
+  protect_git_dir "$workspace/.git"
   mask_dir "$workspace/.git/hooks"
   mask_readonly_file "$workspace/.git/config"
   mask_readonly_file "$workspace/.git/config.worktree"
@@ -416,6 +440,7 @@ main() {
   local git_dir nested
   for git_dir in "$workspace"/.git/modules/* "$workspace"/.git/worktrees/*; do
     [ -d "$git_dir" ] || continue
+    protect_git_dir "$git_dir"
     mask_dir "$git_dir/hooks"
     mask_readonly_file "$git_dir/config"
     mask_readonly_file "$git_dir/config.worktree"
@@ -425,6 +450,7 @@ main() {
   # both land here).
   for nested in "$workspace"/*/.git; do
     [ -d "$nested" ] || continue
+    protect_git_dir "$nested"
     mask_dir "$nested/hooks"
     mask_readonly_file "$nested/config"
     mask_readonly_file "$nested/config.worktree"

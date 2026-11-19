@@ -63,8 +63,10 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   Wayland/D-Bus/PipeWire sockets, `/run/user/*`, and the Docker/Podman socket
   do not resolve; the launcher also refuses a workspace anywhere under `/run` or
   `$XDG_RUNTIME_DIR`, so they cannot be bound in by pointing `--workspace` at
-  them. `.git/hooks` is masked with an empty directory, and `.git/config` is
-  read-only so `core.hooksPath` cannot redirect host-side hooks; `.mcp.json` and
+  them. Git metadata is the one protected corner of the writable workspace: each
+  git directory is self-bound so it cannot be renamed or replaced, `.git/hooks`
+  is masked with an empty reserved directory, `.git/config` is read-only, and a
+  linked worktree's `.git` file cannot be repointed. `.mcp.json` and
   credential-shaped paths inside the workspace are masked the same way.
 - **Network:** the default mode is `netless` — loopback only, no resolver, no
   route. `--proxy` adds the single road out: a host-side CONNECT relay over a
