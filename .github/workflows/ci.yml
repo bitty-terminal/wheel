@@ -71,7 +71,7 @@ jobs:
             sudo apparmor_parser -R /etc/apparmor.d/bwrap-userns-restrict || true
           fi
       - name: Prove bubblewrap can build the sandbox
-        run: bwrap --unshare-all --die-with-parent -- /bin/true
+        run: bwrap --unshare-all --die-with-parent --ro-bind / / -- /bin/true
       - name: Run the escape suite as a hard gate
         env:
           WHEEL_SANDBOX_REQUIRE: "1"

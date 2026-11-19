@@ -754,6 +754,7 @@ import importlib.util
 import os
 import sys
 
+sys.dont_write_bytecode = True  # a __pycache__ here would dirty the worktree
 path = sys.argv[1]
 spec = importlib.util.spec_from_file_location("relay", path)
 relay = importlib.util.module_from_spec(spec)
@@ -795,7 +796,7 @@ for name, got, want in checks:
 print("SUMMARY %d %d" % (sum(1 for _n, got, want in checks if got == want), len(checks)))
 PYPROBE
 
-  output=$(python3 "$probe" "$RELAY" 2>&1 || true)
+  output=$(PYTHONDONTWRITEBYTECODE=1 python3 "$probe" "$RELAY" 2>&1 || true)
   summary=$(printf '%s\n' "$output" | grep -o 'SUMMARY [0-9]* [0-9]*' | tail -1)
   if [ -n "$summary" ]; then
     local passed=${summary#SUMMARY }
