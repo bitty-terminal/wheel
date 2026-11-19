@@ -1135,14 +1135,14 @@ unchanged, and a non-allowlisted destination is refused and recorded; and the
 launcher refuses an empty allowlist, `/` as a workspace, and the owner's home as
 a workspace. The suite skips with a message when `bwrap` is absent and fails
 when `WHEEL_SANDBOX_REQUIRE=1` is set. The default `Quality gates` job has no
-`bwrap` and therefore reports the skip; a dedicated `Sandbox escape tests` job
-installs `bubblewrap` on a pinned `ubuntu-24.04` image, proves
-`bwrap --unshare-all` works there, and runs the suite with
-`WHEEL_SANDBOX_REQUIRE=1`. That job is currently `continue-on-error` and tracked
-by wheel#156, because Ubuntu 24.04 mediates unprivileged user namespaces through
-AppArmor and the gate must not be weakened to make it pass; until #156 closes, a
-green `Quality gates` run proves nothing about the sandbox, and the release gate
-must run the suite on a Linux host that has `bwrap`.
+`bwrap` and therefore reports the skip; the dedicated `Sandbox escape tests` job
+is the gate for this surface. It installs `bubblewrap` and `lua5.1` on a pinned
+`ubuntu-24.04` image, relaxes AppArmor's unprivileged-userns mediation on the
+disposable runner, proves `bwrap --unshare-all` can build a sandbox there, and
+runs the suite with `WHEEL_SANDBOX_REQUIRE=1`, so a missing backend fails the
+job instead of skipping it. The job was observed green on that image (64
+assertions, 0 skipped); if a future image refuses the relaxation step, the job
+moves to a self-hosted Linux runner rather than weakening the gate (wheel#156).
 
 This is Gate 1-style mechanism evidence for the sandbox itself. It is not the
 0.1.0 ceiling evidence, it is not an independent security review, and it does

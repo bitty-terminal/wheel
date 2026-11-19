@@ -44,7 +44,8 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   read-only so `core.hooksPath` cannot redirect host-side hooks. The launcher
   fails closed when `bwrap` is missing and never falls back to an unsandboxed
   run. Linux only; the macOS backend is not implemented, and Windows is
-  WSL2-only. Evidence: `just test-sandbox` (wheel#156 tracks the CI gate).
+  WSL2-only. Evidence: `just test-sandbox` and the `Sandbox escape tests` CI job,
+  which runs it with `WHEEL_SANDBOX_REQUIRE=1` on a pinned image.
 
 ### Provider Cache
 

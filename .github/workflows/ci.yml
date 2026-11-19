@@ -40,19 +40,15 @@ jobs:
         run: just verify-package
 
   # OS-level sandbox escape suite. Kept as its own job so a runner that cannot
-  # build a user namespace never blocks unrelated work.
-  #
-  # TODO(#156): remove continue-on-error once this job is proven on the chosen
-  # runner and make it a required check. The job has not been observed green on
-  # a hosted runner: Ubuntu 24.04 mediates unprivileged user namespaces through
-  # AppArmor, so bwrap fails with "setting up uid map: Permission denied" unless
-  # the mediation is relaxed. If that relaxation is refused on the runner, move
-  # this job to a self-hosted Linux runner instead of weakening the gate.
+  # build a user namespace never blocks unrelated work, and pinned to one image
+  # because the gate depends on that image's unprivileged-userns policy
+  # (`ubuntu-latest` is moving to 26.04). If a future image refuses the
+  # relaxation step, move the job to a self-hosted Linux runner instead of
+  # weakening the gate; see wheel#156.
   sandbox:
     name: Sandbox escape tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    continue-on-error: true
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
