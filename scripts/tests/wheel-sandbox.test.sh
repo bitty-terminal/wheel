@@ -257,7 +257,17 @@ environment_group() {
   printf '\n# environment confinement\n'
 
   local environment
-  environment=$(in_sandbox 'env' 2>&1)
+  environment=$(in_sandbox 'env; echo ENV-PROBE-OK' 2>&1)
+  case $'
+'"$environment" in
+  *$'
+'"ENV-PROBE-OK"*) ;;
+  *)
+    report_fail "the environment probe ran inside the sandbox" \
+      "saw: ${environment%%$'\n'*}"
+    return
+    ;;
+  esac
   local name
   for name in HOME WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS XDG_RUNTIME_DIR OPENCODE_GO_API_KEY ANTHROPIC_API_KEY; do
     # Match a whole assignment line: XDG_CONFIG_HOME= must not look like HOME=.
@@ -513,13 +523,17 @@ LUA
   local egress_output
   egress_output=$("${proxy_env[@]}" "$WRAPPER" --proxy --allow "127.0.0.1:$port" \
     --session "proxy-egress" --exec -- \
-    sh -c 'curl --noproxy "*" -sS --max-time 8 https://example.com' 2>&1)
+    sh -c 'curl --noproxy "*" -sS --max-time 8 https://example.com; echo "curl-rc=$?"; echo EGRESS-PROBE-OK' 2>&1)
   case $egress_output in
-  *"{"* | *"<html"* | *"<HTML"*)
+  *"curl-rc=0"*)
     report_fail "proxy mode has no direct egress outside the relay" "saw: $egress_output"
     ;;
-  *)
+  *"EGRESS-PROBE-OK"*)
     report_pass "proxy mode has no direct egress outside the relay"
+    ;;
+  *)
+    report_fail "proxy mode has no direct egress outside the relay" \
+      "the probe did not run: ${egress_output%%$'\n'*}"
     ;;
   esac
 
@@ -675,6 +689,12 @@ runtime_dir_group() {
     "runtime root" \
     env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" "XDG_RUNTIME_DIR=$synthetic" \
     "$WRAPPER" --workspace "$synthetic/sub" --exec -- true
+  mkdir -p "$WORK/contains-runtime/runtime"
+  expect_launcher_refusal "the launcher refuses a workspace that contains a runtime directory" \
+    "contains a protected" \
+    env "HOME=$FAKE_HOME" "WHEEL_SANDBOX_CACHE=$CACHE_BASE" \
+    "XDG_RUNTIME_DIR=$WORK/contains-runtime/runtime" \
+    "$WRAPPER" --workspace "$WORK/contains-runtime" --exec -- true
 
   # Nothing runtime-shaped is visible from inside either: no /run mount, no
   # runtime directory, no display or bus socket.
@@ -702,30 +722,43 @@ git_config_group() {
   printf '\n# repository configuration and hooks\n'
 
   local config_output
-  config_output=$(in_sandbox 'git config core.hooksPath .evil-hooks 2>&1; echo "config-rc=$?"' 2>&1)
+  config_output=$(in_sandbox 'git config core.hooksPath .evil-hooks 2>&1; echo "config-rc=$?"; echo PROBE-OK' 2>&1)
   case $config_output in
   *"config-rc=0"*)
     report_fail "the sandbox cannot set core.hooksPath"
     ;;
-  *)
+  *"PROBE-OK"*)
     report_pass "the sandbox cannot set core.hooksPath"
+    ;;
+  *)
+    report_fail "the sandbox cannot set core.hooksPath" \
+      "the probe did not run: ${config_output%%$'\n'*}"
     ;;
   esac
 
   local append_output
-  append_output=$(in_sandbox 'printf x >> .git/config 2>&1; echo "append-rc=$?"' 2>&1)
+  append_output=$(in_sandbox 'printf x >> .git/config 2>&1; echo "append-rc=$?"; echo PROBE-OK' 2>&1)
   case $append_output in
   *"append-rc=0"*)
     report_fail ".git/config is read-only inside the sandbox"
     ;;
-  *)
+  *"PROBE-OK"*)
     report_pass ".git/config is read-only inside the sandbox"
+    ;;
+  *)
+    report_fail ".git/config is read-only inside the sandbox" \
+      "the probe did not run: ${append_output%%$'\n'*}"
     ;;
   esac
 
   # Plant an executable hook through the writable workspace, then prove the
   # host-side git invocation does not run it.
-  in_sandbox 'mkdir -p .evil-hooks && printf "#!/bin/sh\necho host-side-hook-executed\n" > .evil-hooks/pre-commit && chmod +x .evil-hooks/pre-commit' >/dev/null 2>&1 || true
+  if ! in_sandbox 'mkdir -p .evil-hooks && printf "#!/bin/sh\necho host-side-hook-executed\n" > .evil-hooks/pre-commit && chmod +x .evil-hooks/pre-commit' >/dev/null 2>&1 ||
+    [ ! -x "$WS/.evil-hooks/pre-commit" ]; then
+    report_fail "a hook can be planted in the writable workspace (probe setup)"
+  else
+    report_pass "a hook can be planted in the writable workspace (probe setup)"
+  fi
   local host_hooks_path host_hook
   host_hooks_path=$(git -C "$WS" config --get core.hooksPath 2>/dev/null || true)
   if [ -z "$host_hooks_path" ]; then
@@ -734,6 +767,89 @@ git_config_group() {
     report_fail "a sandboxed session cannot redirect host-side git hooks" \
       "host hooksPath=$host_hooks_path"
   fi
+  # Submodule and linked-worktree git directories keep their own hooks/config.
+  mkdir -p "$WS/.git/modules/demo/hooks" "$WS/.git/worktrees/demo/hooks"
+  printf '#!/bin/sh\necho nested-hook-executed\n' >"$WS/.git/modules/demo/hooks/post-checkout"
+  chmod +x "$WS/.git/modules/demo/hooks/post-checkout"
+  printf '[core]\n' >"$WS/.git/modules/demo/config"
+  printf '#!/bin/sh\necho worktree-hook-executed\n' >"$WS/.git/worktrees/demo/hooks/post-checkout"
+  chmod +x "$WS/.git/worktrees/demo/hooks/post-checkout"
+  local nested_output
+  nested_output=$(in_sandbox 'cat .git/modules/demo/hooks/post-checkout 2>/dev/null; echo "hooks-lines=$(ls -A .git/modules/demo/hooks 2>/dev/null | wc -l)"; printf x >> .git/modules/demo/config 2>&1; echo "nested-config-rc=$?"; echo PROBE-OK' 2>&1)
+  case $nested_output in
+  *"hooks-lines=0"*"nested-config-rc=0"*)
+    report_fail "nested git hooks and config are protected inside the sandbox" \
+      "saw: $nested_output"
+    ;;
+  *"hooks-lines=0"*"PROBE-OK"*)
+    report_pass "nested git hooks and config are protected inside the sandbox"
+    ;;
+  *)
+    report_fail "nested git hooks and config are protected inside the sandbox" \
+      "saw: $nested_output"
+    ;;
+  esac
+
+  # A nested checkout one level down keeps its own git directory.
+  mkdir -p "$WS/nested-repo/.git/hooks"
+  printf '[core]\n' >"$WS/nested-repo/.git/config"
+  printf '#!/bin/sh\necho nested-checkout-hook\n' >"$WS/nested-repo/.git/hooks/pre-commit"
+  chmod +x "$WS/nested-repo/.git/hooks/pre-commit"
+  local nested_checkout
+  nested_checkout=$(in_sandbox 'ls -A nested-repo/.git/hooks | wc -l; printf x >> nested-repo/.git/config 2>&1; echo "nested-rc=$?"; echo PROBE-OK' 2>&1)
+  case $nested_checkout in
+  "0"*"nested-rc=1"*"PROBE-OK"*)
+    report_pass "a nested checkout keeps its hooks and config protected"
+    ;;
+  *)
+    report_fail "a nested checkout keeps its hooks and config protected" "saw: $nested_checkout"
+    ;;
+  esac
+
+  # A symlinked .git/config must be protected through its resolved target.
+  local link_ws=$WORK/ws-symlink link_output
+  mkdir -p "$link_ws"
+  (
+    cd "$link_ws" || exit 1
+    git init -q .
+    mv .git/config .git/config.real
+    ln -s config.real .git/config
+  )
+  link_output=$(HOME=$FAKE_HOME WHEEL_SANDBOX_CACHE="$CACHE_BASE" WHEEL_SANDBOX_WORKSPACE="$link_ws" \
+    "$WRAPPER" --exec -- sh -c 'git config core.hooksPath .evil 2>&1; echo "link-config-rc=$?"; echo PROBE-OK' 2>&1)
+  case $link_output in
+  *"link-config-rc=0"*)
+    report_fail "a symlinked .git/config is protected through its target"
+    ;;
+  *"PROBE-OK"*)
+    report_pass "a symlinked .git/config is protected through its target"
+    ;;
+  *)
+    report_fail "a symlinked .git/config is protected through its target" \
+      "the probe did not run: ${link_output%%$'\n'*}"
+    ;;
+  esac
+
+  # A repository without .git/hooks gets a reserved, masked directory instead of
+  # a writable one the session could fill.
+  local bare_ws=$WORK/ws-nohooks nohooks_output
+  mkdir -p "$bare_ws"
+  (
+    cd "$bare_ws" || exit 1
+    git init -q .
+    rm -rf .git/hooks
+  )
+  nohooks_output=$(HOME=$FAKE_HOME WHEEL_SANDBOX_CACHE="$CACHE_BASE" WHEEL_SANDBOX_WORKSPACE="$bare_ws" \
+    "$WRAPPER" --exec -- sh -c 'mkdir -p .git/hooks 2>&1; printf x > .git/hooks/pre-commit 2>&1; echo "hooks-write-rc=$?"; ls -A .git/hooks | wc -l; echo PROBE-OK' 2>&1)
+  case $nohooks_output in
+  *$'\n'"0"*"PROBE-OK"*)
+    report_pass "an absent .git/hooks is reserved and masked"
+    ;;
+  *)
+    report_fail "an absent .git/hooks is reserved and masked" "saw: $nohooks_output"
+    ;;
+  esac
+
   host_hook=$(git -C "$WS" hook run --ignore-missing pre-commit 2>&1 || true)
   case $host_hook in
   *host-side-hook-executed*)

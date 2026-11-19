@@ -20,6 +20,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 PROG = "wheel-sandbox-bridge"
 
@@ -34,20 +35,31 @@ def pump(client, upstream, timeout):
     instant cannot make the bridge drop the pending bytes it already read.
     """
 
+    last_activity = [time.monotonic()]
+
     def relay(source, sink):
-        try:
-            while True:
+        while True:
+            try:
                 data = source.recv(65536)
-                if not data:
+            except socket.timeout:
+                # Silence is not end of stream: the peer may be waiting for a
+                # response on the other direction. Only an idle tunnel closes.
+                if time.monotonic() - last_activity[0] > timeout:
                     break
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            last_activity[0] = time.monotonic()
+            try:
                 sink.sendall(data)
+            except OSError:
+                break
+        try:
+            sink.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-        finally:
-            try:
-                sink.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
 
     reverse = threading.Thread(target=relay, args=(upstream, client), daemon=True)
     reverse.start()

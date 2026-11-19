@@ -953,6 +953,11 @@ its credential socket, and it keeps the caller's stdin across the background
   symlinks on a merged-`/usr` distribution are recreated as symlinks.
 - **Workspace at its own path.** The workspace is bound read-write at the same
   absolute path, so tooling that embeds paths keeps working.
+- **Streamed upstream responses.** The relay forwards the response body as it
+  arrives, bounded by the idle timeout and the response byte cap, so a slow or
+  server-sent-event response reaches the client incrementally instead of
+  failing as an aggregate-timeout 502; a response that exceeds the byte cap is
+  cut off and logged.
 - **One writable scratch directory.** `<session>/work` is mounted at `/cache`
   and exported as `TMPDIR`, `CARGO_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`,
   `XDG_STATE_HOME`, `XDG_CONFIG_HOME`, and `npm_config_cache`. Nothing else is
@@ -970,15 +975,19 @@ its credential socket, and it keeps the caller's stdin across the background
   `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, and `DBUS_SESSION_BUS_ADDRESS` are unset,
   so Wheel cannot reach the owner's live session or draw on their display.
 - **Masked in-workspace code paths.** `.git/hooks` is replaced by an empty
-  directory (a hook would execute outside the harness's process tree), the
-  repository's `.git/config` and `.git/config.worktree` are mounted read-only so
-  `core.hooksPath`, `core.fsmonitor`, `core.pager`, `core.sshCommand`, and
-  filter drivers cannot be redirected, and `.mcp.json`, `.git-credentials`,
-  `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`, and `.kube` inside the
-  workspace are masked when present. A **nested** repository inside the
-  workspace keeps its own `.git`; its hooks and configuration are workspace
-  content, so a later host-side git invocation in that nested repository is
-  trusted-workspace territory.
+  directory, reserved first when it is absent so a session cannot create and
+  fill it (a hook would execute outside the harness's process tree). `.git/config`
+  and `.git/config.worktree` are mounted read-only so `core.hooksPath`,
+  `core.fsmonitor`, `core.pager`, `core.sshCommand`, and filter drivers cannot be
+  redirected; a symlinked configuration is protected through its resolved
+  target, and the same hook and config treatment applies to every nested git
+  directory under `.git/modules/*` and `.git/worktrees/*`. `.mcp.json`,
+  `.git-credentials`, `.netrc`, `.ssh`, `.aws`, `.gnupg`, `.docker`, and `.kube`
+  inside the workspace are masked when present. A **nested repository checked
+  out inside the workspace** keeps its own `.git` directory at that path; the
+  masks above cover git metadata directories, not every possible nested
+  checkout, so a nested repository's own hooks directory is workspace content
+  and a later host-side git invocation there is trusted-workspace territory.
 - **No privilege.** `--cap-drop ALL`, a private user namespace, a private PID
   namespace, a private UTS namespace (hostname `wheel-sandbox`), a private IPC
   namespace, and `--die-with-parent` so the sandbox cannot outlive the launcher.
@@ -1069,8 +1078,14 @@ container and gVisor/microVM tiers are for, and neither is implemented here.
   until the kernel reclaims them, and can fill the filesystem through its
   workspace and scratch directory.
 - **The workspace is writable by design.** The session is meant to edit the
-  repository, so tracked files, `.git/config`, and build outputs are writable;
-  only hooks and the listed credential-shaped paths are masked.
+  repository, so tracked files and build outputs are writable. Git metadata is
+  the exception the launcher protects: `.git/hooks` is masked (and reserved when
+  absent), `.git/config`, `.git/config.worktree`, and the same files under
+  `.git/modules/*` and `.git/worktrees/*` are read-only, and symlinked
+  configuration is protected through its resolved target. Everything else inside
+  the workspace — other tracked content, `.git/objects`, other files under
+  `.git` — is writable, so a session can still corrupt the repository or plant
+  content that a later host-side command consumes for its own reasons.
 - **Readable system trees.** `/etc` and `/usr` are readable, so hostnames,
   package metadata, and distribution configuration are visible. The backend
   does not verify that every file under `/etc` is secret-free: a user who stores

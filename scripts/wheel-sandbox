@@ -257,6 +257,11 @@ main() {
       die "refusing a workspace inside a protected credential or runtime root: $protected"
       ;;
     esac
+    case $protected/ in
+    "$workspace"/*)
+      die "the workspace contains a protected credential or runtime root; binding it read-write would expose $protected"
+      ;;
+    esac
   done
 
   if [ -z "$session" ]; then
@@ -383,16 +388,47 @@ main() {
   # sandbox's process tree; credential stores inside a checkout are masked too.
   # Masking .git/hooks alone is not enough: core.hooksPath (or core.fsmonitor,
   # core.pager, core.sshCommand, and filter drivers) in .git/config can point
-  # anywhere, so the repository configuration is read-only here as well.
+  # anywhere, so the repository configuration is read-only here as well, and the
+  # same treatment applies to submodule and linked-worktree git directories.
   mask_readonly_file() {
-    if [ -f "$1" ] && [ ! -L "$1" ]; then
-      bwrap_args+=(--ro-bind "$1" "$1")
+    local path=$1 target
+    if [ -L "$path" ]; then
+      target=$(readlink -f -- "$path" 2>/dev/null || true)
+      case $target in
+      "$workspace"/*) path=$target ;;
+      *) return 0 ;;
+      esac
+    fi
+    if [ -f "$path" ] || [ -d "$path" ]; then
+      bwrap_args+=(--ro-bind "$path" "$path")
     fi
   }
 
+  # A repository without .git/hooks would let the session create one and plant a
+  # hook for the next host-side git invocation, so reserve it before masking.
+  if [ -d "$workspace/.git" ] && [ ! -e "$workspace/.git/hooks" ]; then
+    mkdir -m 700 -- "$workspace/.git/hooks" 2>/dev/null || true
+  fi
   mask_dir "$workspace/.git/hooks"
   mask_readonly_file "$workspace/.git/config"
   mask_readonly_file "$workspace/.git/config.worktree"
+
+  local git_dir nested
+  for git_dir in "$workspace"/.git/modules/* "$workspace"/.git/worktrees/*; do
+    [ -d "$git_dir" ] || continue
+    mask_dir "$git_dir/hooks"
+    mask_readonly_file "$git_dir/config"
+    mask_readonly_file "$git_dir/config.worktree"
+  done
+
+  # Nested checkout one level down (submodule worktrees and independent clones
+  # both land here).
+  for nested in "$workspace"/*/.git; do
+    [ -d "$nested" ] || continue
+    mask_dir "$nested/hooks"
+    mask_readonly_file "$nested/config"
+    mask_readonly_file "$nested/config.worktree"
+  done
   mask_file "$workspace/.mcp.json"
   mask_file "$workspace/.git-credentials"
   mask_file "$workspace/.netrc"

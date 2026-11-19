@@ -538,11 +538,12 @@ class Relay:
             return
         try:
             upstream.sendall(upstream_head + body)
-            response = read_response(
+            response = relay_response(
                 upstream,
+                client,
                 self.args.max_header_bytes,
                 self.args.max_response_bytes,
-                deadline,
+                self.args.io_timeout,
             )
             if response is None:
                 self.log(
@@ -555,8 +556,7 @@ class Relay:
                 )
                 send_status(client, 502, "Bad Gateway")
                 return
-            response_head, response_body, status_code = response
-            client.sendall(response_head + response_body)
+            response_head, response_bytes, status_code = response
             self.log(
                 {
                     "event": "forward",
@@ -566,7 +566,7 @@ class Relay:
                     "path": sanitize_path(target),
                     "status": status_code,
                     "request_bytes": len(body),
-                    "response_bytes": len(response_body),
+                    "response_bytes": response_bytes,
                     "injected": bool(inject),
                 }
             )
@@ -946,9 +946,9 @@ class Reader:
         return data
 
 
-def read_response(conn, head_limit, body_limit, deadline):
-    reader = Reader(conn)
-    head = reader.read_head(head_limit, deadline)
+def relay_response(upstream, client, head_limit, body_limit, idle_timeout):
+    reader = Reader(upstream)
+    head = reader.read_head(head_limit, time.monotonic() + idle_timeout)
     if head is None:
         return None
     lines = head.split(b"\r\n")
@@ -966,10 +966,33 @@ def read_response(conn, head_limit, body_limit, deadline):
         kept.append(line)
     kept.append(b"Connection: close")
     head_out = b"\r\n".join(kept) + b"\r\n\r\n"
-    body = reader.read_to_eof(body_limit, deadline)
-    if body is None:
+
+    # Relay the body as it arrives. Buffering the whole response made a slow or
+    # streamed (SSE) upstream a 502 on the aggregate I/O budget and delayed every
+    # byte until the end; the socket idle timeout now bounds each read and the
+    # byte cap still bounds the transfer.
+    total = 0
+    try:
+        client.sendall(head_out)
+        if reader.buffer:
+            client.sendall(reader.buffer)
+            total += len(reader.buffer)
+        while True:
+            if total > body_limit:
+                return None
+            try:
+                chunk = upstream.recv(65536)
+            except socket.timeout:
+                return None
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > body_limit:
+                return None
+            client.sendall(chunk)
+    except OSError:
         return None
-    return head_out, body, status_code
+    return head_out, total, status_code
 
 
 def sanitize_path(target):
@@ -1000,24 +1023,35 @@ def pump(client, upstream, limit, timeout):
     when the destination was not writable.
     """
 
+    last_activity = [time.monotonic()]
+
     def relay(source, sink):
         total = 0
-        try:
-            while True:
+        while True:
+            try:
                 data = source.recv(65536)
-                if not data:
+            except socket.timeout:
+                # Silence is not end of stream: the destination may still be
+                # producing a response on the other direction.
+                if time.monotonic() - last_activity[0] > timeout:
                     break
-                total += len(data)
-                if total > limit:
-                    break
+                continue
+            except OSError:
+                break
+            if not data:
+                break
+            last_activity[0] = time.monotonic()
+            total += len(data)
+            if total > limit:
+                break
+            try:
                 sink.sendall(data)
+            except OSError:
+                break
+        try:
+            sink.shutdown(socket.SHUT_WR)
         except OSError:
             pass
-        finally:
-            try:
-                sink.shutdown(socket.SHUT_WR)
-            except OSError:
-                pass
 
     reverse = threading.Thread(target=relay, args=(upstream, client), daemon=True)
     reverse.start()
