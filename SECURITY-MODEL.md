@@ -1149,9 +1149,10 @@ own `WheelProvider.default_http_client` transport reaches that destination
 unchanged, and a non-allowlisted destination is refused and recorded; and the
 launcher refuses an empty allowlist, `/` as a workspace, and the owner's home as
 a workspace. The suite skips with a message when `bwrap` is absent and fails
-when `WHEEL_SANDBOX_REQUIRE=1` is set. The default `Quality gates` job has no
-`bwrap` and therefore reports the skip; the dedicated `Sandbox escape tests` job
-is the gate for this surface. It installs `bubblewrap` and `lua5.1` on a pinned
+when `WHEEL_SANDBOX_REQUIRE=1` is set. The generic `Quality gates` job also runs
+the suite and, on the current `ubuntu-latest` image, executes it with a real
+`bwrap` (observed `0 skipped`); a host without `bwrap` reports the skip instead.
+The dedicated `Sandbox escape tests` job is the explicit gate for this surface. It installs `bubblewrap` and `lua5.1` on a pinned
 `ubuntu-24.04` image, relaxes AppArmor's unprivileged-userns mediation on the
 disposable runner, proves `bwrap --unshare-all` can build a sandbox there, and
 runs the suite with `WHEEL_SANDBOX_REQUIRE=1`, so a missing backend fails the

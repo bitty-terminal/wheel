@@ -7,6 +7,12 @@
 # synthetic and planted under the suite's own scratch directory; the real
 # ~/.ssh and the real provider key are never read.
 #
+# Assertions must not depend on the specific `sh` implementation: the CI runner
+# uses dash and the owner's host uses bash, and the two shells differ in the exit
+# status of a failed redirection (2 vs 1) and in their error wording. Assert on
+# the refusal diagnostic plus the unchanged target, never on a literal status
+# produced by a shell builtin.
+#
 # Requirements: bwrap for every group, python3 and openssl for the proxy group.
 # When a requirement is absent the group is reported as SKIP and the suite exits
 # 0, because a development host or CI image without bubblewrap cannot run it.
@@ -718,38 +724,75 @@ runtime_dir_group() {
   esac
 }
 
+expect_write_denied() {
+  # A protected-path write must be refused, and the refusal must be visible as a
+  # diagnostic plus an unchanged target. The exit status is deliberately not
+  # compared with a literal: `sh` is dash on CI and bash on the owner's host, and
+  # a redirection failure returns 2 under dash and 1 under bash.
+  local description=$1 target=$2 snippet=$3 output before after status
+  before=$(sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1)
+  output=$(in_sandbox "$snippet" 2>&1)
+  after=$(sha256sum -- "$target" 2>/dev/null | cut -d' ' -f1)
+
+  case $output in
+  *"PROBE-OK"*) ;;
+  *)
+    report_fail "$description" "the probe did not run: ${output%%$'\n'*}"
+    return
+    ;;
+  esac
+  case $output in
+  *"Read-only file system"* | *"Permission denied"* | *"Device or resource busy"*) ;;
+  *)
+    report_fail "$description" "no refusal diagnostic: ${output%%$'\n'*}"
+    return
+    ;;
+  esac
+  status=$(printf '%s\n' "$output" | sed -n 's/^WRITE-STATUS=//p' | tail -1)
+  if [ -z "$status" ] || [ "$status" = 0 ]; then
+    report_fail "$description" "write status: ${status:-missing}"
+    return
+  fi
+  if [ -n "$before" ] && [ "$before" = "$after" ]; then
+    report_pass "$description"
+  else
+    report_fail "$description" "the target changed"
+  fi
+}
+
+expect_hooks_masked() {
+  # The hooks directory is masked: nothing is listed, nothing reaches the host,
+  # and a created file must not survive. Status codes are not compared.
+  local description=$1 host_dir=$2 snippet=$3 output listing
+  output=$(in_sandbox "$snippet" 2>&1)
+  case $output in
+  *"PROBE-OK"*) ;;
+  *)
+    report_fail "$description" "the probe did not run: ${output%%$'\n'*}"
+    return
+    ;;
+  esac
+  listing=$(printf '%s\n' "$output" | sed -n 's/^HOOK-LINES=//p' | tail -1)
+  if [ "$listing" != 0 ]; then
+    report_fail "$description" "hooks directory listed ${listing:-?} entries"
+    return
+  fi
+  if [ -e "$host_dir/planted-inside" ]; then
+    report_fail "$description" "a hook reached the host directory"
+  else
+    report_pass "$description"
+  fi
+}
+
 git_config_group() {
   printf '\n# repository configuration and hooks\n'
 
-  local config_output
-  config_output=$(in_sandbox 'git config core.hooksPath .evil-hooks 2>&1; echo "config-rc=$?"; echo PROBE-OK' 2>&1)
-  case $config_output in
-  *"config-rc=0"*)
-    report_fail "the sandbox cannot set core.hooksPath"
-    ;;
-  *"PROBE-OK"*)
-    report_pass "the sandbox cannot set core.hooksPath"
-    ;;
-  *)
-    report_fail "the sandbox cannot set core.hooksPath" \
-      "the probe did not run: ${config_output%%$'\n'*}"
-    ;;
-  esac
-
-  local append_output
-  append_output=$(in_sandbox 'printf x >> .git/config 2>&1; echo "append-rc=$?"; echo PROBE-OK' 2>&1)
-  case $append_output in
-  *"append-rc=0"*)
-    report_fail ".git/config is read-only inside the sandbox"
-    ;;
-  *"PROBE-OK"*)
-    report_pass ".git/config is read-only inside the sandbox"
-    ;;
-  *)
-    report_fail ".git/config is read-only inside the sandbox" \
-      "the probe did not run: ${append_output%%$'\n'*}"
-    ;;
-  esac
+  expect_write_denied "the sandbox cannot rewrite .git/config (sentinel absent)" \
+    "$WS/.git/config" \
+    'printf "WHEEL-SANDBOX-SENTINEL\n" >> .git/config 2>&1; echo "WRITE-STATUS=$?"; echo PROBE-OK'
+  expect_write_denied "the sandbox cannot redirect core.hooksPath" \
+    "$WS/.git/config" \
+    'git config core.hooksPath .evil-hooks 2>&1; echo "WRITE-STATUS=$?"; echo PROBE-OK'
 
   # Plant an executable hook through the writable workspace, then prove the
   # host-side git invocation does not run it.
@@ -767,6 +810,7 @@ git_config_group() {
     report_fail "a sandboxed session cannot redirect host-side git hooks" \
       "host hooksPath=$host_hooks_path"
   fi
+
   # Submodule and linked-worktree git directories keep their own hooks/config.
   mkdir -p "$WS/.git/modules/demo/hooks" "$WS/.git/worktrees/demo/hooks"
   printf '#!/bin/sh\necho nested-hook-executed\n' >"$WS/.git/modules/demo/hooks/post-checkout"
@@ -774,40 +818,27 @@ git_config_group() {
   printf '[core]\n' >"$WS/.git/modules/demo/config"
   printf '#!/bin/sh\necho worktree-hook-executed\n' >"$WS/.git/worktrees/demo/hooks/post-checkout"
   chmod +x "$WS/.git/worktrees/demo/hooks/post-checkout"
-  local nested_output
-  nested_output=$(in_sandbox 'cat .git/modules/demo/hooks/post-checkout 2>/dev/null; echo "hooks-lines=$(ls -A .git/modules/demo/hooks 2>/dev/null | wc -l)"; printf x >> .git/modules/demo/config 2>&1; echo "nested-config-rc=$?"; echo PROBE-OK' 2>&1)
-  case $nested_output in
-  *"hooks-lines=0"*"nested-config-rc=0"*)
-    report_fail "nested git hooks and config are protected inside the sandbox" \
-      "saw: $nested_output"
-    ;;
-  *"hooks-lines=0"*"PROBE-OK"*)
-    report_pass "nested git hooks and config are protected inside the sandbox"
-    ;;
-  *)
-    report_fail "nested git hooks and config are protected inside the sandbox" \
-      "saw: $nested_output"
-    ;;
-  esac
+
+  expect_hooks_masked "nested module hooks are masked" "$WS/.git/modules/demo/hooks" \
+    'printf x > .git/modules/demo/hooks/planted-inside 2>/dev/null; ls -A .git/modules/demo/hooks 2>/dev/null | wc -l | sed "s/^/HOOK-LINES=/"; echo PROBE-OK'
+  expect_write_denied "a nested module config is read-only" "$WS/.git/modules/demo/config" \
+    'printf "WHEEL-SANDBOX-SENTINEL\n" >> .git/modules/demo/config 2>&1; echo "WRITE-STATUS=$?"; echo PROBE-OK'
+  expect_hooks_masked "linked-worktree hooks are masked" "$WS/.git/worktrees/demo/hooks" \
+    'printf x > .git/worktrees/demo/hooks/planted-inside 2>/dev/null; ls -A .git/worktrees/demo/hooks 2>/dev/null | wc -l | sed "s/^/HOOK-LINES=/"; echo PROBE-OK'
 
   # A nested checkout one level down keeps its own git directory.
   mkdir -p "$WS/nested-repo/.git/hooks"
   printf '[core]\n' >"$WS/nested-repo/.git/config"
   printf '#!/bin/sh\necho nested-checkout-hook\n' >"$WS/nested-repo/.git/hooks/pre-commit"
   chmod +x "$WS/nested-repo/.git/hooks/pre-commit"
-  local nested_checkout
-  nested_checkout=$(in_sandbox 'ls -A nested-repo/.git/hooks | wc -l; printf x >> nested-repo/.git/config 2>&1; echo "nested-rc=$?"; echo PROBE-OK' 2>&1)
-  case $nested_checkout in
-  "0"*"nested-rc=1"*"PROBE-OK"*)
-    report_pass "a nested checkout keeps its hooks and config protected"
-    ;;
-  *)
-    report_fail "a nested checkout keeps its hooks and config protected" "saw: $nested_checkout"
-    ;;
-  esac
+  expect_hooks_masked "a nested checkout keeps its hooks masked" "$WS/nested-repo/.git/hooks" \
+    'printf x > nested-repo/.git/hooks/planted-inside 2>/dev/null; ls -A nested-repo/.git/hooks 2>/dev/null | wc -l | sed "s/^/HOOK-LINES=/"; echo PROBE-OK'
+  expect_write_denied "a nested checkout keeps its config read-only" \
+    "$WS/nested-repo/.git/config" \
+    'printf "WHEEL-SANDBOX-SENTINEL\n" >> nested-repo/.git/config 2>&1; echo "WRITE-STATUS=$?"; echo PROBE-OK'
 
   # A symlinked .git/config must be protected through its resolved target.
-  local link_ws=$WORK/ws-symlink link_output
+  local link_ws=$WORK/ws-symlink
   mkdir -p "$link_ws"
   (
     cd "$link_ws" || exit 1
@@ -815,14 +846,25 @@ git_config_group() {
     mv .git/config .git/config.real
     ln -s config.real .git/config
   )
+  local link_output
   link_output=$(HOME=$FAKE_HOME WHEEL_SANDBOX_CACHE="$CACHE_BASE" WHEEL_SANDBOX_WORKSPACE="$link_ws" \
-    "$WRAPPER" --exec -- sh -c 'git config core.hooksPath .evil 2>&1; echo "link-config-rc=$?"; echo PROBE-OK' 2>&1)
+    "$WRAPPER" --exec -- sh -c 'printf "WHEEL-SANDBOX-SENTINEL\n" >> .git/config.real 2>&1; echo "WRITE-STATUS=$?"; echo PROBE-OK' 2>&1)
   case $link_output in
-  *"link-config-rc=0"*)
-    report_fail "a symlinked .git/config is protected through its target"
-    ;;
   *"PROBE-OK"*)
-    report_pass "a symlinked .git/config is protected through its target"
+    case $link_output in
+    *"Read-only file system"* | *"Permission denied"* | *"Device or resource busy"*)
+      if grep -q "WHEEL-SANDBOX-SENTINEL" "$link_ws/.git/config.real" 2>/dev/null; then
+        report_fail "a symlinked .git/config is protected through its target" \
+          "the sentinel reached the target"
+      else
+        report_pass "a symlinked .git/config is protected through its target"
+      fi
+      ;;
+    *)
+      report_fail "a symlinked .git/config is protected through its target" \
+        "no refusal diagnostic: ${link_output%%$'\n'*}"
+      ;;
+    esac
     ;;
   *)
     report_fail "a symlinked .git/config is protected through its target" \
@@ -832,18 +874,24 @@ git_config_group() {
 
   # A repository without .git/hooks gets a reserved, masked directory instead of
   # a writable one the session could fill.
-  local bare_ws=$WORK/ws-nohooks nohooks_output
+  local bare_ws=$WORK/ws-nohooks
   mkdir -p "$bare_ws"
   (
     cd "$bare_ws" || exit 1
     git init -q .
     rm -rf .git/hooks
   )
+  local nohooks_output
   nohooks_output=$(HOME=$FAKE_HOME WHEEL_SANDBOX_CACHE="$CACHE_BASE" WHEEL_SANDBOX_WORKSPACE="$bare_ws" \
-    "$WRAPPER" --exec -- sh -c 'mkdir -p .git/hooks 2>&1; printf x > .git/hooks/pre-commit 2>&1; echo "hooks-write-rc=$?"; ls -A .git/hooks | wc -l; echo PROBE-OK' 2>&1)
+    "$WRAPPER" --exec -- sh -c 'mkdir -p .git/hooks 2>/dev/null; printf x > .git/hooks/pre-commit 2>&1; echo "HOOK-LINES=$(ls -A .git/hooks 2>/dev/null | wc -l)"; echo PROBE-OK' 2>&1)
   case $nohooks_output in
-  *$'\n'"0"*"PROBE-OK"*)
-    report_pass "an absent .git/hooks is reserved and masked"
+  *"HOOK-LINES=0"*"PROBE-OK"*)
+    if [ -e "$bare_ws/.git/hooks/pre-commit" ]; then
+      report_fail "an absent .git/hooks is reserved and masked" \
+        "a hook reached the host directory"
+    else
+      report_pass "an absent .git/hooks is reserved and masked"
+    fi
     ;;
   *)
     report_fail "an absent .git/hooks is reserved and masked" "saw: $nohooks_output"

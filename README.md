@@ -84,7 +84,8 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   `openssl` for proxy-mode session certificates. `just test-sandbox` runs the
   escape tests; `WHEEL_SANDBOX_REQUIRE=1 just test-sandbox` runs them as a hard
   gate instead of skipping without `bwrap`, and the `Sandbox escape tests` CI job
-  does exactly that on a pinned image. `SECURITY-MODEL.md` records what is still
+  does exactly that on a pinned image (the generic gate also executes the suite
+  where `bwrap` is present). `SECURITY-MODEL.md` records what is still
   unprotected.
 - **Platforms:** Linux native today. macOS is supported at the core level, but
   its sandbox backend (Seatbelt) is not implemented yet and `--sandbox` fails
