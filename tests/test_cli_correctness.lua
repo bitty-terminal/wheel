@@ -1,12 +1,13 @@
 -- tests/test_cli_correctness.lua
 -- Regression suite for the Wheel CLI correctness fixes (CTX-0057 / wheel#148):
---   1. One model-precedence rule: --model > role config model that belongs to the
---      active provider > provider template default. String and table models both
---      reach WheelAgent.new.
+--   1. One model-precedence rule: --model > role config model (bare names apply
+--      to the active provider) > provider template default. String, table, and
+--      provider/model ids are resolved without retargeting catalogue providers.
 --   2. Per-subcommand --help/-h and `help <command>` exit 0 without a provider
 --      call; unknown options are usage errors, never prompt text.
 --   3. --max-turns bounds and a distinct budget-exhaustion exit code/message.
---   4. --trace writes tool-call diagnostics to stderr only.
+--   4. --trace writes bounded, redacted tool-call diagnostics to stderr only.
+--   5. Role tool lists are validated against the registry at construction.
 --
 -- No network and no real provider: every adapter call goes through an injected
 -- http_client stub.
@@ -14,9 +15,12 @@
 package.path = "./lua/?.lua;./lua/?/init.lua;" .. package.path
 
 local WheelHost = require("wheel.host")
+local WheelConfig = require("wheel.config")
 local WheelProvider = require("wheel.provider")
 local WheelAgent = require("wheel.agent")
 local WheelKernel = require("wheel.kernel")
+local WheelTool = require("wheel.tool")
+local WheelErrors = require("wheel.errors")
 local WheelCLI = require("wheel.cli")
 
 local function make_temp_root(prefix)
@@ -53,7 +57,17 @@ local ok_all, test_err = pcall(function()
     XDG_DATA_HOME = root .. "/data",
     XDG_STATE_HOME = root .. "/state",
     OPENCODE_GO_API_KEY = "test-key-not-a-secret",
+    OPENROUTER_API_KEY = "test-openrouter-key",
+    DEEPSEEK_API_KEY = "test-deepseek-key",
   }
+
+  local function write_text(path, content)
+    local parent = path:match("^(.*)/[^/]+$")
+    if parent then assert(WheelHost.fs.mkdir_p(parent)) end
+    local file = assert(io.open(path, "wb"))
+    file:write(content)
+    file:close()
+  end
 
   local function capture_harness(extra)
     local harness = {
@@ -85,11 +99,13 @@ local ok_all, test_err = pcall(function()
   -- `always_tool` keeps requesting tools until the runner stops.
   local function make_run_http(opts)
     opts = opts or {}
-    local state = { requests = 0, models = {} }
+    local state = { requests = 0, models = {}, urls = {}, bodies = {} }
     local client = function(req)
       state.requests = state.requests + 1
       local decoded = WheelProvider.JSON.decode(req.body or "{}")
       table.insert(state.models, decoded.model)
+      table.insert(state.urls, req.url)
+      table.insert(state.bodies, req.body or "")
       local message, finish
       if opts.always_tool or state.requests <= (opts.tool_turns or 0) then
         message = {
@@ -121,13 +137,18 @@ local ok_all, test_err = pcall(function()
   do
     local coding = WheelAgent.Role.CODING
     local function resolve(model, role_model, extra)
+      extra = extra or {}
       local opts = {
         model = model,
-        provider_name = "opencode-go",
         provider_default_model = "deepseek-v4.1-flash",
         config = { roles = { [coding] = { model = role_model } } },
       }
-      for k, v in pairs(extra or {}) do opts[k] = v end
+      if not extra.no_active_provider then
+        opts.provider_name = "opencode-go"
+      end
+      for k, v in pairs(extra) do
+        if k ~= "no_active_provider" then opts[k] = v end
+      end
       local profile, err = WheelAgent.resolve_model(coding, opts)
       assert(profile ~= nil, "resolve_model failed: " .. tostring(err))
       return profile
@@ -144,15 +165,36 @@ local ok_all, test_err = pcall(function()
     assert(p_string.model == "deepseek-v4.1-flash" and p_string.provider == "opencode-go",
       "string --model must be applied")
 
-    -- `provider/model` selects the provider and keeps the remaining model id.
-    local p_prefixed = resolve("openrouter/deepseek/deepseek-chat")
+    -- `provider/model` selects the provider when no provider is selected yet.
+    local p_prefixed = resolve("openrouter/deepseek/deepseek-chat", nil,
+      { no_active_provider = true, provider_default_model = nil })
     assert(p_prefixed.provider == "openrouter" and p_prefixed.model == "deepseek/deepseek-chat",
-      "provider/model must split on the known provider prefix")
+      "provider/model must split on the known provider prefix, got "
+        .. tostring(p_prefixed.provider) .. "/" .. tostring(p_prefixed.model))
+
+    -- With an explicit provider, only a matching prefix is split. A catalogue
+    -- id like OpenRouter's `deepseek/deepseek-chat` stays opaque.
+    local p_catalogue = resolve("deepseek/deepseek-chat", nil,
+      { provider_name = "openrouter", provider_default_model = "openrouter-default" })
+    assert(p_catalogue.provider == "openrouter" and p_catalogue.model == "deepseek/deepseek-chat",
+      "catalogue provider ids must not retarget the provider, got "
+        .. tostring(p_catalogue.provider) .. "/" .. tostring(p_catalogue.model))
+    local p_same_prefix = resolve("deepseek/deepseek-chat", nil,
+      { provider_name = "deepseek", provider_default_model = "deepseek-chat" })
+    assert(p_same_prefix.provider == "deepseek" and p_same_prefix.model == "deepseek-chat",
+      "a prefix matching the explicit provider must be split")
 
     -- Table form keeps working, including temperature.
     local p_table = resolve({ name = "table-model", provider = "opencode-go", temperature = 0.3 })
     assert(p_table.model == "table-model" and p_table.provider == "opencode-go"
       and p_table.temperature == 0.3, "table --model must keep name/provider/temperature")
+
+    -- A table without a model name is not a model selection and falls through
+    -- to the provider default instead of sending the role default.
+    local p_nameless = resolve({ temperature = 0.3 })
+    assert(p_nameless.model == "deepseek-v4.1-flash" and p_nameless.provider == "opencode-go",
+      "a nameless table model must fall through to the provider default, got "
+        .. tostring(p_nameless.model))
 
     -- Role config model that belongs to the active provider outranks the default.
     local p_role = resolve(nil, { name = "deepseek-reasoner", provider = "opencode-go" })
@@ -164,11 +206,32 @@ local ok_all, test_err = pcall(function()
     assert(p_foreign.model == "deepseek-v4.1-flash",
       "role model from another provider must not override the active provider model")
 
-    -- A bare role model inherits the role's default provider family (anthropic
-    -- for Coding), so it is not applied to opencode-go either.
-    local p_bare = resolve(nil, "deepseek-reasoner")
-    assert(p_bare.model == "deepseek-v4.1-flash" and p_bare.provider == "opencode-go",
-      "bare role model without a matching provider family must fall back to the provider default")
+    -- A bare role model is an explicit model id for the active provider.
+    local p_bare = resolve(nil, "my-custom-model")
+    assert(p_bare.model == "my-custom-model" and p_bare.provider == "opencode-go",
+      "a bare role model must be applied to the active provider, got "
+        .. tostring(p_bare.model))
+
+    -- A role-config string naming a foreign provider is skipped (foreign
+    -- claim), matching the table form and the documented rule.
+    local p_foreign_string = resolve(nil, "anthropic/claude-3-5-sonnet")
+    assert(p_foreign_string.model == "deepseek-v4.1-flash"
+      and p_foreign_string.provider == "opencode-go",
+      "a foreign provider string claim must be skipped, got "
+        .. tostring(p_foreign_string.model))
+
+    -- A role-config string naming the active provider strips the prefix.
+    local p_matching_string = resolve(nil, "opencode-go/my-model")
+    assert(p_matching_string.model == "my-model" and p_matching_string.provider == "opencode-go",
+      "a role-config string for the active provider must be split, got "
+        .. tostring(p_matching_string.model))
+
+    -- A nameless table role model keeps its tuning and falls through instead
+    -- of keeping the role default model.
+    local p_nameless_role = resolve(nil, { temperature = 0.3 })
+    assert(p_nameless_role.model == "deepseek-v4.1-flash"
+      and p_nameless_role.temperature == 0.3,
+      "a nameless role model table must fall through to the provider default and keep tuning")
 
     -- A foreign-provider role model_profile is ignored like a foreign model.
     local p_foreign_profile = WheelAgent.resolve_model(coding, {
@@ -182,6 +245,17 @@ local ok_all, test_err = pcall(function()
     })
     assert(p_foreign_profile.model == "deepseek-v4.1-flash",
       "role model_profile from another provider must not override the active provider model")
+
+    -- A provider-less configured role profile is accepted and uses the active
+    -- provider instead of aborting agent construction.
+    local p_providerless_profile = WheelAgent.resolve_model(coding, {
+      provider_name = "opencode-go",
+      provider_default_model = "deepseek-v4.1-flash",
+      config = { roles = { [coding] = { model_profile = { model = "go-profile-custom" } } } },
+    })
+    assert(p_providerless_profile.model == "go-profile-custom"
+      and p_providerless_profile.provider == "opencode-go",
+      "a provider-less role model_profile must use the active provider")
 
     local p_matching_profile = WheelAgent.resolve_model(coding, {
       provider_name = "opencode-go",
@@ -240,7 +314,288 @@ local ok_all, test_err = pcall(function()
     assert(table_agent.model_profile.model == "cli-table-model"
       and table_agent.model_profile.temperature == 0.4,
       "WheelAgent.new must keep table model support")
+
+    -- A table model that names a provider honours that claim (D1 must not
+    -- return through the documented API form).
+    local foreign_table_agent = assert(WheelAgent.new({
+      name = "foreign-table-model-agent",
+      role = coding,
+      kernel = kernel,
+      model = { name = "claude-3-5-sonnet", provider = "anthropic" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+    }))
+    assert(foreign_table_agent.model_profile.provider == "anthropic"
+      and foreign_table_agent.model_profile.model == "claude-3-5-sonnet",
+      "a table provider claim must be honoured, got "
+        .. tostring(foreign_table_agent.model_profile.provider))
+
+    local catalogue_table_agent = assert(WheelAgent.new({
+      name = "catalogue-table-model-agent",
+      role = coding,
+      kernel = kernel,
+      model = { name = "deepseek/deepseek-chat", provider = "openrouter" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+    }))
+    assert(catalogue_table_agent.model_profile.provider == "openrouter"
+      and catalogue_table_agent.model_profile.model == "deepseek/deepseek-chat",
+      "a table provider claim must keep its catalogue provider")
+
+    -- A nameless table model must not keep the role default (D1 table form).
+    local nameless_agent = assert(WheelAgent.new({
+      name = "nameless-model-agent",
+      role = coding,
+      kernel = kernel,
+      model = { temperature = 0.3 },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+    }))
+    assert(nameless_agent.model_profile.model == "go-default"
+      and nameless_agent.model_profile.provider == "opencode-go"
+      and nameless_agent.model_profile.temperature == 0.3,
+      "a nameless table model must keep tuning and fall through to the provider default, got "
+        .. tostring(nameless_agent.model_profile.model))
+
+    -- A provider-less configured role model_profile is accepted.
+    local profile_agent = assert(WheelAgent.new({
+      name = "providerless-profile-agent",
+      role = coding,
+      kernel = kernel,
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = { model = "go-profile-custom" } } } },
+    }))
+    assert(profile_agent.model_profile.model == "go-profile-custom"
+      and profile_agent.model_profile.provider == "opencode-go",
+      "a provider-less role model_profile must not abort construction")
     print("PASS model precedence (string, provider/model, table, role, template default)")
+  end
+
+  -- 1a. Round-2 review regressions: explicit tuning, canonical role-profile
+  -- model, provider claims without an active provider, and the typed
+  -- no-default-model failure.
+  do
+    local coding = WheelAgent.Role.CODING
+    local function resolve(opts)
+      return WheelAgent.resolve_model(coding, opts)
+    end
+
+    -- Explicit temperature survives a role-supplied model name.
+    local tuned, tuned_err = resolve({
+      model = { temperature = 0.7 },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model = { name = "role-model", temperature = 0.2 } } } },
+    })
+    assert(tuned and tuned.model == "role-model" and tuned.temperature == 0.7,
+      "explicit temperature must win over role tuning: " .. tostring(tuned_err))
+
+    -- Invalid explicit tuning must be validated, not applied after validation.
+    local hot, hot_err = resolve({
+      model = { temperature = "hot" },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "role-model", temperature = 0.2,
+      } } } },
+    })
+    assert(hot == nil and type(hot_err) == "table" and WheelErrors.is_typed(hot_err)
+      and hot_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "invalid explicit temperature must fail typed: " .. tostring(hot_err))
+
+    local false_temp, false_temp_err = resolve({
+      model = { temperature = false },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "role-model", temperature = 0.2,
+      } } } },
+    })
+    assert(false_temp == nil and type(false_temp_err) == "table"
+      and WheelErrors.is_typed(false_temp_err)
+      and false_temp_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "boolean explicit temperature must fail typed: " .. tostring(false_temp_err))
+
+    -- A named provider-less role profile is still validated.
+    local invalid, invalid_err = resolve({
+      config = { roles = { [coding] = { model_profile = { model = "x", temperature = "hot" } } } },
+    })
+    assert(invalid == nil and invalid_err
+      and tostring(invalid_err):find("temperature", 1, true),
+      "an invalid provider-less role profile must fail validation: " .. tostring(invalid_err))
+    assert(type(invalid_err) == "table" and WheelErrors.is_typed(invalid_err)
+      and invalid_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "a model-profile validation failure must be typed")
+
+    -- `model` is canonical for a role profile, not the `name` alias.
+    local canonical = resolve({
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "intended-model", name = "profile-label",
+      } } } },
+    })
+    assert(canonical and canonical.model == "intended-model",
+      "a role profile must resolve its canonical model, got " .. tostring(canonical and canonical.model))
+
+    -- With no active provider, a role model table keeps its provider claim.
+    local claimed = resolve({
+      config = { roles = { [coding] = { model = {
+        name = "deepseek/deepseek-chat", provider = "openrouter",
+      } } } },
+    })
+    assert(claimed and claimed.provider == "openrouter"
+      and claimed.model == "deepseek/deepseek-chat",
+      "a role table provider claim must survive without an active provider")
+
+    -- An active provider with no default model must not inherit another
+    -- provider's role default.
+    local missing, missing_err = resolve({
+      provider_name = "gateway",
+      provider_default_model = "",
+    })
+    assert(missing == nil and missing_err
+      and tostring(missing_err):find("no default model", 1, true),
+      "a providerless default must fail typed, got " .. tostring(missing and missing.model))
+    assert(type(missing_err) == "table" and WheelErrors.is_typed(missing_err)
+      and missing_err.code == WheelErrors.E_MODEL_PROVIDER_UNRESOLVED,
+      "an unresolved provider default must be typed")
+
+    -- F2: a non-string provider must fail validation, not reach provider create.
+    for _, bad_provider in ipairs({ 123, {}, true }) do
+      local bad, bad_err = resolve({
+        config = { roles = { [coding] = { model_profile = {
+          model = "custom", provider = bad_provider, temperature = "hot",
+        } } } },
+      })
+      assert(bad == nil and type(bad_err) == "table"
+        and WheelErrors.is_typed(bad_err)
+        and bad_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+        "a non-string model_profile provider must fail typed, got " .. tostring(bad_err))
+    end
+    local ok_bad_agent, bad_agent_err = pcall(WheelAgent.new, {
+      name = "bad-provider-agent",
+      role = coding,
+      kernel = WheelKernel.new({ in_memory = true }),
+      config = { roles = { [coding] = { model_profile = {
+        model = "custom", provider = 123, temperature = "hot",
+      } } } },
+    })
+    assert(not ok_bad_agent and type(bad_agent_err) == "table"
+      and WheelErrors.is_typed(bad_agent_err)
+      and bad_agent_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "WheelAgent.new must reject a non-string profile provider typed")
+
+    print("PASS round-2 model-resolution regressions")
+  end
+
+  -- 1b. Role tool lists must only name registered tools.
+  do
+    local registry = WheelTool.get_default_registry()
+    local registered = {}
+    for _, schema in ipairs(registry:list_tools()) do
+      registered[schema.name] = true
+    end
+    for role, role_cfg in pairs(WheelConfig.DEFAULTS.roles) do
+      for _, name in ipairs(role_cfg.tools or {}) do
+        assert(registered[name],
+          string.format("roles.%s.tools names unregistered tool '%s'", tostring(role), tostring(name)))
+      end
+    end
+
+    local ok_unknown, err_unknown = WheelAgent.validate_tool_list(
+      "unknown-tool-agent", WheelAgent.Role.CODING, { "read_file", "not_a_tool" },
+      WheelTool.get_default_registry())
+    assert(not ok_unknown and err_unknown ~= nil, "an unregistered tool name must fail validation")
+    assert(tostring(err_unknown):find("E_AGENT_TOOL_UNKNOWN", 1, true)
+      and tostring(err_unknown):find("not_a_tool", 1, true),
+      "the tool diagnostic must be typed and name the unknown tool: " .. tostring(err_unknown))
+    assert(WheelTool.get_default_registry() ~= nil
+      and WheelAgent.validate_tool_list("ok-agent", WheelAgent.Role.CODING,
+        { "read_file", "run_command" }, WheelTool.get_default_registry()) == true,
+      "registered role tools must pass validation")
+
+    -- The "*" wildcard is a valid role tool list.
+    assert(WheelAgent.validate_tool_list("wild-agent", WheelAgent.Role.CODING, { "*" },
+      WheelTool.get_default_registry()) == true, "the '*' wildcard must pass validation")
+    local wild_agent = assert(WheelAgent.new({
+      name = "wild-agent",
+      role = WheelAgent.Role.CODING,
+      kernel = WheelKernel.new({ in_memory = true }),
+      config = { roles = { coding = { tools = { "*" } } } },
+    }))
+    assert(wild_agent.tools[1] == "*" and wild_agent:is_tool_allowed("run_command") == true,
+      "a wildcard role tool list must construct and authorize a registered tool")
+
+    -- Map-shaped and sparse lists fail closed instead of being silently empty.
+    local ok_map, err_map = WheelAgent.validate_tool_list(
+      "map-tools-agent", WheelAgent.Role.CODING, { read_file = true },
+      WheelTool.get_default_registry())
+    assert(not ok_map and tostring(err_map):find("dense array", 1, true),
+      "a map-shaped tool list must be rejected: " .. tostring(err_map))
+    local ok_sparse, err_sparse = WheelAgent.validate_tool_list(
+      "sparse-tools-agent", WheelAgent.Role.CODING, { [1] = "read_file", [3] = "run_command" },
+      WheelTool.get_default_registry())
+    assert(not ok_sparse and tostring(err_sparse):find("dense array", 1, true),
+      "a sparse tool list must be rejected: " .. tostring(err_sparse))
+
+    -- The unknown-tool diagnostic is typed and bounded.
+    local many_unknown = {}
+    for index = 1, 40 do many_unknown[index] = "unknown_" .. tostring(index) end
+    local ok_many, err_many = WheelAgent.validate_tool_list(
+      "many-tools-agent", WheelAgent.Role.CODING, many_unknown, WheelTool.get_default_registry())
+    assert(not ok_many, "many unknown tools must fail validation")
+    assert(WheelErrors.E_AGENT_TOOL_UNKNOWN ~= nil
+      and tostring(err_many):find("E_AGENT_TOOL_UNKNOWN", 1, true),
+      "E_AGENT_TOOL_UNKNOWN must be part of the typed vocabulary")
+    local rendered_many = tostring(err_many)
+    assert(#rendered_many <= 200, "the tool diagnostic must be bounded, got " .. tostring(#rendered_many))
+    assert(rendered_many:find("(+35 more)", 1, true) ~= nil,
+      "the bounded diagnostic must count the remaining tools: " .. rendered_many)
+
+    -- An index-0/short list must not hide an unknown tool past the ipairs hole.
+    local ok_index0, err_index0 = WheelAgent.validate_tool_list(
+      "index0-agent", WheelAgent.Role.CODING,
+      { [0] = "read_file", [1] = "read_file", [3] = "not_a_tool" },
+      WheelTool.get_default_registry())
+    assert(not ok_index0 and tostring(err_index0):find("dense array", 1, true),
+      "non-1-based keys must be rejected: " .. tostring(err_index0))
+
+    -- Long names must not squeeze the omitted-count suffix out of the message.
+    local long_name = string.rep("x", 200)
+    local ok_long, err_long = WheelAgent.validate_tool_list(
+      "long-tools-agent", WheelAgent.Role.CODING,
+      { long_name, "a", "b", "c", "d", "e" }, WheelTool.get_default_registry())
+    local rendered_long = tostring(err_long)
+    assert(not ok_long and #rendered_long <= 200
+      and rendered_long:find("(+1 more)", 1, true) ~= nil
+      and not rendered_long:find(long_name, 1, true),
+      "the bounded diagnostic must reserve room for the omitted count: " .. rendered_long)
+
+    -- Config-driven role tools are validated too; the CLI reports exit 2.
+    local bad_cfg_root = root .. "/bad-tools"
+    local bad_env = {
+      HOME = bad_cfg_root,
+      XDG_CONFIG_HOME = bad_cfg_root .. "/config",
+      XDG_DATA_HOME = bad_cfg_root .. "/data",
+      XDG_STATE_HOME = bad_cfg_root .. "/state",
+      OPENCODE_GO_API_KEY = "test-key-not-a-secret",
+    }
+    write_text(bad_cfg_root .. "/config/wheel/init.lua",
+      'return { roles = { coding = { tools = { "read_file", "no_such_tool" } } } }\n')
+    local rc_bad_tools, _, err_bad_tools = run_cli({
+      "run", "--thinking", "off", "--workspace", ws, "task",
+    }, {
+      env = bad_env,
+      http_client = function() error("provider must not be constructed with invalid tools") end,
+      approver = function() return { decision = "allow_once" } end,
+    })
+    assert(rc_bad_tools == 2, "a bad role tool list must exit 2, got " .. tostring(rc_bad_tools))
+    assert(err_bad_tools:find("E_AGENT_TOOL_UNKNOWN", 1, true)
+      and err_bad_tools:find("no_such_tool", 1, true),
+      "wheel run must report the typed tool diagnostic: " .. err_bad_tools)
+    print("PASS role tool lists validated against the registry")
   end
 
   -- 2. The run path sends the requested model, not the role default.
@@ -279,6 +634,64 @@ local ok_all, test_err = pcall(function()
       "ask without flags must keep working")
     assert(ask_models[1] == "ask-model" and ask_models[2] == "deepseek-v4.1-flash",
       "ask must honour --model and default to the template model")
+
+    -- Catalogue ids stay opaque when the provider is explicit: an OpenRouter
+    -- model id must never retarget the endpoint.
+    local client_or, state_or = make_run_http({ tool_turns = 0 })
+    local rc_or = run_cli({
+      "run", "--provider", "openrouter", "--model", "deepseek/deepseek-v4.1-flash",
+      "--thinking", "off", "--workspace", ws, "say done",
+    }, { http_client = client_or, approver = function() return { decision = "allow_once" } end })
+    assert(rc_or == 0, "explicit OpenRouter catalogue id must not be a usage error")
+    assert(state_or.models[1] == "deepseek/deepseek-v4.1-flash",
+      "two-segment catalogue id must stay intact, got " .. tostring(state_or.models[1]))
+    assert(state_or.urls[1]:find("openrouter.ai", 1, true),
+      "two-segment catalogue id must keep the OpenRouter endpoint, got " .. tostring(state_or.urls[1]))
+
+    local client_or3, state_or3 = make_run_http({ tool_turns = 0 })
+    assert(run_cli({
+      "run", "--provider", "openrouter", "--model", "openrouter/deepseek/deepseek-chat",
+      "--thinking", "off", "--workspace", ws, "say done",
+    }, { http_client = client_or3, approver = function() return { decision = "allow_once" } end }) == 0)
+    assert(state_or3.models[1] == "deepseek/deepseek-chat",
+      "three-segment id must strip only the matching provider prefix, got "
+        .. tostring(state_or3.models[1]))
+    assert(state_or3.urls[1]:find("openrouter.ai", 1, true), "three-segment id keeps OpenRouter")
+
+    -- Without --provider a known provider prefix is the override syntax.
+    local client_ds, state_ds = make_run_http({ tool_turns = 0 })
+    assert(run_cli({
+      "run", "--model", "deepseek/deepseek-chat", "--thinking", "off", "--workspace", ws, "say done",
+    }, { http_client = client_ds, approver = function() return { decision = "allow_once" } end }) == 0)
+    assert(state_ds.models[1] == "deepseek-chat" and state_ds.urls[1]:find("api.deepseek.com", 1, true),
+      "without --provider a known prefix selects that provider")
+
+    -- The same rule holds for ask.
+    local ask_urls, ask_ids = {}, {}
+    local ask_split_client = function(req)
+      local decoded = WheelProvider.JSON.decode(req.body or "{}")
+      table.insert(ask_ids, decoded.model)
+      table.insert(ask_urls, req.url)
+      return {
+        status = 200,
+        body = '{"choices":[{"message":{"content":"ask ok"},"finish_reason":"stop"}]}',
+      }
+    end
+    assert(run_cli({ "ask", "--provider", "openrouter", "--model", "deepseek/deepseek-chat",
+      "--no-stream", "hi" }, { http_client = ask_split_client }) == 0)
+    assert(run_cli({ "ask", "--model", "deepseek/deepseek-chat", "--no-stream", "hi" },
+      { http_client = ask_split_client }) == 0)
+    assert(ask_ids[1] == "deepseek/deepseek-chat" and ask_urls[1]:find("openrouter.ai", 1, true),
+      "ask must keep a catalogue id on the explicit provider")
+    assert(ask_ids[2] == "deepseek-chat" and ask_urls[2]:find("api.deepseek.com", 1, true),
+      "ask without --provider must honour a known provider prefix")
+
+    -- --stream/--no-stream are ask-only; run/chat reject them instead of
+    -- silently ignoring the flag.
+    local no_provider = { http_client = function() error("provider must not be contacted") end }
+    assert(run_cli({ "run", "--stream", "task" }, no_provider) == 2, "run must reject --stream")
+    assert(run_cli({ "run", "--no-stream", "task" }, no_provider) == 2, "run must reject --no-stream")
+    assert(run_cli({ "chat", "--stream" }, no_provider) == 2, "chat must reject --stream")
     print("PASS run/ask model wiring")
   end
 
@@ -312,8 +725,6 @@ local ok_all, test_err = pcall(function()
     assert(run_cli({ "run", "--max-turns" }, prov) == 2, "--max-turns without a value must exit 2")
     assert(run_cli({ "ask", "--max-turns", "3", "hi" }, prov) == 2,
       "run-only options must be rejected by ask")
-    assert(run_cli({ "run", "--provider", "opencode-go", "--model", "openai/gpt-4o", "task" }, prov) == 2,
-      "a --model provider prefix conflicting with --provider must exit 2")
     assert(run_cli({ "run", "--approval-mode", "bogus", "task" }, prov) == 2,
       "an invalid --approval-mode must be a usage error (exit 2)")
     print("PASS subcommand help and unknown-option rejection")
@@ -333,16 +744,31 @@ local ok_all, test_err = pcall(function()
     local rc_exhausted, _, err_exhausted = run_cli({
       "run", "--max-turns", "2", "--thinking", "off", "--workspace", ws, "never finish",
     }, { http_client = client, approver = function() return { decision = "allow_once" } end })
-    assert(rc_exhausted == WheelCLI.EXIT_BUDGET_EXHAUSTED,
-      "budget exhaustion must exit " .. tostring(WheelCLI.EXIT_BUDGET_EXHAUSTED)
-        .. ", got " .. tostring(rc_exhausted) .. ": " .. err_exhausted)
+    assert(rc_exhausted == 3,
+      "budget exhaustion must exit the documented code 3, got "
+        .. tostring(rc_exhausted) .. ": " .. err_exhausted)
+    assert(WheelErrors.E_TURN_BUDGET_EXHAUSTED == "E_TURN_BUDGET_EXHAUSTED",
+      "E_TURN_BUDGET_EXHAUSTED must be part of the typed error vocabulary")
     assert(state.requests == 2, "max_turns must bound provider requests, got " .. tostring(state.requests))
     assert(err_exhausted:find("Turn budget exhausted", 1, true),
       "exhaustion message must say the budget was exhausted")
-    assert(err_exhausted:find("not a provider or tool failure", 1, true),
-      "exhaustion message must distinguish provider/tool failure")
-    assert(WheelCLI.EXIT_BUDGET_EXHAUSTED ~= 1 and WheelCLI.EXIT_BUDGET_EXHAUSTED ~= 0,
-      "budget exhaustion needs a distinct exit code")
+    assert(err_exhausted:find("not resumed", 1, true),
+      "exhaustion message must say the run is not resumed")
+    assert(err_exhausted:find("No provider or persistence error", 1, true),
+      "a clean final turn must not be misreported as a provider failure")
+    assert(not err_exhausted:find("not a provider or tool failure", 1, true),
+      "the message must not deny a tool failure that occurred")
+
+    -- A tool failure on the final turn must be named, not denied.
+    local client_fail, state_fail = make_run_http({ always_tool = true })
+    local rc_fail, _, err_fail = run_cli({
+      "run", "--max-turns", "1", "--auto-deny", "--thinking", "off", "--workspace", ws,
+      "never finish",
+    }, { http_client = client_fail, approver = function() return { decision = "deny" } end })
+    assert(rc_fail == 3, "denied final turn must still exit 3, got " .. tostring(rc_fail))
+    assert(state_fail.requests == 1, "max_turns=1 must issue exactly one request")
+    assert(err_fail:find("tool call(s) failed on the final turn", 1, true),
+      "the exhaustion message must name final-turn tool failures: " .. err_fail)
 
     -- A final answer inside the budget stays success.
     local client_ok, state_ok = make_run_http({ tool_turns = 0 })
@@ -354,7 +780,7 @@ local ok_all, test_err = pcall(function()
     print("PASS --max-turns bounds, plumbing, and exhaustion exit code")
   end
 
-  -- 5. --trace prints tool diagnostics to stderr only.
+  -- 5. --trace prints bounded, redacted tool diagnostics to stderr only.
   do
     local client, _ = make_run_http({ tool_turns = 1 })
     local rc_trace, out_trace, err_trace = run_cli({
@@ -366,14 +792,81 @@ local ok_all, test_err = pcall(function()
     assert(err_trace:find("status=success", 1, true), "trace must report the outcome status")
     assert(err_trace:find("out=", 1, true) and err_trace:find("err=", 1, true),
       "trace must report byte counts")
+    assert(err_trace:find("trace-ok", 1, true),
+      "trace must show the first observation content line")
+    assert(not err_trace:find("[Tool:", 1, true),
+      "trace must not repeat the [Tool: ...] header")
     assert(not out_trace:find("[wheel trace]", 1, true), "trace must never leak into stdout")
 
+    -- Redaction happens before the trace line is bounded.
+    local client_secret, _ = make_run_http({
+      tool_turns = 1,
+      tool_args = '{"command":"echo Authorization: Bearer trace-secret-12345"}',
+    })
+    local _, _, err_secret = run_cli({
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "echo a secret",
+    }, { http_client = client_secret, approver = function() return { decision = "allow_once" } end })
+    assert(not err_secret:find("trace-secret-12345", 1, true),
+      "trace must redact secret-shaped observation content: " .. err_secret)
+    assert(err_secret:find("%[redacted:"), "trace must mark the redacted value")
+
+    -- Terminal control bytes are escaped, never written raw to stderr.
+    local client_ctl, _ = make_run_http({
+      tool_turns = 1,
+      tool_args = '{"command":"printf \'\\\\033[31mred\\\\033[0m\\\\n\'"}',
+    })
+    local _, _, err_ctl = run_cli({
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "print colour",
+    }, { http_client = client_ctl, approver = function() return { decision = "allow_once" } end })
+    assert(not err_ctl:find("\27", 1, true),
+      "trace must not write raw escape bytes: " .. err_ctl)
+    assert(err_ctl:find("\\x1b", 1, true),
+      "trace must render control bytes as escapes: " .. err_ctl)
+
+    -- F1: redaction runs on the raw line before escaping. Drive the real CLI
+    -- and the runner's invalid-outcome fallback with a tab-separated
+    -- Authorization header plus a newline-separated Bearer token.
+    local original_execute = WheelAgent.execute_tool
+    WheelAgent.execute_tool = function()
+      error("Authorization\t: Basic dGVzdA== upstream rejected\nBearer\tsecret-token-abc123", 0)
+    end
+    local client_f1, state_f1 = make_run_http({ tool_turns = 1 })
+    local ran_f1, rc_f1, _, err_f1 = pcall(run_cli, {
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "fail dispatch",
+    }, { http_client = client_f1, approver = function() return { decision = "allow_once" } end })
+    WheelAgent.execute_tool = original_execute
+    assert(ran_f1 and rc_f1 == 0, "fallback run must complete: " .. tostring(err_f1))
+    assert(not err_f1:find("dGVzdA==", 1, true), "F1: Basic credential leaked: " .. err_f1)
+    assert(not err_f1:find("secret-token-abc123", 1, true), "F1: Bearer credential leaked: " .. err_f1)
+    assert(not err_f1:find("\t", 1, true) and not err_f1:find("\27", 1, true),
+      "F1: raw control byte in trace: " .. err_f1)
+    assert(err_f1:find("%[redacted:"), "F1: trace must carry a redaction marker")
+    assert(state_f1.bodies[2] and not state_f1.bodies[2]:find("dGVzdA==", 1, true)
+      and not state_f1.bodies[2]:find("secret-token-abc123", 1, true),
+      "F1: model-facing observation must not carry the credential")
+
+    -- A control byte inside the secret itself is redacted as a whole.
+    WheelAgent.execute_tool = function()
+      error("Authorization\t: Basic dGVz\27dA== upstream rejected", 0)
+    end
+    local client_f1b, _ = make_run_http({ tool_turns = 1 })
+    local ran_f1b, rc_f1b, _, err_f1b = pcall(run_cli, {
+      "run", "--trace", "--thinking", "off", "--workspace", ws, "fail dispatch again",
+    }, { http_client = client_f1b, approver = function() return { decision = "allow_once" } end })
+    WheelAgent.execute_tool = original_execute
+    assert(ran_f1b and rc_f1b == 0, "embedded-control fallback run must complete")
+    assert(not err_f1b:find("dGVz", 1, true) and not err_f1b:find("\27", 1, true),
+      "F1: embedded control byte must not leak the secret: " .. err_f1b)
+    assert(err_f1b:find("%[redacted:"), "F1: embedded-control trace must be redacted")
+
     local client_plain, _ = make_run_http({ tool_turns = 1 })
-    local _, out_plain, err_plain = run_cli({
+    local rc_plain, out_plain, err_plain = run_cli({
       "run", "--thinking", "off", "--workspace", ws, "run echo trace-ok",
     }, { http_client = client_plain, approver = function() return { decision = "allow_once" } end })
+    assert(rc_plain == 0, "untraced run must succeed: " .. err_plain)
     assert(not err_plain:find("[wheel trace]", 1, true), "trace must be opt-in")
     assert(not out_plain:find("[wheel trace]", 1, true), "default stdout must stay unchanged")
+    assert(out_plain == out_trace, "trace must not change stdout")
     print("PASS --trace stderr output and default silence")
   end
 end)

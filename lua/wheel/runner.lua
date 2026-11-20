@@ -30,6 +30,11 @@ if not ok_config then
   WheelConfig = ok_config_alt and WheelConfigAlt or nil
 end
 
+local ok_errors, WheelErrors = pcall(require, "wheel.errors")
+if not ok_errors then
+  WheelErrors = nil
+end
+
 -- Conversation policy is deliberately separate from provider budgets. These
 -- bounds apply to the in-memory request history and to the structured state
 -- written into WheelContext, so a provider cannot make a run grow without
@@ -79,7 +84,8 @@ WheelRunner.MAX_CONTEXT_REF_TURNS = 9007199254740991
 -- final answer. Callers must report this separately from provider/tool
 -- failures; files written before exhaustion remain on disk, but the run is not
 -- resumed.
-WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED = "E_TURN_BUDGET_EXHAUSTED"
+WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED = (WheelErrors and WheelErrors.E_TURN_BUDGET_EXHAUSTED)
+  or "E_TURN_BUDGET_EXHAUSTED"
 
 -- The runner's checkpoint rationale keeps the historical six-field contract;
 -- structured rationale records add decision/risk/next_action/evidence fields.
@@ -1173,9 +1179,11 @@ function WheelRunner.run_task(agent, task, opts)
   local loop_success = false
   local final_error = nil
   local final_error_code = nil
+  local last_turn_tool_failures = 0
 
   while turn < max_turns do
     turn = turn + 1
+    local turn_tool_failures = 0
 
     if on_turn_start then
       on_turn_start(turn, task)
@@ -1340,13 +1348,16 @@ function WheelRunner.run_task(agent, task, opts)
                 tostring(self.tool or "tool"),
                 self.exit_code or 1,
                 self.duration_ms or 0,
-                self.stderr or ""
+                self.preview or ""
               )
             end,
           }
         end
         if on_tool_result then
           on_tool_result(tc, outcome)
+        end
+        if outcome.success ~= true then
+          turn_tool_failures = turn_tool_failures + 1
         end
         turn_record.tools[#turn_record.tools + 1] = { call = tc, outcome = outcome }
 
@@ -1386,6 +1397,7 @@ function WheelRunner.run_task(agent, task, opts)
         table.insert(messages, tool_message)
         table.insert(turn_record.messages, tool_message)
       end
+      last_turn_tool_failures = turn_tool_failures
 
       -- Commit turn checkpoint if enabled
       if commit_checkpoints and agent.kernel and type(agent.kernel.commit_checkpoint) == "function" then
@@ -1453,11 +1465,17 @@ function WheelRunner.run_task(agent, task, opts)
   end
 
   if not loop_success and not final_error then
-    final_error = string.format(
+    local detail = string.format(
       "Turn budget exhausted after %d turns without a final answer for task %s. "
-        .. "Workspace changes already written are kept, but this run is not resumed. "
-        .. "This is not a provider or tool failure.",
+        .. "Workspace changes already written are kept, but this run is not resumed.",
       max_turns, task_id)
+    if last_turn_tool_failures > 0 then
+      detail = detail .. string.format(
+        " %d tool call(s) failed on the final turn.", last_turn_tool_failures)
+    else
+      detail = detail .. " No provider or persistence error was recorded."
+    end
+    final_error = detail
     final_error_code = WheelRunner.ERROR_TURN_BUDGET_EXHAUSTED
   end
 

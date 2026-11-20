@@ -52,22 +52,22 @@ Wheel exposes 14 commands declared in `lua/wheel/init.lua` (`M.command_catalog`)
 
 `wheel ask`, `wheel run`, and `wheel chat` accept the flags below. Each subcommand prints its own usage with `wheel ask --help`, `wheel run -h`, `wheel chat --help`, or `wheel help <command>`, and exits 0 without contacting the provider. Unknown options are usage errors (exit 2), never prompt text.
 
-| Flag                     | Commands             | Behaviour                                                                                                                     |
-| ------------------------ | -------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `--provider <name>`      | `ask`, `run`, `chat` | Selects a built-in provider template; defaults to the configured provider.                                                    |
-| `--model <name>`         | `ask`, `run`, `chat` | Model name or `provider/model`; outranks role config and the provider default (see model precedence below).                   |
-| `--thinking <gear>`      | `ask`, `run`, `chat` | Thinking gear: `off`, `low`, `medium`, `high`, or `max`.                                                                      |
-| `--stream`/`--no-stream` | `ask`                | Stream the response (default) or wait for the complete response.                                                              |
-| `--workspace <dir>`      | `run`                | Workspace root for tools; defaults to the current directory.                                                                  |
-| `--approval-mode <m>`    | `run`                | `prompt` (default), `dashboard`, or `auto-deny`.                                                                              |
-| `--auto-deny`            | `run`                | Shorthand for `--approval-mode auto-deny`.                                                                                    |
-| `--max-turns <n>`        | `run`                | Turn budget, integer `1..200`, default `24`.                                                                                  |
-| `--trace`, `--verbose`   | `run`                | Print one stderr line per tool call: tool name, outcome status, exit code, stdout/stderr byte counts, first observation line. |
-| `--`                     | all                  | End option parsing; everything after it is prompt/task text.                                                                  |
+| Flag                     | Commands             | Behaviour                                                                                                                                               |
+| ------------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--provider <name>`      | `ask`, `run`, `chat` | Selects a built-in provider template; defaults to the configured provider.                                                                              |
+| `--model <name>`         | `ask`, `run`, `chat` | Model name or `provider/model`; outranks role config and the provider default (see model precedence below).                                             |
+| `--thinking <gear>`      | `ask`, `run`, `chat` | Thinking gear: `off`, `low`, `medium`, `high`, or `max`.                                                                                                |
+| `--stream`/`--no-stream` | `ask`                | Stream the response (default) or wait for the complete response.                                                                                        |
+| `--workspace <dir>`      | `run`                | Workspace root for tools; defaults to the current directory.                                                                                            |
+| `--approval-mode <m>`    | `run`                | `prompt` (default), `dashboard`, or `auto-deny`.                                                                                                        |
+| `--auto-deny`            | `run`                | Shorthand for `--approval-mode auto-deny`.                                                                                                              |
+| `--max-turns <n>`        | `run`                | Turn budget, integer `1..200`, default `24`.                                                                                                            |
+| `--trace`, `--verbose`   | `run`                | Print one stderr line per tool call: tool name, outcome status, exit code, stdout/stderr byte counts, and the first redacted, bounded observation line. |
+| `--`                     | all                  | End option parsing; everything after it is prompt/task text.                                                                                            |
 
-**Model precedence** (resolved once in `WheelAgent.resolve_model`): `--model` (string, `provider/model`, or table) → `roles.<role>.model` from configuration **only when it belongs to the active provider** (an explicit provider claim, a `provider/model` prefix, or a model without a claim inheriting the role's default provider family) → the provider's effective default model (provider config `model`, then template default). A `provider/model` prefix selects that provider unless `--provider` names a different one, which is a usage error.
+**Model precedence** (resolved once in `WheelAgent.resolve_model`; applies to `wheel run` and the agent API, while `wheel ask`/`wheel chat` use `--model` or the provider's configured/template model without role-model resolution): (1) `opts.model_profile` (strict complete override). (2) `--model`/`opts.model` — a string is an opaque model id for the resolved provider, except a `provider/model` prefix that names a known provider and is compatible with the selection (no provider selected, or the prefix equals the selected/active provider); a table honours `name`/`model`, its `provider` claim when present, and `temperature`, an explicit table `temperature` applies to the final profile, and a table without a name is not a selection (tuning is kept and resolution continues). (3) `roles.<role>.model_profile` when it names the active provider or no provider (a complete override that is validated, not a skippable claim). (4) `roles.<role>.model` — a bare name applies to the active provider; a `provider/model` string or table naming a different provider is a foreign claim and is skipped; role model tables prefer `model`, while `opts.model` tables prefer `name`. (5) The provider's effective default model (provider config `model`, then template default). The built-in role default supplies the remaining profile fields and is the model fallback only when the provider has no default model; an active provider with no default model and no usable role model fails with the typed `E_MODEL_PROVIDER_UNRESOLVED` error instead of inheriting another provider's id.
 
-`wheel run` exit codes: `0` the model produced a final answer inside the turn budget; `1` provider, persistence, or run failure; `2` usage/validation error; `3` turn budget exhausted before a final answer (workspace changes already written are kept, the run is not resumed, and this is not a provider or tool failure).
+`wheel run` exit codes: `0` the model produced a final answer inside the turn budget; `1` provider, persistence, or run failure; `2` usage/validation error; `3` turn budget exhausted before a final answer (workspace changes already written are kept and the run is not resumed; the message counts any tool calls that failed on the final turn instead of denying them).
 
 | Command       | Invocation                         | Arguments schema                                                       | Result contract   |
 | ------------- | ---------------------------------- | ---------------------------------------------------------------------- | ----------------- |
@@ -95,7 +95,7 @@ This plugin declares no settings.
 Configuration is resolved by `lua/wheel/config.lua` across deterministic precedence (`session_override > trusted_project > global_config > $XDG_DATA_HOME/wheel/settings.json > WheelConfig.RUNTIME_DEFAULTS`) alongside `$XDG_CONFIG_HOME/wheel/init.lua` (plus modular `providers/*.lua`, `agents/*.lua`, `commands/*.lua`, `tools/*.lua`, and `skills/*/SKILL.md` under `$XDG_CONFIG_HOME/wheel/`) and `.wheel/init.lua` gated by the executable project-config trust gate pinned in `$XDG_STATE_HOME/wheel/trusted_projects.json` (see [SECURITY-MODEL.md](SECURITY-MODEL.md#executable-project-configuration-trust-gate)). Project `.wheel/` overrides reject `api_key`, `credentials`, `base_url`, and permission weakening (`project_config_escalation`, including keeping `approval_mode` no weaker than `auto-deny`). Credentials resolve by `session_override > env_var > global_config_provider_key > $XDG_DATA_HOME/wheel/credentials.json > ""`. Built-in provider templates (`WheelProvider.TEMPLATES`), unified thinking settings (`thinking`, `thinking_enabled`, `thinking_gear`), and interactive `PermissionGate` approvals (`allow|ask|deny`, with `--approval-mode prompt|dashboard|auto-deny` and cross-process `$XDG_DATA_HOME/wheel/approvals.json` inspected via `wheel approvals [list|resolve]`) govern daily execution. Comprehensive configuration examples and plugin docs will be published at `https://wheel.bitty.run`.
 
 - **Function classes** (`lua/wheel/config.lua` schema):
-  - `roles` — role definitions, capability narrowing, and model profile references.
+  - `roles` — role definitions, tool allowlists validated against the tool registry at agent construction, and model profile references.
   - `directives` — structured prompt directives applied across roles.
   - `tools` — tool allow/deny lists and custom tool declarations.
   - `skills` — session skill filters discovered from `.agents/`.
@@ -114,26 +114,30 @@ Wheel exposes commands, not keybindings. The Bitty host owns keybinding registra
 
 Every command crosses the typed failure boundary in `lua/wheel/errors.lua` and surfaces a three-field `{ class, code, message }` table:
 
-| `code`                        | `class`      | Meaning                                                                                                                           |
-| ----------------------------- | ------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                                    |
-| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.                |
-| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                              |
-| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                          |
-| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                        |
-| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                       |
-| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.             |
-| `E_PROJECTION_INVALID`        | `validation` | A role-aware Context projection received malformed, cyclic, unsupported, out-of-scope, or over-budget input and failed closed.    |
-| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                        |
-| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic.      |
-| `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                                  |
-| `E_JOB_METADATA_INVALID`      | `runtime`    | A job record is malformed, unowned, wrongly moded, oversized, or names an invalid id/generation; no signal was sent.              |
-| `E_JOB_GENERATION_MISMATCH`   | `runtime`    | The recorded leader generation, process group, session, or owner uid does not match the live retained leader; no signal was sent. |
-| `E_JOB_NOT_RUNNING`           | `runtime`    | The job did not reach `running`, or its retained leader already exited without a terminal record; no signal was sent.             |
-| `E_JOB_BUSY`                  | `runtime`    | The bounded terminal-transition lock stayed held; the request was refused rather than racing the transition.                      |
-| `E_JOB_SIGNAL_FAILED`         | `runtime`    | The recorded process group could not be signalled after validation; the failure is reported without a fallback pattern kill.      |
-| `E_JOB_UNAVAILABLE`           | `runtime`    | The private job root, random source, capture file, or bounded sleep is unavailable; no weaker execution path was used.            |
-| `E_JOB_CLEANUP_FAILED`        | `runtime`    | A terminal job's private files could not be removed; the record was kept for diagnosis and no other path was deleted.             |
+| `code`                        | `class`      | Meaning                                                                                                                                                             |
+| ----------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `E_CAPABILITY_DENIED`         | `runtime`    | The host removed a surface the command needs. The message names the missing capability family.                                                                      |
+| `E_INTERNAL`                  | `runtime`    | The handler failed unexpectedly. The message is generic and never describes the underlying defect as a capability.                                                  |
+| `E_ARGS_INVALID`              | `validation` | Arguments did not match the command's closed `args_schema`; the handler did not run.                                                                                |
+| `E_SCHEMA_INVALID`            | `validation` | A command's `args_schema` or `result_schema` was malformed or unbounded at registration.                                                                            |
+| `E_RESULT_INVALID`            | `validation` | A handler result did not match its closed `result_schema`.                                                                                                          |
+| `E_COMPLETION_BUDGET_INVALID` | `validation` | A completion-token bound override was zero, negative, non-integer, non-numeric, or above the named maximum.                                                         |
+| `E_TURN_BUDGET_EXHAUSTED`     | `budget`     | A run stopped at its turn limit before a final answer; `wheel run` exits `3`, keeps already-written workspace changes, and does not resume.                         |
+| `E_AGENT_TOOL_UNKNOWN`        | `validation` | A configuration-derived role tool list names unregistered tools, is map-shaped, or is not a dense array; agent construction fails closed with a bounded diagnostic. |
+| `E_MODEL_PROFILE_INVALID`     | `validation` | A model profile (explicit or role-configured) is malformed, e.g. a non-string provider or out-of-range temperature; model resolution fails closed.                  |
+| `E_MODEL_PROVIDER_UNRESOLVED` | `resolution` | The active provider has no default model and no usable role model; pass `--model` or configure `providers.<name>.model`.                                            |
+| `E_SNAPSHOT_INVALID`          | `validation` | A `WheelContext` snapshot failed format, bounds, hash, ref, reflog, or commit-graph validation; no context was built.                                               |
+| `E_PROJECTION_INVALID`        | `validation` | A role-aware Context projection received malformed, cyclic, unsupported, out-of-scope, or over-budget input and failed closed.                                      |
+| `E_MODULE_LOAD_FAILED`        | `resolution` | A Wheel submodule could not be loaded; the message names the rooted module and a bounded, path-free cause.                                                          |
+| `E_AUDIT_UNAVAILABLE`         | `runtime`    | A local audit record could not be written; the message is static and never includes a path, value, or filesystem diagnostic.                                        |
+| `E_JOB_NOT_FOUND`             | `runtime`    | The requested job record or its private root does not exist; no signal was sent.                                                                                    |
+| `E_JOB_METADATA_INVALID`      | `runtime`    | A job record is malformed, unowned, wrongly moded, oversized, or names an invalid id/generation; no signal was sent.                                                |
+| `E_JOB_GENERATION_MISMATCH`   | `runtime`    | The recorded leader generation, process group, session, or owner uid does not match the live retained leader; no signal was sent.                                   |
+| `E_JOB_NOT_RUNNING`           | `runtime`    | The job did not reach `running`, or its retained leader already exited without a terminal record; no signal was sent.                                               |
+| `E_JOB_BUSY`                  | `runtime`    | The bounded terminal-transition lock stayed held; the request was refused rather than racing the transition.                                                        |
+| `E_JOB_SIGNAL_FAILED`         | `runtime`    | The recorded process group could not be signalled after validation; the failure is reported without a fallback pattern kill.                                        |
+| `E_JOB_UNAVAILABLE`           | `runtime`    | The private job root, random source, capture file, or bounded sleep is unavailable; no weaker execution path was used.                                              |
+| `E_JOB_CLEANUP_FAILED`        | `runtime`    | A terminal job's private files could not be removed; the record was kept for diagnosis and no other path was deleted.                                               |
 
 ### Configuration failures
 

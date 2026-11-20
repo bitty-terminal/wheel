@@ -8,21 +8,54 @@ and the project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### CLI
 
-- `--model` accepts a string, a `provider/model` value, or a table and is now
-  applied to the agent; `wheel run --model` previously kept the role-default
-  model. Model precedence is resolved once in `WheelAgent.resolve_model`:
-  `--model` > role config model that belongs to the active provider > the
-  provider's effective default model.
+- `--model`/`opts.model` accepts a model name or `provider/model`; the
+  `WheelAgent.new` API also accepts `{ name, provider, temperature }`. The
+  table honours its `provider` claim, an explicit table `temperature` applies
+  to the final profile, and a table without a model name is not a selection
+  (tuning kept, resolution continues). A string is an opaque model id for the
+  resolved provider unless a `provider/model` prefix names a known provider and
+  is compatible with the selection (no provider selected, or the prefix equals
+  the selected/active provider), so OpenRouter catalogue ids such as
+  `deepseek/deepseek-v4.1-flash` survive an explicit `--provider`.
+- Model precedence is resolved once in `WheelAgent.resolve_model` for
+  `wheel run` and the agent API (`wheel ask`/`wheel chat` use `--model` or the
+  provider's configured/template model without role-model resolution):
+  `opts.model_profile` (strict complete override) > `--model`/`opts.model` >
+  `roles.<role>.model_profile` for the active provider (or provider-less; a
+  complete override that is validated) > `roles.<role>.model`, where a bare
+  name applies to the active provider, a `provider/model` string or table
+  naming a different provider is a foreign claim and is skipped, role model
+  tables prefer `model` while `opts.model` tables prefer `name`, > the
+  provider's effective default model. An active provider with no default model
+  and no usable role model fails with the typed `E_MODEL_PROVIDER_UNRESOLVED`
+  error instead of inheriting another provider's id. `wheel run --model`
+  previously kept the role-default model.
+- A malformed model profile (including a non-string provider) or an unresolved
+  provider default is rejected with a typed error (`E_MODEL_PROFILE_INVALID`,
+  `E_MODEL_PROVIDER_UNRESOLVED`) instead of reaching provider creation.
 - `wheel ask|run|chat --help` and `wheel help <command>` print documented usage
   and exit 0 without contacting the provider. Unknown options are usage errors
-  (exit 2) instead of being sent to the model as prompt text.
+  (exit 2) instead of being sent to the model as prompt text. `--stream` and
+  `--no-stream` belong to `ask` and are rejected by `run`/`chat`.
 - `wheel run --max-turns <1..200>` (default 24) bounds the ReAct loop. Budget
-  exhaustion exits `3` with a message that reports the exhaustion honestly and
-  distinguishes it from provider/tool failures; already-written workspace
-  changes remain, but the run is not resumed. Completed runs still exit `0`.
+  exhaustion exits `3` with a message that reports the exhaustion honestly,
+  counts failed tool calls from the final turn, and notes that already-written
+  workspace changes remain while the run is not resumed. Completed runs still
+  exit `0`.
 - `wheel run --trace` (alias `--verbose`) prints one stderr line per tool call
   with tool name, outcome status, exit code, byte counts, and the first
-  observation line. Default output is unchanged.
+  observation content line, redacted and bounded. Default output is unchanged.
+- `WheelAgent.new` fails closed with `E_AGENT_TOOL_UNKNOWN` (typed, bounded)
+  when a configuration-derived role tool list names tools missing from the
+  registry, is map-shaped, or is sparse; `"*"` wildcard lists remain valid. The
+  built-in role defaults now reference only registered core tools, and the
+  commander lists no shell or write tool so its tool list adds no authority
+  beyond the permission gate.
+
+### Agent
+
+- `E_TURN_BUDGET_EXHAUSTED` is now part of the `lua/wheel/errors.lua` typed
+  vocabulary (`budget` class) instead of a runner-local string.
 
 ### Provider Cache
 
