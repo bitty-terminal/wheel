@@ -404,6 +404,19 @@ local ok_all, test_err = pcall(function()
       and hot_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
       "invalid explicit temperature must fail typed: " .. tostring(hot_err))
 
+    local false_temp, false_temp_err = resolve({
+      model = { temperature = false },
+      provider_name = "opencode-go",
+      provider_default_model = "go-default",
+      config = { roles = { [coding] = { model_profile = {
+        model = "role-model", temperature = 0.2,
+      } } } },
+    })
+    assert(false_temp == nil and type(false_temp_err) == "table"
+      and WheelErrors.is_typed(false_temp_err)
+      and false_temp_err.code == WheelErrors.E_MODEL_PROFILE_INVALID,
+      "boolean explicit temperature must fail typed: " .. tostring(false_temp_err))
+
     -- A named provider-less role profile is still validated.
     local invalid, invalid_err = resolve({
       config = { roles = { [coding] = { model_profile = { model = "x", temperature = "hot" } } } },
