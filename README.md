@@ -89,10 +89,14 @@ with per-platform backends; the Linux backend uses `bubblewrap` (`bwrap`).
   does exactly that on a pinned image (the generic gate also executes the suite
   where `bwrap` is present). `SECURITY-MODEL.md` records what is still
   unprotected.
-- **Platforms:** Linux native today. macOS is supported at the core level, but
-  its sandbox backend (Seatbelt) is not implemented yet and `--sandbox` fails
-  closed there. Windows is supported **only through WSL2**; native Windows fails
-  closed at seam construction, has no process backend, and none is planned.
+- **Platforms:** Linux native today — `scripts/wheel-sandbox` runs the `bwrap`
+  backend with the allowlisted egress relay. macOS runs the core POSIX surface
+  only; the sandbox backend (Seatbelt) is not implemented, and `--sandbox`
+  fails closed there because the launcher refuses to start without `bwrap`.
+  Windows is **WSL2 only**: the Linux backend runs inside WSL2, and native
+  Windows fails closed at seam construction — the standalone host seam
+  (`lua/wheel/host.lua`) raises `E_CAPABILITY_DENIED` on a non-POSIX platform —
+  and no native process backend is planned.
 
 - **Gate interpreter:** Lua 5.1 (`lua5.1` primary release gate; `luajit` and `lua` development fallbacks with JIT disabled for evaluated project-config chunks).
 - **Platform:** POSIX hosts with GNU coreutils, `util-linux` (`setsid`), `tar`, and `gzip`.
