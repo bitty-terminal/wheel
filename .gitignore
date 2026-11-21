@@ -12,3 +12,7 @@ dist/
 # Lua compiler output is never a source input. The packaging regression uses
 # this ignore rule to prove ignored files cannot enter the release archive.
 *.luac
+
+# Python bytecode from tooling that imports the relay module.
+__pycache__/
+*.pyc
