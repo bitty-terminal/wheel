@@ -1131,6 +1131,30 @@ container and gVisor/microVM tiers are for, and neither is implemented here.
 | macOS (native) | Core POSIX surface supported; the sandbox backend is **not implemented**. `wheel --sandbox` fails closed there. | Planned Seatbelt (`sandbox-exec`) profile generated from the same policy.                                                                                                                    |
 | Windows        | **WSL2 only.** The Linux backend runs inside WSL2.                                                              | Native Windows fails closed at seam construction: there is no native process backend (no `setsid`, POSIX FIFOs, or `sh -c` equivalent), and none is planned. The sandbox is not the blocker. |
 
+Each row's enforcement point, verified against the current tree:
+
+- **Linux.** `scripts/wheel-sandbox` declares the policy and implements the
+  backend; it requires `bwrap`, refuses to start when `bwrap` is missing, and
+  never falls back to an unsandboxed run. Proxy-mode egress is the host relay
+  `scripts/wheel-sandbox-proxy.py`, reached through the in-sandbox
+  `scripts/wheel-sandbox-bridge.py`, with a default-deny destination allowlist
+  and relay-side credential injection. Escape evidence: `just test-sandbox`
+  (`scripts/tests/wheel-sandbox.test.sh`).
+- **macOS.** The core surface is the standalone POSIX seam
+  (`WheelHost.select_backend("standalone")` in `lua/wheel/host.lua`), which
+  constructs on a POSIX platform. `scripts/wheel-sandbox` is the only sandbox
+  entry point, so `wheel --sandbox` fails closed there: the launcher's
+  `bwrap` requirement is refused, not bypassed. No Seatbelt profile exists in
+  the tree; a `sandbox-exec` profile generated from this same policy is the
+  planned follow-up.
+- **Windows.** `resolve_platform` in `lua/wheel/host.lua` classifies a
+  non-POSIX interpreter platform as `unsupported`, and the standalone factory
+  fails closed at seam construction with the typed `E_CAPABILITY_DENIED`
+  (`host.backend.standalone`); no native process backend (no `setsid`, POSIX
+  FIFOs, or `sh -c` equivalent) exists or is planned. Under WSL2 the host
+  inside the VM is Linux, so the Linux backend applies unchanged;
+  WSL2-specific validation is an open point, not evidence.
+
 The evidence in this document is Linux evidence. No macOS or Windows claim is
 made, and no macOS or Windows code is added.
 
